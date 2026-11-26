@@ -25,7 +25,6 @@ fn default_empty_object() -> Value {
 }
 
 crate::wire::wire_string_enum! {
-    #[derive(Hash)]
     pub enum FrameKind {
         HelloAck => "hello_ack",
         CommandReq => "command_req",
@@ -349,13 +348,16 @@ impl BridgeCommand {
             Self::RunWorkflow {
                 workflow_name,
                 workspace_dir,
-                ..
+                params,
             } => {
                 if workflow_name.trim().is_empty() {
                     return Err(ValidationError("workflow name"));
                 }
                 if workspace_dir.trim().is_empty() {
                     return Err(ValidationError("workspace dir"));
+                }
+                if !params.is_object() {
+                    return Err(ValidationError("workflow params object"));
                 }
                 Ok(())
             }
@@ -519,10 +521,16 @@ impl BridgePayload for RosterSyncPayload {
             return Err(ValidationError("roster chunk index"));
         }
         for participant in &self.participants {
+            if !participant.capabilities.is_object() {
+                return Err(ValidationError("participant capabilities object"));
+            }
             validate_approval_fields(
                 participant.state,
                 participant.can_respond_remotely,
                 participant.approval_id.as_deref(),
+                participant.wait_kind.is_some()
+                    || participant.action_hint.is_some()
+                    || participant.summary.is_some(),
             )?;
         }
         Ok(())
@@ -656,8 +664,16 @@ impl BridgePayload for NodeEventPayload {
                 state,
                 can_respond_remotely,
                 approval_id,
+                wait_kind,
+                action_hint,
+                summary,
                 ..
-            } => validate_approval_fields(*state, *can_respond_remotely, approval_id.as_deref()),
+            } => validate_approval_fields(
+                *state,
+                *can_respond_remotely,
+                approval_id.as_deref(),
+                wait_kind.is_some() || action_hint.is_some() || summary.is_some(),
+            ),
             Self::AgentReplyCreated {
                 recipient_id,
                 attachments,
@@ -670,10 +686,22 @@ impl BridgePayload for NodeEventPayload {
                 }
                 validate_message_extras(attachments, question.as_ref(), answer.as_ref())
             }
-            Self::WorkflowRunStarted { workflow_name, .. }
-            | Self::WorkflowRunFinished { workflow_name, .. } => {
+            Self::WorkflowRunStarted { workflow_name, .. } => {
                 if workflow_name.trim().is_empty() {
                     return Err(ValidationError("workflow name"));
+                }
+                Ok(())
+            }
+            Self::WorkflowRunFinished {
+                workflow_name,
+                state,
+                ..
+            } => {
+                if workflow_name.trim().is_empty() {
+                    return Err(ValidationError("workflow name"));
+                }
+                if *state == WorkflowRunState::Running {
+                    return Err(ValidationError("workflow run finished state"));
                 }
                 Ok(())
             }

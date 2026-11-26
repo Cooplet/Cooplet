@@ -1,5 +1,4 @@
 use std::{
-    cmp::Ordering as CmpOrdering,
     sync::{
         Arc,
         atomic::{AtomicBool, Ordering},
@@ -9,21 +8,17 @@ use std::{
 
 use crate::PlatformError;
 
+/// Continuous monotonic timestamp. Ordering intentionally omitted so callers
+/// always evaluate deadlines through fail-closed `MonotonicClock` helpers.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct MonoInstant(Option<u128>);
 
-impl PartialOrd for MonoInstant {
-    fn partial_cmp(&self, other: &Self) -> Option<CmpOrdering> {
-        match (self.0, other.0) {
-            (Some(left), Some(right)) => Some(left.cmp(&right)),
-            // INVALID must never compare less than a deadline (fail-closed).
-            _ => None,
-        }
-    }
-}
-
 impl MonoInstant {
     pub const INVALID: Self = Self(None);
+
+    pub const fn is_valid(self) -> bool {
+        self.0.is_some()
+    }
 
     pub fn as_millis(self) -> Option<u64> {
         self.0
@@ -183,16 +178,17 @@ mod tests {
     }
 
     #[test]
-    fn invalid_instant_never_compares_before_a_deadline() {
-        let deadline = MonoInstant(Some(100));
-        assert!(!MonoInstant::INVALID.lt(&deadline));
-        assert!(!MonoInstant::INVALID.le(&deadline));
-        assert!(!deadline.lt(&MonoInstant::INVALID));
-        assert_eq!(MonoInstant::INVALID.partial_cmp(&deadline), None);
+    fn invalid_instant_always_fails_closed() {
+        let deadline = MonoInstant(Some(100_000_000));
+        assert!(!MonoInstant::INVALID.is_valid());
+        assert!(deadline.is_valid());
+        assert_eq!(MonotonicClock::remaining_ms(MonoInstant::INVALID), None);
+        assert!(MonotonicClock::is_expired(MonoInstant::INVALID));
+        assert_eq!(deadline.remaining_ms_at(MonoInstant::INVALID), None);
+        assert_eq!(MonoInstant::INVALID.remaining_ms_at(deadline), None);
         assert_eq!(
-            MonoInstant::INVALID.partial_cmp(&MonoInstant::INVALID),
-            None
+            deadline.remaining_ms_at(MonoInstant(Some(50_000_000))),
+            Some(50)
         );
-        assert!(MonoInstant(Some(50)) < deadline);
     }
 }

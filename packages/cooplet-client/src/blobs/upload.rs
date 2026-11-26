@@ -9,7 +9,9 @@ use std::{
 };
 
 use bytes::{Bytes, BytesMut};
-use cooplet_protocol::{AttachmentRef, validate_media_type, validate_sha256};
+use cooplet_protocol::{
+    AttachmentRef, validate_attachment_name, validate_media_type, validate_sha256,
+};
 use futures_util::stream;
 use http::{
     HeaderValue, Method, StatusCode,
@@ -22,11 +24,14 @@ use tokio::{
     sync::mpsc,
 };
 
-use super::{CHUNK_BYTES, check_digest, checked_blob_size};
+use super::{check_digest, checked_blob_size};
 use crate::{
     ClientError, CoopletClient, X_COOPLET_FILENAME, X_COOPLET_SHA256, client::timeout,
     error::read_bounded,
 };
+
+const CHUNK_BYTES: usize = 64 * 1024;
+const MIN_READ_CAPACITY: usize = 8 * 1024;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum UploadVerification {
@@ -64,9 +69,10 @@ impl CoopletClient {
                 "Hub receipt verification requires a pinned Hub",
             ));
         }
-        let mut request = self
+        let (request, pin_epoch) = self
             .protected(Method::POST, url, spec.idempotency_key.as_deref())
-            .await?
+            .await?;
+        let mut request = request
             .header(X_COOPLET_FILENAME, headers.filename)
             .header(CONTENT_TYPE, headers.content_type);
         if let Some(length) = spec.content_length {
@@ -103,7 +109,7 @@ impl CoopletClient {
 
         let status = response.status();
         if !matches!(status, StatusCode::OK | StatusCode::CREATED) {
-            return Err(self.failure(response, false).await);
+            return Err(self.failure(response, false, pin_epoch).await);
         }
         let receipt: AttachmentRef = timeout(self.config.request_timeout, "blob receipt", async {
             let bytes = read_bounded(response, self.config.max_json_response_bytes).await?;
@@ -188,9 +194,8 @@ struct UploadHeaders {
 
 impl UploadHeaders {
     fn validate(spec: &BlobUploadSpec, max_bytes: u64) -> Result<Self, ClientError> {
-        if spec.filename.is_empty() || spec.filename.len() > 255 || spec.filename.contains('\0') {
-            return Err(ClientError::invalid("invalid blob filename"));
-        }
+        validate_attachment_name(&spec.filename)
+            .map_err(|_| ClientError::invalid("invalid blob filename"))?;
         if let Some(expected) = spec.expected_sha256.as_deref() {
             validate_sha256(expected)
                 .map_err(|_| ClientError::invalid("invalid expected SHA-256"))?;
@@ -269,8 +274,9 @@ async fn produce(
     let mut bytes = 0;
     let mut last = None;
     loop {
-        if buffer.capacity() < CHUNK_BYTES {
-            buffer.reserve(CHUNK_BYTES);
+        let min_cap = if last.is_some() { 1 } else { MIN_READ_CAPACITY };
+        if buffer.capacity() < min_cap {
+            buffer.reserve(if last.is_some() { 1 } else { CHUNK_BYTES });
         }
         let count = timeout(progress_timeout, "blob source progress", async {
             tokio::select! {

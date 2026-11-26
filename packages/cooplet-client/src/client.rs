@@ -2,8 +2,8 @@ use std::{
     future::Future,
     pin::Pin,
     sync::{
-        Arc,
-        atomic::{AtomicBool, Ordering},
+        Arc, Mutex,
+        atomic::{AtomicU64, Ordering},
     },
     time::Duration,
 };
@@ -19,7 +19,6 @@ use http::{Method, header::AUTHORIZATION};
 use percent_encoding::{NON_ALPHANUMERIC, percent_decode_str, utf8_percent_encode};
 use reqwest::{Certificate, RequestBuilder, Response};
 use serde::{Serialize, de::DeserializeOwned};
-use tokio::sync::Mutex;
 use url::{Host, Url};
 
 use crate::{
@@ -76,16 +75,21 @@ impl ClientConfig {
 // The callers own the in-flight GET. Cancelling one caller leaves other
 // waiters on the same request, and cancelling them all drops that request.
 enum HubPin {
-    Unverified(Option<WeakShared<BoxFuture<'static, Result<(), ClientError>>>>),
-    Verified,
+    Unverified(Option<WeakShared<BoxFuture<'static, Result<u64, ClientError>>>>),
+    Verified(u64),
+}
+
+struct HubPinState {
+    pin: HubPin,
+    next_epoch: u64,
 }
 
 #[derive(Clone)]
 pub struct CoopletClient {
     http: reqwest::Client,
     pub(crate) config: Arc<ClientConfig>,
-    hub_pin: Arc<Mutex<HubPin>>,
-    verified: Arc<AtomicBool>,
+    hub_pin: Arc<Mutex<HubPinState>>,
+    verified_epoch: Arc<AtomicU64>,
 }
 
 impl CoopletClient {
@@ -111,16 +115,28 @@ impl CoopletClient {
         Ok(Self {
             http,
             config: Arc::new(config),
-            hub_pin: Arc::new(Mutex::new(HubPin::Unverified(None))),
-            verified: Arc::new(AtomicBool::new(false)),
+            hub_pin: Arc::new(Mutex::new(HubPinState {
+                pin: HubPin::Unverified(None),
+                next_epoch: 0,
+            })),
+            verified_epoch: Arc::new(AtomicU64::new(0)),
         })
     }
 
     /// Query a prospective destination without credentials. Pinning the
     /// returned Hub ID is a separate caller decision.
     pub async fn discover_info(base_url: &Url) -> Result<InfoResponse, ClientError> {
+        Self::discover_info_with_roots(base_url, &[]).await
+    }
+
+    /// Query a prospective destination without credentials, trusting additional
+    /// PEM-encoded CA roots alongside WebPKI roots.
+    pub async fn discover_info_with_roots(
+        base_url: &Url,
+        root_certificates_pem: &[Vec<u8>],
+    ) -> Result<InfoResponse, ClientError> {
         let loopback = validate_origin(base_url, false)?;
-        let http = build_http(DEFAULT_CONNECT_TIMEOUT, loopback, &[])?;
+        let http = build_http(DEFAULT_CONNECT_TIMEOUT, loopback, root_certificates_pem)?;
         let url = make_url(base_url, "/v1/info", &[])?;
         timeout(DEFAULT_REQUEST_TIMEOUT, "public info", async {
             let response = http.get(url).send().await?;
@@ -130,55 +146,80 @@ impl CoopletClient {
     }
 
     pub async fn verify_hub_identity(&self) -> Result<(), ClientError> {
+        self.verify_hub_epoch().await.map(|_| ())
+    }
+
+    async fn verify_hub_epoch(&self) -> Result<u64, ClientError> {
         let Some(expected) = self.expected_hub() else {
-            return Ok(());
+            return Ok(0);
         };
-        if self.verified.load(Ordering::Acquire) {
-            return Ok(());
+        let epoch = self.verified_epoch.load(Ordering::Acquire);
+        if epoch != 0 {
+            return Ok(epoch);
         }
-        let mut pin = self.hub_pin.lock().await;
-        let HubPin::Unverified(pending) = &mut *pin else {
-            return Ok(());
-        };
-        let attempt = if let Some(attempt) = pending.as_ref().and_then(WeakShared::upgrade) {
-            attempt
-        } else {
-            let client = self.clone();
-            let expected = expected.clone();
-            let attempt = async move {
-                let result = client.check_hub_identity(&expected).await;
-                let mut pin = client.hub_pin.lock().await;
-                if result.is_ok() {
-                    *pin = HubPin::Verified;
-                    client.verified.store(true, Ordering::Release);
-                } else {
-                    *pin = HubPin::Unverified(None);
-                    client.verified.store(false, Ordering::Release);
+        let attempt = {
+            let mut state = self
+                .hub_pin
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            match &mut state.pin {
+                HubPin::Verified(epoch) => return Ok(*epoch),
+                HubPin::Unverified(pending) => {
+                    if let Some(attempt) = pending.as_ref().and_then(WeakShared::upgrade) {
+                        attempt
+                    } else {
+                        let client = self.clone();
+                        let expected = expected.clone();
+                        let attempt = async move {
+                            let result = client.check_hub_identity(&expected).await;
+                            let mut state = client
+                                .hub_pin
+                                .lock()
+                                .unwrap_or_else(std::sync::PoisonError::into_inner);
+                            match result {
+                                Ok(()) => {
+                                    state.next_epoch += 1;
+                                    let epoch = state.next_epoch;
+                                    state.pin = HubPin::Verified(epoch);
+                                    client.verified_epoch.store(epoch, Ordering::Release);
+                                    Ok(epoch)
+                                }
+                                Err(error) => {
+                                    state.pin = HubPin::Unverified(None);
+                                    client.verified_epoch.store(0, Ordering::Release);
+                                    Err(error)
+                                }
+                            }
+                        }
+                        .boxed()
+                        .shared();
+                        *pending = attempt.downgrade();
+                        attempt
+                    }
                 }
-                result
             }
-            .boxed()
-            .shared();
-            *pending = attempt.downgrade();
-            attempt
         };
-        drop(pin);
         attempt.await
     }
 
-    async fn invalidate_hub_pin(&self) {
-        self.verified.store(false, Ordering::Release);
-        let mut pin = self.hub_pin.lock().await;
-        if matches!(*pin, HubPin::Verified) {
-            *pin = HubPin::Unverified(None);
+    fn invalidate_hub_pin(&self, expected_epoch: u64) {
+        if expected_epoch == 0 {
+            return;
+        }
+        let mut state = self
+            .hub_pin
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if matches!(state.pin, HubPin::Verified(current) if current == expected_epoch) {
+            state.pin = HubPin::Unverified(None);
+            self.verified_epoch.store(0, Ordering::Release);
         }
     }
 
-    async fn observe_error(&self, error: ClientError) -> ClientError {
+    fn observe_error(&self, error: &ClientError, pin_epoch: u64) {
         if matches!(error, ClientError::HubIdentityMismatch { .. }) {
-            self.invalidate_hub_pin().await;
+            self.invalidate_hub_pin(pin_epoch);
         }
-        error
     }
 
     async fn check_hub_identity(&self, expected: &HubId) -> Result<(), ClientError> {
@@ -195,7 +236,7 @@ impl CoopletClient {
 
     pub async fn info(&self) -> Result<InfoResponse, ClientError> {
         let url = self.url("/v1/info", &[])?;
-        self.execute_json(self.http.get(url), false, false).await
+        self.execute_json(self.http.get(url), None, false).await
     }
 
     pub async fn health(&self) -> Result<HealthResponse, ClientError> {
@@ -212,8 +253,8 @@ impl CoopletClient {
         query: &[(&str, String)],
     ) -> Result<Resp, ClientError> {
         let url = self.url(path, query)?;
-        let request = self.protected(Method::GET, url, None).await?;
-        self.execute_json(request, true, false).await
+        let (request, pin_epoch) = self.protected(Method::GET, url, None).await?;
+        self.execute_json(request, Some(pin_epoch), false).await
     }
 
     pub async fn post_json<Req: Serialize + ?Sized, Resp: DeserializeOwned>(
@@ -252,8 +293,8 @@ impl CoopletClient {
         idempotency_key: Option<&str>,
     ) -> Result<Resp, ClientError> {
         let url = self.url(path, &[])?;
-        let request = self.protected(Method::DELETE, url, idempotency_key).await?;
-        self.execute_json(request, true, false).await
+        let (request, pin_epoch) = self.protected(Method::DELETE, url, idempotency_key).await?;
+        self.execute_json(request, Some(pin_epoch), false).await
     }
 
     pub async fn delete_no_content(
@@ -262,7 +303,7 @@ impl CoopletClient {
         idempotency_key: Option<&str>,
     ) -> Result<(), ClientError> {
         let url = self.url(path, &[])?;
-        let request = self.protected(Method::DELETE, url, idempotency_key).await?;
+        let (request, pin_epoch) = self.protected(Method::DELETE, url, idempotency_key).await?;
         let hub = self.expected_hub();
         let result = timeout(self.config.request_timeout, "empty response", async {
             let response = request.send().await?;
@@ -276,10 +317,10 @@ impl CoopletClient {
             Ok(())
         })
         .await;
-        match result {
-            Ok(()) => Ok(()),
-            Err(error) => Err(self.observe_error(error).await),
+        if let Err(error) = &result {
+            self.observe_error(error, pin_epoch);
         }
+        result
     }
 
     async fn mutate_json<Req: Serialize + ?Sized, Resp: DeserializeOwned>(
@@ -290,14 +331,14 @@ impl CoopletClient {
         idempotency_key: Option<&str>,
     ) -> Result<Resp, ClientError> {
         let url = self.url(path, &[])?;
-        let request = self.protected(method, url, idempotency_key).await?;
+        let (request, pin_epoch) = self.protected(method, url, idempotency_key).await?;
         let body = serde_json::to_vec(body)
             .map_err(|_| ClientError::invalid("could not serialize JSON body"))?;
         self.execute_json(
             request
                 .header(http::header::CONTENT_TYPE, "application/json")
                 .body(body),
-            true,
+            Some(pin_epoch),
             false,
         )
         .await
@@ -319,12 +360,12 @@ impl CoopletClient {
         method: Method,
         url: Url,
         idempotency_key: Option<&str>,
-    ) -> Result<RequestBuilder, ClientError> {
+    ) -> Result<(RequestBuilder, u64), ClientError> {
         if let Some(key) = idempotency_key {
             validate_idempotency_key(key)
                 .map_err(|_| ClientError::invalid("invalid idempotency key"))?;
         }
-        self.verify_hub_identity().await?;
+        let pin_epoch = self.verify_hub_epoch().await?;
         let mut request = self.http.request(method, url);
         if let Some(hub_id) = self.expected_hub() {
             request = request.header(X_COOPLET_HUB, hub_id.as_str());
@@ -335,28 +376,33 @@ impl CoopletClient {
         if let Some(key) = idempotency_key {
             request = request.header(IDEMPOTENCY_KEY, key);
         }
-        Ok(request)
+        Ok((request, pin_epoch))
     }
 
     pub(crate) async fn execute_json<T: DeserializeOwned>(
         &self,
         request: RequestBuilder,
-        protected: bool,
+        pin_epoch: Option<u64>,
         events: bool,
     ) -> Result<T, ClientError> {
-        let hub = if protected { self.expected_hub() } else { None };
+        let hub = pin_epoch.and_then(|_| self.expected_hub());
         let result = timeout(self.config.request_timeout, "JSON response", async {
             let response = request.send().await?;
             decode_json(response, self.config.max_json_response_bytes, hub, events).await
         })
         .await;
-        match result {
-            Ok(value) => Ok(value),
-            Err(error) => Err(self.observe_error(error).await),
+        if let (Some(epoch), Err(error)) = (pin_epoch, &result) {
+            self.observe_error(error, epoch);
         }
+        result
     }
 
-    pub(crate) async fn failure(&self, response: Response, events: bool) -> ClientError {
+    pub(crate) async fn failure(
+        &self,
+        response: Response,
+        events: bool,
+        pin_epoch: u64,
+    ) -> ClientError {
         let error = match tokio::time::timeout(
             self.config.request_timeout,
             parse_failure(response, self.expected_hub(), events),
@@ -366,7 +412,8 @@ impl CoopletClient {
             Ok(error) => error,
             Err(_) => ClientError::Timeout("error response"),
         };
-        self.observe_error(error).await
+        self.observe_error(&error, pin_epoch);
+        error
     }
 }
 
@@ -408,8 +455,8 @@ fn build_http(
         }
     }
     builder.build().map_err(|error| {
-        if !root_certificates_pem.is_empty() && error.is_builder() {
-            ClientError::invalid("invalid root certificate PEM")
+        if error.is_builder() {
+            ClientError::invalid("invalid HTTP/TLS client configuration")
         } else {
             error.into()
         }

@@ -505,6 +505,22 @@ async fn local_sha256_mismatch_is_rejected_before_final_chunk_even_on_early_200_
         Err(ClientError::InvalidInput(_))
     ));
 
+    // Invalid filenames (blank, control characters, NUL, oversized) fail before network I/O.
+    for bad_name in ["", "   ", "bad\nname", "bad\x1bname", "bad\0name"] {
+        let mut bad = spec(None);
+        bad.filename = bad_name.into();
+        let source = PendingReader::default();
+        let polls = source.0.clone();
+        assert!(
+            matches!(
+                client.upload_blob(bad, source).await,
+                Err(ClientError::InvalidInput(_))
+            ),
+            "accepted bad filename {bad_name:?}"
+        );
+        assert_eq!(polls.load(Ordering::Relaxed), 0);
+    }
+
     // Fast mismatched reader fails locally with BlobDigestMismatch before completing the request.
     let mut fast_wrong = spec(Some(5));
     fast_wrong.idempotency_key = Some("fast-mismatch-key".into());
@@ -516,13 +532,15 @@ async fn local_sha256_mismatch_is_rejected_before_final_chunk_even_on_early_200_
 
     // Streaming upload whose local bytes do not match expected_sha256 must fail with
     // BlobDigestMismatch before releasing the final held chunk, even when headers were
-    // already accepted by the server.
+    // already accepted by the server; and if the server replies early with 200 OK while
+    // the local stream has not reached EOF, the client may only return
+    // AcknowledgedWithoutLocalVerification (never VerifiedLocal).
     let (accepted_tx, accepted_rx) = tokio::sync::oneshot::channel();
     let serve = async {
+        // Subcase 1: server accepts headers and waits for body -> client aborts with BlobDigestMismatch before 5th byte.
         let (head, mut peer) = server.accept().await?;
         assert_eq!(head.header("x-cooplet-sha256"), Some(HELLO_SHA));
         let _ = accepted_tx.send(());
-        // Read any partial bytes sent; the client must abort before delivering all 5 bytes.
         let mut received = Vec::new();
         let _ = tokio::time::timeout(
             Duration::from_millis(150),
@@ -530,6 +548,17 @@ async fn local_sha256_mismatch_is_rejected_before_final_chunk_even_on_early_200_
         )
         .await;
         assert!(received.len() < 5);
+
+        // Subcase 2: server immediately returns 200 OK replay receipt while local reader is stalled mid-stream.
+        let (head, peer) = server.accept().await?;
+        assert_eq!(head.header("idempotency-key"), Some("early-200-key"));
+        assert_eq!(head.header("x-cooplet-sha256"), Some(HELLO_SHA));
+        peer.respond(
+            "200 OK",
+            &[("content-type", "application/json")],
+            receipt(5, HELLO_SHA).as_bytes(),
+        )
+        .await?;
         Ok::<_, Box<dyn std::error::Error + Send + Sync>>(())
     };
     let call = async {
@@ -549,6 +578,18 @@ async fn local_sha256_mismatch_is_rejected_before_final_chunk_even_on_early_200_
             Err(ClientError::BlobDigestMismatch { .. })
         ));
         feed.await??;
+
+        let mut early = spec(Some(5));
+        early.idempotency_key = Some("early-200-key".into());
+        early.expected_sha256 = Some(HELLO_SHA.into());
+        let (mut held_open, stalled_reader) = tokio::io::duplex(32);
+        held_open.write_all(b"jell").await?;
+        let outcome = client.upload_blob(early, stalled_reader).await?;
+        assert!(matches!(
+            outcome,
+            BlobUploadOutcome::AcknowledgedWithoutLocalVerification(blob) if blob.sha256 == HELLO_SHA
+        ));
+        drop(held_open);
         Ok::<_, Box<dyn std::error::Error + Send + Sync>>(())
     };
     let (a, b) = tokio::join!(call, serve);

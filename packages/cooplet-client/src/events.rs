@@ -36,8 +36,8 @@ impl CoopletClient {
             params.push(("limit", limit.to_string()));
         }
         let url = self.url("/v1/events", &params)?;
-        let request = self.protected(Method::GET, url, None).await?;
-        let page: EventsPage = self.execute_json(request, true, true).await?;
+        let (request, pin_epoch) = self.protected(Method::GET, url, None).await?;
+        let page: EventsPage = self.execute_json(request, Some(pin_epoch), true).await?;
         for event in &page.items {
             validate_event(event)?;
         }
@@ -50,10 +50,8 @@ impl CoopletClient {
         kinds: &[EventKind],
     ) -> Result<EventStream, ClientError> {
         let url = self.url("/v1/events/stream", &event_query(after, kinds))?;
-        let request = self
-            .protected(Method::GET, url, None)
-            .await?
-            .header(ACCEPT, NDJSON_MEDIA_TYPE);
+        let (request, pin_epoch) = self.protected(Method::GET, url, None).await?;
+        let request = request.header(ACCEPT, NDJSON_MEDIA_TYPE);
         let response = timeout(
             self.config.request_timeout,
             "EventBus response headers",
@@ -61,7 +59,7 @@ impl CoopletClient {
         )
         .await?;
         if response.status() != StatusCode::OK {
-            return Err(self.failure(response, true).await);
+            return Err(self.failure(response, true, pin_epoch).await);
         }
         if !media_type(&response).is_some_and(|media| media.eq_ignore_ascii_case(NDJSON_MEDIA_TYPE))
         {
@@ -138,6 +136,25 @@ impl EventStream {
         self.line = Vec::new();
         Poll::Ready(Some(Err(error)))
     }
+
+    fn yield_frame(
+        &mut self,
+        frame: Result<EventStreamFrame, ClientError>,
+    ) -> Poll<Option<Result<EventStreamFrame, ClientError>>> {
+        match frame {
+            Ok(EventStreamFrame::ResyncRequired {
+                oldest_available_seq,
+                latest_seq,
+                reason,
+            }) => self.terminate(ClientError::resync(
+                oldest_available_seq,
+                latest_seq,
+                reason,
+            )),
+            Ok(frame) => Poll::Ready(Some(Ok(frame))),
+            Err(error) => self.terminate(error),
+        }
+    }
 }
 
 impl Stream for EventStream {
@@ -178,19 +195,7 @@ impl Stream for EventStream {
                 }
                 let frame = parse_ndjson_line(trimmed);
                 stream.current.advance(pos + 1);
-                return match frame {
-                    Ok(EventStreamFrame::ResyncRequired {
-                        oldest_available_seq,
-                        latest_seq,
-                        reason,
-                    }) => stream.terminate(ClientError::resync(
-                        oldest_available_seq,
-                        latest_seq,
-                        reason,
-                    )),
-                    Ok(frame) => Poll::Ready(Some(Ok(frame))),
-                    Err(error) => stream.terminate(error),
-                };
+                return stream.yield_frame(frame);
             }
             let line_bytes = newline.unwrap_or(stream.current.len());
             let segment = &stream.current[..line_bytes];
@@ -217,19 +222,7 @@ impl Stream for EventStream {
             if stream.line.capacity() > LINE_SHRINK_THRESHOLD {
                 stream.line = Vec::new();
             }
-            return match frame {
-                Ok(EventStreamFrame::ResyncRequired {
-                    oldest_available_seq,
-                    latest_seq,
-                    reason,
-                }) => stream.terminate(ClientError::resync(
-                    oldest_available_seq,
-                    latest_seq,
-                    reason,
-                )),
-                Ok(frame) => Poll::Ready(Some(Ok(frame))),
-                Err(error) => stream.terminate(error),
-            };
+            return stream.yield_frame(frame);
         }
     }
 }

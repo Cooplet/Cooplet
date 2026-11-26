@@ -2,14 +2,14 @@ use serde::Deserialize;
 use serde_json::Value;
 
 use crate::{
-    AggregateType, AnswerPayload, EventId, MessageId, ParticipantState, ProtocolError, SourceId,
-    SourceKind, ThreadId, ValidationError, domain::validate_approval_fields,
+    AggregateType, AnswerPayload, ApprovalWaitKind, EventId, MessageId, ParticipantState,
+    ProtocolError, SourceId, SourceKind, ThreadId, ValidationError,
+    domain::validate_approval_fields,
 };
 
 macro_rules! event_kinds {
     ($($variant:ident => $value:tt,)*) => {
         crate::wire::wire_string_enum! {
-            #[derive(Hash)]
             pub enum EventKind {
                 $($variant => $value,)*
             }
@@ -83,8 +83,11 @@ impl EventEnvelope {
                     state: ParticipantState,
                     approval_id: Option<&'a str>,
                     can_respond_remotely: Option<bool>,
+                    wait_kind: Option<ApprovalWaitKind>,
+                    action_hint: Option<&'a str>,
+                    summary: Option<&'a str>,
                 }
-                let fields: ApprovalFields<'_> = T_deserialize_object(&self.payload)?;
+                let fields = ApprovalFields::deserialize(&self.payload)?;
                 if self.kind == EventKind::ParticipantAwaitingApproval
                     && fields.state != ParticipantState::AwaitingApproval
                 {
@@ -94,6 +97,9 @@ impl EventEnvelope {
                     fields.state,
                     fields.can_respond_remotely,
                     fields.approval_id,
+                    fields.wait_kind.is_some()
+                        || fields.action_hint.is_some()
+                        || fields.summary.is_some(),
                 )?;
             }
             EventKind::QuestionAnswered => {
@@ -111,7 +117,7 @@ impl EventEnvelope {
                     thread_id: _thread_id,
                     answered_by,
                     answer,
-                } = T_deserialize_object(&self.payload)?;
+                } = AnsweredFields::deserialize(&self.payload)?;
                 if answered_by.trim().is_empty() {
                     return Err(ValidationError("question answer event").into());
                 }
@@ -121,11 +127,6 @@ impl EventEnvelope {
         }
         Ok(())
     }
-}
-
-#[allow(non_snake_case)]
-fn T_deserialize_object<'de, T: Deserialize<'de>>(payload: &'de Value) -> Result<T, ProtocolError> {
-    Ok(T::deserialize(payload)?)
 }
 
 crate::wire::wire_object! {

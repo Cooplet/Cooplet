@@ -2,13 +2,14 @@ use std::{
     collections::BTreeSet,
     fs, io,
     os::fd::{AsRawFd, FromRawFd, OwnedFd},
+    os::unix::fs::MetadataExt,
     path::Path,
     ptr,
     time::Duration,
 };
 
 use super::{ProcessIdentity, Snapshot, StopState, TerminateOutcome, group_absent};
-use crate::PlatformError;
+use crate::{PlatformError, current_euid};
 
 fn boot_id() -> io::Result<String> {
     let id = fs::read_to_string("/proc/sys/kernel/random/boot_id")?;
@@ -151,12 +152,13 @@ pub(super) fn group_gone(pgid: libc::pid_t, proc_visible: bool) -> io::Result<bo
         if current.is_empty() {
             return Err(invalid_proc());
         }
-        // Drop exited PIDs from `confirmed` so a recycled PID is always re-checked.
+        // Evict PIDs observed absent between `/proc` directory snapshots.
         confirmed.retain(|pid| current.contains(pid));
         let pending: Vec<_> = current.difference(&confirmed).copied().collect();
         if pending.is_empty() {
             return Ok(true);
         }
+        let own_uid = current_euid();
         for pid in pending {
             match read_stat_into(pid, &mut path, &mut buffer) {
                 Ok(stat) => {
@@ -172,11 +174,38 @@ pub(super) fn group_gone(pgid: libc::pid_t, proc_visible: bool) -> io::Result<bo
                     // An unrelated process exited mid-scan. Leave it out of `confirmed`
                     // so any child it spawned or recycled PID is checked on the next pass.
                 }
+                Err(error) if error.kind() == io::ErrorKind::PermissionDenied => {
+                    // Under `hidepid=1` (`noaccess`), foreign-UID entries remain listed in
+                    // `/proc` while opening `/proc/<pid>/stat` returns EACCES. Confirm
+                    // foreign-UID processes via `/proc/<pid>` ownership; fail closed on own UID.
+                    let proc_dir = path.strip_suffix("/stat").unwrap_or(path.as_str());
+                    let proc_uid = fs::symlink_metadata(proc_dir).map(|meta| meta.uid());
+                    if classify_stat_permission_denied(proc_uid, own_uid, error)? {
+                        confirmed.insert(pid);
+                    }
+                }
                 Err(error) => return Err(error),
             }
         }
     }
     Ok(false)
+}
+
+fn classify_stat_permission_denied(
+    proc_uid: io::Result<u32>,
+    own_uid: u32,
+    original_error: io::Error,
+) -> io::Result<bool> {
+    match proc_uid {
+        Ok(uid) if uid != own_uid => Ok(true),
+        Err(error)
+            if error.kind() == io::ErrorKind::NotFound
+                || error.raw_os_error() == Some(libc::ESRCH) =>
+        {
+            Ok(false)
+        }
+        _ => Err(original_error),
+    }
 }
 
 fn read_stat_into(pid: libc::pid_t, path: &mut String, buffer: &mut [u8; 512]) -> io::Result<Stat> {
@@ -233,8 +262,9 @@ fn verify_proc_visibility() -> io::Result<()> {
 
 fn proc_mount_visible(mountinfo: &str) -> bool {
     // Use the topmost (last) mount on /proc so an overmount cannot be bypassed.
-    // Within a single-UID sandbox (D02), own-UID children remain visible under hidepid=1|2;
-    // reject subset=pid, non-root proc mounts, or non-proc mounts.
+    // Within a single-UID workspace, own-UID dumpable children remain visible under
+    // hidepid=0|off|1|noaccess|2|invisible; reject subset=pid, hidepid=4|ptraceable,
+    // unknown hidepid values, non-root proc mounts, or non-proc mounts.
     mountinfo
         .lines()
         .filter_map(|line| line.split_once(" - "))
@@ -244,9 +274,19 @@ fn proc_mount_visible(mountinfo: &str) -> bool {
             let mut system = system.split_ascii_whitespace();
             root == Some("/")
                 && system.next() == Some("proc")
-                && system
-                    .nth(1)
-                    .is_some_and(|options| options.split(',').all(|option| option != "subset=pid"))
+                && system.nth(1).is_some_and(|options| {
+                    options.split(',').all(|option| {
+                        if option == "subset=pid" {
+                            return false;
+                        }
+                        match option.strip_prefix("hidepid=") {
+                            None => true,
+                            Some(mode) => {
+                                matches!(mode, "0" | "off" | "1" | "noaccess" | "2" | "invisible")
+                            }
+                        }
+                    })
+                })
         })
 }
 
@@ -447,10 +487,8 @@ mod tests {
     }
 
     #[test]
-    fn proc_mount_visibility_uses_topmost_mount_and_allows_hidepid() {
+    fn proc_mount_visibility_uses_topmost_mount_and_allowlists_hidepid() {
         let clean = "24 1 0:21 / /proc rw,nosuid,nodev,noexec,relatime - proc proc rw\n";
-        let hidepid =
-            "24 1 0:21 / /proc rw,nosuid,nodev,noexec,relatime - proc proc rw,hidepid=2\n";
         let subset =
             "24 1 0:21 / /proc rw,nosuid,nodev,noexec,relatime - proc proc rw,subset=pid\n";
         let overmounted_bad = format!("{clean}{subset}");
@@ -459,12 +497,48 @@ mod tests {
         let non_proc = "24 1 0:21 / /proc rw - tmpfs tmpfs rw\n";
 
         assert!(proc_mount_visible(clean));
-        assert!(proc_mount_visible(hidepid));
+        for allowed in ["0", "off", "1", "noaccess", "2", "invisible"] {
+            let line = format!(
+                "24 1 0:21 / /proc rw,nosuid,nodev,noexec,relatime - proc proc rw,hidepid={allowed}\n"
+            );
+            assert!(
+                proc_mount_visible(&line),
+                "expected hidepid={allowed} allowed"
+            );
+        }
+        for rejected in ["4", "ptraceable", "future"] {
+            let line = format!(
+                "24 1 0:21 / /proc rw,nosuid,nodev,noexec,relatime - proc proc rw,hidepid={rejected}\n"
+            );
+            assert!(
+                !proc_mount_visible(&line),
+                "expected hidepid={rejected} rejected"
+            );
+        }
         assert!(!proc_mount_visible(subset));
         assert!(!proc_mount_visible(&overmounted_bad));
         assert!(proc_mount_visible(&overmounted_good));
         assert!(!proc_mount_visible(non_root));
         assert!(!proc_mount_visible(non_proc));
+    }
+
+    #[test]
+    fn hidepid1_permission_denied_confirms_only_foreign_uid() -> io::Result<()> {
+        let perm = || io::Error::new(io::ErrorKind::PermissionDenied, "denied");
+        assert!(classify_stat_permission_denied(Ok(0), 1000, perm())?);
+        assert!(!classify_stat_permission_denied(
+            Err(io::Error::new(io::ErrorKind::NotFound, "exited")),
+            1000,
+            perm()
+        )?);
+        assert!(!classify_stat_permission_denied(
+            Err(io::Error::from_raw_os_error(libc::ESRCH)),
+            1000,
+            perm()
+        )?);
+        assert!(classify_stat_permission_denied(Ok(1000), 1000, perm()).is_err());
+        assert!(classify_stat_permission_denied(Err(perm()), 1000, perm()).is_err());
+        Ok(())
     }
 }
 

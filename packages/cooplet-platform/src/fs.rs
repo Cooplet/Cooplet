@@ -155,8 +155,8 @@ impl PrivateFs {
         }
         if removed > 0 {
             dir_fd.sync_all()?;
-            verify_path(&canonical, &identity)?;
         }
+        verify_path(&canonical, &identity)?;
         Ok(removed)
     }
 
@@ -657,6 +657,41 @@ mod tests {
         assert!(!target_tmp.exists());
         assert!(other_tmp.exists());
         assert!(keep_file.exists());
+
+        // Negative checks on fd-relative operations: symlinks, insecure modes, hardlinks, traversal.
+        let wide_dir = root.join("wide");
+        DirBuilder::new().mode(0o755).create(&wide_dir)?;
+        fs::set_permissions(&wide_dir, Permissions::from_mode(0o755))?;
+        assert!(matches!(
+            PrivateFs::open_dir_at(&root_fd, "wide"),
+            Err(PlatformError::InsecurePermissions { .. })
+        ));
+        let dir_link = root.join("dir_link");
+        symlink(&wide_dir, &dir_link)?;
+        assert!(PrivateFs::open_dir_at(&root_fd, "dir_link").is_err());
+        assert!(matches!(
+            PrivateFs::open_dir_at(&root_fd, ".."),
+            Err(PlatformError::InvalidPath(_))
+        ));
+
+        let sealed_file = PrivateFs::create_private_file_at(&root_fd, "sealed")?;
+        PrivateFs::seal_readonly(&sealed_file)?;
+        drop(sealed_file);
+        fs::hard_link(root.join("sealed"), root.join("sealed_link"))?;
+        assert!(matches!(
+            PrivateFs::open_sealed_at(&root_fd, "sealed"),
+            Err(PlatformError::InsecurePermissions { .. })
+        ));
+        assert!(PrivateFs::unlink_file_at(&root_fd, "sealed_link")?);
+        assert!(PrivateFs::open_sealed_at(&root_fd, "sealed").is_ok());
+        assert!(matches!(
+            PrivateFs::unlink_file_at(&root_fd, "../escape"),
+            Err(PlatformError::InvalidPath(_))
+        ));
+        assert!(matches!(
+            PrivateFs::remove_dir_at(&root_fd, ".."),
+            Err(PlatformError::InvalidPath(_))
+        ));
         Ok(())
     }
 }

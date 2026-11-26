@@ -374,6 +374,23 @@ async fn accepted_write_survives_cancellation_and_broadcast_waits_for_commit() -
         })
         .await?;
     assert_eq!(rows, 1);
+    // The writer must remain usable immediately after a deferred-FK CommitFailed rollback.
+    engine
+        .db()
+        .write_sqlite(|tx| {
+            tx.execute("INSERT INTO rows VALUES(3, NULL)", [])?;
+            Ok(WriteOutcome::new(()))
+        })
+        .await?;
+    let rows_after =
+        engine
+            .reads()
+            .read(|connection| {
+                Ok(connection
+                    .query_row("SELECT count(*) FROM rows", [], |row| row.get::<_, i32>(0))?)
+            })
+            .await?;
+    assert_eq!(rows_after, 2);
     engine.shutdown().await?;
     Ok(())
 }

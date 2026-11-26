@@ -1,9 +1,6 @@
-use std::{
-    collections::VecDeque,
-    sync::{
-        Arc, Mutex, MutexGuard,
-        atomic::{AtomicBool, Ordering},
-    },
+use std::sync::{
+    Arc, Mutex, MutexGuard,
+    atomic::{AtomicBool, Ordering},
 };
 
 use cooplet_platform::FileLock;
@@ -16,7 +13,7 @@ use crate::{StorageConfig, StorageError, pragma};
 pub struct ReadPool(Arc<Pool>);
 
 struct Pool {
-    connections: Mutex<VecDeque<Connection>>,
+    connections: Mutex<Vec<Connection>>,
     permits: Arc<Semaphore>,
     config: StorageConfig,
     lock: Mutex<Option<Arc<FileLock>>>,
@@ -75,7 +72,7 @@ impl ReadPool {
         }
         let pool = self.0.clone();
         tokio::task::spawn_blocking(move || {
-            let available = pool.connections().pop_back();
+            let available = pool.connections().pop();
             let connection = match available {
                 Some(connection) => connection,
                 None => pragma::open_readonly(&pool.config.db_path, &pool.config)?,
@@ -115,8 +112,8 @@ impl ReadPool {
 }
 
 impl Pool {
-    fn connections(&self) -> MutexGuard<'_, VecDeque<Connection>> {
-        // The mutex only guards infallible deque moves. A callback cannot
+    fn connections(&self) -> MutexGuard<'_, Vec<Connection>> {
+        // The mutex only guards infallible vec moves. A callback cannot
         // panic while holding it.
         self.connections
             .lock()
@@ -138,7 +135,7 @@ impl Drop for ReadLease {
         if let Some(connection) = self.connection.take()
             && (connection.is_autocommit() || connection.execute_batch("ROLLBACK").is_ok())
         {
-            self.pool.connections().push_back(connection);
+            self.pool.connections().push(connection);
         }
     }
 }

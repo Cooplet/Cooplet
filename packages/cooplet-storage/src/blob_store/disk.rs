@@ -5,7 +5,7 @@ use std::{
     path::{Component, Path, PathBuf},
     sync::{
         Arc,
-        atomic::{AtomicU64, Ordering},
+        atomic::{AtomicBool, AtomicU64, Ordering},
     },
 };
 
@@ -43,6 +43,7 @@ pub(super) struct Disk {
     pub(super) max_blob_bytes: u64,
     max_total_bytes: u64,
     used_bytes: AtomicU64,
+    synced_shards: [AtomicBool; 256],
 }
 
 impl Disk {
@@ -64,6 +65,7 @@ impl Disk {
             max_blob_bytes: config.max_blob_bytes,
             max_total_bytes: config.max_total_blob_bytes,
             used_bytes: AtomicU64::new(0),
+            synced_shards: std::array::from_fn(|_| AtomicBool::new(false)),
         })
     }
 
@@ -161,14 +163,25 @@ impl Disk {
 
     pub(super) fn publish(&self, stage: &StagedBlob) -> Result<PublishOutcome, StorageError> {
         let path = validate_path(&stage.info.disk_rel_path, &stage.info.blob_id)?;
+        let shard_idx = shard_index(path.shard)?;
         let objects_fd = PrivateFs::open_dir_nofollow(&self.objects)?;
-        let shard_fd = match PrivateFs::open_dir_at(&objects_fd, path.shard) {
-            Ok(fd) => fd,
-            Err(PlatformError::Io(error)) if error.kind() == io::ErrorKind::NotFound => {
-                PrivateFs::ensure_private_dir(&self.objects.join(path.shard))?;
-                PrivateFs::open_dir_at(&objects_fd, path.shard)?
+        let shard_fd = if self.synced_shards[shard_idx].load(Ordering::Acquire) {
+            match PrivateFs::open_dir_at(&objects_fd, path.shard) {
+                Ok(fd) => fd,
+                Err(PlatformError::Io(error)) if error.kind() == io::ErrorKind::NotFound => {
+                    self.synced_shards[shard_idx].store(false, Ordering::Release);
+                    PrivateFs::ensure_private_dir(&self.objects.join(path.shard))?;
+                    let fd = PrivateFs::open_dir_at(&objects_fd, path.shard)?;
+                    self.synced_shards[shard_idx].store(true, Ordering::Release);
+                    fd
+                }
+                Err(error) => return Err(error.into()),
             }
-            Err(error) => return Err(error.into()),
+        } else {
+            PrivateFs::ensure_private_dir(&self.objects.join(path.shard))?;
+            let fd = PrivateFs::open_dir_at(&objects_fd, path.shard)?;
+            self.synced_shards[shard_idx].store(true, Ordering::Release);
+            fd
         };
         let dest_path = self
             .objects
@@ -337,7 +350,11 @@ fn validate_root_disjoint(root: &Path, database_path: &Path) -> Result<(), Stora
         .ok_or(StorageError::InvalidConfig("database path has no parent"))?;
     let db_parent_meta = fs::symlink_metadata(db_parent)?;
     let normalized_root: PathBuf = root.components().collect();
-    if normalized_root == db_parent || db_parent.starts_with(&normalized_root) {
+    if normalized_root == db_parent
+        || db_parent.starts_with(&normalized_root)
+        || normalized_root == database_path
+        || normalized_root.starts_with(database_path)
+    {
         return Err(StorageError::InvalidConfig(
             "blob root must be a dedicated directory distinct from the database directory",
         ));
@@ -350,7 +367,11 @@ fn validate_root_disjoint(root: &Path, database_path: &Path) -> Result<(), Stora
         }
         if root_meta.is_dir() {
             let canonical_root = fs::canonicalize(&normalized_root)?;
-            if canonical_root == db_parent || db_parent.starts_with(&canonical_root) {
+            if canonical_root == db_parent
+                || db_parent.starts_with(&canonical_root)
+                || canonical_root == database_path
+                || canonical_root.starts_with(database_path)
+            {
                 return Err(StorageError::InvalidConfig(
                     "blob root must be a dedicated directory distinct from the database directory",
                 ));
@@ -628,6 +649,12 @@ fn lower_hex(byte: u8) -> bool {
 
 fn valid_shard(shard: &str) -> bool {
     shard.len() == 2 && shard.bytes().all(lower_hex)
+}
+
+fn shard_index(shard: &str) -> Result<usize, StorageError> {
+    u8::from_str_radix(shard, 16)
+        .map(usize::from)
+        .map_err(|_| StorageError::InvalidBlobPath(shard.to_owned()))
 }
 
 pub fn safe_disk_name(input: &str) -> String {

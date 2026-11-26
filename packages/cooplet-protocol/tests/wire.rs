@@ -49,14 +49,17 @@ fn id_schemas_and_parsers_share_the_128_bit_boundary() -> TestResult {
     for (prefix, kind) in [("node", SourceKind::Node), ("hub", SourceKind::Hub)] {
         let last = format!("{prefix}_7zzzzzzzzzzzzzzzzzzzzzzzzz");
         let overflow = format!("{prefix}_80000000000000000000000000");
-        assert_eq!(last.parse::<SourceId>()?.kind(), kind);
+        assert_eq!(SourceId::parse(&last)?.kind(), kind);
+        assert_eq!(last.parse::<SourceId>()?, SourceId::parse(&last)?);
         assert_eq!(
             serde_json::from_value::<SourceId>(json!(last))?.to_string(),
             last
         );
+        assert!(SourceId::parse(&overflow).is_err());
         assert!(overflow.parse::<SourceId>().is_err());
         assert!(serde_json::from_value::<SourceId>(json!(overflow)).is_err());
     }
+    assert!(SourceId::parse("part_00000000000000000000000000").is_err());
     assert_eq!(
         serde_json::to_value(SourceId::schema())?["pattern"],
         "^(node|hub)_[0-7][0-9a-hjkmnpqrstvwxyz]{25}$"
@@ -351,6 +354,12 @@ fn wire_enum_labels_accept_only_strings_in_every_json_representation() -> TestRe
     check(WorkflowRunState::Interrupted, "interrupted")?;
     check(WorkflowStepStatus::Completed, "completed")?;
     check(WorkflowLogLevel::Warn, "warn")?;
+    let mut seen_states = std::collections::HashSet::new();
+    seen_states.insert(ParticipantState::Idle);
+    assert!(seen_states.contains(&ParticipantState::Idle));
+    let mut seen_events = std::collections::HashSet::new();
+    seen_events.insert(EventKind::WorkflowLog);
+    assert!(seen_events.contains(&EventKind::WorkflowLog));
     assert_eq!(ErrorCode::DeliveryUnknown.as_str(), "delivery_unknown");
     assert_eq!(ErrorCode::DeliveryUnknown.to_string(), "delivery_unknown");
     assert_eq!(
@@ -422,7 +431,12 @@ fn attachment_approval_question_and_canonical_edge_cases() -> TestResult {
         att.mime_type = bad_mime.into();
         assert!(att.validate().is_err(), "accepted bad mime {bad_mime:?}");
     }
+    validate_attachment_name("spec.md")?;
     for bad_name in ["", "   ", "a\0b", "a\nb", "a\x1bb", &"a".repeat(256)] {
+        assert!(
+            validate_attachment_name(bad_name).is_err(),
+            "accepted bad name {bad_name:?}"
+        );
         let mut att = valid_att.clone();
         att.name = bad_name.into();
         assert!(att.validate().is_err(), "accepted bad name {bad_name:?}");

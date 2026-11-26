@@ -1,10 +1,12 @@
 use serde::{Deserialize, Serialize};
 use utoipa::ToSchema;
 
-use crate::{BlobId, HubId, NodeId, ParticipantId, ValidationError, validate_media_type};
+use crate::{
+    BlobId, HubId, NodeId, ParticipantId, ValidationError, validate_attachment_name,
+    validate_media_type,
+};
 
 crate::wire::wire_string_enum! {
-    #[derive(Hash)]
     pub enum ParticipantKind {
         Agent => "agent",
         Human => "human",
@@ -13,7 +15,6 @@ crate::wire::wire_string_enum! {
 }
 
 crate::wire::wire_string_enum! {
-    #[derive(Hash)]
     pub enum ParticipantState {
         Starting => "starting",
         Idle => "idle",
@@ -41,7 +42,6 @@ impl ParticipantState {
 }
 
 crate::wire::wire_string_enum! {
-    #[derive(Hash)]
     pub enum IntakeState {
         Ready => "ready",
         Busy => "busy",
@@ -52,7 +52,6 @@ crate::wire::wire_string_enum! {
 }
 
 crate::wire::wire_string_enum! {
-    #[derive(Hash)]
     pub enum DeliveryMode {
         DirectNow => "direct_now",
         QueueUntilIdle => "queue_until_idle",
@@ -60,7 +59,6 @@ crate::wire::wire_string_enum! {
 }
 
 crate::wire::wire_string_enum! {
-    #[derive(Hash)]
     pub enum DeliveryState {
         Accepted => "accepted",
         Queued => "queued",
@@ -75,7 +73,6 @@ crate::wire::wire_string_enum! {
 }
 
 crate::wire::wire_string_enum! {
-    #[derive(Hash)]
     pub enum WorkflowRunState {
         Running => "running",
         Completed => "completed",
@@ -86,7 +83,6 @@ crate::wire::wire_string_enum! {
 }
 
 crate::wire::wire_string_enum! {
-    #[derive(Hash)]
     pub enum WorkflowStepStatus {
         Completed => "completed",
         Failed => "failed",
@@ -94,7 +90,6 @@ crate::wire::wire_string_enum! {
 }
 
 crate::wire::wire_string_enum! {
-    #[derive(Hash)]
     pub enum WorkflowLogLevel {
         Debug => "debug",
         Info => "info",
@@ -116,13 +111,7 @@ crate::wire::wire_object! {
 
 impl AttachmentRef {
     pub fn validate(&self) -> Result<(), ValidationError> {
-        if self.name.is_empty()
-            || self.name.len() > 255
-            || self.name.trim().is_empty()
-            || self.name.bytes().any(|byte| byte < 0x20 || byte == 0x7f)
-        {
-            return Err(ValidationError("attachment name"));
-        }
+        validate_attachment_name(&self.name)?;
         validate_media_type(&self.mime_type)
             .map_err(|_| ValidationError("attachment MIME type"))?;
         validate_sha256(&self.sha256)
@@ -142,7 +131,6 @@ pub fn validate_sha256(sha256: &str) -> Result<(), ValidationError> {
 }
 
 crate::wire::wire_string_enum! {
-    #[derive(Hash)]
     pub enum ApprovalWaitKind {
         Permission => "permission",
         Question => "question",
@@ -170,6 +158,7 @@ impl ApprovalWait {
             ParticipantState::AwaitingApproval,
             Some(self.can_respond_remotely),
             self.approval_id.as_deref(),
+            true,
         )
     }
 }
@@ -178,6 +167,7 @@ pub(crate) fn validate_approval_fields(
     state: ParticipantState,
     can_respond_remotely: Option<bool>,
     approval_id: Option<&str>,
+    has_extra_approval_metadata: bool,
 ) -> Result<(), ValidationError> {
     if approval_id.is_some_and(|id| id.trim().is_empty()) {
         return Err(ValidationError("approval ID"));
@@ -189,14 +179,14 @@ pub(crate) fn validate_approval_fields(
         if remote && approval_id.is_none() {
             return Err(ValidationError("approval ID for remote response"));
         }
-    } else if can_respond_remotely.is_some() || approval_id.is_some() {
+    } else if can_respond_remotely.is_some() || approval_id.is_some() || has_extra_approval_metadata
+    {
         return Err(ValidationError("approval fields outside awaiting_approval"));
     }
     Ok(())
 }
 
 crate::wire::wire_string_enum! {
-    #[derive(Hash)]
     pub enum ApprovalAction {
         Approve => "approve",
         Deny => "deny",
@@ -221,7 +211,7 @@ impl ApprovalDecision {
 }
 
 crate::wire::wire_string_enum! {
-    #[derive(PartialOrd, Ord, Hash)]
+    #[derive(PartialOrd, Ord)]
     pub enum ServiceScope {
         Read => "read",
         Collaborate => "collaborate",
@@ -230,7 +220,6 @@ crate::wire::wire_string_enum! {
 }
 
 crate::wire::wire_string_enum! {
-    #[derive(Hash)]
     pub enum PrincipalKind {
         Participant => "participant",
         Operator => "operator",

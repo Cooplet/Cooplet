@@ -27,8 +27,6 @@ use crate::{
 
 pub use upload::{BlobUploadOutcome, BlobUploadSpec, UploadVerification};
 
-const CHUNK_BYTES: usize = 64 * 1024;
-
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DownloadedBlob {
     pub blob_id: BlobId,
@@ -67,7 +65,7 @@ impl CoopletClient {
         }
         let path = crate::api_path(&["blobs", blob_id.as_str()])?;
         let url = self.url(&path, &[])?;
-        let request = self.protected(Method::GET, url, None).await?;
+        let (request, pin_epoch) = self.protected(Method::GET, url, None).await?;
         let response = timeout(
             self.config.request_timeout,
             "blob response headers",
@@ -75,7 +73,7 @@ impl CoopletClient {
         )
         .await?;
         if response.status() != StatusCode::OK {
-            return Err(self.failure(response, false).await);
+            return Err(self.failure(response, false, pin_epoch).await);
         }
 
         let mut tags = response.headers().get_all(ETAG).iter();
@@ -267,12 +265,6 @@ impl AsyncRead for BlobDownload {
             return Poll::Ready(Err(io::Error::other("blob reader failed earlier")));
         }
         if buffer.remaining() == 0 {
-            return Poll::Ready(Ok(()));
-        }
-        if !this.pending.is_empty() {
-            let count = buffer.remaining().min(this.pending.len());
-            buffer.put_slice(&this.pending[..count]);
-            this.pending.advance(count);
             return Poll::Ready(Ok(()));
         }
         match this.poll_next_chunk(context) {

@@ -514,5 +514,89 @@ async fn patch_delete_discover_whoami_token_and_sanitized_errors() -> TestResult
     assert!(rendered.len() > "HTTP transport failed: ".len());
     assert!(!rendered.contains("my-secret-token"));
     assert!(!rendered.contains(closed_url.as_str()));
+
+    // discover_info_with_roots validates custom CA PEM before network I/O.
+    assert!(matches!(
+        CoopletClient::discover_info_with_roots(&closed_url, &[b"not a pem".to_vec()]).await,
+        Err(ClientError::InvalidInput(_))
+    ));
     Ok(())
+}
+
+#[tokio::test]
+async fn stale_epoch_hub_mismatch_does_not_invalidate_newer_pin_verification() -> TestResult {
+    let server = Server::bind().await?;
+    let client = pinned(server.url.clone(), Some(BearerToken::new("top-secret")?))?;
+    let mismatch_problem = format!(
+        r#"{{"type":"https://cooplet.dev/problems/hub-identity-mismatch","title":"Hub mismatch","status":409,"detail":"restarted","code":"hub_identity_mismatch","retryable":false,"extensions":{{"actual_hub_id":"{OTHER_HUB_ID}"}}}}"#
+    );
+    let (stale_accepted_tx, stale_accepted_rx) = tokio::sync::oneshot::channel();
+    let (reverified_tx, reverified_rx) = tokio::sync::oneshot::channel();
+    let serve = async {
+        // Epoch 1 pin verification.
+        let (head, peer) = server.accept().await?;
+        assert_eq!(head.request, "GET /v1/info HTTP/1.1");
+        peer.respond("200 OK", &[], HUB_INFO).await?;
+
+        // Req 1 enters under epoch 1 and stays open until epoch 2 is verified.
+        let (head, stale_peer) = server.accept().await?;
+        assert_eq!(head.request, "GET /v1/health HTTP/1.1");
+        let _ = stale_accepted_tx.send(());
+
+        // Req 2 also uses epoch 1 and receives 409, invalidating epoch 1.
+        let (head, peer) = server.accept().await?;
+        assert_eq!(head.request, "GET /v1/health HTTP/1.1");
+        peer.respond(
+            "409 Conflict",
+            &[("content-type", "application/problem+json")],
+            mismatch_problem.as_bytes(),
+        )
+        .await?;
+
+        // Req 3 re-verifies under epoch 2 and succeeds.
+        let (head, peer) = server.accept().await?;
+        assert_eq!(head.request, "GET /v1/info HTTP/1.1");
+        peer.respond("200 OK", &[], HUB_INFO).await?;
+        let (head, peer) = server.accept().await?;
+        assert_eq!(head.request, "GET /v1/health HTTP/1.1");
+        peer.respond("200 OK", &[], br#"{"status":"ok"}"#).await?;
+
+        // Now deliver the delayed 409 to Req 1 (stale epoch 1).
+        let _ = reverified_rx.await;
+        stale_peer
+            .respond(
+                "409 Conflict",
+                &[("content-type", "application/problem+json")],
+                mismatch_problem.as_bytes(),
+            )
+            .await?;
+
+        // Req 4 must keep epoch 2 and go straight to /v1/health without another /v1/info.
+        let (head, peer) = server.accept().await?;
+        assert_eq!(head.request, "GET /v1/health HTTP/1.1");
+        peer.respond("200 OK", &[], br#"{"status":"ok"}"#).await?;
+        Ok::<_, Box<dyn std::error::Error + Send + Sync>>(())
+    };
+    let call = async {
+        client.verify_hub_identity().await?;
+        let stale_client = client.clone();
+        let req1 = tokio::spawn(async move { stale_client.health().await });
+        let _ = stale_accepted_rx.await;
+
+        assert!(matches!(
+            client.health().await,
+            Err(ClientError::HubIdentityMismatch { .. })
+        ));
+        assert_eq!(client.health().await?.status, "ok");
+        let _ = reverified_tx.send(());
+        assert!(matches!(
+            req1.await?,
+            Err(ClientError::HubIdentityMismatch { .. })
+        ));
+        assert_eq!(client.health().await?.status, "ok");
+        Ok::<_, Box<dyn std::error::Error + Send + Sync>>(())
+    };
+    let (a, b) = tokio::join!(call, serve);
+    a?;
+    b
 }

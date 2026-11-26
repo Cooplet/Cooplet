@@ -356,6 +356,7 @@ impl StopState {
             }
             *self = Self::TermSent(MonotonicClock::deadline_after(grace));
         }
+        let mut sent_kill = false;
         if let Self::TermSent(deadline) = self {
             // The group can finish during the last sleep of the grace period.
             if wait_for_group(*deadline, &mut gone) || gone().is_ok_and(|gone| gone) {
@@ -369,6 +370,13 @@ impl StopState {
                 );
             }
             *self = Self::KillSent;
+            sent_kill = true;
+        }
+        if matches!(self, Self::KillSent)
+            && !sent_kill
+            && let Err(error) = signal(libc::SIGKILL)
+        {
+            return after_signal_error(error, &mut gone, TerminateOutcome::KilledAfterGrace);
         }
         if wait_for_group(
             MonotonicClock::deadline_after(KILL_CONFIRM_TIMEOUT),
@@ -637,6 +645,45 @@ mod tests {
             TerminateOutcome::KilledAfterGrace
         );
         assert_eq!(*signals.borrow(), [libc::SIGTERM, libc::SIGKILL]);
+    }
+
+    #[test]
+    fn retries_sigkill_when_group_survives_first_kill_attempt() {
+        let signals = RefCell::new(Vec::new());
+        let kills = Cell::new(0);
+        let mut state = StopState::default();
+        // First drive sends SIGTERM and SIGKILL, but group stays alive (e.g. fork-during-SIGKILL).
+        let first = state.drive(
+            Duration::ZERO,
+            || Ok(false),
+            |signal| {
+                signals.borrow_mut().push(signal);
+                if signal == libc::SIGKILL {
+                    kills.set(kills.get() + 1);
+                }
+                Ok(())
+            },
+        );
+        assert_eq!(first, TerminateOutcome::CleanupUnverified);
+        assert_eq!(*signals.borrow(), [libc::SIGTERM, libc::SIGKILL]);
+
+        // Retry in KillSent must re-send SIGKILL when the group is still alive.
+        let second = state.drive(
+            Duration::ZERO,
+            || Ok(kills.get() >= 2),
+            |signal| {
+                signals.borrow_mut().push(signal);
+                if signal == libc::SIGKILL {
+                    kills.set(kills.get() + 1);
+                }
+                Ok(())
+            },
+        );
+        assert_eq!(second, TerminateOutcome::KilledAfterGrace);
+        assert_eq!(
+            *signals.borrow(),
+            [libc::SIGTERM, libc::SIGKILL, libc::SIGKILL]
+        );
     }
 
     #[test]

@@ -447,6 +447,16 @@ fn bridge_and_event_nested_validation_and_object_defaults() -> TestResult {
     ));
     BridgeFrame::encode_json(1, &cmd)?;
 
+    // Reject non-object params on RunWorkflow and non-object capabilities on ParticipantWire
+    let bad_params: CommandReqPayload = serde_json::from_value(json!({
+        "op_id": OP,
+        "actor_id": "operator:alfa",
+        "admission_budget_ms": 100,
+        "delivery_mode": "direct_now",
+        "command": {"type": "run_workflow", "workflow_name": "deploy", "workspace_dir": "/work", "params": [1, 2]}
+    }))?;
+    assert!(BridgeFrame::encode_json(1, &bad_params).is_err());
+
     let participant: ParticipantWire = serde_json::from_value(json!({
         "participant_id": PART,
         "kind": "agent",
@@ -455,12 +465,34 @@ fn bridge_and_event_nested_validation_and_object_defaults() -> TestResult {
     }))?;
     assert!(participant.capabilities.is_object());
 
-    // Reject stale approval fields on non-awaiting participant
-    let mut bad_roster: RosterSyncPayload = serde_json::from_value(empty_roster())?;
-    let mut stale_participant = participant;
-    stale_participant.approval_id = Some("old".into());
-    bad_roster.participants.push(stale_participant);
-    assert!(BridgeFrame::encode_json(1, &bad_roster).is_err());
+    let mut bad_caps_roster: RosterSyncPayload = serde_json::from_value(empty_roster())?;
+    let mut bad_caps_participant = participant.clone();
+    bad_caps_participant.capabilities = json!("not-an-object");
+    bad_caps_roster.participants.push(bad_caps_participant);
+    assert!(BridgeFrame::encode_json(1, &bad_caps_roster).is_err());
+
+    // Reject stale approval fields (including wait_kind/action_hint/summary) on non-awaiting participant
+    for stale_case in [
+        json!({"participant_id": PART, "kind": "agent", "name": "coder", "state": "idle", "approval_id": "old"}),
+        json!({"participant_id": PART, "kind": "agent", "name": "coder", "state": "idle", "wait_kind": "permission"}),
+        json!({"participant_id": PART, "kind": "agent", "name": "coder", "state": "idle", "action_hint": "approve"}),
+        json!({"participant_id": PART, "kind": "agent", "name": "coder", "state": "idle", "summary": "run cmd"}),
+    ] {
+        let mut bad_roster: RosterSyncPayload = serde_json::from_value(empty_roster())?;
+        bad_roster
+            .participants
+            .push(serde_json::from_value(stale_case)?);
+        assert!(BridgeFrame::encode_json(1, &bad_roster).is_err());
+    }
+
+    for stale_event in [
+        json!({"type": "participant_state_changed", "participant_id": PART, "state": "idle", "wait_kind": "permission"}),
+        json!({"type": "participant_state_changed", "participant_id": PART, "state": "idle", "action_hint": "approve"}),
+        json!({"type": "participant_state_changed", "participant_id": PART, "state": "idle", "summary": "run cmd"}),
+    ] {
+        let event: NodeEventPayload = serde_json::from_value(stale_event)?;
+        assert!(BridgeFrame::encode_json(1, &event).is_err());
+    }
 
     // Reject bad nested attachment, question+answer, empty approval_id, bad step_key, bad seq range
     let bad_send: CommandReqPayload = serde_json::from_value(json!({
@@ -549,6 +581,14 @@ fn bridge_and_event_nested_validation_and_object_defaults() -> TestResult {
         error: None,
     };
     BridgeFrame::encode_json(1, &good_wf)?;
+    let bad_wf = NodeEventPayload::WorkflowRunFinished {
+        run_id: "run_00000000000000000000000000".parse()?,
+        workflow_name: "deploy".into(),
+        state: WorkflowRunState::Running,
+        result: None,
+        error: None,
+    };
+    assert!(BridgeFrame::encode_json(1, &bad_wf).is_err());
 
     // EventEnvelope validation negative cases
     let base_event = json!({
@@ -598,15 +638,21 @@ fn bridge_and_event_nested_validation_and_object_defaults() -> TestResult {
             .is_err()
     );
 
-    let mut stale_state = base_event.clone();
-    stale_state["kind"] = json!("participant.state_changed");
-    stale_state["payload"] =
-        json!({"state": "idle", "can_respond_remotely": true, "approval_id": "a1"});
-    assert!(
-        serde_json::from_value::<EventEnvelope>(stale_state)?
-            .validate()
-            .is_err()
-    );
+    for stale_payload in [
+        json!({"state": "idle", "can_respond_remotely": true, "approval_id": "a1"}),
+        json!({"state": "idle", "wait_kind": "permission"}),
+        json!({"state": "idle", "action_hint": "review"}),
+        json!({"state": "idle", "summary": "run cmd"}),
+    ] {
+        let mut stale_state = base_event.clone();
+        stale_state["kind"] = json!("participant.state_changed");
+        stale_state["payload"] = stale_payload;
+        assert!(
+            serde_json::from_value::<EventEnvelope>(stale_state)?
+                .validate()
+                .is_err()
+        );
+    }
 
     let mut bad_answered = base_event;
     bad_answered["kind"] = json!("question.answered");

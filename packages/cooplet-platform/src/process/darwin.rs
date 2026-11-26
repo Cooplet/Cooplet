@@ -178,3 +178,21 @@ pub(super) fn terminate_detached(
         TerminateOutcome::CleanupUnverified
     })
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn probe_token_matching_tolerates_boot_time_drift() {
+        assert!(tokens_match_for_probe(
+            "darwin:1700000000:1700001234.567890",
+            "darwin:1700000005:1700001234.567890"
+        ));
+        assert!(!tokens_match_for_probe(
+            "darwin:1700000000:1700001234.567890",
+            "darwin:1700000000:1700001235.0"
+        ));
+        assert!(!tokens_match_for_probe("invalid", "darwin:1:2.3"));
+    }
+}

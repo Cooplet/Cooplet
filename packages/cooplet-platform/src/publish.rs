@@ -100,6 +100,18 @@ fn publish_via_link(
     dest_dir: &File,
     final_name: &CStr,
 ) -> Result<PublishOutcome, PlatformError> {
+    publish_via_link_with(stage_dir, tmp, dest_dir, final_name, |dir| {
+        sync_dir(dir, PublishStage::DestinationSync)
+    })
+}
+
+fn publish_via_link_with(
+    stage_dir: &File,
+    tmp: &CStr,
+    dest_dir: &File,
+    final_name: &CStr,
+    sync_dest: impl FnOnce(&File) -> Result<(), PlatformError>,
+) -> Result<PublishOutcome, PlatformError> {
     // SAFETY: the borrowed directory fds and terminated names live through the call.
     let linked = unsafe {
         libc::linkat(
@@ -118,7 +130,7 @@ fn publish_via_link(
             Err(error.into())
         };
     }
-    if let Err(error) = sync_dir(dest_dir, PublishStage::DestinationSync) {
+    if let Err(error) = sync_dest(dest_dir) {
         // Avoid leaving an extra staging hardlink (nlink == 2) that would block
         // open_sealed_file if the destination entry persists after the sync failure.
         let _ = unlink_entry(stage_dir, tmp);
@@ -189,5 +201,38 @@ mod tests {
         assert!(!is_noreplace_unsupported(&io::Error::from_raw_os_error(
             libc::EXDEV
         )));
+    }
+
+    #[test]
+    fn link_fallback_unlinks_staging_on_destination_sync_error()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let scratch = Scratch::new()?;
+        let stage = PrivateFs::ensure_private_dir(&scratch.0.join("stage"))?;
+        let dest = PrivateFs::ensure_private_dir(&scratch.0.join("dest"))?;
+        let stage_dir = PrivateFs::open_dir_nofollow(&stage)?;
+        let dest_dir = PrivateFs::open_dir_nofollow(&dest)?;
+        fs::write(stage.join("blob.part"), b"payload")?;
+        let result = publish_via_link_with(
+            &stage_dir,
+            &component("blob.part")?,
+            &dest_dir,
+            &component("blob.bin")?,
+            |_| {
+                Err(PlatformError::PublishedDurabilityUnknown {
+                    stage: PublishStage::DestinationSync,
+                    source: io::Error::other("simulated sync error"),
+                })
+            },
+        );
+        assert!(matches!(
+            result,
+            Err(PlatformError::PublishedDurabilityUnknown {
+                stage: PublishStage::DestinationSync,
+                ..
+            })
+        ));
+        assert!(!stage.join("blob.part").exists());
+        assert_eq!(fs::metadata(dest.join("blob.bin"))?.nlink(), 1);
+        Ok(())
     }
 }

@@ -317,6 +317,14 @@ impl GcDriver {
             }
             let previous_cursor = state.tombstone_cursor.clone();
             let candidates = blobs.pending_tombstones(previous_cursor.clone()).await?;
+            if let (Some(prev), Some(first)) = (&previous_cursor, candidates.first())
+                && (first.deleted_at_ms, &first.record.blob_id)
+                    <= (prev.deleted_at_ms, &prev.record.blob_id)
+            {
+                state.tombstone_cursor = None;
+                has_more = true;
+                break;
+            }
             let batch_full = candidates.len() == GC_BATCH_SIZE;
             let last = candidates.last().cloned();
             let mut interrupted = false;

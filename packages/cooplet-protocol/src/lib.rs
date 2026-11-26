@@ -58,6 +58,19 @@ pub fn validate_step_key(key: &str) -> Result<(), ValidationError> {
     }
 }
 
+/// Validate a user-facing attachment filename (1..=255 UTF-8 bytes, non-blank, no ASCII controls).
+pub fn validate_attachment_name(name: &str) -> Result<(), ValidationError> {
+    if name.is_empty()
+        || name.len() > 255
+        || name.trim().is_empty()
+        || name.bytes().any(|byte| byte < 0x20 || byte == 0x7f)
+    {
+        Err(ValidationError("attachment name"))
+    } else {
+        Ok(())
+    }
+}
+
 /// Validate an RFC 9110 concrete media type (`type/subtype` with optional parameters).
 pub fn validate_media_type(value: &str) -> Result<(), ValidationError> {
     if value.is_empty()

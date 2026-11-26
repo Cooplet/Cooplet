@@ -30,6 +30,7 @@ pub(crate) use disk::{check_before_database_open, validate_config};
 
 const MUTATION_SLOTS: usize = 64;
 const STAGING_QUEUE: usize = 8;
+const MIN_READ_CAPACITY: usize = 8 * 1024;
 
 #[derive(Clone, Debug)]
 pub struct BlobInput {
@@ -262,6 +263,14 @@ impl BlobDiskStore {
             if candidates.is_empty() {
                 break;
             }
+            if let (Some(prev), Some(first)) = (&cursor, candidates.first())
+                && (first.deleted_at_ms, &first.record.blob_id)
+                    <= (prev.deleted_at_ms, &prev.record.blob_id)
+            {
+                return Err(StorageError::BlobUnverified(
+                    "startup tombstone pagination did not advance".into(),
+                ));
+            }
             let full = candidates.len() == GC_BATCH_SIZE;
             let next_cursor = candidates.last().cloned();
             for candidate in candidates {
@@ -473,11 +482,20 @@ impl Store {
                     }
                 }
                 if let Err(cleanup) = self.unlink(record, true).await {
-                    tracing::warn!(
-                        blob_id = %id,
-                        %cleanup,
-                        "blob registration failed and rollback unlink also failed"
-                    );
+                    match &error {
+                        WriteFailure::Storage(original) => tracing::warn!(
+                            blob_id = %id,
+                            registration_error = %original,
+                            %cleanup,
+                            "blob registration failed and rollback unlink also failed"
+                        ),
+                        WriteFailure::App(_) => tracing::warn!(
+                            blob_id = %id,
+                            registration_error = "application rejected write",
+                            %cleanup,
+                            "blob registration failed and rollback unlink also failed"
+                        ),
+                    }
                     slot.quarantine(id);
                     return Err(cleanup.into());
                 }
@@ -531,7 +549,8 @@ impl Store {
         let disk = self.disk.clone();
         let sidecar = self.reads.clone();
         tokio::task::spawn_blocking(move || {
-            let _sidecar = sidecar;
+            let (_, lock) = sidecar.database_and_sidecar()?;
+            lock.verify_path()?;
             disk.unlink(&record, account)
         })
         .await?
@@ -547,7 +566,7 @@ async fn feed(
     let mut buffer = BytesMut::with_capacity(CHUNK_BYTES);
     let mut bytes = 0;
     loop {
-        if buffer.capacity() < CHUNK_BYTES {
+        if buffer.capacity() < MIN_READ_CAPACITY {
             buffer.reserve(CHUNK_BYTES);
         }
         let count = tokio::select! {

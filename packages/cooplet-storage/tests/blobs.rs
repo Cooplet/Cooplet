@@ -1320,5 +1320,20 @@ async fn recovery_unlinks_separate_sibling_and_rejects_same_inode_alias() -> Tes
             .await
             .is_err()
     );
+
+    // A blob root equal to or nested under database_path is rejected before creating the DB.
+    let disjoint_scratch = Scratch::new()?;
+    let db_path = disjoint_scratch.0.join("node.sqlite3");
+    for bad_root in [db_path.clone(), db_path.join("blobs")] {
+        let attempt = StorageEngine::open_managed(
+            StorageConfig::new(db_path.clone()),
+            SCHEMA,
+            Arc::new(Registry::default()),
+            Some(BlobStoreConfig::new(bad_root)),
+        )
+        .await;
+        assert!(matches!(attempt, Err(StorageError::InvalidConfig(_))));
+        assert!(!db_path.try_exists()?);
+    }
     Ok(())
 }

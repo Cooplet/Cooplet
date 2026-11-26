@@ -9,7 +9,6 @@ pub const PROBLEM_JSON_MEDIA_TYPE: &str = "application/problem+json";
 macro_rules! error_codes {
     ($($variant:ident => $wire:tt: $status:literal, $retryable:literal, $slug:literal, $title:literal;)*) => {
         crate::wire::wire_string_enum! {
-            #[derive(Hash)]
             pub enum ErrorCode {
                 $($variant => $wire,)*
             }

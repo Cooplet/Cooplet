@@ -60,7 +60,7 @@ macro_rules! wire_string_enum {
             $($variant:ident => $wire:tt),+ $(,)?
         }
     ) => {
-        #[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, utoipa::ToSchema)]
+        #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, serde::Serialize, utoipa::ToSchema)]
         $(#[$attr])*
         pub enum $name {
             $(#[serde(rename = $wire)] $variant,)+

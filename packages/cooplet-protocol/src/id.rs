@@ -161,7 +161,6 @@ define_id!(HubId, "hub_");
 define_id!(RequestId, "req_");
 
 crate::wire::wire_string_enum! {
-    #[derive(Hash)]
     pub enum SourceKind {
         Node => "node",
         Hub => "hub",
@@ -194,6 +193,10 @@ impl Ord for SourceId {
 
 impl SourceId {
     pub const PATTERN: &str = "^(node|hub)_[0-7][0-9a-hjkmnpqrstvwxyz]{25}$";
+
+    pub fn parse(input: &str) -> Result<Self, IdError> {
+        input.parse()
+    }
 
     pub fn kind(&self) -> SourceKind {
         match self {
@@ -280,7 +283,6 @@ impl PartialSchema for SourceId {
 impl ToSchema for SourceId {}
 
 crate::wire::wire_string_enum! {
-    #[derive(Hash)]
     pub enum AggregateType {
         Node => "node",
         Participant => "participant",
