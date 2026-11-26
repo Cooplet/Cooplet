@@ -81,9 +81,11 @@ impl BlobDiskStore {
         hooks: Arc<dyn GcHooks>,
     ) -> Result<Self, StorageError> {
         let startup_reads = reads.clone();
-        let disk =
-            tokio::task::spawn_blocking(move || Disk::open(config, startup_reads.database_path()))
-                .await??;
+        let disk = tokio::task::spawn_blocking(move || {
+            let (database_path, sidecar) = startup_reads.database_and_sidecar()?;
+            Disk::open(config, database_path, &sidecar)
+        })
+        .await??;
         let store = Self(Arc::new(Store {
             disk: Arc::new(disk),
             db,

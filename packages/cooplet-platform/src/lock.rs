@@ -1,7 +1,7 @@
 use std::{
-    fs::{File, OpenOptions, TryLockError},
+    fs::{self, File, Metadata, OpenOptions, TryLockError},
     io,
-    os::unix::fs::OpenOptionsExt,
+    os::unix::fs::{MetadataExt, OpenOptionsExt},
     path::{Path, PathBuf},
     thread,
     time::Duration,
@@ -79,9 +79,24 @@ impl FileLock {
     }
 
     pub fn verify_path(&self) -> Result<(), PlatformError> {
+        self.verified_metadata().map(|_| ())
+    }
+
+    /// Check whether this lock already owns the file at another path.
+    pub fn protects_path(&self, path: &Path) -> Result<bool, PlatformError> {
+        let opened = self.verified_metadata()?;
+        match fs::symlink_metadata(path) {
+            Ok(current) => Ok((current.dev(), current.ino()) == (opened.dev(), opened.ino())),
+            Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(false),
+            Err(error) => Err(error.into()),
+        }
+    }
+
+    fn verified_metadata(&self) -> Result<Metadata, PlatformError> {
         let metadata = self.file.metadata()?;
         verify_path(&self.path, &metadata)?;
-        verify_private_file(&self.path, &metadata, 0o600)
+        verify_private_file(&self.path, &metadata, 0o600)?;
+        Ok(metadata)
     }
 }
 
@@ -108,6 +123,11 @@ mod tests {
 
         let lock = FileLock::acquire_exclusive(&path)?;
         assert_eq!(path.metadata()?.mode() & 0o777, 0o600);
+        assert!(lock.protects_path(&path)?);
+        let alias = scratch.0.join("node-alias.lock");
+        symlink(&path, &alias)?;
+        assert!(!lock.protects_path(&alias)?);
+        assert!(!lock.protects_path(&scratch.0.join("absent.lock"))?);
         assert!(matches!(
             FileLock::acquire_exclusive(&path),
             Err(PlatformError::LockBusy)

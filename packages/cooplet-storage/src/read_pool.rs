@@ -20,8 +20,16 @@ struct Pool {
 }
 
 impl ReadPool {
-    pub(crate) fn database_path(&self) -> &std::path::Path {
-        &self.0.config.db_path
+    pub(crate) fn database_and_sidecar(
+        &self,
+    ) -> Result<(&std::path::Path, Arc<FileLock>), StorageError> {
+        let lock = self
+            .0
+            .lock
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let sidecar = lock.as_ref().ok_or(StorageError::Closed)?.clone();
+        Ok((&self.0.config.db_path, sidecar))
     }
 
     pub(crate) fn open(config: StorageConfig, lock: Arc<FileLock>) -> Result<Self, StorageError> {

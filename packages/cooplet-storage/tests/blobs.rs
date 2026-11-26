@@ -833,3 +833,42 @@ async fn interrupted_initial_claim_is_recoverable_and_concurrent_claims_have_one
     resumed.shutdown().await?;
     Ok(())
 }
+
+#[tokio::test]
+async fn root_claim_reuses_the_database_sidecar_if_its_path_coincides() -> TestResult {
+    let scratch = Scratch::new()?;
+    let config = StorageConfig::new(scratch.0.join("database-owner.sqlite3"));
+    let blobs = BlobStoreConfig::new(&scratch.0);
+    let registry = Arc::new(Registry::default());
+    let engine = StorageEngine::open_managed(
+        config.clone(),
+        SCHEMA,
+        registry.clone(),
+        Some(blobs.clone()),
+    )
+    .await?;
+    let same = StorageEngine::open_managed(
+        config.clone(),
+        SCHEMA,
+        registry.clone(),
+        Some(blobs.clone()),
+    )
+    .await;
+    assert!(matches!(
+        same,
+        Err(StorageError::Platform(
+            cooplet_platform::PlatformError::LockBusy
+        ))
+    ));
+    let (stored, ()) = engine
+        .blobs()
+        .ok_or("missing store")?
+        .store(input(BlobId::generate()?), &b"hello"[..], register)
+        .await?;
+    engine.shutdown().await?;
+    let engine = StorageEngine::open_managed(config, SCHEMA, registry, Some(blobs)).await?;
+    assert_eq!(engine.blobs().ok_or("missing store")?.used_bytes(), 5);
+    assert_eq!(fs::read(stored.absolute_path)?, b"hello");
+    engine.shutdown().await?;
+    Ok(())
+}

@@ -40,6 +40,7 @@ impl Disk {
     pub(super) fn open(
         config: BlobStoreConfig,
         database_path: &Path,
+        database_sidecar: &FileLock,
     ) -> Result<Self, StorageError> {
         if config.max_blob_bytes == 0 {
             return Err(StorageError::InvalidConfig(
@@ -47,7 +48,7 @@ impl Disk {
             ));
         }
         let root = PrivateFs::ensure_private_dir(&config.root)?;
-        bind_root(&root, database_path)?;
+        bind_root(&root, database_path, database_sidecar)?;
         let staging = PrivateFs::ensure_private_dir(&root.join("staging"))?;
         let objects = PrivateFs::ensure_private_dir(&root.join("objects"))?;
         Ok(Self {
@@ -260,11 +261,21 @@ impl Disk {
     }
 }
 
-fn bind_root(root: &Path, database_path: &Path) -> Result<(), StorageError> {
+fn bind_root(
+    root: &Path,
+    database_path: &Path,
+    database_sidecar: &FileLock,
+) -> Result<(), StorageError> {
     const OWNER: &str = "database.owner";
     // The DB sidecar excludes another instance of this database. This
     // short-lived lock serializes claims from differently configured databases.
-    let claim = FileLock::acquire_exclusive(&root.join("database-owner.lock"))?;
+    let claim_path = root.join("database-owner.lock");
+    // A database in this root can already hold this exact sidecar.
+    let separate_claim = (!database_sidecar.protects_path(&claim_path)?)
+        .then(|| FileLock::acquire_exclusive(&claim_path))
+        .transpose()?;
+    let claim = separate_claim.as_ref().unwrap_or(database_sidecar);
+    claim.verify_path()?;
     let marker = root.join(OWNER);
     let owner = database_path.as_os_str().as_encoded_bytes();
     let max_owner_bytes = owner.len().max(4096) as u64;
