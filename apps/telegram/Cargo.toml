@@ -1,0 +1,21 @@
+[package]
+name = "cooplet-telegram"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+default-run = "cooplet-telegram"
+
+[[bin]]
+name = "cooplet-telegram"
+path = "src/main.rs"
+
+[dependencies]
+cooplet-client = { path = "../../packages/cooplet-client" }
+cooplet-platform = { path = "../../packages/cooplet-platform" }
+cooplet-protocol = { path = "../../packages/cooplet-protocol" }
+rustls = { workspace = true }
+
+[lints]
+workspace = true

@@ -1,0 +1,28 @@
+[package]
+name = "cooplet-hub"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+default-run = "cooplet-hub"
+
+[[bin]]
+name = "cooplet-hub"
+path = "src/main.rs"
+
+[dependencies]
+axum = { workspace = true }
+cooplet-platform = { path = "../../packages/cooplet-platform" }
+cooplet-protocol = { path = "../../packages/cooplet-protocol" }
+cooplet-storage = { path = "../../packages/cooplet-storage" }
+hmac = { workspace = true }
+rustls = { workspace = true }
+tokio-rustls = { workspace = true }
+tokio-tungstenite = { workspace = true }
+
+[dev-dependencies]
+cooplet-client = { path = "../../packages/cooplet-client" }
+
+[lints]
+workspace = true

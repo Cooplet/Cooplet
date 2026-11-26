@@ -1,0 +1,59 @@
+[workspace]
+resolver = "3"
+members = [
+    "packages/cooplet-protocol",
+    "packages/cooplet-platform",
+    "packages/cooplet-storage",
+    "packages/cooplet-client",
+    "apps/node",
+    "apps/hub",
+    "apps/telegram",
+    "apps/history",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.99.1"
+license = "AGPL-3.0-only"
+publish = false
+
+[workspace.dependencies]
+axum = { version = "0.8", features = ["ws"] }
+clap = { version = "4", features = ["derive"] }
+getrandom = "0.4"
+hmac = "0.12"
+reqwest = { version = "0.12", default-features = false, features = ["json", "stream", "multipart", "rustls-tls-webpki-roots"] }
+rusqlite = { version = "0.39", features = ["bundled", "fallible_uint"] }
+rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12", "logging"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+sha2 = "0.10"
+tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
+tokio-rustls = { version = "0.26", default-features = false, features = ["ring", "tls12", "logging"] }
+tokio-tungstenite = { version = "0.26", default-features = false, features = ["connect", "handshake"] }
+toml = "1"
+tracing = "0.1"
+utoipa = "5"
+webpki-roots = "0.26"
+
+[workspace.lints.rust]
+unsafe_code = "forbid"
+
+[workspace.lints.clippy]
+unwrap_used = "deny"
+expect_used = "deny"
+panic = "deny"
+todo = "deny"
+unimplemented = "deny"
+await_holding_lock = "deny"
+dbg_macro = "deny"
+exit = "deny"
+
+[profile.dev]
+debug = 1
+incremental = true
+
+[profile.test]
+debug = 1
+incremental = true

@@ -1,0 +1,19 @@
+{
+  "schemaVersion": 1,
+  "version": "0.6.0",
+  "packageMode": "registry",
+  "profiles": {
+    "rust": {},
+    "ts-library": {
+      "@arethetypeswrong/core": "0.18.5",
+      "@docouno/env": "0.6.0",
+      "@types/node": "24.19.2",
+      "eslint": "10.13.0",
+      "prettier": "3.9.10",
+      "publint": "0.3.25",
+      "tsdown": "0.23.7",
+      "typescript": "6.0.3",
+      "vitest": "5.0.5"
+    }
+  }
+}

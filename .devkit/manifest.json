@@ -1,0 +1,298 @@
+{
+  "schemaVersion": 2,
+  "version": "0.6.0",
+  "releaseIdentity": "1e3a61daf9a5a1527dd049d9f04f84a42ec22aaba783b66d16cbc95af285914c",
+  "generation": "dc3461a6-4175-4277-8a31-c4c77ee5562b",
+  "packageMode": "registry",
+  "managed": {
+    ".devkit/compose.apps.yaml": {
+      "sha256": "38ddc1d08bd54a013908e59f877afdc438ad1a4def928de55edfd5c92cbd819f",
+      "mode": 420
+    },
+    ".devkit/project.mk": {
+      "sha256": "5c850a42f28e7cf9eb191c57987f26d78a7d5dbe6de283989fcd174f696ab727",
+      "mode": 420
+    },
+    ".devkit/runtime.sha256": {
+      "sha256": "e814ee95b5808bd7c7394132e3d357dedb6b490cd7f99a1391086ecd4b3e4518",
+      "mode": 420
+    },
+    ".devkit/runtime/GUIDE.md": {
+      "sha256": "f4a28453e45ced46adb54b81cea2bab626719e698cac94b7cea5e4c31b15d4d2",
+      "mode": 420
+    },
+    ".devkit/runtime/LICENSE": {
+      "sha256": "da39312b3c1fd7a483ccb2ef16bf02836ac84ac9ef3b8f9511dc87b7dda929c1",
+      "mode": 420
+    },
+    ".devkit/runtime/api.env": {
+      "sha256": "0906f4ab98e156befc98147438fc775beb1511f0fc91a8a28e070d11decd6897",
+      "mode": 420
+    },
+    ".devkit/runtime/devkit.mk": {
+      "sha256": "3593a6d46063987facb7dd4fca0476c03d0c4f7eaa2e449f0c2ade446302bffa",
+      "mode": 420
+    },
+    ".devkit/runtime/devkit.sh": {
+      "sha256": "ae4b25e97706f88d4d2455efdfdb7d3a4146ffd0b8d8631b63a11cbffd722414",
+      "mode": 493
+    },
+    ".devkit/runtime/pnpm.env": {
+      "sha256": "7264d408b8302825d0ec663c87d07b943957cb1c6d76e6072ec9c388e6d990e0",
+      "mode": 420
+    },
+    ".devkit/runtime/rust.Dockerfile": {
+      "sha256": "88b4dfb67f04eb6639988453a62e3489bc2492aade0e811e32983ceca5abab94",
+      "mode": 420
+    },
+    ".devkit/runtime/toolchains.env": {
+      "sha256": "76dfa9ab279fb3d33dbb8fbd18f4ed1bcf7a7b33038fa6d0252a518ee64829b2",
+      "mode": 420
+    },
+    ".devkit/tooling-profiles.json": {
+      "sha256": "a1ecb6878027330a409154e59f4cc4032e06a0cc43e50e6ad12ab52b139504be",
+      "mode": 420
+    },
+    "rust-toolchain.toml": {
+      "sha256": "5e7517b95a2b4e810124f84091dd4a6e3f2192523fcac7b6d52abc7fc6aff91d",
+      "mode": 420
+    }
+  },
+  "components": {
+    "apps/history": {
+      "role": "app",
+      "toolchain": "rust",
+      "toolingProfile": "rust",
+      "origin": {
+        "template": "rust-api",
+        "version": "0.6.0",
+        "registrationIntent": {
+          "template": "rust-api",
+          "api": null,
+          "use": [
+            "cooplet-protocol",
+            "cooplet-platform",
+            "cooplet-client"
+          ],
+          "reconcile": false
+        }
+      },
+      "toolDependencies": {},
+      "dependencies": [
+        "packages/cooplet-client",
+        "packages/cooplet-platform",
+        "packages/cooplet-protocol"
+      ],
+      "development": {
+        "owner": "managed",
+        "kind": "compose",
+        "service": "history"
+      }
+    },
+    "apps/hub": {
+      "role": "app",
+      "toolchain": "rust",
+      "toolingProfile": "rust",
+      "origin": {
+        "template": "rust-api",
+        "version": "0.6.0",
+        "registrationIntent": {
+          "template": "rust-api",
+          "api": null,
+          "use": [
+            "cooplet-protocol",
+            "cooplet-platform",
+            "cooplet-storage"
+          ],
+          "reconcile": false
+        }
+      },
+      "toolDependencies": {},
+      "dependencies": [
+        "packages/cooplet-client",
+        "packages/cooplet-platform",
+        "packages/cooplet-protocol",
+        "packages/cooplet-storage"
+      ],
+      "development": {
+        "owner": "managed",
+        "kind": "compose",
+        "service": "hub"
+      }
+    },
+    "apps/node": {
+      "role": "app",
+      "toolchain": "rust",
+      "toolingProfile": "rust",
+      "origin": {
+        "template": "rust-api",
+        "version": "0.6.0",
+        "registrationIntent": {
+          "template": "rust-api",
+          "api": null,
+          "use": [
+            "cooplet-protocol",
+            "cooplet-platform",
+            "cooplet-storage",
+            "cooplet-client"
+          ],
+          "reconcile": false
+        }
+      },
+      "toolDependencies": {},
+      "dependencies": [
+        "packages/cooplet-client",
+        "packages/cooplet-platform",
+        "packages/cooplet-protocol",
+        "packages/cooplet-storage"
+      ],
+      "development": {
+        "owner": "managed",
+        "kind": "compose",
+        "service": "node"
+      }
+    },
+    "apps/telegram": {
+      "role": "app",
+      "toolchain": "rust",
+      "toolingProfile": "rust",
+      "origin": {
+        "template": "rust-api",
+        "version": "0.6.0",
+        "registrationIntent": {
+          "template": "rust-api",
+          "api": null,
+          "use": [
+            "cooplet-protocol",
+            "cooplet-platform",
+            "cooplet-client"
+          ],
+          "reconcile": false
+        }
+      },
+      "toolDependencies": {},
+      "dependencies": [
+        "packages/cooplet-client",
+        "packages/cooplet-platform",
+        "packages/cooplet-protocol"
+      ],
+      "development": {
+        "owner": "managed",
+        "kind": "compose",
+        "service": "telegram"
+      }
+    },
+    "packages/cooplet-client": {
+      "role": "library",
+      "toolchain": "rust",
+      "toolingProfile": "rust",
+      "origin": {
+        "template": "rust-library",
+        "version": "0.6.0",
+        "registrationIntent": {
+          "template": "rust-library",
+          "api": null,
+          "use": [
+            "cooplet-protocol"
+          ],
+          "reconcile": false
+        }
+      },
+      "toolDependencies": {},
+      "dependencies": [
+        "packages/cooplet-protocol"
+      ]
+    },
+    "packages/cooplet-platform": {
+      "role": "library",
+      "toolchain": "rust",
+      "toolingProfile": "rust",
+      "origin": {
+        "template": "rust-library",
+        "version": "0.6.0"
+      },
+      "toolDependencies": {},
+      "dependencies": []
+    },
+    "packages/cooplet-protocol": {
+      "role": "library",
+      "toolchain": "rust",
+      "toolingProfile": "rust",
+      "origin": {
+        "template": "rust-library",
+        "version": "0.6.0"
+      },
+      "toolDependencies": {},
+      "dependencies": []
+    },
+    "packages/cooplet-storage": {
+      "role": "library",
+      "toolchain": "rust",
+      "toolingProfile": "rust",
+      "origin": {
+        "template": "rust-library",
+        "version": "0.6.0",
+        "registrationIntent": {
+          "template": "rust-library",
+          "api": null,
+          "use": [
+            "cooplet-protocol",
+            "cooplet-platform"
+          ],
+          "reconcile": false
+        }
+      },
+      "toolDependencies": {},
+      "dependencies": [
+        "packages/cooplet-platform",
+        "packages/cooplet-protocol"
+      ]
+    },
+    "packages/workflow-sdk": {
+      "role": "library",
+      "toolchain": "node",
+      "toolingProfile": "ts-library",
+      "origin": {
+        "template": "ts-library",
+        "version": "0.6.0",
+        "registrationIntent": {
+          "template": "ts-library",
+          "api": null,
+          "use": [],
+          "reconcile": false
+        }
+      },
+      "toolDependencies": {
+        "@arethetypeswrong/core": "0.18.5",
+        "@docouno/env": "0.6.0",
+        "@types/node": "24.19.2",
+        "eslint": "10.13.0",
+        "prettier": "3.9.10",
+        "publint": "0.3.25",
+        "tsdown": "0.23.7",
+        "typescript": "6.0.3",
+        "vitest": "5.0.5"
+      },
+      "dependencies": []
+    }
+  },
+  "cargoResolution": {
+    "version": 1,
+    "lock": "c263c8f202411645e142f3313e4b0e34102f15091963b6c82cf1f3bd9ac948c0",
+    "inputs": {
+      "digest": "47b76ec5f06f886d0d9edd3be3f88744354b934acd55469ed7dd5b5038aebde6",
+      "policy": "429da50873c26c405a5f19222a2e434c7aa5669207448c0cb02b832c7eed5378",
+      "members": {
+        "apps/history": "09b8467fa0be8b13e71b6e5175196dd0a9d902cf3cd98f36d37c068f4879d7fc",
+        "apps/hub": "7a6cea9eb0c32870a73a9c96817749ca35622c5145ce258e17eba2ee5a1b0af1",
+        "apps/node": "3b42b80cff1e57bc6e986c493990cb54f08de27a9bc64ea4bf1a2c3393af062e",
+        "apps/telegram": "e6e0dd6114d7d942608595c0605f4e73f133297a169e7d39afccca076147f07a",
+        "packages/cooplet-client": "eceb61b4581c9368f3c38ec0d89028a0e05b92837c224630c23ff39fe118eef0",
+        "packages/cooplet-platform": "c0b1ba869c6011c1674c1624047072cab22d27a0af0adecd36535d67235c502a",
+        "packages/cooplet-protocol": "e96ff3ae751b882b0dc2aa7c8032c93824565c5e720ac289d0c193da4d00882a",
+        "packages/cooplet-storage": "af05427034e7d7d186106ce70f8e817fd6de9b28d9a9093e99fb21dc2dc4a31c"
+      },
+      "locals": "44136fa355b3678a1146ad16f7e8649e94fb4fc21fe77e8310c060f61caaff8a"
+    }
+  }
+}

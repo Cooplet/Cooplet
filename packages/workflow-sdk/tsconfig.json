@@ -1,0 +1,9 @@
+{
+  "extends": "@docouno/env/tsconfig/library.json",
+  "include": ["src/**/*.ts"],
+  "exclude": ["src/**/*.test.ts"],
+  "compilerOptions": {
+    "strict": true,
+    "erasableSyntaxOnly": true
+  }
+}

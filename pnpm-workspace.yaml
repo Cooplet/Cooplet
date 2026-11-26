@@ -1,0 +1,7 @@
+packages:
+- packages/workflow-sdk
+nodeLinker: isolated
+packageImportMethod: hardlink
+verifyDepsBeforeRun: false
+minimumReleaseAgeExclude:
+- "@docouno/env@0.6.0"

@@ -1,0 +1,15 @@
+[package]
+name = "cooplet-client"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[dependencies]
+cooplet-protocol = { path = "../cooplet-protocol" }
+reqwest = { workspace = true }
+webpki-roots = { workspace = true }
+
+[lints]
+workspace = true
