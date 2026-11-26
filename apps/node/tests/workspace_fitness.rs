@@ -1,7 +1,7 @@
 use std::collections::BTreeSet;
 use std::error::Error;
 use std::fs;
-use std::path::{Path, PathBuf};
+use std::path::{Component, Path, PathBuf};
 use std::process::Command;
 
 use serde::Deserialize;
@@ -310,11 +310,27 @@ fn reject_config_path_overrides(
                 ConfigInclude::Path(path) => (path, false),
                 ConfigInclude::Entry { path, optional } => (path, optional),
             };
-            reject_config_path_overrides(root, &directory.join(path), optional, active)?;
+            let path = normalize_config_include(&directory.join(path));
+            reject_config_path_overrides(root, &path, optional, active)?;
         }
     }
     active.remove(&canonical);
     Ok(())
+}
+
+fn normalize_config_include(absolute_path: &Path) -> PathBuf {
+    // Cargo collapses dot components before checking if an include exists.
+    let mut normalized = PathBuf::new();
+    for component in absolute_path.components() {
+        match component {
+            Component::CurDir => {}
+            Component::ParentDir => {
+                normalized.pop();
+            }
+            _ => normalized.push(component.as_os_str()),
+        }
+    }
+    normalized
 }
 
 fn reject_override_tables(document: &Value, file: &str) -> PolicyResult {

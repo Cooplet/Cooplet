@@ -1,1 +1,4 @@
-include = [{ path = "optional.toml", optional = true }, "overrides.toml"]
+include = [
+    { path = "optional.toml", optional = true },
+    { path = "missing/../overrides.toml", optional = true },
+]
