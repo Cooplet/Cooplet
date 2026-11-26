@@ -13,26 +13,28 @@ pub enum QuestionMode {
     Text,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
-#[serde(deny_unknown_fields)]
-pub struct QuestionOption {
-    pub id: String,
-    pub label: String,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub description: Option<String>,
+crate::wire::wire_object! {
+    #[serde(deny_unknown_fields)]
+    pub struct QuestionOption {
+        pub id: String,
+        pub label: String,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        pub description: Option<String>,
+    }
 }
 
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
-#[serde(deny_unknown_fields)]
-pub struct QuestionPayload {
-    pub prompt: String,
-    pub mode: QuestionMode,
-    #[serde(default)]
-    pub options: Vec<QuestionOption>,
-    #[serde(default)]
-    pub allow_free_text: bool,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub expires_at_ms: Option<i64>,
+crate::wire::wire_object! {
+    #[serde(deny_unknown_fields)]
+    pub struct QuestionPayload {
+        pub prompt: String,
+        pub mode: QuestionMode,
+        #[serde(default)]
+        pub options: Vec<QuestionOption>,
+        #[serde(default)]
+        pub allow_free_text: bool,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        pub expires_at_ms: Option<i64>,
+    }
 }
 
 impl QuestionPayload {
@@ -73,13 +75,14 @@ impl QuestionPayload {
     }
 }
 
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
-#[serde(deny_unknown_fields)]
-pub struct AnswerPayload {
-    #[serde(default)]
-    pub selected_option_ids: Vec<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub text: Option<String>,
+crate::wire::wire_object! {
+    #[serde(deny_unknown_fields)]
+    pub struct AnswerPayload {
+        #[serde(default)]
+        pub selected_option_ids: Vec<String>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        pub text: Option<String>,
+    }
 }
 
 impl AnswerPayload {

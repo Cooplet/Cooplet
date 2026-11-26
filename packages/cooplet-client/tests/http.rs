@@ -146,6 +146,39 @@ async fn bad_hub_info_never_serializes_or_sends_secrets() -> TestResult {
 }
 
 #[tokio::test]
+async fn cancelling_hub_waiters_releases_only_abandoned_probes() -> TestResult {
+    let server = Server::bind().await?;
+    let client = pinned(server.url.clone(), Some(BearerToken::new("test-secret")?))?;
+    let mut abandoned = Box::pin(client.verify_hub_identity());
+    let (head, held_open) = tokio::select! {
+        biased;
+        _ = &mut abandoned => return Err("preflight completed before the reply".into()),
+        accepted = server.accept() => accepted?,
+    };
+    assert_eq!(head.request, "GET /v1/info HTTP/1.1");
+    drop(abandoned);
+
+    let mut leader = Box::pin(client.verify_hub_identity());
+    let mut waiter = Box::pin(client.verify_hub_identity());
+    let (head, peer) = tokio::select! {
+        biased;
+        _ = &mut leader => return Err("preflight completed before the reply".into()),
+        _ = &mut waiter => return Err("preflight completed before the reply".into()),
+        accepted = server.accept() => accepted?,
+    };
+    assert_eq!(head.request, "GET /v1/info HTTP/1.1");
+    assert_eq!(head.count("authorization"), 0);
+    drop(leader);
+    peer.respond("200 OK", &[], NODE_INFO).await?;
+    assert!(matches!(
+        tokio::time::timeout(Duration::from_secs(2), waiter).await?,
+        Err(ClientError::HubIdentityMismatch { actual: None, .. })
+    ));
+    drop(held_open);
+    Ok(())
+}
+
+#[tokio::test]
 async fn overlapping_calls_pin_once_and_local_node_never_gets_hub_header() -> TestResult {
     let server = Server::bind().await?;
     let client = pinned(server.url.clone(), Some(BearerToken::new("test-secret")?))?;
@@ -232,10 +265,14 @@ async fn redirect_is_terminal_and_failed_preflight_is_not_cached() -> TestResult
         Ok::<_, Box<dyn std::error::Error + Send + Sync>>(())
     };
     let call = async {
-        assert!(matches!(
-            client.verify_hub_identity().await,
-            Err(ClientError::Timeout(_))
-        ));
+        let (first, second, third) = tokio::join!(
+            client.verify_hub_identity(),
+            client.verify_hub_identity(),
+            client.verify_hub_identity()
+        );
+        for failed in [first, second, third] {
+            assert!(matches!(failed, Err(ClientError::Timeout(_))));
+        }
         let result = client
             .post_json::<_, Value>("/v1/enroll", "one-shot-secret", None)
             .await;

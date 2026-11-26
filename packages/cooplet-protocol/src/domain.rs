@@ -69,14 +69,15 @@ pub enum DeliveryState {
     Unknown,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
-#[serde(deny_unknown_fields)]
-pub struct AttachmentRef {
-    pub blob_id: BlobId,
-    pub name: String,
-    pub mime_type: String,
-    pub size_bytes: u64,
-    pub sha256: String,
+crate::wire::wire_object! {
+    #[serde(deny_unknown_fields)]
+    pub struct AttachmentRef {
+        pub blob_id: BlobId,
+        pub name: String,
+        pub mime_type: String,
+        pub size_bytes: u64,
+        pub sha256: String,
+    }
 }
 
 impl AttachmentRef {
@@ -111,17 +112,18 @@ pub enum ApprovalWaitKind {
     Unspecified,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
-#[serde(deny_unknown_fields)]
-pub struct ApprovalWait {
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub approval_id: Option<String>,
-    pub kind: ApprovalWaitKind,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub summary: Option<String>,
-    pub can_respond_remotely: bool,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub action_hint: Option<String>,
+crate::wire::wire_object! {
+    #[serde(deny_unknown_fields)]
+    pub struct ApprovalWait {
+        #[serde(skip_serializing_if = "Option::is_none")]
+        pub approval_id: Option<String>,
+        pub kind: ApprovalWaitKind,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        pub summary: Option<String>,
+        pub can_respond_remotely: bool,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        pub action_hint: Option<String>,
+    }
 }
 
 impl ApprovalWait {
@@ -155,11 +157,12 @@ pub enum ApprovalAction {
     Deny,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
-#[serde(deny_unknown_fields)]
-pub struct ApprovalDecision {
-    pub approval_id: String,
-    pub action: ApprovalAction,
+crate::wire::wire_object! {
+    #[serde(deny_unknown_fields)]
+    pub struct ApprovalDecision {
+        pub approval_id: String,
+        pub action: ApprovalAction,
+    }
 }
 
 #[derive(
@@ -201,37 +204,41 @@ impl InfoResponse {
     }
 }
 
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
-#[serde(deny_unknown_fields)]
-pub struct HubInfoResponse {
-    pub hub_id: HubId,
-    pub display_name: String,
-    pub protocol_version: u8,
+crate::wire::wire_object! {
+    #[serde(deny_unknown_fields)]
+    pub struct HubInfoResponse {
+        pub hub_id: HubId,
+        pub display_name: String,
+        pub protocol_version: u8,
+    }
 }
 
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
-#[serde(deny_unknown_fields)]
-pub struct NodeInfoResponse {
-    pub node_id: NodeId,
-    pub display_name: String,
-    pub protocol_version: u8,
+crate::wire::wire_object! {
+    #[serde(deny_unknown_fields)]
+    pub struct NodeInfoResponse {
+        pub node_id: NodeId,
+        pub display_name: String,
+        pub protocol_version: u8,
+    }
 }
 
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
-#[serde(deny_unknown_fields)]
-pub struct HealthResponse {
-    pub status: String,
+crate::wire::wire_object! {
+    #[serde(deny_unknown_fields)]
+    pub struct HealthResponse {
+        pub status: String,
+    }
 }
 
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
-#[serde(deny_unknown_fields)]
-pub struct WhoamiResponse {
-    pub actor_id: String,
-    pub principal_kind: PrincipalKind,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub node_id: Option<NodeId>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub participant_id: Option<ParticipantId>,
-    pub name: String,
-    pub scopes: Vec<ServiceScope>,
+crate::wire::wire_object! {
+    #[serde(deny_unknown_fields)]
+    pub struct WhoamiResponse {
+        pub actor_id: String,
+        pub principal_kind: PrincipalKind,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        pub node_id: Option<NodeId>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        pub participant_id: Option<ParticipantId>,
+        pub name: String,
+        pub scopes: Vec<ServiceScope>,
+    }
 }

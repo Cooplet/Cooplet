@@ -57,10 +57,7 @@ impl ProcessIdentity {
                     Ok(ProcessProbe::Running)
                 }
             }
-            Err(PlatformError::Io(error))
-                if error.kind() == io::ErrorKind::NotFound
-                    || error.raw_os_error() == Some(libc::ESRCH) =>
-            {
+            Err(PlatformError::Io(error)) if process_missing(pid, &error) => {
                 Ok(ProcessProbe::Missing)
             }
             Err(error) => Err(error),
@@ -255,7 +252,7 @@ impl OwnedGroup {
                 // A successful WNOWAIT observation proves the private Child still
                 // anchors this PID. No numeric signal is sent once that is lost.
                 observe_owned_exit(pid)?;
-                signal_group(pid, signal)
+                send_signal(-pid, signal)
             },
         );
         if outcome == TerminateOutcome::CleanupUnverified || !leader_exited {
@@ -303,17 +300,22 @@ impl StopState {
             };
         }
         if matches!(self, Self::Ready) {
-            if signal(libc::SIGTERM).is_err() {
-                return TerminateOutcome::CleanupUnverified;
+            if let Err(error) = signal(libc::SIGTERM) {
+                return after_signal_error(error, &mut gone, TerminateOutcome::AlreadyGone);
             }
             *self = Self::TermSent(MonotonicClock::deadline_after(grace));
         }
         if let Self::TermSent(deadline) = self {
-            if wait_for_group(*deadline, &mut gone) {
+            // The group can finish during the last sleep of the grace period.
+            if wait_for_group(*deadline, &mut gone) || gone().is_ok_and(|gone| gone) {
                 return TerminateOutcome::TerminatedGracefully;
             }
-            if signal(libc::SIGKILL).is_err() {
-                return TerminateOutcome::CleanupUnverified;
+            if let Err(error) = signal(libc::SIGKILL) {
+                return after_signal_error(
+                    error,
+                    &mut gone,
+                    TerminateOutcome::TerminatedGracefully,
+                );
             }
             *self = Self::KillSent;
         }
@@ -325,6 +327,18 @@ impl StopState {
         } else {
             TerminateOutcome::CleanupUnverified
         }
+    }
+}
+
+fn after_signal_error(
+    error: io::Error,
+    gone: &mut impl FnMut() -> io::Result<bool>,
+    confirmed: TerminateOutcome,
+) -> TerminateOutcome {
+    if error.raw_os_error() == Some(libc::ESRCH) && gone().is_ok_and(|gone| gone) {
+        confirmed
+    } else {
+        TerminateOutcome::CleanupUnverified
     }
 }
 
@@ -366,10 +380,18 @@ fn observe_owned_exit(pid: libc::pid_t) -> io::Result<bool> {
     }
 }
 
-fn signal_group(pgid: libc::pid_t, signal: libc::c_int) -> io::Result<()> {
-    // SAFETY: all callers pass a validated, positive PGID. The negative PID
-    // addresses that group. Signal zero is an existence check only.
-    if unsafe { libc::kill(-pgid, signal) } == 0 {
+fn process_missing(pid: libc::pid_t, metadata_error: &io::Error) -> bool {
+    // A missing metadata file (such as Linux boot_id) or a filtered procfs
+    // does not establish whether the process exists in our PID namespace.
+    (metadata_error.kind() == io::ErrorKind::NotFound
+        || metadata_error.raw_os_error() == Some(libc::ESRCH))
+        && send_signal(pid, 0).is_err_and(|error| error.raw_os_error() == Some(libc::ESRCH))
+}
+
+fn send_signal(target: libc::pid_t, signal: libc::c_int) -> io::Result<()> {
+    // SAFETY: callers pass a validated PID for signal zero, or a negated
+    // validated PGID to address a group. kill borrows no memory.
+    if unsafe { libc::kill(target, signal) } == 0 {
         Ok(())
     } else {
         Err(io::Error::last_os_error())
@@ -377,7 +399,7 @@ fn signal_group(pgid: libc::pid_t, signal: libc::c_int) -> io::Result<()> {
 }
 
 fn group_absent(pgid: libc::pid_t) -> io::Result<bool> {
-    match signal_group(pgid, 0) {
+    match send_signal(-pgid, 0) {
         Ok(()) => Ok(false),
         Err(error) if error.raw_os_error() == Some(libc::ESRCH) => Ok(true),
         Err(error) => Err(error),
@@ -387,7 +409,7 @@ fn group_absent(pgid: libc::pid_t) -> io::Result<bool> {
 #[cfg(test)]
 mod tests {
     use std::{
-        cell::RefCell,
+        cell::{Cell, RefCell},
         io::{BufRead, BufReader},
         process::Stdio,
     };
@@ -472,6 +494,52 @@ mod tests {
     }
 
     #[test]
+    fn checks_for_graceful_exit_at_the_end_of_grace() {
+        let terminated = Cell::new(false);
+        let result = StopState::default().drive(
+            Duration::ZERO,
+            || Ok(terminated.get()),
+            |signal| {
+                assert_eq!(signal, libc::SIGTERM);
+                terminated.set(true);
+                Ok(())
+            },
+        );
+        assert_eq!(result, TerminateOutcome::TerminatedGracefully);
+    }
+
+    #[test]
+    fn confirms_group_disappearance_when_a_signal_finds_no_recipient() {
+        for (missing_on, expected) in [
+            (libc::SIGTERM, TerminateOutcome::AlreadyGone),
+            (libc::SIGKILL, TerminateOutcome::TerminatedGracefully),
+        ] {
+            let absent = Cell::new(false);
+            let result = StopState::default().drive(
+                Duration::ZERO,
+                || Ok(absent.get()),
+                |signal| {
+                    if signal == missing_on {
+                        absent.set(true);
+                        return Err(io::Error::from_raw_os_error(libc::ESRCH));
+                    }
+                    Ok(())
+                },
+            );
+            assert_eq!(result, expected);
+        }
+    }
+
+    #[test]
+    fn a_confirmation_that_finishes_after_the_kill_deadline_is_inconclusive() {
+        let deadline = MonotonicClock::deadline_after(Duration::from_millis(5));
+        assert!(!wait_for_group(deadline, &mut || {
+            thread::sleep(Duration::from_millis(10));
+            Ok(true)
+        }));
+    }
+
+    #[test]
     fn rejects_unsafe_identity_and_preserves_uncertain_cleanup_state() {
         for (pid, pgid) in [(0, 0), (1, 1), (11, 10), (u32::MAX, u32::MAX)] {
             assert!(ProcessIdentity::capture(pid, pgid).is_err());
@@ -519,6 +587,12 @@ mod tests {
             start_token: "linux:00000000-0000-0000-0000-000000000000:0".into(),
             ..identity.clone()
         };
+        // A live leader can have inaccessible metadata, for example on a
+        // procfs mounted with subset=pid and no /proc/sys/kernel/random/boot_id.
+        assert!(!process_missing(
+            libc::pid_t::try_from(identity.pid)?,
+            &io::Error::from(io::ErrorKind::NotFound),
+        ));
         let invalid_start = ProcessHandle::terminate_detached(&stale, Duration::ZERO);
         let stale_boot = ProcessHandle::terminate_detached(&last_boot, Duration::ZERO);
         let still_live = !handle.observe_exit()?;
@@ -529,6 +603,7 @@ mod tests {
         assert!(still_live);
         assert_eq!(termination?, TerminateOutcome::TerminatedGracefully);
         assert_eq!(reaped.outcome, TerminateOutcome::AlreadyGone);
+        assert_eq!(identity.probe()?, ProcessProbe::Missing);
         assert_eq!(
             ProcessHandle::terminate_detached(&identity, Duration::ZERO)?,
             TerminateOutcome::AlreadyGone

@@ -1,4 +1,4 @@
-use std::{fmt, io};
+use std::{fmt, io, sync::Arc};
 
 use cooplet_protocol::{ErrorCode, HubId, PROBLEM_JSON_MEDIA_TYPE, ProblemDetails};
 use http::{StatusCode, header::CONTENT_TYPE};
@@ -6,7 +6,7 @@ use reqwest::Response;
 
 const MAX_PROBLEM_BYTES: usize = 64 * 1024;
 
-#[derive(thiserror::Error)]
+#[derive(Clone, thiserror::Error)]
 pub enum ClientError {
     #[error("hub identity mismatch")]
     HubIdentityMismatch {
@@ -34,9 +34,9 @@ pub enum ClientError {
     #[error("protocol error: {0}")]
     Protocol(String),
     #[error("HTTP transport failed")]
-    Transport(#[source] reqwest::Error),
+    Transport(#[source] Arc<reqwest::Error>),
     #[error("I/O failed")]
-    Io(#[source] io::Error),
+    Io(#[source] Arc<io::Error>),
     #[error("timed out waiting for {0}")]
     Timeout(&'static str),
 }
@@ -51,13 +51,13 @@ impl fmt::Debug for ClientError {
 
 impl From<reqwest::Error> for ClientError {
     fn from(error: reqwest::Error) -> Self {
-        Self::Transport(error.without_url())
+        Self::Transport(Arc::new(error.without_url()))
     }
 }
 
 impl From<io::Error> for ClientError {
     fn from(error: io::Error) -> Self {
-        Self::Io(error)
+        Self::Io(Arc::new(error))
     }
 }
 

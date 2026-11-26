@@ -65,19 +65,20 @@ event_kinds! {
     WorkflowLog => "workflow.log",
 }
 
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
-#[serde(deny_unknown_fields)]
-pub struct EventEnvelope {
-    pub seq: u64,
-    pub event_id: EventId,
-    pub source_kind: SourceKind,
-    pub source_id: SourceId,
-    pub kind: EventKind,
-    pub aggregate_type: AggregateType,
-    pub aggregate_id: String,
-    pub actor_id: Option<String>,
-    pub created_at_ms: i64,
-    pub payload: Value,
+crate::wire::wire_object! {
+    #[serde(deny_unknown_fields)]
+    pub struct EventEnvelope {
+        pub seq: u64,
+        pub event_id: EventId,
+        pub source_kind: SourceKind,
+        pub source_id: SourceId,
+        pub kind: EventKind,
+        pub aggregate_type: AggregateType,
+        pub aggregate_id: String,
+        pub actor_id: Option<String>,
+        pub created_at_ms: i64,
+        pub payload: Value,
+    }
 }
 
 impl EventEnvelope {
@@ -95,7 +96,7 @@ impl EventEnvelope {
                     approval_id: Option<&'a str>,
                     can_respond_remotely: Option<bool>,
                 }
-                let fields = ApprovalFields::deserialize(&self.payload)?;
+                let fields: ApprovalFields<'_> = self.payload_fields()?;
                 if self.kind == EventKind::ParticipantAwaitingApproval
                     && fields.state != ParticipantState::AwaitingApproval
                 {
@@ -122,7 +123,7 @@ impl EventEnvelope {
                     thread_id: _thread_id,
                     answered_by,
                     answer,
-                } = AnsweredFields::deserialize(&self.payload)?;
+                } = self.payload_fields()?;
                 if answered_by.trim().is_empty()
                     || (answer.selected_option_ids.is_empty()
                         && answer
@@ -137,28 +138,37 @@ impl EventEnvelope {
         }
         Ok(())
     }
+
+    fn payload_fields<'de, T: Deserialize<'de>>(&'de self) -> Result<T, ProtocolError> {
+        if !self.payload.is_object() {
+            return Err(ValidationError("event payload object").into());
+        }
+        Ok(T::deserialize(&self.payload)?)
+    }
 }
 
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
-#[serde(tag = "type", rename_all = "snake_case", deny_unknown_fields)]
-pub enum EventStreamFrame {
-    Event {
-        event: EventEnvelope,
-    },
-    Ping {},
-    ResyncRequired {
-        oldest_available_seq: u64,
-        latest_seq: u64,
-        reason: String,
-    },
+crate::wire::wire_object! {
+    #[serde(tag = "type", rename_all = "snake_case", deny_unknown_fields)]
+    pub enum EventStreamFrame {
+        Event {
+            event: EventEnvelope,
+        },
+        Ping {},
+        ResyncRequired {
+            oldest_available_seq: u64,
+            latest_seq: u64,
+            reason: String,
+        },
+    }
 }
 
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
-#[serde(deny_unknown_fields)]
-pub struct EventsPage {
-    pub items: Vec<EventEnvelope>,
-    pub next_seq: u64,
-    pub oldest_available_seq: u64,
-    pub latest_seq: u64,
-    pub has_more: bool,
+crate::wire::wire_object! {
+    #[serde(deny_unknown_fields)]
+    pub struct EventsPage {
+        pub items: Vec<EventEnvelope>,
+        pub next_seq: u64,
+        pub oldest_available_seq: u64,
+        pub latest_seq: u64,
+        pub has_more: bool,
+    }
 }

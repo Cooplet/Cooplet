@@ -123,6 +123,9 @@ async fn incompatible_preflight_preserves_database_bytes_and_ddl() -> TestResult
         "PRAGMA user_version=99",
         "CREATE TRIGGER forbidden AFTER INSERT ON data BEGIN SELECT 1; END",
         "CREATE TABLE stale_storage_rows(x)",
+        "CREATE TABLE Node_Storage(x)",
+        "CREATE TABLE Hub_STORAGE(x)",
+        "CREATE TABLE Stale_Storage_Rows(x)",
         "PRAGMA auto_vacuum=NONE; VACUUM",
     ]
     .into_iter()
@@ -171,6 +174,15 @@ async fn incompatible_preflight_preserves_database_bytes_and_ddl() -> TestResult
         StorageEngine::open(config.clone(), &[BASE, version_two]).await,
         Err(StorageError::IncompatibleDatabase(_))
     ));
+    let mixed_case_table = Migration {
+        version: 2,
+        name: "forbidden mixed-case table",
+        sql: "CREATE TABLE Node_Storage(id);",
+    };
+    assert!(matches!(
+        StorageEngine::open(config.clone(), &[BASE, mixed_case_table]).await,
+        Err(StorageError::IncompatibleDatabase(_))
+    ));
     let engine = StorageEngine::open(config.clone(), &[BASE]).await?;
     engine
         .reads()
@@ -181,7 +193,7 @@ async fn incompatible_preflight_preserves_database_bytes_and_ddl() -> TestResult
             );
             assert_eq!(
                 connection.query_row(
-                    "SELECT count(*) FROM sqlite_schema WHERE name IN ('next','invalid')",
+                    "SELECT count(*) FROM sqlite_schema WHERE name IN ('next','invalid','Node_Storage')",
                     [],
                     |row| row.get::<_, u32>(0)
                 )?,

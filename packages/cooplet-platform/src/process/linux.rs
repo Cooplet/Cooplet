@@ -46,12 +46,7 @@ pub(super) fn capture(pid: libc::pid_t) -> Result<(Snapshot, String), PlatformEr
     let dir = format!("/proc/{pid}");
     let dir = Path::new(&dir);
     let stat = read_stat(dir)?;
-    let uid = fs::read_to_string(dir.join("status"))?
-        .lines()
-        .find_map(|line| line.strip_prefix("Uid:"))
-        .and_then(|uid| uid.split_ascii_whitespace().nth(1))
-        .and_then(|uid| uid.parse().ok())
-        .ok_or_else(invalid_proc)?;
+    let uid = effective_uid(&fs::read(dir.join("status"))?)?;
     // A separately read stat confirms the PID and start time did not change
     // while reading the owner. Detached signaling also brackets this with a pidfd.
     let after = read_stat(dir)?;
@@ -67,6 +62,17 @@ pub(super) fn capture(pid: libc::pid_t) -> Result<(Snapshot, String), PlatformEr
         },
         format!("linux:{boot}:{}", stat.ticks),
     ))
+}
+
+fn effective_uid(status: &[u8]) -> io::Result<u32> {
+    // Only the UID line is ASCII. The task name can contain arbitrary bytes.
+    let uid = status
+        .split(|&byte| byte == b'\n')
+        .find_map(|line| line.strip_prefix(b"Uid:"))
+        .and_then(|line| std::str::from_utf8(line).ok())
+        .and_then(|line| line.split_ascii_whitespace().nth(1))
+        .and_then(|field| field.parse().ok());
+    uid.ok_or_else(invalid_proc)
 }
 
 struct Stat {
@@ -88,19 +94,25 @@ fn parse_stat(contents: &[u8]) -> io::Result<Stat> {
         .ok_or_else(invalid_proc)?;
     let tail = std::str::from_utf8(&contents[end + 1..]).map_err(|_| invalid_proc())?;
     let mut fields = tail.split_ascii_whitespace();
-    let exited = matches!(fields.next().ok_or_else(invalid_proc)?, "Z" | "X");
+    let leader_exited = matches!(fields.next().ok_or_else(invalid_proc)?, "Z" | "X");
     let pgid = fields
         .nth(1)
         .and_then(|field| field.parse().ok())
         .ok_or_else(invalid_proc)?;
+    // Field 20 counts the whole thread group, including a zombie main
+    // thread. Its workers can continue after the main thread exits.
+    let threads: u32 = fields
+        .nth(14)
+        .and_then(|field| field.parse().ok())
+        .ok_or_else(invalid_proc)?;
     let ticks = fields
-        .nth(16)
+        .nth(1)
         .and_then(|field| field.parse().ok())
         .ok_or_else(invalid_proc)?;
     Ok(Stat {
         pgid,
         ticks,
-        exited,
+        exited: leader_exited && threads == 1,
     })
 }
 
@@ -125,16 +137,8 @@ pub(super) fn group_gone(pgid: libc::pid_t) -> io::Result<bool> {
         let dir = format!("/proc/{pid}");
         let dir = Path::new(&dir);
         let stat = read_stat(dir)?;
-        if stat.pgid == pgid {
-            if !stat.exited {
-                return Ok(false);
-            }
-            // The thread-group leader can exit before another thread in
-            // the process. Treat every visible extra task conservatively.
-            let mut tasks = fs::read_dir(dir.join("task"))?;
-            if tasks.next().transpose()?.is_none() || tasks.next().transpose()?.is_some() {
-                return Ok(false);
-            }
+        if stat.pgid == pgid && !stat.exited {
+            return Ok(false);
         }
     }
     Ok(pids == list_pids()?)
@@ -226,7 +230,7 @@ fn verify_leader<T>(
         return None;
     }
     let (snapshot, token) = capture().ok()?;
-    if snapshot.exited || !identity.matches(&snapshot, &token) || exited(&reference).ok()? {
+    if !identity.matches(&snapshot, &token) || exited(&reference).ok()? {
         return None;
     }
     Some(reference)
@@ -338,6 +342,21 @@ mod tests {
         assert_eq!(stat.pgid, 100);
         assert_eq!(stat.ticks, 5500);
         assert!(parse_stat(b"not enough fields").is_err());
+        Ok(())
+    }
+
+    #[test]
+    fn captures_a_live_worker_with_an_exited_main_thread_and_a_non_utf8_name() -> io::Result<()> {
+        let stat = parse_stat(
+            b"100 (arbitrary )\xff name) Z 1 100 100 0 0 0 0 0 0 0 0 0 0 0 0 0 2 0 5500",
+        )?;
+        assert!(!stat.exited);
+        assert_eq!(stat.pgid, 100);
+        assert_eq!(stat.ticks, 5500);
+        assert_eq!(
+            effective_uid(b"Name:\tworker-\xff\nUid:\t10 20 30 40\n")?,
+            20
+        );
         Ok(())
     }
 

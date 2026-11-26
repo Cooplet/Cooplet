@@ -2,6 +2,7 @@ use std::{future::Future, pin::Pin, sync::Arc, time::Duration};
 
 use bytes::Bytes;
 use futures_core::Stream;
+use futures_util::future::{BoxFuture, FutureExt, WeakShared};
 
 use cooplet_protocol::{
     HealthResponse, HubId, InfoResponse, WhoamiResponse, validate_idempotency_key,
@@ -10,7 +11,7 @@ use http::{Method, header::AUTHORIZATION};
 use percent_encoding::{NON_ALPHANUMERIC, percent_decode_str, utf8_percent_encode};
 use reqwest::{RequestBuilder, Response};
 use serde::{Serialize, de::DeserializeOwned};
-use tokio::sync::OnceCell;
+use tokio::sync::Mutex;
 use url::{Host, Url};
 
 use crate::{
@@ -59,11 +60,18 @@ impl ClientConfig {
     }
 }
 
+// The callers own the in-flight GET. Cancelling one caller leaves other
+// waiters on the same request, and cancelling them all drops that request.
+enum HubPin {
+    Unverified(Option<WeakShared<BoxFuture<'static, Result<(), ClientError>>>>),
+    Verified,
+}
+
 #[derive(Clone)]
 pub struct CoopletClient {
     http: reqwest::Client,
     pub(crate) config: Arc<ClientConfig>,
-    verified: Arc<OnceCell<()>>,
+    hub_pin: Arc<Mutex<HubPin>>,
 }
 
 impl CoopletClient {
@@ -85,7 +93,7 @@ impl CoopletClient {
         Ok(Self {
             http,
             config: Arc::new(config),
-            verified: Arc::new(OnceCell::new()),
+            hub_pin: Arc::new(Mutex::new(HubPin::Unverified(None))),
         })
     }
 
@@ -106,20 +114,43 @@ impl CoopletClient {
         let Some(expected) = self.expected_hub() else {
             return Ok(());
         };
-        self.verified
-            .get_or_try_init(|| async {
-                let actual = match self.info().await? {
-                    InfoResponse::Hub(info) if &info.hub_id == expected => return Ok(()),
-                    InfoResponse::Hub(info) => Some(info.hub_id.to_string()),
-                    InfoResponse::Node(_) => None,
+        let mut pin = self.hub_pin.lock().await;
+        let HubPin::Unverified(pending) = &mut *pin else {
+            return Ok(());
+        };
+        let attempt = if let Some(attempt) = pending.as_ref().and_then(WeakShared::upgrade) {
+            attempt
+        } else {
+            let client = self.clone();
+            let expected = expected.clone();
+            let attempt = async move {
+                let result = client.check_hub_identity(&expected).await;
+                *client.hub_pin.lock().await = if result.is_ok() {
+                    HubPin::Verified
+                } else {
+                    HubPin::Unverified(None)
                 };
-                Err(ClientError::HubIdentityMismatch {
-                    expected: expected.clone(),
-                    actual,
-                })
-            })
-            .await
-            .map(|_| ())
+                result
+            }
+            .boxed()
+            .shared();
+            *pending = attempt.downgrade();
+            attempt
+        };
+        drop(pin);
+        attempt.await
+    }
+
+    async fn check_hub_identity(&self, expected: &HubId) -> Result<(), ClientError> {
+        let actual = match self.info().await? {
+            InfoResponse::Hub(info) if &info.hub_id == expected => return Ok(()),
+            InfoResponse::Hub(info) => Some(info.hub_id.to_string()),
+            InfoResponse::Node(_) => None,
+        };
+        Err(ClientError::HubIdentityMismatch {
+            expected: expected.clone(),
+            actual,
+        })
     }
 
     pub async fn info(&self) -> Result<InfoResponse, ClientError> {

@@ -4,7 +4,7 @@ use std::{
 };
 
 use bytes::{Buf, Bytes};
-use cooplet_protocol::{EventKind, EventStreamFrame, EventsPage};
+use cooplet_protocol::{EventEnvelope, EventKind, EventStreamFrame, EventsPage};
 use futures_core::Stream;
 use futures_util::StreamExt;
 use http::{Method, StatusCode, header::ACCEPT};
@@ -37,7 +37,11 @@ impl CoopletClient {
         }
         let url = self.url("/v1/events", &params)?;
         let request = self.protected(Method::GET, url, None).await?;
-        self.execute_json(request, true, true).await
+        let page: EventsPage = self.execute_json(request, true, true).await?;
+        for event in &page.items {
+            validate_event(event)?;
+        }
+        Ok(page)
     }
 
     pub async fn stream_events(
@@ -89,7 +93,18 @@ fn event_query(after: u64, kinds: &[EventKind]) -> Vec<(&'static str, String)> {
 
 /// Decode one frame without mapping a terminal resync frame to an error.
 pub fn parse_ndjson_line(line: &[u8]) -> Result<EventStreamFrame, ClientError> {
-    serde_json::from_slice(line).map_err(|_| ClientError::protocol("invalid NDJSON frame"))
+    let frame =
+        serde_json::from_slice(line).map_err(|_| ClientError::protocol("invalid NDJSON frame"))?;
+    if let EventStreamFrame::Event { event } = &frame {
+        validate_event(event)?;
+    }
+    Ok(frame)
+}
+
+fn validate_event(event: &EventEnvelope) -> Result<(), ClientError> {
+    event
+        .validate()
+        .map_err(|_| ClientError::protocol("invalid EventBus event"))
 }
 
 pub struct EventStream {

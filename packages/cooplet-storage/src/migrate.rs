@@ -32,7 +32,7 @@ pub(crate) fn schema_hygiene(connection: &Connection) -> Result<(), StorageError
     let forbidden: Option<String> = connection.query_row(
         "SELECT name FROM sqlite_schema
          WHERE type = 'trigger'
-            OR (type = 'table' AND (name IN ('node_storage', 'hub_storage') OR name GLOB '*_storage_rows'))
+            OR (type = 'table' AND (lower(name) IN ('node_storage', 'hub_storage') OR lower(name) GLOB '*_storage_rows'))
          UNION ALL SELECT name FROM sqlite_temp_schema WHERE type = 'trigger' LIMIT 1",
         [], |row| row.get(0),
     ).map(Some).or_else(|error| match error {

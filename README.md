@@ -19,6 +19,12 @@ Setup downloads the pinned tools and prepares the dependency caches. Checks, tes
 
 Use `make check app=node` or `make test package=cooplet-protocol` for focused work. Aggregate `make check` runs the workspace policy tests as well as the component checks. CI also checks the unified Cargo feature graph with Clippy.
 
+Run `sh packages/cooplet-client/tests/relay_fixture/run.sh` to exercise the client and storage together. It uploads a blob to a test Hub, streams it into a second store, and checks the results for complete, corrupt, and interrupted transfers.
+
+## Storage recovery
+
+Keep a managed store's SQLite database and blob directory together when backing up or restoring state. Startup uses the committed registry to remove orphan files and finish pending deletions. If the directory already has a database owner and the database is missing or empty, startup stops. Restore the matching database before reopening the store. An older or unrelated database at the same path can classify valid objects as orphans.
+
 ## Layout
 
 | Path | Role |

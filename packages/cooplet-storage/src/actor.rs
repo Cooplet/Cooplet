@@ -1,5 +1,6 @@
 use std::{
     convert::Infallible,
+    path::PathBuf,
     sync::{Arc, Mutex},
     thread::{self, JoinHandle},
 };
@@ -51,6 +52,7 @@ impl DbActor {
     pub(crate) async fn start(
         mut config: StorageConfig,
         migrations: &[Migration],
+        blob_root: Option<PathBuf>,
     ) -> Result<(Self, ReadPool, JoinHandle<()>), StorageError> {
         pragma::validate_config(&config)?;
         let migrations = migrations.to_vec();
@@ -61,7 +63,8 @@ impl DbActor {
             .name("cooplet-db-writer".into())
             .spawn(move || {
                 let result = (|| {
-                    let (connection, lock) = pragma::open_writer(&mut config, &migrations)?;
+                    let (connection, lock) =
+                        pragma::open_writer(&mut config, &migrations, blob_root.as_deref())?;
                     let lock = Arc::new(lock);
                     let reads = ReadPool::open(config.clone(), lock.clone())?;
                     Ok::<_, StorageError>((connection, lock, reads))

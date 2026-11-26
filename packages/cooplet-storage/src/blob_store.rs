@@ -24,6 +24,7 @@ use crate::{
     BlobRecord, BlobState, BlobStoreConfig, BlobTombstone, DbActor, GC_BATCH_SIZE, GcHooks,
     ReadPool, StorageError, WriteError, WriteFailure, WriteOutcome,
 };
+pub(crate) use disk::check_before_database_create;
 pub use disk::safe_disk_name;
 use disk::{CHUNK_BYTES, Disk, InputChunk, StagedBlob, checked_blob_size, validate_path};
 

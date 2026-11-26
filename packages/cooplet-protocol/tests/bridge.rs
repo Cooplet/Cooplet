@@ -350,3 +350,49 @@ fn reconnect_wire_preserves_receipt_and_injection_fence_after_lost_ack() -> Test
     assert_eq!(fence.highest_dispatched_seq, 10);
     Ok(())
 }
+
+#[test]
+fn bridge_requires_named_fields_at_each_record_boundary() -> TestResult {
+    let positional_envelope = br#"[1,3,"roster_sync",[0,true,[],[],[],[],[]]]"#;
+    assert!(BridgeFrame::from_json(positional_envelope).is_err());
+
+    let positional_roster =
+        br#"{"v":1,"epoch":3,"kind":"roster_sync","payload":[0,true,[],[],[],[],[]]}"#;
+    let frame = BridgeFrame::from_json(positional_roster)?;
+    assert!(frame.decode_payload::<RosterSyncPayload>().is_err());
+
+    let positional_fence = br#"{"v":1,"epoch":3,"kind":"roster_sync","payload":{
+        "chunk_index":0,"is_final":true,"participants":[],"templates":[],"workflows":[],
+        "resolved_op_receipts":[],"unresolved_thread_fences":[
+            ["thr_00000000000000000000000000","part_00000000000000000000000000",10]
+        ]}}"#;
+    let frame = BridgeFrame::from_json(positional_fence)?;
+    assert!(frame.decode_payload::<RosterSyncPayload>().is_err());
+    Ok(())
+}
+
+#[test]
+fn tagged_enum_schemas_close_every_variant_and_keep_the_discriminator() -> TestResult {
+    use utoipa::PartialSchema;
+
+    for (schema, expected_variants) in [
+        (BridgeCommand::schema(), 7),
+        (NodeEventPayload::schema(), 7),
+        (EventStreamFrame::schema(), 3),
+    ] {
+        let schema = serde_json::to_value(schema)?;
+        let variants = schema["oneOf"].as_array().ok_or("expected oneOf")?;
+        assert_eq!(variants.len(), expected_variants);
+        for variant in variants {
+            assert_eq!(variant["type"], "object");
+            assert_eq!(variant["additionalProperties"], false);
+            assert!(variant["properties"]["type"]["enum"].is_array());
+            assert!(
+                variant["required"]
+                    .as_array()
+                    .is_some_and(|required| required.iter().any(|name| name == "type"))
+            );
+        }
+    }
+    Ok(())
+}

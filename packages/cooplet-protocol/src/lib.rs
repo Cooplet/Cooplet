@@ -7,6 +7,7 @@ mod hash;
 mod id;
 mod problem;
 mod question;
+mod wire;
 
 pub use bridge::*;
 pub use domain::*;

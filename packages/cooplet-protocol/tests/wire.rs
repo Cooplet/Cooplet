@@ -265,3 +265,34 @@ fn questions_validate_shape_ids_and_utf8_bounds() -> TestResult {
     assert!(question.validate().is_err());
     Ok(())
 }
+
+#[test]
+fn http_and_event_records_require_objects_and_preserve_json_data() -> TestResult {
+    let info = r#"["hub_00000000000000000000000000","Hub",1]"#;
+    assert!(serde_json::from_str::<InfoResponse>(info).is_err());
+    assert!(serde_json::from_str::<HealthResponse>(r#"["ok"]"#).is_err());
+    assert!(serde_json::from_str::<EventStreamFrame>(r#"["ping"]"#).is_err());
+    let question = r#"{"prompt":"Choose","mode":"single","options":[["a","One",null]]}"#;
+    assert!(serde_json::from_str::<QuestionPayload>(question).is_err());
+
+    let mut event: EventEnvelope = serde_json::from_str(
+        r#"{
+        "seq":1,"event_id":"evt_00000000000000000000000000","source_kind":"node",
+        "source_id":"node_00000000000000000000000000","kind":"participant.awaiting_approval",
+        "aggregate_type":"participant","aggregate_id":"p","created_at_ms":0,
+        "payload":["awaiting_approval","a1",true]
+    }"#,
+    )?;
+    assert!(event.validate().is_err());
+    event.kind = EventKind::QuestionAnswered;
+    event.payload = json!(["msg_00000000000000000000000000","msg_00000000000000000000000001",
+        null,"p",{"text":"yes"}]);
+    assert!(event.validate().is_err());
+
+    // An open JSON value still admits arrays, including nested objects and arrays.
+    let receipt: CommandResPayload = serde_json::from_str(
+        r#"{"op_id":"op_00000000000000000000000000","outcome":"succeeded","result":[[1],{"values":[2]}]}"#,
+    )?;
+    assert_eq!(receipt.result, Some(json!([[1], {"values":[2]}])));
+    Ok(())
+}

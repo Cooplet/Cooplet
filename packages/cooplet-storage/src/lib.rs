@@ -10,6 +10,7 @@ mod pragma;
 mod read_pool;
 
 use std::{
+    path::PathBuf,
     sync::Arc,
     thread::JoinHandle,
     time::{Duration, SystemTime, UNIX_EPOCH},
@@ -48,7 +49,15 @@ impl StorageEngine {
         config: StorageConfig,
         migrations: &[Migration],
     ) -> Result<Self, StorageError> {
-        let (db, reads, writer) = DbActor::start(config, migrations).await?;
+        Self::open_database(config, migrations, None).await
+    }
+
+    async fn open_database(
+        config: StorageConfig,
+        migrations: &[Migration],
+        blob_root: Option<PathBuf>,
+    ) -> Result<Self, StorageError> {
+        let (db, reads, writer) = DbActor::start(config, migrations, blob_root).await?;
         Ok(Self {
             db,
             reads,
@@ -69,7 +78,8 @@ impl StorageEngine {
         blob_config: Option<BlobStoreConfig>,
     ) -> Result<Self, StorageError> {
         let interval = config.gc_interval;
-        let mut engine = Self::open(config, migrations).await?;
+        let blob_root = blob_config.as_ref().map(|config| config.root.clone());
+        let mut engine = Self::open_database(config, migrations, blob_root).await?;
         if let Some(config) = blob_config {
             let opened = BlobDiskStore::open(
                 config,

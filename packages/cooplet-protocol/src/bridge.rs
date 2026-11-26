@@ -31,15 +31,16 @@ pub enum FrameKind {
     NodeEvent,
 }
 
-/// The envelope is parsed before selecting a typed payload. Bounded WebSocket
-/// receivers should use the original byte length, including JSON whitespace.
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
-#[serde(deny_unknown_fields)]
-pub struct BridgeFrame {
-    pub v: u8,
-    pub epoch: u64,
-    pub kind: FrameKind,
-    pub payload: Value,
+crate::wire::wire_object! {
+    /// The envelope is parsed before selecting a typed payload. Bounded WebSocket
+    /// receivers should use the original byte length, including JSON whitespace.
+    #[serde(deny_unknown_fields)]
+    pub struct BridgeFrame {
+        pub v: u8,
+        pub epoch: u64,
+        pub kind: FrameKind,
+        pub payload: Value,
+    }
 }
 
 pub trait BridgePayload: Serialize + DeserializeOwned {
@@ -115,14 +116,15 @@ macro_rules! payload_kind {
     };
 }
 
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
-#[serde(deny_unknown_fields)]
-pub struct HelloAckPayload {
-    pub hub_id: HubId,
-    pub node_id: NodeId,
-    pub max_inflight_commands: u32,
-    pub max_inflight_threads: u32,
-    pub pending_op_ids: Vec<OperationId>,
+crate::wire::wire_object! {
+    #[serde(deny_unknown_fields)]
+    pub struct HelloAckPayload {
+        pub hub_id: HubId,
+        pub node_id: NodeId,
+        pub max_inflight_commands: u32,
+        pub max_inflight_threads: u32,
+        pub pending_op_ids: Vec<OperationId>,
+    }
 }
 
 impl BridgePayload for HelloAckPayload {
@@ -140,67 +142,69 @@ impl BridgePayload for HelloAckPayload {
     }
 }
 
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
-#[serde(deny_unknown_fields)]
-pub struct CommandReqPayload {
-    pub op_id: OperationId,
-    pub actor_id: String,
-    pub command: BridgeCommand,
-    pub delivery_mode: DeliveryMode,
-    pub admission_budget_ms: u64,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub ttl_ms: Option<u64>,
+crate::wire::wire_object! {
+    #[serde(deny_unknown_fields)]
+    pub struct CommandReqPayload {
+        pub op_id: OperationId,
+        pub actor_id: String,
+        pub command: BridgeCommand,
+        pub delivery_mode: DeliveryMode,
+        pub admission_budget_ms: u64,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        pub ttl_ms: Option<u64>,
+    }
 }
 
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
-#[serde(tag = "type", rename_all = "snake_case", deny_unknown_fields)]
-pub enum BridgeCommand {
-    SendMessage {
-        message_id: MessageId,
-        recipient_id: ParticipantId,
-        #[serde(skip_serializing_if = "Option::is_none")]
-        in_reply_to: Option<MessageId>,
-        body: String,
-        #[serde(default)]
-        attachments: Vec<AttachmentRef>,
-        #[serde(skip_serializing_if = "Option::is_none")]
-        question: Option<QuestionPayload>,
-        #[serde(skip_serializing_if = "Option::is_none")]
-        answer: Option<AnswerPayload>,
-    },
-    CreateAgent {
-        #[serde(skip_serializing_if = "Option::is_none")]
-        client_kind: Option<String>,
-        #[serde(skip_serializing_if = "Option::is_none")]
-        template_id: Option<String>,
-        #[serde(skip_serializing_if = "Option::is_none")]
-        name: Option<String>,
-        #[serde(skip_serializing_if = "Option::is_none")]
-        workspace_dir: Option<String>,
-        #[serde(skip_serializing_if = "Option::is_none")]
-        overrides: Option<Value>,
-    },
-    StopAgent {
-        participant_id: ParticipantId,
-        #[serde(default)]
-        cancel_turn_only: bool,
-    },
-    RespondApproval {
-        participant_id: ParticipantId,
-        decision: ApprovalDecision,
-    },
-    RunWorkflow {
-        workflow_name: String,
-        workspace_dir: String,
-        #[serde(default)]
-        params: Value,
-    },
-    CancelWorkflow {
-        run_id: RunId,
-    },
-    InspectAgent {
-        participant_id: ParticipantId,
-    },
+crate::wire::wire_object! {
+    #[serde(tag = "type", rename_all = "snake_case", deny_unknown_fields)]
+    pub enum BridgeCommand {
+        SendMessage {
+            message_id: MessageId,
+            recipient_id: ParticipantId,
+            #[serde(skip_serializing_if = "Option::is_none")]
+            in_reply_to: Option<MessageId>,
+            body: String,
+            #[serde(default)]
+            attachments: Vec<AttachmentRef>,
+            #[serde(skip_serializing_if = "Option::is_none")]
+            question: Option<QuestionPayload>,
+            #[serde(skip_serializing_if = "Option::is_none")]
+            answer: Option<AnswerPayload>,
+        },
+        CreateAgent {
+            #[serde(skip_serializing_if = "Option::is_none")]
+            client_kind: Option<String>,
+            #[serde(skip_serializing_if = "Option::is_none")]
+            template_id: Option<String>,
+            #[serde(skip_serializing_if = "Option::is_none")]
+            name: Option<String>,
+            #[serde(skip_serializing_if = "Option::is_none")]
+            workspace_dir: Option<String>,
+            #[serde(skip_serializing_if = "Option::is_none")]
+            overrides: Option<Value>,
+        },
+        StopAgent {
+            participant_id: ParticipantId,
+            #[serde(default)]
+            cancel_turn_only: bool,
+        },
+        RespondApproval {
+            participant_id: ParticipantId,
+            decision: ApprovalDecision,
+        },
+        RunWorkflow {
+            workflow_name: String,
+            workspace_dir: String,
+            #[serde(default)]
+            params: Value,
+        },
+        CancelWorkflow {
+            run_id: RunId,
+        },
+        InspectAgent {
+            participant_id: ParticipantId,
+        },
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
@@ -217,53 +221,56 @@ pub enum CommandOutcome {
     Expired,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
-#[serde(deny_unknown_fields)]
-pub struct CommandResPayload {
-    pub op_id: OperationId,
-    pub outcome: CommandOutcome,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub resource_id: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub result: Option<Value>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub error: Option<ProblemDetails>,
+crate::wire::wire_object! {
+    #[serde(deny_unknown_fields)]
+    pub struct CommandResPayload {
+        pub op_id: OperationId,
+        pub outcome: CommandOutcome,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        pub resource_id: Option<String>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        pub result: Option<Value>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        pub error: Option<ProblemDetails>,
+    }
 }
 
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
-#[serde(deny_unknown_fields)]
-pub struct ThreadDeliverPayload {
-    pub delivery_id: OperationId,
-    pub thread_id: ThreadId,
-    pub member_id: ParticipantId,
-    pub from_seq: u64,
-    pub to_seq: u64,
-    pub posts: Vec<ThreadPostWire>,
-    #[serde(default)]
-    pub truncated_earlier: bool,
-    pub delivery_mode: DeliveryMode,
-    pub admission_budget_ms: u64,
+crate::wire::wire_object! {
+    #[serde(deny_unknown_fields)]
+    pub struct ThreadDeliverPayload {
+        pub delivery_id: OperationId,
+        pub thread_id: ThreadId,
+        pub member_id: ParticipantId,
+        pub from_seq: u64,
+        pub to_seq: u64,
+        pub posts: Vec<ThreadPostWire>,
+        #[serde(default)]
+        pub truncated_earlier: bool,
+        pub delivery_mode: DeliveryMode,
+        pub admission_budget_ms: u64,
+    }
 }
 
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
-#[serde(deny_unknown_fields)]
-pub struct ThreadPostWire {
-    pub seq: u64,
-    pub post_id: MessageId,
-    pub author_actor_id: String,
-    pub author_handle: String,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub in_reply_to_post_id: Option<MessageId>,
-    pub body: String,
-    #[serde(default)]
-    pub mentions: Vec<String>,
-    #[serde(default)]
-    pub attachments: Vec<AttachmentRef>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub question: Option<QuestionPayload>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub answer: Option<AnswerPayload>,
-    pub created_at_ms: i64,
+crate::wire::wire_object! {
+    #[serde(deny_unknown_fields)]
+    pub struct ThreadPostWire {
+        pub seq: u64,
+        pub post_id: MessageId,
+        pub author_actor_id: String,
+        pub author_handle: String,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        pub in_reply_to_post_id: Option<MessageId>,
+        pub body: String,
+        #[serde(default)]
+        pub mentions: Vec<String>,
+        #[serde(default)]
+        pub attachments: Vec<AttachmentRef>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        pub question: Option<QuestionPayload>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        pub answer: Option<AnswerPayload>,
+        pub created_at_ms: i64,
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
@@ -278,28 +285,30 @@ pub enum ThreadDeliveryOutcome {
     Expired,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
-#[serde(deny_unknown_fields)]
-pub struct ThreadAckPayload {
-    pub delivery_id: OperationId,
-    pub thread_id: ThreadId,
-    pub member_id: ParticipantId,
-    pub acked_seq: u64,
-    pub outcome: ThreadDeliveryOutcome,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub detail: Option<String>,
+crate::wire::wire_object! {
+    #[serde(deny_unknown_fields)]
+    pub struct ThreadAckPayload {
+        pub delivery_id: OperationId,
+        pub thread_id: ThreadId,
+        pub member_id: ParticipantId,
+        pub acked_seq: u64,
+        pub outcome: ThreadDeliveryOutcome,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        pub detail: Option<String>,
+    }
 }
 
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
-#[serde(deny_unknown_fields)]
-pub struct RosterSyncPayload {
-    pub chunk_index: u32,
-    pub is_final: bool,
-    pub participants: Vec<ParticipantWire>,
-    pub templates: Vec<TemplateSummary>,
-    pub workflows: Vec<WorkflowSummary>,
-    pub unresolved_thread_fences: Vec<ThreadFenceReport>,
-    pub resolved_op_receipts: Vec<CommandResPayload>,
+crate::wire::wire_object! {
+    #[serde(deny_unknown_fields)]
+    pub struct RosterSyncPayload {
+        pub chunk_index: u32,
+        pub is_final: bool,
+        pub participants: Vec<ParticipantWire>,
+        pub templates: Vec<TemplateSummary>,
+        pub workflows: Vec<WorkflowSummary>,
+        pub unresolved_thread_fences: Vec<ThreadFenceReport>,
+        pub resolved_op_receipts: Vec<CommandResPayload>,
+    }
 }
 
 impl BridgePayload for RosterSyncPayload {
@@ -322,117 +331,122 @@ impl BridgePayload for RosterSyncPayload {
     }
 }
 
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
-#[serde(deny_unknown_fields)]
-pub struct ParticipantWire {
-    pub participant_id: ParticipantId,
-    pub kind: ParticipantKind,
-    pub name: String,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub client_kind: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub workspace_dir: Option<String>,
-    pub state: ParticipantState,
-    #[serde(default)]
-    pub capabilities: Value,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub wait_kind: Option<ApprovalWaitKind>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub approval_id: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub action_hint: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub summary: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub can_respond_remotely: Option<bool>,
-}
-
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
-#[serde(deny_unknown_fields)]
-pub struct TemplateSummary {
-    pub template_id: String,
-    pub title: String,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub description: Option<String>,
-    pub client_kind: String,
-}
-
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
-#[serde(deny_unknown_fields)]
-pub struct WorkflowSummary {
-    pub workflow_name: String,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub title: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub description: Option<String>,
-}
-
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
-#[serde(deny_unknown_fields)]
-pub struct ThreadFenceReport {
-    pub thread_id: ThreadId,
-    pub participant_id: ParticipantId,
-    pub highest_dispatched_seq: u64,
-}
-
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
-#[serde(tag = "type", rename_all = "snake_case", deny_unknown_fields)]
-pub enum NodeEventPayload {
-    ParticipantStateChanged {
-        participant_id: ParticipantId,
-        state: ParticipantState,
+crate::wire::wire_object! {
+    #[serde(deny_unknown_fields)]
+    pub struct ParticipantWire {
+        pub participant_id: ParticipantId,
+        pub kind: ParticipantKind,
+        pub name: String,
         #[serde(skip_serializing_if = "Option::is_none")]
-        approval_id: Option<String>,
+        pub client_kind: Option<String>,
         #[serde(skip_serializing_if = "Option::is_none")]
-        action_hint: Option<String>,
-        #[serde(skip_serializing_if = "Option::is_none")]
-        summary: Option<String>,
-        #[serde(skip_serializing_if = "Option::is_none")]
-        wait_kind: Option<ApprovalWaitKind>,
-        #[serde(skip_serializing_if = "Option::is_none")]
-        can_respond_remotely: Option<bool>,
-    },
-    AgentReplyCreated {
-        message_id: MessageId,
-        sender_id: ParticipantId,
-        recipient_id: String,
-        #[serde(skip_serializing_if = "Option::is_none")]
-        in_reply_to: Option<MessageId>,
-        body: String,
+        pub workspace_dir: Option<String>,
+        pub state: ParticipantState,
         #[serde(default)]
-        attachments: Vec<AttachmentRef>,
+        pub capabilities: Value,
         #[serde(skip_serializing_if = "Option::is_none")]
-        question: Option<QuestionPayload>,
+        pub wait_kind: Option<ApprovalWaitKind>,
         #[serde(skip_serializing_if = "Option::is_none")]
-        answer: Option<AnswerPayload>,
-    },
-    WorkflowRunStarted {
-        run_id: RunId,
-        workflow_name: String,
-    },
-    WorkflowStepStarted {
-        run_id: RunId,
-        step_key: String,
-    },
-    WorkflowStepCompleted {
-        run_id: RunId,
-        step_key: String,
-        status: String,
-    },
-    WorkflowRunFinished {
-        run_id: RunId,
-        workflow_name: String,
-        state: String,
+        pub approval_id: Option<String>,
         #[serde(skip_serializing_if = "Option::is_none")]
-        result: Option<Value>,
+        pub action_hint: Option<String>,
         #[serde(skip_serializing_if = "Option::is_none")]
-        error: Option<Value>,
-    },
-    WorkflowLog {
-        run_id: RunId,
-        level: String,
-        message: String,
-    },
+        pub summary: Option<String>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        pub can_respond_remotely: Option<bool>,
+    }
+}
+
+crate::wire::wire_object! {
+    #[serde(deny_unknown_fields)]
+    pub struct TemplateSummary {
+        pub template_id: String,
+        pub title: String,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        pub description: Option<String>,
+        pub client_kind: String,
+    }
+}
+
+crate::wire::wire_object! {
+    #[serde(deny_unknown_fields)]
+    pub struct WorkflowSummary {
+        pub workflow_name: String,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        pub title: Option<String>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        pub description: Option<String>,
+    }
+}
+
+crate::wire::wire_object! {
+    #[serde(deny_unknown_fields)]
+    pub struct ThreadFenceReport {
+        pub thread_id: ThreadId,
+        pub participant_id: ParticipantId,
+        pub highest_dispatched_seq: u64,
+    }
+}
+
+crate::wire::wire_object! {
+    #[serde(tag = "type", rename_all = "snake_case", deny_unknown_fields)]
+    pub enum NodeEventPayload {
+        ParticipantStateChanged {
+            participant_id: ParticipantId,
+            state: ParticipantState,
+            #[serde(skip_serializing_if = "Option::is_none")]
+            approval_id: Option<String>,
+            #[serde(skip_serializing_if = "Option::is_none")]
+            action_hint: Option<String>,
+            #[serde(skip_serializing_if = "Option::is_none")]
+            summary: Option<String>,
+            #[serde(skip_serializing_if = "Option::is_none")]
+            wait_kind: Option<ApprovalWaitKind>,
+            #[serde(skip_serializing_if = "Option::is_none")]
+            can_respond_remotely: Option<bool>,
+        },
+        AgentReplyCreated {
+            message_id: MessageId,
+            sender_id: ParticipantId,
+            recipient_id: String,
+            #[serde(skip_serializing_if = "Option::is_none")]
+            in_reply_to: Option<MessageId>,
+            body: String,
+            #[serde(default)]
+            attachments: Vec<AttachmentRef>,
+            #[serde(skip_serializing_if = "Option::is_none")]
+            question: Option<QuestionPayload>,
+            #[serde(skip_serializing_if = "Option::is_none")]
+            answer: Option<AnswerPayload>,
+        },
+        WorkflowRunStarted {
+            run_id: RunId,
+            workflow_name: String,
+        },
+        WorkflowStepStarted {
+            run_id: RunId,
+            step_key: String,
+        },
+        WorkflowStepCompleted {
+            run_id: RunId,
+            step_key: String,
+            status: String,
+        },
+        WorkflowRunFinished {
+            run_id: RunId,
+            workflow_name: String,
+            state: String,
+            #[serde(skip_serializing_if = "Option::is_none")]
+            result: Option<Value>,
+            #[serde(skip_serializing_if = "Option::is_none")]
+            error: Option<Value>,
+        },
+        WorkflowLog {
+            run_id: RunId,
+            level: String,
+            message: String,
+        },
+    }
 }
 
 impl BridgePayload for NodeEventPayload {

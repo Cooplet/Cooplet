@@ -36,6 +36,7 @@ pub(crate) fn validate_config(config: &StorageConfig) -> Result<(), StorageError
 pub(crate) fn open_writer(
     config: &mut StorageConfig,
     migrations: &[Migration],
+    blob_root: Option<&Path>,
 ) -> Result<(Connection, FileLock), StorageError> {
     validate_config(config)?;
     let target = migrate::target_version(migrations)?;
@@ -55,7 +56,7 @@ pub(crate) fn open_writer(
     let parent = PrivateFs::ensure_private_dir(parent)?;
     let path = parent.join(file);
     let lock = FileLock::acquire_exclusive(&path.with_extension("lock"))?;
-    let fresh = match fs::symlink_metadata(&path) {
+    let size = match fs::symlink_metadata(&path) {
         Ok(metadata)
             if !metadata.is_file() || metadata.nlink() != 1 || metadata.uid() != current_euid() =>
         {
@@ -63,19 +64,23 @@ pub(crate) fn open_writer(
                 "expected a regular single-link database owned by the current user".into(),
             ));
         }
-        Ok(metadata) => metadata.len() == 0,
-        Err(error) if error.kind() == io::ErrorKind::NotFound => {
+        Ok(metadata) => Some(metadata.len()),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => None,
+        Err(error) => return Err(error.into()),
+    };
+
+    let fresh = size.unwrap_or(0) == 0;
+    let from = if fresh {
+        if let Some(root) = blob_root {
+            crate::blob_store::check_before_database_create(root, &path, &lock)?;
+        }
+        if size.is_none() {
             OpenOptions::new()
                 .write(true)
                 .create_new(true)
                 .mode(0o600)
                 .open(&path)?;
-            true
         }
-        Err(error) => return Err(error.into()),
-    };
-
-    let from = if fresh {
         0
     } else {
         let preflight = open_readonly(&path, config)?;

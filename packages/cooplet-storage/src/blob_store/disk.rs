@@ -48,7 +48,7 @@ impl Disk {
             ));
         }
         let root = PrivateFs::ensure_private_dir(&config.root)?;
-        bind_root(&root, database_path, database_sidecar)?;
+        check_or_claim_root(&root, database_path, database_sidecar, RootUse::Bind)?;
         let staging = PrivateFs::ensure_private_dir(&root.join("staging"))?;
         let objects = PrivateFs::ensure_private_dir(&root.join("objects"))?;
         Ok(Self {
@@ -261,10 +261,32 @@ impl Disk {
     }
 }
 
-fn bind_root(
+enum RootUse {
+    BeforeDatabaseCreate,
+    Bind,
+}
+
+pub(crate) fn check_before_database_create(
     root: &Path,
     database_path: &Path,
     database_sidecar: &FileLock,
+) -> Result<(), StorageError> {
+    if checked_dir(root)?.is_some() {
+        check_or_claim_root(
+            root,
+            database_path,
+            database_sidecar,
+            RootUse::BeforeDatabaseCreate,
+        )?;
+    }
+    Ok(())
+}
+
+fn check_or_claim_root(
+    root: &Path,
+    database_path: &Path,
+    database_sidecar: &FileLock,
+    usage: RootUse,
 ) -> Result<(), StorageError> {
     const OWNER: &str = "database.owner";
     // The DB sidecar excludes another instance of this database. This
@@ -294,6 +316,9 @@ fn bind_root(
                     ));
                 }
             }
+            if matches!(usage, RootUse::BeforeDatabaseCreate) {
+                return Ok(());
+            }
             // The marker must have one name on either side of a crash. A
             // link/unlink fallback can leave a durable two-link intermediate.
             claim.verify_path()?;
@@ -306,6 +331,13 @@ fn bind_root(
     if stored != owner {
         return Err(StorageError::InvalidConfig(
             "blob root belongs to another database",
+        ));
+    }
+    // The owner marker is only installed after SQLite has a durable header.
+    // Recreating its registry would make recovery delete every retained object.
+    if matches!(usage, RootUse::BeforeDatabaseCreate) {
+        return Err(StorageError::IncompatibleDatabase(
+            "missing or empty database for an existing blob root".into(),
         ));
     }
     // Also cover a previous claim whose rename was visible but directory
@@ -508,16 +540,7 @@ fn valid_shard(shard: &str) -> bool {
 
 pub fn safe_disk_name(input: &str) -> String {
     let basename = input.rsplit(['/', '\\']).next().unwrap_or_default();
-    let (stem, suffix) = basename
-        .rsplit_once('.')
-        .filter(|(stem, ext)| {
-            !stem.is_empty()
-                && (1..=16).contains(&ext.chars().count())
-                && ext
-                    .chars()
-                    .all(|c| !c.is_whitespace() && !unsafe_filename_char(c))
-        })
-        .map_or((basename, ""), |(stem, _)| (stem, &basename[stem.len()..]));
+    let (stem, suffix) = split_extension(basename);
 
     let mut safe = String::new();
     let mut replaced = false;
@@ -536,7 +559,7 @@ pub fn safe_disk_name(input: &str) -> String {
         prev_dot = c == '.';
         replaced |= substitute;
     }
-    if safe.trim().is_empty() || (replaced && safe.chars().all(|c| c == '_' || c.is_whitespace())) {
+    if replaced && safe.chars().all(|c| c == '_' || c.is_whitespace()) {
         return "file.bin".into();
     }
     // A dot left at the end of a stem would join the extension as '..'.
@@ -545,7 +568,25 @@ pub fn safe_disk_name(input: &str) -> String {
         safe.push('_');
     }
     safe.push_str(suffix);
+    // Substitution or truncation can turn an invalid extension into a valid
+    // one. Apply the empty-stem rule to the final filename that will be read.
+    if split_extension(&safe).0.trim().is_empty() {
+        return "file.bin".into();
+    }
     safe
+}
+
+fn split_extension(basename: &str) -> (&str, &str) {
+    basename
+        .rsplit_once('.')
+        .filter(|(stem, ext)| {
+            !stem.is_empty()
+                && (1..=16).contains(&ext.chars().count())
+                && ext
+                    .chars()
+                    .all(|c| !c.is_whitespace() && !unsafe_filename_char(c))
+        })
+        .map_or((basename, ""), |(stem, _)| (stem, &basename[stem.len()..]))
 }
 
 fn unsafe_filename_char(c: char) -> bool {

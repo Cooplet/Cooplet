@@ -73,22 +73,23 @@ error_codes! {
     InternalError: 500, true, "internal-error", "Internal error";
 }
 
-/// RFC 9457 problem document. Readers ignore unrecognized top-level members.
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
-pub struct ProblemDetails {
-    #[serde(rename = "type")]
-    pub problem_type: String,
-    pub title: String,
-    pub status: u16,
-    pub detail: String,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub instance: Option<String>,
-    pub code: ErrorCode,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub request_id: Option<RequestId>,
-    pub retryable: bool,
-    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
-    pub extensions: BTreeMap<String, Value>,
+crate::wire::wire_object! {
+    /// RFC 9457 problem document. Readers ignore unrecognized top-level members.
+    pub struct ProblemDetails {
+        #[serde(rename = "type")]
+        pub problem_type: String,
+        pub title: String,
+        pub status: u16,
+        pub detail: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub instance: Option<String>,
+        pub code: ErrorCode,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub request_id: Option<RequestId>,
+        pub retryable: bool,
+        #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+        pub extensions: BTreeMap<String, Value>,
+    }
 }
 
 impl ProblemDetails {

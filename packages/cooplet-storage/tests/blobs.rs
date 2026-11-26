@@ -239,6 +239,17 @@ async fn stores_sealed_contents_only_after_valid_eof_and_checks_bounds() -> Test
     assert!(name.chars().count() <= 120 && name.len() <= 255);
     assert_eq!(safe_disk_name(&name), name);
 
+    for (original, expected) in [(" .?", "file.bin"), (" ..", "file.bin"), ("a.?", "a._")] {
+        let mut upload = input(BlobId::generate()?);
+        upload.original_name = original.into();
+        let normalized = safe_disk_name(original);
+        assert_eq!(normalized, expected);
+        assert_eq!(safe_disk_name(&normalized), normalized);
+        let (stored, ()) = store.store(upload, &b""[..], register).await?;
+        assert_eq!(stored.safe_disk_name, normalized);
+        assert!(store.open_blob(&stored.blob_id).await?.is_some());
+    }
+
     let id = BlobId::generate()?;
     let mut valid = input(id.clone());
     valid.expected_size = Some(5);
@@ -720,6 +731,62 @@ async fn a_blob_root_belongs_to_one_canonical_database_across_restarts() -> Test
     assert_eq!(reopened.blobs().ok_or("missing store")?.used_bytes(), 5);
     assert_eq!(fs::read(blob.absolute_path)?, b"hello");
     reopened.shutdown().await?;
+    Ok(())
+}
+
+#[tokio::test]
+async fn lost_database_preserves_the_claimed_root_until_the_registry_is_restored() -> TestResult {
+    let scratch = Scratch::new()?;
+    let (config, blobs) = configs(&scratch);
+    let registry = Arc::new(Registry::default());
+    let open = || {
+        StorageEngine::open_managed(
+            config.clone(),
+            SCHEMA,
+            registry.clone(),
+            Some(blobs.clone()),
+        )
+    };
+    let engine = open().await?;
+    let (stored, ()) = engine
+        .blobs()
+        .ok_or("missing store")?
+        .store(input(BlobId::generate()?), &b"hello"[..], register)
+        .await?;
+    engine.shutdown().await?;
+
+    let saved = scratch.0.join("saved.sqlite3");
+    fs::rename(&config.db_path, &saved)?;
+    for zero_length in [false, true] {
+        if zero_length {
+            fs::File::create(&config.db_path)?;
+        }
+        for _ in 0..2 {
+            assert!(matches!(
+                open().await,
+                Err(StorageError::IncompatibleDatabase(_))
+            ));
+            if zero_length {
+                assert_eq!(fs::metadata(&config.db_path)?.len(), 0);
+            } else {
+                assert!(!config.db_path.try_exists()?);
+            }
+            assert_eq!(fs::read(&stored.absolute_path)?, b"hello");
+        }
+    }
+    fs::rename(saved, &config.db_path)?;
+    let restored = open().await?;
+    let store = restored.blobs().ok_or("missing store")?;
+    assert_eq!(store.used_bytes(), 5);
+    assert_eq!(
+        store
+            .open_blob(&stored.blob_id)
+            .await?
+            .ok_or("missing live object")?
+            .0,
+        stored.record()
+    );
+    restored.shutdown().await?;
     Ok(())
 }
 

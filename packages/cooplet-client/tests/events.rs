@@ -78,6 +78,64 @@ async fn list_returns_filtered_watermark_and_events_map_only_canonical_410() -> 
 }
 
 #[tokio::test]
+async fn invalid_events_fail_the_page_and_terminate_the_stream() -> TestResult {
+    let server = Server::bind().await?;
+    let client = CoopletClient::new(ClientConfig::new(
+        server.url.clone(),
+        Destination::LocalNode,
+        None,
+    ))?;
+    let frame: serde_json::Value = serde_json::from_slice(EVENT)?;
+    let valid = &frame["event"];
+    let mut wrong_source = valid.clone();
+    wrong_source["source_kind"] = "hub".into();
+    let mut missing_approval_id = valid.clone();
+    missing_approval_id["kind"] = "participant.awaiting_approval".into();
+    missing_approval_id["payload"] = serde_json::json!({
+        "state": "awaiting_approval", "can_respond_remotely": true
+    });
+
+    for bad in [wrong_source, missing_approval_id] {
+        let serve = async {
+            let (_, peer) = server.accept().await?;
+            let page = serde_json::json!({
+                "items": [valid, bad], "next_seq": 54, "oldest_available_seq": 1,
+                "latest_seq": 54, "has_more": false
+            });
+            peer.respond("200 OK", &[], &serde_json::to_vec(&page)?)
+                .await?;
+            let (_, peer) = server.accept().await?;
+            let bad_frame = serde_json::json!({"type": "event", "event": bad});
+            let mut stream = serde_json::to_vec(&bad_frame)?;
+            stream.extend_from_slice(b"\n{\"type\":\"ping\"}\n");
+            peer.respond(
+                "200 OK",
+                &[("content-type", "application/x-ndjson")],
+                &stream,
+            )
+            .await
+        };
+        let call = async {
+            assert!(matches!(
+                client.list_events(&EventsQuery::default()).await,
+                Err(ClientError::Protocol(_))
+            ));
+            let mut stream = client.stream_events(0, &[]).await?;
+            assert!(matches!(
+                stream.next_frame().await,
+                Some(Err(ClientError::Protocol(_)))
+            ));
+            assert!(stream.next_frame().await.is_none());
+            Ok::<_, ClientError>(())
+        };
+        let (served, result) = tokio::join!(serve, call);
+        served?;
+        result?;
+    }
+    Ok(())
+}
+
+#[tokio::test]
 async fn long_stream_keeps_fragmented_ping_and_event_until_terminal_resync() -> TestResult {
     let server = Server::bind().await?;
     let mut config = ClientConfig::new(server.url.clone(), Destination::LocalNode, None);
