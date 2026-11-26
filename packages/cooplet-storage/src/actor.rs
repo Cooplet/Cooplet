@@ -53,6 +53,7 @@ impl DbActor {
         mut config: StorageConfig,
         migrations: &[Migration],
         blob_root: Option<PathBuf>,
+        existing_check: Option<pragma::ExistingDatabaseCheck>,
     ) -> Result<(Self, ReadPool, JoinHandle<()>), StorageError> {
         pragma::validate_config(&config)?;
         let migrations = migrations.to_vec();
@@ -63,8 +64,12 @@ impl DbActor {
             .name("cooplet-db-writer".into())
             .spawn(move || {
                 let result = (|| {
-                    let (connection, lock) =
-                        pragma::open_writer(&mut config, &migrations, blob_root.as_deref())?;
+                    let (connection, lock) = pragma::open_writer(
+                        &mut config,
+                        &migrations,
+                        blob_root.as_deref(),
+                        existing_check,
+                    )?;
                     let lock = Arc::new(lock);
                     let reads = ReadPool::open(config.clone(), lock.clone())?;
                     Ok::<_, StorageError>((connection, lock, reads))

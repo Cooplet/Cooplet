@@ -1,17 +1,20 @@
 use std::{
-    fs::{self, OpenOptions},
+    fs::{self, Metadata, OpenOptions},
     io,
     os::unix::fs::{MetadataExt, OpenOptionsExt},
     path::{Path, PathBuf},
 };
 
-use cooplet_platform::{FileLock, PrivateFs, current_euid};
+use cooplet_platform::{FileLock, PlatformError, PrivateFs, current_euid};
 use rusqlite::{Connection, OpenFlags};
 
 use crate::{Migration, StorageConfig, StorageError, SynchronousMode, migrate};
 
 const PAGE_SIZE: u32 = 4096;
 const MAX_SQLITE_PAGES: u32 = 4_294_967_294;
+
+pub(crate) type ExistingDatabaseCheck =
+    Box<dyn FnOnce(&Connection) -> Result<(), StorageError> + Send>;
 
 pub(crate) fn validate_config(config: &StorageConfig) -> Result<(), StorageError> {
     if config.read_pool_size == 0
@@ -37,6 +40,7 @@ pub(crate) fn open_writer(
     config: &mut StorageConfig,
     migrations: &[Migration],
     blob_root: Option<&Path>,
+    existing_check: Option<ExistingDatabaseCheck>,
 ) -> Result<(Connection, FileLock), StorageError> {
     validate_config(config)?;
     let target = migrate::target_version(migrations)?;
@@ -53,21 +57,32 @@ pub(crate) fn open_writer(
         .ok_or(StorageError::InvalidConfig(
             "database must have a .sqlite3 basename",
         ))?;
-    let parent = PrivateFs::ensure_private_dir(parent)?;
+    let existing_only = existing_check.is_some();
+    let parent = if existing_only {
+        match PrivateFs::validate_private_dir(parent) {
+            Err(PlatformError::Io(error)) if error.kind() == io::ErrorKind::NotFound => {
+                return Err(StorageError::DatabaseMissing);
+            }
+            result => result?,
+        }
+    } else {
+        PrivateFs::ensure_private_dir(parent)?
+    };
     let path = parent.join(file);
     let lock = FileLock::acquire_exclusive(&path.with_extension("lock"))?;
-    let size = match fs::symlink_metadata(&path) {
-        Ok(metadata)
-            if !metadata.is_file() || metadata.nlink() != 1 || metadata.uid() != current_euid() =>
-        {
-            return Err(StorageError::IncompatibleDatabase(
-                "expected a regular single-link database owned by the current user".into(),
-            ));
+    let metadata = database_metadata(&path)?;
+    let size = metadata.as_ref().map(Metadata::len);
+    if existing_only {
+        match size {
+            None => return Err(StorageError::DatabaseMissing),
+            Some(0) => {
+                return Err(StorageError::IncompatibleDatabase(
+                    "expected a non-empty existing database".into(),
+                ));
+            }
+            Some(_) => {}
         }
-        Ok(metadata) => Some(metadata.len()),
-        Err(error) if error.kind() == io::ErrorKind::NotFound => None,
-        Err(error) => return Err(error.into()),
-    };
+    }
 
     let fresh = size.unwrap_or(0) == 0;
     let from = if fresh {
@@ -93,13 +108,26 @@ pub(crate) fn open_writer(
         }
         check_page_limit(pragma(&preflight, "page_count")?, config.max_page_count)?;
         migrate::schema_hygiene(&preflight)?;
+        if let Some(check) = existing_check {
+            check(&preflight)?;
+        }
         from as u32
     };
 
     lock.verify_path()?;
+    if existing_only
+        && database_metadata(&path)?.as_ref().map(file_identity)
+            != metadata.as_ref().map(file_identity)
+    {
+        return Err(StorageError::IncompatibleDatabase(
+            "database file changed during startup validation".into(),
+        ));
+    }
     let mut connection = Connection::open_with_flags(
         &path,
-        OpenFlags::SQLITE_OPEN_READ_WRITE | OpenFlags::SQLITE_OPEN_NO_MUTEX,
+        OpenFlags::SQLITE_OPEN_READ_WRITE
+            | OpenFlags::SQLITE_OPEN_NO_MUTEX
+            | OpenFlags::SQLITE_OPEN_NOFOLLOW,
     )?;
     if fresh {
         connection.pragma_update(None, "page_size", PAGE_SIZE)?;
@@ -144,13 +172,34 @@ pub(crate) fn open_writer(
     Ok((connection, lock))
 }
 
+fn database_metadata(path: &Path) -> Result<Option<Metadata>, StorageError> {
+    match fs::symlink_metadata(path) {
+        Ok(metadata)
+            if metadata.is_file() && metadata.nlink() == 1 && metadata.uid() == current_euid() =>
+        {
+            Ok(Some(metadata))
+        }
+        Ok(_) => Err(StorageError::IncompatibleDatabase(
+            "expected a regular single-link database owned by the current user".into(),
+        )),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(None),
+        Err(error) => Err(error.into()),
+    }
+}
+
+fn file_identity(file: &Metadata) -> (u64, u64) {
+    (file.dev(), file.ino())
+}
+
 pub(crate) fn open_readonly(
     path: &Path,
     config: &StorageConfig,
 ) -> Result<Connection, StorageError> {
     let connection = Connection::open_with_flags(
         path,
-        OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX,
+        OpenFlags::SQLITE_OPEN_READ_ONLY
+            | OpenFlags::SQLITE_OPEN_NO_MUTEX
+            | OpenFlags::SQLITE_OPEN_NOFOLLOW,
     )?;
     connection.pragma_update(None, "query_only", true)?;
     common_pragmas(&connection, config)?;

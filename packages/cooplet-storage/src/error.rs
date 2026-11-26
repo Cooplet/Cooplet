@@ -6,6 +6,8 @@ pub enum StorageError {
     InvalidConfig(&'static str),
     #[error("incompatible SQLite database: {0}")]
     IncompatibleDatabase(String),
+    #[error("existing SQLite database is missing")]
+    DatabaseMissing,
     #[error("SQLite page limit {requested} cannot be set with {effective} pages")]
     PageLimit { requested: u32, effective: u32 },
     #[error("storage is full")]

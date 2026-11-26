@@ -49,15 +49,17 @@ impl StorageEngine {
         config: StorageConfig,
         migrations: &[Migration],
     ) -> Result<Self, StorageError> {
-        Self::open_database(config, migrations, None).await
+        Self::open_database(config, migrations, None, None).await
     }
 
     async fn open_database(
         config: StorageConfig,
         migrations: &[Migration],
         blob_root: Option<PathBuf>,
+        existing_check: Option<pragma::ExistingDatabaseCheck>,
     ) -> Result<Self, StorageError> {
-        let (db, reads, writer) = DbActor::start(config, migrations, blob_root).await?;
+        let (db, reads, writer) =
+            DbActor::start(config, migrations, blob_root, existing_check).await?;
         Ok(Self {
             db,
             reads,
@@ -77,9 +79,42 @@ impl StorageEngine {
         hooks: Arc<dyn GcHooks>,
         blob_config: Option<BlobStoreConfig>,
     ) -> Result<Self, StorageError> {
+        Self::open_managed_database(config, migrations, hooks, blob_config, None).await
+    }
+
+    /// Open an existing database and verify its application state before startup.
+    ///
+    /// The check runs once on the writer thread with a read-only connection
+    /// and the database sidecar held. Returning an error aborts startup before
+    /// read-write open, migrations or blob recovery. On success the same
+    /// sidecar remains held for managed startup and normal operation.
+    pub async fn open_existing_managed_checked(
+        config: StorageConfig,
+        migrations: &[Migration],
+        hooks: Arc<dyn GcHooks>,
+        blob_config: Option<BlobStoreConfig>,
+        check: impl FnOnce(&rusqlite::Connection) -> Result<(), StorageError> + Send + 'static,
+    ) -> Result<Self, StorageError> {
+        Self::open_managed_database(
+            config,
+            migrations,
+            hooks,
+            blob_config,
+            Some(Box::new(check)),
+        )
+        .await
+    }
+
+    async fn open_managed_database(
+        config: StorageConfig,
+        migrations: &[Migration],
+        hooks: Arc<dyn GcHooks>,
+        blob_config: Option<BlobStoreConfig>,
+        existing_check: Option<pragma::ExistingDatabaseCheck>,
+    ) -> Result<Self, StorageError> {
         let interval = config.gc_interval;
         let blob_root = blob_config.as_ref().map(|config| config.root.clone());
-        let mut engine = Self::open_database(config, migrations, blob_root).await?;
+        let mut engine = Self::open_database(config, migrations, blob_root, existing_check).await?;
         if let Some(config) = blob_config {
             let opened = BlobDiskStore::open(
                 config,

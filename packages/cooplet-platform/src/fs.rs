@@ -22,6 +22,12 @@ impl PrivateFs {
         Self::ensure_private_dir_with(path, File::sync_all)
     }
 
+    /// Verify and canonicalize an existing private directory.
+    pub fn validate_private_dir(path: &Path) -> Result<PathBuf, PlatformError> {
+        let path: PathBuf = path.components().collect();
+        canonical_private_directory(&path).map(|(canonical, _)| canonical)
+    }
+
     fn ensure_private_dir_with(
         path: &Path,
         sync_parent: impl FnOnce(&File) -> io::Result<()>,
@@ -41,12 +47,7 @@ impl PrivateFs {
             }
             Err(error) => return Err(error.into()),
         }
-        let dir = Self::open_dir_nofollow(&path)?;
-        let metadata = dir.metadata()?;
-        verify_private_dir(&path, &metadata)?;
-        verify_path(&path, &metadata)?;
-        let canonical = fs::canonicalize(&path)?;
-        verify_path(&canonical, &metadata)?;
+        let (canonical, metadata) = canonical_private_directory(&path)?;
         // An existing entry might have just been created by another caller
         // or left behind after its parent sync failed. Complete that sync.
         if let Some(parent) = canonical.parent() {
@@ -140,6 +141,16 @@ impl PrivateFs {
         verify_path(path, &metadata)?;
         Ok(file)
     }
+}
+
+fn canonical_private_directory(path: &Path) -> Result<(PathBuf, Metadata), PlatformError> {
+    let dir = PrivateFs::open_dir_nofollow(path)?;
+    let metadata = dir.metadata()?;
+    verify_private_dir(path, &metadata)?;
+    verify_path(path, &metadata)?;
+    let canonical = fs::canonicalize(path)?;
+    verify_path(&canonical, &metadata)?;
+    Ok((canonical, metadata))
 }
 
 fn private_directory(path: &Path) -> Result<(PathBuf, File, Metadata), PlatformError> {

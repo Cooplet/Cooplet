@@ -939,3 +939,201 @@ async fn root_claim_reuses_the_database_sidecar_if_its_path_coincides() -> TestR
     engine.shutdown().await?;
     Ok(())
 }
+
+#[tokio::test]
+async fn checked_open_requires_an_existing_nonempty_database() -> TestResult {
+    let scratch = Scratch::new()?;
+    let (config, blobs) = configs(&scratch);
+    let missing_dir = scratch.0.join("absent");
+    let open = |db| {
+        StorageEngine::open_existing_managed_checked(
+            db,
+            SCHEMA,
+            Arc::new(Registry::default()),
+            Some(blobs.clone()),
+            |_| Err(StorageError::InvalidConfig("unexpected callback")),
+        )
+    };
+    for path in [missing_dir.join("node.sqlite3"), config.db_path.clone()] {
+        assert!(matches!(
+            open(StorageConfig::new(&path)).await,
+            Err(StorageError::DatabaseMissing)
+        ));
+        assert!(!path.try_exists()?);
+    }
+    assert!(!missing_dir.try_exists()?);
+    fs::File::create_new(&config.db_path)?;
+    assert!(matches!(
+        open(config.clone()).await,
+        Err(StorageError::IncompatibleDatabase(_))
+    ));
+    assert_eq!(fs::metadata(&config.db_path)?.len(), 0);
+    assert!(!blobs.root.try_exists()?);
+    Ok(())
+}
+
+#[tokio::test]
+async fn checked_open_validates_under_the_sidecar_before_migrations_and_recovery() -> TestResult {
+    use cooplet_platform::{FileLock, LockProbe};
+
+    let scratch = Scratch::new()?;
+    let (config, blobs) = configs(&scratch);
+    let registry = Arc::new(Registry::default());
+    let engine = StorageEngine::open_managed(
+        config.clone(),
+        SCHEMA,
+        registry.clone(),
+        Some(blobs.clone()),
+    )
+    .await?;
+    engine
+        .db()
+        .write_sqlite(|tx| {
+            tx.execute_batch(
+                "CREATE TABLE identity(fingerprint TEXT); INSERT INTO identity VALUES('old')",
+            )?;
+            Ok(WriteOutcome::new(()))
+        })
+        .await?;
+    let fingerprint = |c: &Connection| -> rusqlite::Result<String> {
+        c.query_row("SELECT fingerprint FROM identity", [], |r| r.get(0))
+    };
+    let early = engine.reads().read(move |c| Ok(fingerprint(c)?)).await?;
+    let (stored, ()) = engine
+        .blobs()
+        .ok_or("missing store")?
+        .store(input(BlobId::generate()?), &b"hello"[..], register)
+        .await?;
+    tombstone(&engine, &stored).await?;
+    engine
+        .db()
+        .write_sqlite(|tx| {
+            tx.execute("UPDATE identity SET fingerprint='current'", [])?;
+            Ok(WriteOutcome::new(()))
+        })
+        .await?;
+    engine.shutdown().await?;
+
+    // Make a premature transition to WAL observable even if no migration ran.
+    Connection::open(&config.db_path)?.execute_batch("PRAGMA journal_mode=DELETE")?;
+    let before = fs::read(&config.db_path)?;
+    let part = blobs
+        .root
+        .join("staging/00000000000000000000000000000001.part");
+    fs::write(&part, b"incomplete")?;
+    let migrations = [
+        SCHEMA[0],
+        Migration {
+            version: 2,
+            name: "after_validation",
+            sql: "CREATE TABLE upgraded(id INTEGER)",
+        },
+    ];
+    let check = |expected: String| {
+        let sidecar = config.db_path.with_extension("lock");
+        move |c: &Connection| -> Result<(), StorageError> {
+            assert_eq!(
+                FileLock::probe_owner_state(&sidecar)?,
+                LockProbe::OwnedByLiveProcess
+            );
+            assert!(c.is_readonly("main")?);
+            assert_eq!(
+                c.query_row("PRAGMA query_only", [], |r| r.get::<_, i32>(0))?,
+                1
+            );
+            assert_eq!(
+                c.query_row("PRAGMA user_version", [], |r| r.get::<_, i32>(0))?,
+                1
+            );
+            assert_eq!(
+                c.query_row("PRAGMA journal_mode", [], |r| r.get::<_, String>(0))?,
+                "delete"
+            );
+            if fingerprint(c)? != expected {
+                return Err(StorageError::IncompatibleDatabase(
+                    "fingerprint mismatch".into(),
+                ));
+            }
+            Ok(())
+        }
+    };
+    let rejected = StorageEngine::open_existing_managed_checked(
+        config.clone(),
+        &migrations,
+        registry.clone(),
+        Some(blobs.clone()),
+        check(early),
+    )
+    .await;
+    assert!(
+        matches!(rejected, Err(StorageError::IncompatibleDatabase(s)) if s == "fingerprint mismatch")
+    );
+    assert_eq!(fs::read(&config.db_path)?, before);
+    assert_eq!(fs::read(&part)?, b"incomplete");
+    assert_eq!(fs::read(&stored.absolute_path)?, b"hello");
+
+    let engine = StorageEngine::open_existing_managed_checked(
+        config.clone(),
+        &migrations,
+        registry,
+        Some(blobs),
+        check("current".into()),
+    )
+    .await?;
+    assert_eq!(
+        FileLock::probe_owner_state(&config.db_path.with_extension("lock"))?,
+        LockProbe::OwnedByLiveProcess
+    );
+    engine
+        .db()
+        .write_sqlite(|tx| {
+            tx.execute("INSERT INTO upgraded VALUES(1)", [])?;
+            Ok(WriteOutcome::new(()))
+        })
+        .await?;
+    assert!(!part.try_exists()?);
+    assert!(!stored.absolute_path.try_exists()?);
+    engine.shutdown().await?;
+    Ok(())
+}
+
+#[tokio::test]
+async fn checked_open_reads_identity_committed_in_the_wal() -> TestResult {
+    let scratch = Scratch::new()?;
+    let (config, _) = configs(&scratch);
+    let engine = StorageEngine::open(config.clone(), SCHEMA).await?;
+    engine
+        .db()
+        .write_sqlite(|tx| {
+            tx.execute_batch(
+                "CREATE TABLE identity(fingerprint TEXT); INSERT INTO identity VALUES('in-wal')",
+            )?;
+            Ok(WriteOutcome::new(()))
+        })
+        .await?;
+    // Copy a quiescent database before shutdown checkpoints its committed WAL.
+    let copy = scratch.0.join("copy.sqlite3");
+    fs::copy(&config.db_path, &copy)?;
+    assert!(
+        fs::copy(
+            config.db_path.with_extension("sqlite3-wal"),
+            copy.with_extension("sqlite3-wal")
+        )? > 0
+    );
+    engine.shutdown().await?;
+    let engine = StorageEngine::open_existing_managed_checked(
+        StorageConfig::new(copy),
+        SCHEMA,
+        Arc::new(Registry::default()),
+        None,
+        |c| {
+            let fingerprint: String =
+                c.query_row("SELECT fingerprint FROM identity", [], |r| r.get(0))?;
+            assert_eq!(fingerprint, "in-wal");
+            Ok(())
+        },
+    )
+    .await?;
+    engine.shutdown().await?;
+    Ok(())
+}
