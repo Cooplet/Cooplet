@@ -133,7 +133,10 @@ impl PrivateFs {
     }
 
     pub fn open_sealed_file(path: &Path) -> Result<File, PlatformError> {
-        let file = OpenOptions::new().read(true).custom_flags(NOFOLLOW_FILE).open(path)?;
+        let file = OpenOptions::new()
+            .read(true)
+            .custom_flags(NOFOLLOW_FILE)
+            .open(path)?;
         let metadata = file.metadata()?;
         verify_private_file(path, &metadata, 0o400)?;
         verify_path(path, &metadata)?;
