@@ -21,6 +21,7 @@ use tokio::io::{AsyncRead, AsyncReadExt, AsyncWriteExt, ReadBuf};
 use support::*;
 
 const LARGE_SHA: &str = "4b0d375a615c0382b4f958b48e43e7f356b4fcac76e20423294adc07b8d4976e";
+const CHUNK64K_SHA: &str = "fee47b1f0d7685a226fd5f2b9dd8f525038bbb05fe9d89a5d75c249edac868e3";
 
 fn settings(server: &Server) -> ClientConfig {
     ClientConfig::new(server.url.clone(), Destination::LocalNode, None)
@@ -670,6 +671,54 @@ async fn download_enforces_config_cap_chunk_timeout_duplicate_etag_and_truncatio
         assert!(matches!(
             timed,
             Err(ClientError::Timeout("blob download progress"))
+        ));
+        Ok::<_, Box<dyn std::error::Error + Send + Sync>>(())
+    };
+    let (a, b) = tokio::join!(call, serve);
+    a?;
+    b
+}
+
+#[tokio::test]
+async fn exact_64k_content_length_verifies_eof_and_rejects_trailing_byte() -> TestResult {
+    const EXACT: usize = 64 * 1024;
+    let server = Server::bind().await?;
+    let client = CoopletClient::new(settings(&server))?;
+    let serve = async {
+        let (head, mut peer) = server.accept().await?;
+        assert_eq!(head.header("content-length"), Some("65536"));
+        let body = peer.read_body(&head).await?;
+        assert_eq!(body.len(), EXACT);
+        assert!(body.iter().all(|&b| b == 0x42));
+        peer.respond(
+            "201 Created",
+            &[("content-type", "application/json")],
+            receipt(EXACT as u64, CHUNK64K_SHA).as_bytes(),
+        )
+        .await?;
+        Ok::<_, Box<dyn std::error::Error + Send + Sync>>(())
+    };
+    let call = async {
+        let exact = client
+            .upload_blob(spec(Some(EXACT as u64)), io::Cursor::new(vec![0x42; EXACT]))
+            .await?;
+        assert!(matches!(
+            exact,
+            BlobUploadOutcome::VerifiedLocal(blob)
+                if blob.size_bytes == EXACT as u64 && blob.sha256 == CHUNK64K_SHA
+        ));
+        let trailing = client
+            .upload_blob(
+                spec(Some(EXACT as u64)),
+                io::Cursor::new(vec![0x42; EXACT + 1]),
+            )
+            .await;
+        assert!(matches!(
+            trailing,
+            Err(ClientError::BlobLengthMismatch {
+                expected: 65_536,
+                actual: 65_537
+            })
         ));
         Ok::<_, Box<dyn std::error::Error + Send + Sync>>(())
     };

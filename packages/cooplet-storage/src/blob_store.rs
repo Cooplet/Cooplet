@@ -308,6 +308,7 @@ impl BlobDiskStore {
             let states = self.0.lookup(ids).await?;
             let owner = self.0.clone();
             used = tokio::task::spawn_blocking(move || {
+                let (_, lock) = owner.reads.database_and_sidecar()?;
                 let mut used = used;
                 for candidate in batch {
                     match states.get(&candidate.blob_id) {
@@ -316,11 +317,15 @@ impl BlobDiskStore {
                                 .checked_add(record.size_bytes)
                                 .ok_or(StorageError::StorageFull)?;
                         }
-                        Some(BlobState::Absent) => owner.disk.unlink(&candidate, false)?,
+                        Some(BlobState::Absent) => {
+                            lock.verify_path()?;
+                            owner.disk.unlink(&candidate, false)?;
+                        }
                         Some(BlobState::Live(record))
                             if record.disk_rel_path != candidate.disk_rel_path =>
                         {
                             owner.disk.prove_separate(&candidate, record)?;
+                            lock.verify_path()?;
                             owner.disk.unlink(&candidate, false)?;
                         }
                         _ => {

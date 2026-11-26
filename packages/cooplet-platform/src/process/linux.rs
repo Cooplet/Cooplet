@@ -176,7 +176,7 @@ pub(super) fn group_gone(pgid: libc::pid_t, proc_visible: bool) -> io::Result<bo
                 }
                 Err(error) if error.kind() == io::ErrorKind::PermissionDenied => {
                     // Under `hidepid=1` (`noaccess`), foreign-UID entries remain listed in
-                    // `/proc` while opening `/proc/<pid>/stat` returns EACCES. Confirm
+                    // `/proc` while opening `/proc/<pid>/stat` returns EPERM or EACCES. Confirm
                     // foreign-UID processes via `/proc/<pid>` ownership; fail closed on own UID.
                     let proc_dir = path.strip_suffix("/stat").unwrap_or(path.as_str());
                     let proc_uid = fs::symlink_metadata(proc_dir).map(|meta| meta.uid());
