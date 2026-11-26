@@ -254,6 +254,11 @@ async fn redirect_is_terminal_and_failed_preflight_is_not_cached() -> TestResult
 
 #[tokio::test]
 async fn problem_details_are_structured_and_their_display_is_safe() -> TestResult {
+    type Fixture = (
+        &'static str,
+        &'static [(&'static str, &'static str)],
+        &'static [u8],
+    );
     let server = Server::bind().await?;
     let client = CoopletClient::new(ClientConfig::new(
         server.url.clone(),
@@ -261,7 +266,7 @@ async fn problem_details_are_structured_and_their_display_is_safe() -> TestResul
         None,
     ))?;
     let serve = async {
-        let fixtures: &[(&str, &[(&str,&str)], &[u8])] = &[
+        let fixtures: &[Fixture] = &[
             ("409 Conflict", &[("Content-Type", "application/problem+json; charset=utf-8")],
              br#"{"type":"https://cooplet.dev/problems/pin-conflict","title":"Pin conflict","status":409,"detail":"test-secret","code":"pin_conflict","retryable":true,"extensions":{"pin_version":3},"trace_id":"ignored"}"#),
             ("410 Gone", &[],

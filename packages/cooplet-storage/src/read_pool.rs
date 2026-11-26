@@ -20,6 +20,10 @@ struct Pool {
 }
 
 impl ReadPool {
+    pub(crate) fn database_path(&self) -> &std::path::Path {
+        &self.0.config.db_path
+    }
+
     pub(crate) fn open(config: StorageConfig, lock: Arc<FileLock>) -> Result<Self, StorageError> {
         let connections = (0..config.read_pool_size)
             .map(|_| pragma::open_readonly(&config.db_path, &config))

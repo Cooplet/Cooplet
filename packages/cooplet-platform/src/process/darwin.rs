@@ -56,7 +56,7 @@ fn process_info(pid: libc::pid_t) -> io::Result<libc::proc_bsdinfo> {
         match libc::proc_pidinfo(
             pid,
             libc::PROC_PIDTBSDINFO,
-            0,
+            1, // PROC_PIDTBSDINFO also examines unreaped zombies with a nonzero argument.
             info.as_mut_ptr().cast(),
             size,
         ) {
@@ -96,15 +96,15 @@ fn boot_time() -> io::Result<u64> {
 }
 
 pub(super) fn group_gone(pgid: libc::pid_t) -> io::Result<bool> {
-    if group_absent(pgid)? {
-        return Ok(true);
+    match group_absent(pgid) {
+        Ok(true) => return Ok(true),
+        Ok(false) => {}
+        // Darwin's signal probe can return EPERM for a group composed only
+        // of zombies. libproc must independently confirm membership.
+        Err(error) if error.raw_os_error() == Some(libc::EPERM) => {}
+        Err(error) => return Err(error),
     }
     let pids = group_pids(pgid)?;
-    // A zero result from libproc can also indicate failure. Only the
-    // independent absence check above can use an empty membership set.
-    if pids.is_empty() {
-        return Err(invalid_proc());
-    }
     for pid in &pids {
         let info = process_info(*pid)?;
         if info.pbi_pgid != pgid as u32 {
@@ -121,9 +121,18 @@ fn group_pids(pgid: libc::pid_t) -> io::Result<Vec<libc::pid_t>> {
     for capacity in [64, 512, 4096, 32_768] {
         let mut pids = vec![0; capacity];
         let bytes = size_of_val(pids.as_slice()) as libc::c_int;
-        // SAFETY: the mutable vector has the advertised byte capacity and
-        // remains borrowed exclusively while libproc fills it.
-        let count = unsafe { libc::proc_listpgrppids(pgid, pids.as_mut_ptr().cast(), bytes) };
+        // SAFETY: the vector has the advertised writable byte capacity.
+        // __error returns this thread's errno, which distinguishes an empty
+        // list from libproc's zero return on failure.
+        let (count, errno) = unsafe {
+            let errno = libc::__error();
+            *errno = 0;
+            let count = libc::proc_listpgrppids(pgid, pids.as_mut_ptr().cast(), bytes);
+            (count, *errno)
+        };
+        if count == 0 && errno != 0 {
+            return Err(io::Error::from_raw_os_error(errno));
+        }
         let count = usize::try_from(count).map_err(|_| invalid_proc())?;
         if count < capacity {
             pids.truncate(count);

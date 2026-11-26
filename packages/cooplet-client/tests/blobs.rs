@@ -389,3 +389,54 @@ async fn download_requires_external_digest_and_rejects_partial_or_mismatched_con
     a?;
     b
 }
+
+#[tokio::test]
+async fn declared_empty_upload_waits_for_eof_before_sending_request() -> TestResult {
+    let server = Server::bind().await?;
+    let client = CoopletClient::new(settings(&server))?;
+    let (mut input, reader) = tokio::io::duplex(32);
+    let uploading = tokio::spawn(async move { client.upload_blob(spec(Some(0)), reader).await });
+    assert!(
+        tokio::time::timeout(Duration::from_millis(30), server.listener.accept())
+            .await
+            .is_err()
+    );
+
+    input.shutdown().await?;
+    let (head, peer) = server.accept().await?;
+    assert_eq!(head.request, "POST /v1/blobs HTTP/1.1");
+    assert_eq!(head.header("content-length"), Some("0"));
+    peer.respond("201 Created", &[], receipt(0, EMPTY_SHA).as_bytes())
+        .await?;
+    assert!(
+        matches!(uploading.await??, BlobUploadOutcome::VerifiedLocal(blob) if blob.size_bytes == 0)
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn malformed_mime_parameters_fail_before_reading_source_or_network() -> TestResult {
+    let server = Server::bind().await?;
+    let client = CoopletClient::new(settings(&server))?;
+    for mime_type in [
+        "text/plain; charset",
+        "text/plain; charset=\"unterminated",
+        "text/*",
+    ] {
+        let mut spec = spec(None);
+        spec.mime_type = mime_type.into();
+        let source = PendingReader::default();
+        let polls = source.0.clone();
+        assert!(matches!(
+            client.upload_blob(spec, source).await,
+            Err(ClientError::InvalidInput(_))
+        ));
+        assert_eq!(polls.load(Ordering::Relaxed), 0);
+    }
+    assert!(
+        tokio::time::timeout(Duration::from_millis(20), server.listener.accept())
+            .await
+            .is_err()
+    );
+    Ok(())
+}

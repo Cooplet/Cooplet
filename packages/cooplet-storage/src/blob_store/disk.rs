@@ -10,7 +10,7 @@ use std::{
 };
 
 use bytes::Bytes;
-use cooplet_platform::{AtomicPublish, PrivateFs, PublishOutcome, current_euid};
+use cooplet_platform::{AtomicPublish, PlatformError, PrivateFs, PublishOutcome, current_euid};
 use cooplet_protocol::BlobId;
 use sha2::{Digest, Sha256};
 use tokio::sync::mpsc;
@@ -35,13 +35,17 @@ pub(super) struct Disk {
 }
 
 impl Disk {
-    pub(super) fn open(config: BlobStoreConfig) -> Result<Self, StorageError> {
+    pub(super) fn open(
+        config: BlobStoreConfig,
+        database_path: &Path,
+    ) -> Result<Self, StorageError> {
         if config.max_blob_bytes == 0 {
             return Err(StorageError::InvalidConfig(
                 "blob size limit must be positive",
             ));
         }
         let root = PrivateFs::ensure_private_dir(&config.root)?;
+        bind_root(&root, database_path)?;
         let staging = PrivateFs::ensure_private_dir(&root.join("staging"))?;
         let objects = PrivateFs::ensure_private_dir(&root.join("objects"))?;
         Ok(Self {
@@ -252,6 +256,42 @@ impl Disk {
         }
         Err(io::Error::new(io::ErrorKind::AlreadyExists, "blob staging name collisions").into())
     }
+}
+
+fn bind_root(root: &Path, database_path: &Path) -> Result<(), StorageError> {
+    const OWNER: &str = "database.owner";
+    let marker = root.join(OWNER);
+    let owner = database_path.as_os_str().as_encoded_bytes();
+    let read = || PrivateFs::read_private_file(&marker, owner.len().max(4096) as u64);
+    let stored = match read() {
+        Ok(stored) => stored,
+        Err(PlatformError::Io(error)) if error.kind() == io::ErrorKind::NotFound => {
+            // A root with data must have a durable owner before recovery may
+            // interpret absent rows as permission to remove objects.
+            for directory in ["objects", "staging"] {
+                let path = root.join(directory);
+                if checked_dir(&path)?.is_some()
+                    && fs::read_dir(path)?.next().transpose()?.is_some()
+                {
+                    return Err(StorageError::InvalidConfig(
+                        "blob root has data without a database owner",
+                    ));
+                }
+            }
+            PrivateFs::create_private_file_atomic(root, OWNER, owner)?;
+            read()?
+        }
+        Err(error) => return Err(error.into()),
+    };
+    if stored != owner {
+        return Err(StorageError::InvalidConfig(
+            "blob root belongs to another database",
+        ));
+    }
+    // Also cover a previous claim whose rename was visible but directory
+    // sync did not complete before shutdown.
+    PrivateFs::open_dir_nofollow(root)?.sync_all()?;
+    Ok(())
 }
 
 fn object_missing(record: &BlobRecord) -> StorageError {

@@ -3,6 +3,7 @@ use std::{io, path::PathBuf};
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum PublishStage {
     RenameDirectorySync,
+    DirectoryIdentity,
     DestinationSync,
     StagingUnlink,
     StagingSync,

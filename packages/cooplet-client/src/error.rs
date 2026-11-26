@@ -79,7 +79,7 @@ impl ClientError {
     }
 
     pub(crate) fn resync(oldest_available_seq: u64, latest_seq: u64, reason: String) -> Self {
-        if oldest_available_seq > latest_seq.saturating_add(1) {
+        if oldest_available_seq == 0 || oldest_available_seq > latest_seq.saturating_add(1) {
             Self::protocol("inconsistent EventBus watermarks")
         } else {
             Self::ResyncRequired {

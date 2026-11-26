@@ -57,7 +57,10 @@ impl ProcessIdentity {
                     Ok(ProcessProbe::Running)
                 }
             }
-            Err(PlatformError::Io(error)) if error.kind() == io::ErrorKind::NotFound => {
+            Err(PlatformError::Io(error))
+                if error.kind() == io::ErrorKind::NotFound
+                    || error.raw_os_error() == Some(libc::ESRCH) =>
+            {
                 Ok(ProcessProbe::Missing)
             }
             Err(error) => Err(error),
@@ -532,4 +535,23 @@ mod tests {
         );
         Ok(())
     }
+}
+
+#[cfg(all(test, target_os = "macos"))]
+#[test]
+fn darwin_boot_time_change_does_not_confirm_detached_cleanup()
+-> Result<(), Box<dyn std::error::Error>> {
+    let mut command = Command::new("sh");
+    command.args(["-c", "exec sleep 20"]);
+    let mut handle = ProcessHandle::spawn_isolated_group(&mut command)?;
+    let mut stale = handle.identity().clone();
+    let (_, after_boot) = stale.start_token.rsplit_once(':').ok_or("start token")?;
+    stale.start_token = format!("darwin:0:{after_boot}");
+    let outcome = ProcessHandle::terminate_detached(&stale, Duration::ZERO);
+    let alive = !handle.observe_exit()?;
+    let reaped = handle.terminate_and_reap(Duration::from_millis(400))?;
+    assert_eq!(outcome?, TerminateOutcome::CleanupUnverified);
+    assert!(alive);
+    assert_eq!(reaped.outcome, TerminateOutcome::TerminatedGracefully);
+    Ok(())
 }

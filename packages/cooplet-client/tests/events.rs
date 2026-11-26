@@ -167,3 +167,48 @@ async fn invalid_stream_shapes_fail_once_and_do_not_resynchronize_silently() -> 
     a?;
     b
 }
+
+#[tokio::test]
+async fn both_resync_forms_reject_zero_floor_but_admit_an_empty_journal() -> TestResult {
+    let server = Server::bind().await?;
+    let client = CoopletClient::new(ClientConfig::new(
+        server.url.clone(),
+        Destination::LocalNode,
+        None,
+    ))?;
+    let serve = async {
+        let (_, peer) = server.accept().await?;
+        peer.respond("410 Gone", &[("content-type", "application/problem+json")],
+            br#"{"type":"about:blank","title":"Gone","status":410,"detail":"expired","code":"resync_required","retryable":false,"extensions":{"oldest_available_seq":0,"latest_seq":0}}"#).await?;
+        let (_, peer) = server.accept().await?;
+        peer.respond("200 OK", &[("content-type", "application/x-ndjson")],
+            b"{\"type\":\"resync_required\",\"oldest_available_seq\":0,\"latest_seq\":0,\"reason\":\"expired\"}\n").await?;
+        let (_, peer) = server.accept().await?;
+        peer.respond("200 OK", &[("content-type", "application/x-ndjson")],
+            b"{\"type\":\"resync_required\",\"oldest_available_seq\":1,\"latest_seq\":0,\"reason\":\"expired\"}\n").await
+    };
+    let call = async {
+        assert!(matches!(
+            client.list_events(&EventsQuery::default()).await,
+            Err(ClientError::Protocol(_))
+        ));
+        let mut invalid = client.stream_events(0, &[]).await?;
+        assert!(matches!(
+            invalid.next_frame().await,
+            Some(Err(ClientError::Protocol(_)))
+        ));
+        let mut empty = client.stream_events(0, &[]).await?;
+        assert!(matches!(
+            empty.next_frame().await,
+            Some(Err(ClientError::ResyncRequired {
+                oldest_available_seq: 1,
+                latest_seq: 0,
+                ..
+            }))
+        ));
+        Ok::<_, Box<dyn std::error::Error + Send + Sync>>(())
+    };
+    let (a, b) = tokio::join!(call, serve);
+    a?;
+    b
+}

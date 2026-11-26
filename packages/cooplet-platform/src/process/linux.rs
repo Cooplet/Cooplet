@@ -198,46 +198,69 @@ pub(super) fn terminate_detached(
         return Ok(TerminateOutcome::AlreadyGone);
     }
 
-    let verified = (|| -> Option<OwnedFd> {
-        verify_proc_visibility().ok()?;
-        let handle = open_pidfd(pid).ok()?;
-        if pidfd_exited(&handle).ok()? {
-            return None;
-        }
-        let (snapshot, token) = capture(pid).ok()?;
-        if snapshot.exited || !identity.matches(&snapshot, &token) || pidfd_exited(&handle).ok()? {
-            return None;
-        }
-        Some(handle)
-    })();
-    let Some(handle) = verified else {
+    if verify_proc_visibility().is_err() {
+        return Ok(TerminateOutcome::CleanupUnverified);
+    }
+    let Some(handle) = open_pidfd(pid)
+        .ok()
+        .and_then(|handle| verify_leader(identity, handle, pidfd_exited, || capture(pid)))
+    else {
         return Ok(TerminateOutcome::CleanupUnverified);
     };
-    let flags = match signal_scope(|flags| pidfd_signal(&handle, 0, flags)) {
+    Ok(stop_verified(
+        &handle,
+        grace,
+        pidfd_signal,
+        pidfd_exited,
+        || group_gone(pid),
+    ))
+}
+
+fn verify_leader<T>(
+    identity: &ProcessIdentity,
+    reference: T,
+    exited: impl Fn(&T) -> io::Result<bool>,
+    capture: impl FnOnce() -> Result<(Snapshot, String), PlatformError>,
+) -> Option<T> {
+    if exited(&reference).ok()? {
+        return None;
+    }
+    let (snapshot, token) = capture().ok()?;
+    if snapshot.exited || !identity.matches(&snapshot, &token) || exited(&reference).ok()? {
+        return None;
+    }
+    Some(reference)
+}
+
+fn stop_verified<T>(
+    reference: &T,
+    grace: Duration,
+    signal: impl Fn(&T, libc::c_int, libc::c_uint) -> io::Result<()>,
+    exited: impl Fn(&T) -> io::Result<bool>,
+    gone: impl Fn() -> io::Result<bool>,
+) -> TerminateOutcome {
+    let flags = match signal_scope(|flags| signal(reference, 0, flags)) {
         Ok(flags) => flags,
         Err(error)
-            if error.raw_os_error() == Some(libc::ESRCH)
-                && group_gone(pid).is_ok_and(|gone| gone) =>
+            if error.raw_os_error() == Some(libc::ESRCH) && gone().is_ok_and(|gone| gone) =>
         {
-            return Ok(TerminateOutcome::AlreadyGone);
+            return TerminateOutcome::AlreadyGone;
         }
-        Err(_) => return Ok(TerminateOutcome::CleanupUnverified),
+        Err(_) => return TerminateOutcome::CleanupUnverified,
     };
-    let outcome = StopState::default().drive(
+    StopState::default().drive(
         grace,
         || {
             if flags == libc::PIDFD_SIGNAL_PROCESS_GROUP
-                && pidfd_signal(&handle, 0, flags)
+                && signal(reference, 0, flags)
                     .is_err_and(|error| error.raw_os_error() == Some(libc::ESRCH))
             {
                 return Ok(true);
             }
-            pidfd_exited(&handle)
-                .and_then(|exited| if exited { group_gone(pid) } else { Ok(false) })
+            exited(reference).and_then(|exited| if exited { gone() } else { Ok(false) })
         },
-        |signal| pidfd_signal(&handle, signal, flags),
-    );
-    Ok(outcome)
+        |which| signal(reference, which, flags),
+    )
 }
 
 fn signal_scope(probe: impl FnOnce(libc::c_uint) -> io::Result<()>) -> io::Result<libc::c_uint> {
@@ -334,5 +357,124 @@ mod tests {
         assert!(signal_scope(|_| Err(io::Error::from_raw_os_error(libc::EPERM))).is_err());
         assert!(signal_scope(|_| Err(io::Error::from_raw_os_error(libc::ESRCH))).is_err());
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod detached_tests {
+    use std::cell::{Cell, RefCell};
+
+    use super::*;
+    use crate::current_euid;
+
+    #[test]
+    fn identity_capture_rejects_a_leader_lost_during_the_snapshot() {
+        let identity = ProcessIdentity {
+            pid: 40,
+            pgid: 40,
+            start_token: "linux:00000000-0000-0000-0000-000000000000:45".into(),
+        };
+        let observations = Cell::new(0);
+        let result = verify_leader(
+            &identity,
+            "stable-reference",
+            |address| {
+                assert_eq!(address, &"stable-reference");
+                let count = observations.get();
+                observations.set(count + 1);
+                Ok(count > 0)
+            },
+            || {
+                Ok((
+                    Snapshot {
+                        pgid: 40,
+                        uid: current_euid(),
+                        exited: false,
+                    },
+                    identity.start_token.clone(),
+                ))
+            },
+        );
+        assert_eq!(result, None);
+        assert_eq!(observations.get(), 2);
+    }
+
+    #[test]
+    fn detached_group_sends_each_signal_to_the_same_stable_reference() {
+        let sends = RefCell::new(Vec::new());
+        let killed = Cell::new(false);
+        let reference = String::from("held");
+        let outcome = stop_verified(
+            &reference,
+            Duration::ZERO,
+            |address, which, scope| {
+                assert!(std::ptr::eq(address, &reference));
+                assert_eq!(scope, libc::PIDFD_SIGNAL_PROCESS_GROUP);
+                if which == 0 {
+                    if killed.get() {
+                        return Err(io::Error::from_raw_os_error(libc::ESRCH));
+                    }
+                } else {
+                    sends.borrow_mut().push(which);
+                    if which == libc::SIGKILL {
+                        killed.set(true);
+                    }
+                }
+                Ok(())
+            },
+            |_| Ok(false),
+            || Ok(false),
+        );
+        assert_eq!(outcome, TerminateOutcome::KilledAfterGrace);
+        assert_eq!(*sends.borrow(), [libc::SIGTERM, libc::SIGKILL]);
+    }
+
+    #[test]
+    fn legacy_individual_pidfd_never_claims_a_residual_group_was_cleaned() {
+        let sends = RefCell::new(Vec::new());
+        let leader_gone = Cell::new(false);
+        let result = stop_verified(
+            &17,
+            Duration::ZERO,
+            |address, which, scope| {
+                assert_eq!(*address, 17);
+                if which == 0 {
+                    assert_eq!(scope, libc::PIDFD_SIGNAL_PROCESS_GROUP);
+                    return Err(io::Error::from_raw_os_error(libc::EINVAL));
+                }
+                assert_eq!(scope, 0);
+                sends.borrow_mut().push(which);
+                if which == libc::SIGTERM {
+                    leader_gone.set(true);
+                    Ok(())
+                } else {
+                    Err(io::Error::from_raw_os_error(libc::ESRCH))
+                }
+            },
+            |_| Ok(leader_gone.get()),
+            || Ok(false),
+        );
+        assert_eq!(result, TerminateOutcome::CleanupUnverified);
+        assert_eq!(*sends.borrow(), [libc::SIGTERM, libc::SIGKILL]);
+    }
+
+    #[test]
+    fn denied_group_address_sends_no_signal() {
+        let calls = Cell::new(0);
+        let result = stop_verified(
+            &17,
+            Duration::ZERO,
+            |address, which, scope| {
+                assert_eq!(*address, 17);
+                assert_eq!(which, 0);
+                assert_eq!(scope, libc::PIDFD_SIGNAL_PROCESS_GROUP);
+                calls.set(calls.get() + 1);
+                Err(io::Error::from_raw_os_error(libc::EPERM))
+            },
+            |_| Ok(false),
+            || Ok(false),
+        );
+        assert_eq!(result, TerminateOutcome::CleanupUnverified);
+        assert_eq!(calls.get(), 1);
     }
 }

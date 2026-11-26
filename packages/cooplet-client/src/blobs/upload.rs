@@ -76,28 +76,24 @@ impl CoopletClient {
             request = request.header(X_COOPLET_SHA256, sha256);
         }
 
-        let (send, receive) = mpsc::channel(1);
-        let progress = Arc::new(WireProgress::default());
-        let request = request.body(wire_body(receive, progress.clone()));
-        let (response, stats) = {
-            let mut response = pin!(request.send());
-            let mut source = pin!(produce(
-                &mut reader,
-                send,
-                &spec,
-                self.config.max_blob_bytes,
-                self.config.request_timeout,
-            ));
-            tokio::select! {
-                biased;
-                result = &mut source => {
-                    let stats = result?;
-                    (timeout(self.config.request_timeout, "blob upload response", async {
-                        Ok(response.await?)
-                    }).await?, stats)
-                }
-                result = &mut response => (result?, None),
-            }
+        let (response, stats) = if spec.content_length == Some(0) {
+            // The request is complete as soon as its headers reach the peer.
+            // There is no last body chunk to hold back while seeking EOF.
+            let mut byte = [0];
+            let count = timeout(self.config.request_timeout, "blob source progress", async {
+                Ok(reader.read(&mut byte).await?)
+            })
+            .await?;
+            check_length(0, count as u64)?;
+            let response = timeout(self.config.request_timeout, "blob upload response", async {
+                Ok(request.send().await?)
+            })
+            .await?;
+            let sha256 = (spec.verification == UploadVerification::LocalSha256)
+                .then(|| format!("{:x}", Sha256::digest([])));
+            (response, Some(SourceStats { bytes: 0, sha256 }))
+        } else {
+            self.transmit_upload(request, &spec, &mut reader).await?
         };
 
         let status = response.status();
@@ -120,9 +116,7 @@ impl CoopletClient {
         if let Some(expected) = spec.expected_sha256.as_deref() {
             check_digest(expected, &receipt.sha256)?;
         }
-        if let Some(stats) = stats
-            && progress.complete(stats.bytes, spec.content_length.is_some())
-        {
+        if let Some(stats) = stats {
             check_length(stats.bytes, receipt.size_bytes)?;
             return match stats.sha256 {
                 Some(sha256) => {
@@ -145,6 +139,41 @@ impl CoopletClient {
             "blob receipt arrived before confirmed source EOF and upload",
         ))
     }
+
+    async fn transmit_upload(
+        &self,
+        request: reqwest::RequestBuilder,
+        spec: &BlobUploadSpec,
+        reader: &mut (impl AsyncRead + Unpin),
+    ) -> Result<(reqwest::Response, Option<SourceStats>), ClientError> {
+        let (send, receive) = mpsc::channel(1);
+        let progress = Arc::new(WireProgress::default());
+        let request = request.body(wire_body(receive, progress.clone()));
+        let (response, stats) = {
+            let mut response = pin!(request.send());
+            let mut source = pin!(produce(
+                reader,
+                send,
+                spec,
+                self.config.max_blob_bytes,
+                self.config.request_timeout,
+            ));
+            tokio::select! {
+                biased;
+                result = &mut source => {
+                    let stats = result?;
+                    (timeout(self.config.request_timeout, "blob upload response", async {
+                        Ok(response.await?)
+                    }).await?, stats)
+                }
+                result = &mut response => (result?, None),
+            }
+        };
+
+        let stats =
+            stats.filter(|stats| progress.complete(stats.bytes, spec.content_length.is_some()));
+        Ok((response, stats))
+    }
 }
 
 struct UploadHeaders {
@@ -165,9 +194,11 @@ impl UploadHeaders {
             checked_blob_size(0, length, max_bytes)?;
         }
         let invalid_mime = || ClientError::invalid("invalid blob content type");
-        let mime = spec.mime_type.split(';').next().unwrap_or_default().trim();
-        let (top, sub) = mime.split_once('/').ok_or_else(invalid_mime)?;
-        if !mime_token(top) || !mime_token(sub) {
+        let mime = spec
+            .mime_type
+            .parse::<mime::Mime>()
+            .map_err(|_| invalid_mime())?;
+        if mime.type_() == mime::STAR || mime.subtype() == mime::STAR {
             return Err(invalid_mime());
         }
         let content_type = HeaderValue::from_str(&spec.mime_type).map_err(|_| invalid_mime())?;
@@ -179,12 +210,6 @@ impl UploadHeaders {
             content_type,
         })
     }
-}
-
-fn mime_token(s: &str) -> bool {
-    !s.is_empty()
-        && s.bytes()
-            .all(|b| b.is_ascii_alphanumeric() || b"!#$&^_.+-".contains(&b))
 }
 
 enum UploadChunk {

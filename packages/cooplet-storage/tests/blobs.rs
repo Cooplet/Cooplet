@@ -42,11 +42,12 @@ const HELLO_SHA: &str = "2cf24dba5fb0a30e26e83b2ac5b9e29e1b161e5c1fa7425e7304336
 #[derive(Default)]
 struct Registry {
     lookup_fails: AtomicBool,
-    failure_before_ack: Mutex<Option<AckFailure>>,
+    failure_before_ack: Mutex<Option<Pause>>,
+    pause_after_lookup: Mutex<Option<Pause>>,
     stale_candidate: Mutex<Option<BlobTombstone>>,
 }
 
-struct AckFailure {
+struct Pause {
     entered: oneshot::Sender<()>,
     release: mpsc::Receiver<()>,
 }
@@ -133,7 +134,8 @@ impl GcHooks for Registry {
             return Err(rusqlite::Error::InvalidQuery);
         }
         let mut query = connection.prepare("SELECT path,bytes,deleted FROM objects WHERE id=?")?;
-        ids.iter()
+        let states = ids
+            .iter()
             .map(|id| {
                 let record = query
                     .query_row([id.as_str()], |row| {
@@ -155,7 +157,17 @@ impl GcHooks for Registry {
                     .unwrap_or(BlobState::Absent);
                 Ok((id.clone(), record))
             })
-            .collect()
+            .collect();
+        let pause = self
+            .pause_after_lookup
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .take();
+        if let Some(pause) = pause {
+            let _ = pause.entered.send(());
+            let _ = pause.release.recv();
+        }
+        states
     }
 }
 
@@ -357,7 +369,20 @@ async fn pre_eof_abort_releases_quota_but_accepted_registration_survives_cancell
             .await
     });
     active.await?;
-    assert!(store.open_blob(&lost_response).await?.is_none());
+    let pending_id = lost_response.clone();
+    assert_eq!(
+        engine
+            .reads()
+            .read(move |db| {
+                Ok(db.query_row(
+                    "SELECT count(*) FROM objects WHERE id = ?",
+                    [pending_id.as_str()],
+                    |row| row.get::<_, u32>(0),
+                )?)
+            })
+            .await?,
+        0
+    );
     task.abort();
     assert!(task.await.is_err());
     commit.send(())?;
@@ -507,7 +532,7 @@ async fn gc_holds_mutation_through_ack_and_revalidates_stale_candidates() -> Tes
     *registry
         .failure_before_ack
         .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(AckFailure {
+        .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(Pause {
         entered,
         release: blocked,
     });
@@ -647,4 +672,108 @@ fn staging_does_not_hold_the_only_blocking_worker_while_waiting_for_async_input(
         engine.shutdown().await?;
         Ok(())
     })
+}
+
+#[tokio::test]
+async fn a_blob_root_belongs_to_one_canonical_database_across_restarts() -> TestResult {
+    let scratch = Scratch::new()?;
+    let (config, blobs) = configs(&scratch);
+    let other = StorageConfig::new(scratch.0.join("other.sqlite3"));
+    let registry = Arc::new(Registry::default());
+    let engine = StorageEngine::open_managed(
+        config.clone(),
+        SCHEMA,
+        registry.clone(),
+        Some(blobs.clone()),
+    )
+    .await?;
+    let live = engine.blobs().ok_or("missing store")?;
+    let (blob, ()) = live
+        .store(input(BlobId::generate()?), &b"hello"[..], register)
+        .await?;
+    for _ in 0..2 {
+        let attempt = StorageEngine::open_managed(
+            other.clone(),
+            SCHEMA,
+            registry.clone(),
+            Some(blobs.clone()),
+        )
+        .await;
+        assert!(matches!(
+            attempt,
+            Err(StorageError::InvalidConfig(
+                "blob root belongs to another database"
+            ))
+        ));
+        assert_eq!(fs::read(&blob.absolute_path)?, b"hello");
+    }
+    engine.shutdown().await?;
+    let attempt =
+        StorageEngine::open_managed(other, SCHEMA, registry.clone(), Some(blobs.clone())).await;
+    assert!(matches!(
+        attempt,
+        Err(StorageError::InvalidConfig(
+            "blob root belongs to another database"
+        ))
+    ));
+    let reopened = StorageEngine::open_managed(config, SCHEMA, registry, Some(blobs)).await?;
+    assert_eq!(reopened.blobs().ok_or("missing store")?.used_bytes(), 5);
+    assert_eq!(fs::read(blob.absolute_path)?, b"hello");
+    reopened.shutdown().await?;
+    Ok(())
+}
+
+#[tokio::test]
+async fn a_live_read_pins_the_file_before_gc_and_reuse_can_change_its_path() -> TestResult {
+    use std::io::Read as _;
+
+    let scratch = Scratch::new()?;
+    let (config, blobs) = configs(&scratch);
+    let registry = Arc::new(Registry::default());
+    let engine =
+        Arc::new(StorageEngine::open_managed(config, SCHEMA, registry.clone(), Some(blobs)).await?);
+    let store = engine.blobs().ok_or("missing store")?;
+    let id = BlobId::generate()?;
+    let (old, ()) = store
+        .store(input(id.clone()), &b"0000"[..], register)
+        .await?;
+
+    let (seen, visible) = oneshot::channel();
+    let (resume, paused) = mpsc::channel();
+    *registry
+        .pause_after_lookup
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(Pause {
+        entered: seen,
+        release: paused,
+    });
+    let reader = store.clone();
+    let read_id = id.clone();
+    let read = tokio::spawn(async move { reader.open_blob(&read_id).await });
+    visible.await?;
+    tombstone(&engine, &old).await?;
+    let gc = engine.clone();
+    let mut cycle = tokio::spawn(async move { gc.gc_once(99).await });
+    assert!(
+        tokio::time::timeout(Duration::from_millis(30), &mut cycle)
+            .await
+            .is_err()
+    );
+    assert!(old.absolute_path.exists());
+    resume.send(())?;
+
+    let (_, mut file) = read.await??.ok_or("old live file could not be opened")?;
+    assert_eq!(cycle.await??.tombstones_completed, 1);
+    let (replacement, ()) = store.store(input(id), &b"0078"[..], register).await?;
+    assert_eq!(old.disk_rel_path, replacement.disk_rel_path);
+    assert_ne!(old.sha256, replacement.sha256);
+    let mut contents = Vec::new();
+    file.read_to_end(&mut contents)?;
+    assert_eq!(contents, b"0000");
+    assert_eq!(fs::read(replacement.absolute_path)?, b"0078");
+    Arc::try_unwrap(engine)
+        .map_err(|_| "live engine owner")?
+        .shutdown()
+        .await?;
+    Ok(())
 }

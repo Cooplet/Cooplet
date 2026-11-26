@@ -1,6 +1,9 @@
 use std::{ffi::CStr, fs::File, io, os::fd::AsRawFd};
 
-use crate::{PlatformError, PublishStage, fs::component};
+use crate::{
+    PlatformError, PublishStage,
+    fs::{component, unlink_entry},
+};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum PublishOutcome {
@@ -22,7 +25,16 @@ impl AtomicPublish {
     ) -> Result<PublishOutcome, PlatformError> {
         let tmp_name = component(tmp_name)?;
         let final_name = component(final_name)?;
-        match rename_noreplace(stage_dir, &tmp_name, dest_dir, &final_name) {
+        Self::publish_noreplace_at(stage_dir, &tmp_name, dest_dir, &final_name)
+    }
+
+    pub(crate) fn publish_noreplace_at(
+        stage_dir: &File,
+        tmp_name: &CStr,
+        dest_dir: &File,
+        final_name: &CStr,
+    ) -> Result<PublishOutcome, PlatformError> {
+        match rename_noreplace(stage_dir, tmp_name, dest_dir, final_name) {
             Ok(()) => {
                 sync_dir(dest_dir, PublishStage::DestinationSync)?;
                 sync_dir(stage_dir, PublishStage::StagingSync)?;
@@ -37,7 +49,7 @@ impl AtomicPublish {
                     Some(libc::ENOSYS | libc::EINVAL | libc::EOPNOTSUPP)
                 ) =>
             {
-                publish_via_link(stage_dir, &tmp_name, dest_dir, &final_name)
+                publish_via_link(stage_dir, tmp_name, dest_dir, final_name)
             }
             Err(error) => Err(error.into()),
         }
@@ -104,15 +116,13 @@ fn publish_via_link(
         };
     }
     sync_dir(dest_dir, PublishStage::DestinationSync)?;
-    // SAFETY: the borrowed directory fd and terminated name live through the call.
-    if unsafe { libc::unlinkat(stage_dir.as_raw_fd(), tmp.as_ptr(), 0) } != 0 {
-        let source = io::Error::last_os_error();
-        if source.kind() != io::ErrorKind::NotFound {
-            return Err(PlatformError::PublishedDurabilityUnknown {
-                stage: PublishStage::StagingUnlink,
-                source,
-            });
-        }
+    if let Err(source) = unlink_entry(stage_dir, tmp)
+        && source.kind() != io::ErrorKind::NotFound
+    {
+        return Err(PlatformError::PublishedDurabilityUnknown {
+            stage: PublishStage::StagingUnlink,
+            source,
+        });
     }
     sync_dir(stage_dir, PublishStage::StagingSync)?;
     Ok(PublishOutcome::Published)

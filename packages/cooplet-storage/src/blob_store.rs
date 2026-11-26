@@ -67,7 +67,7 @@ struct Store {
     db: DbActor,
     reads: ReadPool,
     hooks: Arc<dyn GcHooks>,
-    slots: [Mutex<HashSet<BlobId>>; MUTATION_SLOTS],
+    slots: [Arc<Mutex<HashSet<BlobId>>>; MUTATION_SLOTS],
     hasher: RandomState,
     admission: Arc<RwLock<()>>,
     closed: AtomicBool,
@@ -81,17 +81,15 @@ impl BlobDiskStore {
         hooks: Arc<dyn GcHooks>,
     ) -> Result<Self, StorageError> {
         let startup_reads = reads.clone();
-        let disk = tokio::task::spawn_blocking(move || {
-            let _sidecar = startup_reads;
-            Disk::open(config)
-        })
-        .await??;
+        let disk =
+            tokio::task::spawn_blocking(move || Disk::open(config, startup_reads.database_path()))
+                .await??;
         let store = Self(Arc::new(Store {
             disk: Arc::new(disk),
             db,
             reads,
             hooks,
-            slots: std::array::from_fn(|_| Mutex::new(HashSet::new())),
+            slots: std::array::from_fn(|_| Arc::new(Mutex::new(HashSet::new()))),
             hasher: RandomState::new(),
             admission: Arc::new(RwLock::new(())),
             closed: AtomicBool::new(false),
@@ -109,11 +107,13 @@ impl BlobDiskStore {
     pub async fn open_blob(&self, id: &BlobId) -> Result<Option<(BlobRecord, File)>, StorageError> {
         let admission = self.enter().await?;
         let store = self.0.clone();
+        let slot = store.slot(id).clone().lock_owned().await;
         let BlobState::Live(record) = self.0.lookup_one(id.clone()).await? else {
             return Ok(None);
         };
         tokio::task::spawn_blocking(move || {
             let _admission = admission;
+            let _slot = slot;
             let file = store.disk.open_live(&record)?;
             Ok(Some((record, file)))
         })
@@ -277,7 +277,7 @@ impl BlobDiskStore {
 }
 
 impl Store {
-    fn slot(&self, id: &BlobId) -> &Mutex<HashSet<BlobId>> {
+    fn slot(&self, id: &BlobId) -> &Arc<Mutex<HashSet<BlobId>>> {
         &self.slots[self.hasher.hash_one(id) as usize % MUTATION_SLOTS]
     }
 

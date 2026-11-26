@@ -42,6 +42,7 @@ impl StorageConfig {
 
 #[derive(Clone, Debug)]
 pub struct BlobStoreConfig {
+    /// Dedicated directory bound to the canonical database path before recovery.
     pub root: PathBuf,
     pub max_blob_bytes: u64,
     pub max_total_blob_bytes: u64,
