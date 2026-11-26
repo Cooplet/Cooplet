@@ -19,6 +19,14 @@ Setup downloads the pinned tools and prepares the dependency caches. Checks, tes
 
 Use `make check app=node` or `make test package=cooplet-protocol` for focused work. Aggregate `make check` runs the workspace policy tests as well as the component checks. CI also checks the unified Cargo feature graph with Clippy.
 
+Run `sh packages/cooplet-client/tests/relay_fixture/run.sh` to exercise the client and storage together. It uploads a blob to a test Hub, streams it into a second store, and checks the results for complete, corrupt, and interrupted transfers.
+
+## Storage recovery
+
+For a cold backup, stop the service, wait for `StorageEngine::shutdown` to finish successfully, and close any other SQLite connections. While the store is stopped, copy the SQLite database, its `-wal` file if present, and the entire blob directory (including `database.owner`) into one backup. A WAL can contain committed registry updates. [SQLite WAL documentation](https://sqlite.org/wal.html#the_wal_file)
+
+Restore the complete backup into clean locations while the service is stopped. Use the original canonical database path and preserve private file and directory permissions. Startup uses the committed registry to remove orphan files and finish pending deletions. A missing or empty database for an owned blob directory stops startup. A valid database from another backup can cause recovery to delete live objects.
+
 ## Layout
 
 | Path | Role |

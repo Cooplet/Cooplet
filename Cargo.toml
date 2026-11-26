@@ -20,22 +20,29 @@ publish = false
 
 [workspace.dependencies]
 axum = { version = "0.8", features = ["ws"] }
+bytes = "1"
 clap = { version = "4", features = ["derive"] }
+futures-core = "0.3"
+futures-util = { version = "0.3", default-features = false, features = ["std"] }
 getrandom = "0.4"
 hmac = "0.12"
+http = "1"
+libc = "0.2"
+percent-encoding = "2"
 reqwest = { version = "0.12", default-features = false, features = ["json", "stream", "multipart", "rustls-tls-webpki-roots"] }
 rusqlite = { version = "0.39", features = ["bundled", "fallible_uint"] }
 rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12", "logging"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 sha2 = "0.10"
-tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
+thiserror = "2"
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "sync", "time", "io-util", "net"] }
 tokio-rustls = { version = "0.26", default-features = false, features = ["ring", "tls12", "logging"] }
 tokio-tungstenite = { version = "0.26", default-features = false, features = ["connect", "handshake"] }
 toml = "1"
 tracing = "0.1"
+url = "2"
 utoipa = "5"
-webpki-roots = "0.26"
 
 [workspace.lints.rust]
 unsafe_code = "forbid"
