@@ -89,13 +89,15 @@ async fn invalid_events_fail_the_page_and_terminate_the_stream() -> TestResult {
     let valid = &frame["event"];
     let mut wrong_source = valid.clone();
     wrong_source["source_kind"] = "hub".into();
+    let mut object_kind = valid.clone();
+    object_kind["kind"] = serde_json::json!({"node.status": null});
     let mut missing_approval_id = valid.clone();
     missing_approval_id["kind"] = "participant.awaiting_approval".into();
     missing_approval_id["payload"] = serde_json::json!({
         "state": "awaiting_approval", "can_respond_remotely": true
     });
 
-    for bad in [wrong_source, missing_approval_id] {
+    for bad in [wrong_source, missing_approval_id, object_kind] {
         let serve = async {
             let (_, peer) = server.accept().await?;
             let page = serde_json::json!({

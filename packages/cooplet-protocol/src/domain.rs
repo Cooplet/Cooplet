@@ -3,25 +3,27 @@ use utoipa::ToSchema;
 
 use crate::{BlobId, HubId, NodeId, ParticipantId, ValidationError};
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize, ToSchema)]
-#[serde(rename_all = "snake_case")]
-pub enum ParticipantKind {
-    Agent,
-    Human,
-    System,
+crate::wire::wire_string_enum! {
+    #[derive(Hash)]
+    pub enum ParticipantKind {
+        Agent,
+        Human,
+        System,
+    }
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize, ToSchema)]
-#[serde(rename_all = "snake_case")]
-pub enum ParticipantState {
-    Starting,
-    Idle,
-    Working,
-    AwaitingApproval,
-    Stopping,
-    Stopped,
-    Unavailable,
-    Unknown,
+crate::wire::wire_string_enum! {
+    #[derive(Hash)]
+    pub enum ParticipantState {
+        Starting,
+        Idle,
+        Working,
+        AwaitingApproval,
+        Stopping,
+        Stopped,
+        Unavailable,
+        Unknown,
+    }
 }
 
 impl ParticipantState {
@@ -38,35 +40,38 @@ impl ParticipantState {
     }
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize, ToSchema)]
-#[serde(rename_all = "snake_case")]
-pub enum IntakeState {
-    Ready,
-    Busy,
-    AwaitingApproval,
-    Unavailable,
-    Unknown,
+crate::wire::wire_string_enum! {
+    #[derive(Hash)]
+    pub enum IntakeState {
+        Ready,
+        Busy,
+        AwaitingApproval,
+        Unavailable,
+        Unknown,
+    }
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize, ToSchema)]
-#[serde(rename_all = "snake_case")]
-pub enum DeliveryMode {
-    DirectNow,
-    QueueUntilIdle,
+crate::wire::wire_string_enum! {
+    #[derive(Hash)]
+    pub enum DeliveryMode {
+        DirectNow,
+        QueueUntilIdle,
+    }
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize, ToSchema)]
-#[serde(rename_all = "snake_case")]
-pub enum DeliveryState {
-    Accepted,
-    Queued,
-    Dispatched,
-    Delivered,
-    Busy,
-    AwaitingApproval,
-    Expired,
-    Unavailable,
-    Unknown,
+crate::wire::wire_string_enum! {
+    #[derive(Hash)]
+    pub enum DeliveryState {
+        Accepted,
+        Queued,
+        Dispatched,
+        Delivered,
+        Busy,
+        AwaitingApproval,
+        Expired,
+        Unavailable,
+        Unknown,
+    }
 }
 
 crate::wire::wire_object! {
@@ -104,12 +109,13 @@ pub fn validate_sha256(sha256: &str) -> Result<(), ValidationError> {
     }
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize, ToSchema)]
-#[serde(rename_all = "snake_case")]
-pub enum ApprovalWaitKind {
-    Permission,
-    Question,
-    Unspecified,
+crate::wire::wire_string_enum! {
+    #[derive(Hash)]
+    pub enum ApprovalWaitKind {
+        Permission,
+        Question,
+        Unspecified,
+    }
 }
 
 crate::wire::wire_object! {
@@ -150,11 +156,12 @@ pub(crate) fn validate_approval_fields(
     Ok(())
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize, ToSchema)]
-#[serde(rename_all = "snake_case")]
-pub enum ApprovalAction {
-    Approve,
-    Deny,
+crate::wire::wire_string_enum! {
+    #[derive(Hash)]
+    pub enum ApprovalAction {
+        Approve,
+        Deny,
+    }
 }
 
 crate::wire::wire_object! {
@@ -165,27 +172,27 @@ crate::wire::wire_object! {
     }
 }
 
-#[derive(
-    Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize, ToSchema,
-)]
-#[serde(rename_all = "snake_case")]
-pub enum ServiceScope {
-    Read,
-    Collaborate,
-    Manage,
+crate::wire::wire_string_enum! {
+    #[derive(PartialOrd, Ord, Hash)]
+    pub enum ServiceScope {
+        Read,
+        Collaborate,
+        Manage,
+    }
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize, ToSchema)]
-#[serde(rename_all = "snake_case")]
-pub enum PrincipalKind {
-    Participant,
-    Operator,
-    Adapter,
-    WorkflowRun,
-    HumanAdmin,
-    HumanMember,
-    Service,
-    Node,
+crate::wire::wire_string_enum! {
+    #[derive(Hash)]
+    pub enum PrincipalKind {
+        Participant,
+        Operator,
+        Adapter,
+        WorkflowRun,
+        HumanAdmin,
+        HumanMember,
+        Service,
+        Node,
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, ToSchema)]

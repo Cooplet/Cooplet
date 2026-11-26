@@ -139,11 +139,12 @@ define_id!(TokenId, "tok_");
 define_id!(HubId, "hub_");
 define_id!(RequestId, "req_");
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize, ToSchema)]
-#[serde(rename_all = "snake_case")]
-pub enum SourceKind {
-    Node,
-    Hub,
+crate::wire::wire_string_enum! {
+    #[derive(Hash)]
+    pub enum SourceKind {
+        Node,
+        Hub,
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
@@ -210,13 +211,14 @@ impl PartialSchema for SourceId {
 
 impl ToSchema for SourceId {}
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize, ToSchema)]
-#[serde(rename_all = "snake_case")]
-pub enum AggregateType {
-    Node,
-    Participant,
-    Message,
-    Thread,
-    Blob,
-    WorkflowRun,
+crate::wire::wire_string_enum! {
+    #[derive(Hash)]
+    pub enum AggregateType {
+        Node,
+        Participant,
+        Message,
+        Thread,
+        Blob,
+        WorkflowRun,
+    }
 }

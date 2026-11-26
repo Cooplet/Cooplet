@@ -1,16 +1,13 @@
 use std::collections::HashSet;
 
-use serde::{Deserialize, Serialize};
-use utoipa::ToSchema;
-
 use crate::ValidationError;
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
-#[serde(rename_all = "snake_case")]
-pub enum QuestionMode {
-    Single,
-    Multi,
-    Text,
+crate::wire::wire_string_enum! {
+    pub enum QuestionMode {
+        Single,
+        Multi,
+        Text,
+    }
 }
 
 crate::wire::wire_object! {

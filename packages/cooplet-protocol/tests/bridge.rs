@@ -396,3 +396,32 @@ fn tagged_enum_schemas_close_every_variant_and_keep_the_discriminator() -> TestR
     }
     Ok(())
 }
+
+#[test]
+fn bridge_and_event_require_string_kinds_and_preserve_untyped_payloads() -> TestResult {
+    let invalid = br#"{"v":1,"epoch":3,"kind":{"roster_sync":null},"payload":{}}"#;
+    assert!(BridgeFrame::from_json(invalid).is_err());
+    let invalid = br#"{"v":1,"epoch":3,"kind":"command_req","payload":{
+        "op_id":"op_00000000000000000000000000","actor_id":"alfa","admission_budget_ms":50,
+        "delivery_mode":"direct_now","command":{"type":2,"participant_id":"part_00000000000000000000000000"}
+    }}"#;
+    assert!(
+        BridgeFrame::from_json(invalid)?
+            .decode_payload::<CommandReqPayload>()
+            .is_err()
+    );
+
+    let mut frame = json!({"type":"event","event":{
+        "seq":1,"event_id":"evt_00000000000000000000000000","source_kind":"node",
+        "source_id":"node_00000000000000000000000000","kind":"node.status",
+        "aggregate_type":"node","aggregate_id":"n","created_at_ms":0,
+        "payload":{"kind":{"node.status":null},"type":1}
+    }});
+    let EventStreamFrame::Event { event } = serde_json::from_value(frame.clone())? else {
+        return Err("expected event".into());
+    };
+    assert_eq!(event.payload, frame["event"]["payload"]);
+    frame["event"]["kind"] = json!({"node.status":null});
+    assert!(serde_json::from_value::<EventStreamFrame>(frame).is_err());
+    Ok(())
+}

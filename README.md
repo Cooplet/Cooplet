@@ -23,7 +23,9 @@ Run `sh packages/cooplet-client/tests/relay_fixture/run.sh` to exercise the clie
 
 ## Storage recovery
 
-Keep a managed store's SQLite database and blob directory together when backing up or restoring state. Startup uses the committed registry to remove orphan files and finish pending deletions. If the directory already has a database owner and the database is missing or empty, startup stops. Restore the matching database before reopening the store. An older or unrelated database at the same path can classify valid objects as orphans.
+For a cold backup, stop the service, wait for `StorageEngine::shutdown` to finish successfully, and close any other SQLite connections. While the store is stopped, copy the SQLite database, its `-wal` file if present, and the entire blob directory (including `database.owner`) into one backup. A WAL can contain committed registry updates. [SQLite WAL documentation](https://sqlite.org/wal.html#the_wal_file)
+
+Restore the complete backup into clean locations while the service is stopped. Use the original canonical database path and preserve private file and directory permissions. Startup uses the committed registry to remove orphan files and finish pending deletions. A missing or empty database for an owned blob directory stops startup. A valid database from another backup can cause recovery to delete live objects.
 
 ## Layout
 

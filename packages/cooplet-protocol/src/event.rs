@@ -1,8 +1,7 @@
 use std::str::FromStr;
 
-use serde::{Deserialize, Serialize};
+use serde::Deserialize;
 use serde_json::Value;
-use utoipa::ToSchema;
 
 use crate::{
     AggregateType, AnswerPayload, EventId, MessageId, ParticipantState, ProtocolError, SourceId,
@@ -10,10 +9,12 @@ use crate::{
 };
 
 macro_rules! event_kinds {
-    ($($variant:ident => $value:literal,)*) => {
-        #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize, ToSchema)]
-        pub enum EventKind {
-            $(#[serde(rename = $value)] $variant,)*
+    ($($variant:ident => $value:tt,)*) => {
+        crate::wire::wire_string_enum! {
+            #[derive(Hash)]
+            pub enum EventKind {
+                $(#[serde(rename = $value)] $variant,)*
+            }
         }
 
         impl EventKind {

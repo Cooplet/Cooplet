@@ -1,9 +1,8 @@
 use std::collections::HashSet;
 use std::time::Duration;
 
-use serde::{Deserialize, Serialize, de::DeserializeOwned};
+use serde::{Serialize, de::DeserializeOwned};
 use serde_json::Value;
-use utoipa::ToSchema;
 
 use crate::{
     AnswerPayload, ApprovalDecision, ApprovalWaitKind, AttachmentRef, DeliveryMode, HubId,
@@ -19,16 +18,17 @@ pub const MAX_ROSTER_FRAMES: u32 = 512;
 pub const ROSTER_TIMEOUT: Duration = Duration::from_secs(30);
 pub const MAX_PENDING_OP_IDS: usize = 512;
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize, ToSchema)]
-#[serde(rename_all = "snake_case")]
-pub enum FrameKind {
-    HelloAck,
-    CommandReq,
-    ThreadDeliver,
-    RosterSync,
-    CommandRes,
-    ThreadAck,
-    NodeEvent,
+crate::wire::wire_string_enum! {
+    #[derive(Hash)]
+    pub enum FrameKind {
+        HelloAck,
+        CommandReq,
+        ThreadDeliver,
+        RosterSync,
+        CommandRes,
+        ThreadAck,
+        NodeEvent,
+    }
 }
 
 crate::wire::wire_object! {
@@ -207,18 +207,18 @@ crate::wire::wire_object! {
     }
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
-#[serde(rename_all = "snake_case")]
-pub enum CommandOutcome {
-    Delivered,
-    Succeeded,
-    Queued,
-    Busy,
-    AwaitingApproval,
-    Unavailable,
-    Rejected,
-    Unknown,
-    Expired,
+crate::wire::wire_string_enum! {
+    pub enum CommandOutcome {
+        Delivered,
+        Succeeded,
+        Queued,
+        Busy,
+        AwaitingApproval,
+        Unavailable,
+        Rejected,
+        Unknown,
+        Expired,
+    }
 }
 
 crate::wire::wire_object! {
@@ -273,16 +273,16 @@ crate::wire::wire_object! {
     }
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
-#[serde(rename_all = "snake_case")]
-pub enum ThreadDeliveryOutcome {
-    Delivered,
-    Busy,
-    AwaitingApproval,
-    Unavailable,
-    Rejected,
-    Unknown,
-    Expired,
+crate::wire::wire_string_enum! {
+    pub enum ThreadDeliveryOutcome {
+        Delivered,
+        Busy,
+        AwaitingApproval,
+        Unavailable,
+        Rejected,
+        Unknown,
+        Expired,
+    }
 }
 
 crate::wire::wire_object! {

@@ -296,3 +296,81 @@ fn http_and_event_records_require_objects_and_preserve_json_data() -> TestResult
     assert_eq!(receipt.result, Some(json!([[1], {"values":[2]}])));
     Ok(())
 }
+
+#[test]
+fn wire_enum_labels_accept_only_strings_in_every_json_representation() -> TestResult {
+    use serde::{Deserialize, de::DeserializeOwned};
+
+    fn check<T>(value: T, label: &str) -> TestResult
+    where
+        T: DeserializeOwned + serde::Serialize + PartialSchema + std::fmt::Debug + Eq,
+    {
+        assert_eq!(serde_json::to_value(&value)?, json!(label));
+        let schema = serde_json::to_value(T::schema())?;
+        assert_eq!(schema["type"], "string");
+        assert!(
+            schema["enum"]
+                .as_array()
+                .is_some_and(|variants| variants.iter().any(|v| v == label)),
+            "{schema} lacks {label}"
+        );
+        for input in [json!(label), json!({label:null}), json!(0), json!([label])] {
+            let bytes = serde_json::to_vec(&input)?;
+            for result in [
+                serde_json::from_slice::<T>(&bytes),
+                serde_json::from_value::<T>(input.clone()),
+                T::deserialize(&input),
+            ] {
+                if input.is_string() {
+                    assert_eq!(result?, value);
+                } else {
+                    assert!(result.is_err(), "{input} accepted as {value:?}");
+                }
+            }
+        }
+        Ok(())
+    }
+
+    check(FrameKind::RosterSync, "roster_sync")?;
+    check(SourceKind::Node, "node")?;
+    check(AggregateType::WorkflowRun, "workflow_run")?;
+    check(ParticipantKind::Human, "human")?;
+    check(ParticipantState::Idle, "idle")?;
+    check(IntakeState::AwaitingApproval, "awaiting_approval")?;
+    check(DeliveryMode::QueueUntilIdle, "queue_until_idle")?;
+    check(DeliveryState::Delivered, "delivered")?;
+    check(ApprovalWaitKind::Permission, "permission")?;
+    check(ApprovalAction::Approve, "approve")?;
+    check(ServiceScope::Manage, "manage")?;
+    check(PrincipalKind::HumanAdmin, "human_admin")?;
+    check(QuestionMode::Multi, "multi")?;
+    check(CommandOutcome::Busy, "busy")?;
+    check(ThreadDeliveryOutcome::Delivered, "delivered")?;
+    check(EventKind::WorkflowLog, "workflow.log")?;
+    check(ErrorCode::DeliveryUnknown, "delivery_unknown")?;
+    assert_eq!(
+        serde_json::from_str::<EventKind>(r#""workflow\u002elog""#)?,
+        EventKind::WorkflowLog
+    );
+
+    #[derive(Deserialize)]
+    #[serde(untagged)]
+    enum Frame {
+        Event(EventStreamFrame),
+    }
+    let Frame::Event(EventStreamFrame::Ping {}) =
+        serde_json::from_str::<Frame>(r#"{"type":"p\u0069ng"}"#)?
+    else {
+        return Err("expected ping".into());
+    };
+    for bad_tag in [json!(1), json!({"ping":null}), json!(["ping"])] {
+        let frame = json!({"type":bad_tag});
+        assert!(
+            serde_json::from_value::<Frame>(frame.clone()).is_err(),
+            "{frame}"
+        );
+        assert!(Frame::deserialize(&frame).is_err());
+        assert!(serde_json::from_slice::<Frame>(&serde_json::to_vec(&frame)?).is_err());
+    }
+    Ok(())
+}

@@ -1,8 +1,6 @@
 use std::collections::BTreeMap;
 
-use serde::{Deserialize, Serialize};
 use serde_json::Value;
-use utoipa::ToSchema;
 
 use crate::RequestId;
 
@@ -10,10 +8,11 @@ pub const PROBLEM_JSON_MEDIA_TYPE: &str = "application/problem+json";
 
 macro_rules! error_codes {
     ($($variant:ident: $status:literal, $retryable:literal, $slug:literal, $title:literal;)*) => {
-        #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize, ToSchema)]
-        #[serde(rename_all = "snake_case")]
-        pub enum ErrorCode {
-            $($variant,)*
+        crate::wire::wire_string_enum! {
+            #[derive(Hash)]
+            pub enum ErrorCode {
+                $($variant,)*
+            }
         }
 
         impl ErrorCode {
