@@ -194,11 +194,7 @@ impl UploadHeaders {
             checked_blob_size(0, length, max_bytes)?;
         }
         let invalid_mime = || ClientError::invalid("invalid blob content type");
-        let mime = spec
-            .mime_type
-            .parse::<mime::Mime>()
-            .map_err(|_| invalid_mime())?;
-        if mime.type_() == mime::STAR || mime.subtype() == mime::STAR {
+        if parse_media_type(spec.mime_type.as_bytes()).is_none() {
             return Err(invalid_mime());
         }
         let content_type = HeaderValue::from_str(&spec.mime_type).map_err(|_| invalid_mime())?;
@@ -210,6 +206,65 @@ impl UploadHeaders {
             content_type,
         })
     }
+}
+
+// RFC 9110 media-type with HTTP token, optional whitespace and quoted-string.
+fn parse_media_type(value: &[u8]) -> Option<()> {
+    let (top, rest) = token(skip_ows(value))?;
+    let (subtype, rest) = token(rest.strip_prefix(b"/")?)?;
+    if top == b"*" || subtype == b"*" {
+        return None;
+    }
+    let mut rest = skip_ows(rest);
+    while !rest.is_empty() {
+        rest = skip_ows(rest.strip_prefix(b";")?);
+        // The HTTP parameters grammar allows an empty parameter slot.
+        if rest.is_empty() || rest.starts_with(b";") {
+            continue;
+        }
+        let (_, value) = token(rest)?;
+        let value = value.strip_prefix(b"=")?;
+        rest = skip_ows(if let Some(quoted) = value.strip_prefix(b"\"") {
+            quoted_value(quoted)?
+        } else {
+            token(value)?.1
+        });
+    }
+    Some(())
+}
+
+fn skip_ows(value: &[u8]) -> &[u8] {
+    let start = value
+        .iter()
+        .position(|&byte| !matches!(byte, b' ' | b'\t'))
+        .unwrap_or(value.len());
+    &value[start..]
+}
+
+fn token(value: &[u8]) -> Option<(&[u8], &[u8])> {
+    let end = value
+        .iter()
+        .position(|&byte| !byte.is_ascii_alphanumeric() && !b"!#$%&'*+-.^_\x60|~".contains(&byte))
+        .unwrap_or(value.len());
+    (end != 0).then(|| value.split_at(end))
+}
+
+fn quoted_value(mut value: &[u8]) -> Option<&[u8]> {
+    while let Some((&byte, rest)) = value.split_first() {
+        value = match byte {
+            b'"' => return Some(rest),
+            b'\\' => {
+                let (&escaped, remaining) = rest.split_first()?;
+                if !matches!(escaped, b'\t' | b' '..=b'~' | 0x80..=0xff) {
+                    return None;
+                }
+                remaining
+            }
+            b'\t' | b' '..=b'~' | 0x80..=0xff => rest,
+            _ => return None,
+        };
+    }
+    None
 }
 
 enum UploadChunk {

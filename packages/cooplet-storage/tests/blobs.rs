@@ -777,3 +777,59 @@ async fn a_live_read_pins_the_file_before_gc_and_reuse_can_change_its_path() -> 
         .await?;
     Ok(())
 }
+
+#[tokio::test]
+async fn interrupted_initial_claim_is_recoverable_and_concurrent_claims_have_one_owner()
+-> TestResult {
+    let scratch = Scratch::new()?;
+    let (left_config, blobs) = configs(&scratch);
+    let right_config = StorageConfig::new(scratch.0.join("second.sqlite3"));
+    let root = PrivateFs::ensure_private_dir(&blobs.root)?;
+    let partial = ".tmp.0123456789abcdef0123456789abcdef";
+    PrivateFs::write_private_file_atomic(&root, partial, b"interrupted initialization")?;
+
+    let registry = Arc::new(Registry::default());
+    let (left, right) = tokio::join!(
+        StorageEngine::open_managed(
+            left_config.clone(),
+            SCHEMA,
+            registry.clone(),
+            Some(blobs.clone())
+        ),
+        StorageEngine::open_managed(
+            right_config.clone(),
+            SCHEMA,
+            registry.clone(),
+            Some(blobs.clone())
+        ),
+    );
+    let (engine, owner, other) = match (left, right) {
+        (Ok(engine), Err(_)) => (engine, left_config, right_config),
+        (Err(_), Ok(engine)) => (engine, right_config, left_config),
+        _ => return Err("exactly one database must provision the root".into()),
+    };
+    assert!(!root.join(partial).exists());
+    let marker = root.join("database.owner");
+    assert_eq!(marker.metadata()?.nlink(), 1);
+    assert_eq!(marker.metadata()?.mode() & 0o777, 0o600);
+    assert_eq!(
+        fs::read(marker)?,
+        owner.db_path.canonicalize()?.as_os_str().as_encoded_bytes()
+    );
+    let (live, ()) = engine
+        .blobs()
+        .ok_or("missing store")?
+        .store(input(BlobId::generate()?), &b"hello"[..], register)
+        .await?;
+    engine.shutdown().await?;
+    assert!(
+        StorageEngine::open_managed(other, SCHEMA, registry.clone(), Some(blobs.clone()))
+            .await
+            .is_err()
+    );
+    let resumed = StorageEngine::open_managed(owner, SCHEMA, registry, Some(blobs)).await?;
+    assert_eq!(resumed.blobs().ok_or("missing store")?.used_bytes(), 5);
+    assert_eq!(fs::read(live.absolute_path)?, b"hello");
+    resumed.shutdown().await?;
+    Ok(())
+}

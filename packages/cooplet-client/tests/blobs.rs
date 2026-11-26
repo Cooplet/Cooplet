@@ -419,8 +419,11 @@ async fn malformed_mime_parameters_fail_before_reading_source_or_network() -> Te
     let server = Server::bind().await?;
     let client = CoopletClient::new(settings(&server))?;
     for mime_type in [
+        "text/",
         "text/plain; charset",
+        "text/plain;charset=",
         "text/plain; charset=\"unterminated",
+        "text/plain; charset =utf-8",
         "text/*",
     ] {
         let mut spec = spec(None);
@@ -439,4 +442,38 @@ async fn malformed_mime_parameters_fail_before_reading_source_or_network() -> Te
             .is_err()
     );
     Ok(())
+}
+
+#[tokio::test]
+async fn valid_http_media_types_keep_ows_and_quoted_parameters() -> TestResult {
+    let server = Server::bind().await?;
+    let client = CoopletClient::new(settings(&server))?;
+    let media_types = [
+        "text/plain ; charset=utf-8",
+        r#"application/vnd.cooplet+json; ; mode=""; note="a;b=\"z""#,
+    ];
+    let serve = async {
+        for media in media_types {
+            let (head, mut peer) = server.accept().await?;
+            assert_eq!(head.header("content-type"), Some(media));
+            assert_eq!(peer.read_body(&head).await?, b"hello");
+            peer.respond("201 Created", &[], receipt(5, HELLO_SHA).as_bytes())
+                .await?;
+        }
+        Ok::<_, Box<dyn std::error::Error + Send + Sync>>(())
+    };
+    let call = async {
+        for media in media_types {
+            let mut spec = spec(Some(5));
+            spec.mime_type = media.into();
+            assert!(matches!(
+                client.upload_blob(spec, &b"hello"[..]).await?,
+                BlobUploadOutcome::VerifiedLocal(_)
+            ));
+        }
+        Ok::<_, Box<dyn std::error::Error + Send + Sync>>(())
+    };
+    let (a, b) = tokio::join!(call, serve);
+    a?;
+    b
 }

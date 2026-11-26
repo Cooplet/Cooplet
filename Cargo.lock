@@ -240,7 +240,6 @@ dependencies = [
  "futures-core",
  "futures-util",
  "http",
- "mime",
  "percent-encoding",
  "reqwest",
  "rustls",

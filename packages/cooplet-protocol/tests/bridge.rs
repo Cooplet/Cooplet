@@ -299,3 +299,54 @@ fn roster_and_node_event_reject_ambiguous_approval() -> TestResult {
     assert!(BridgeFrame::encode(9, &serde_json::from_value::<RosterSyncPayload>(value)?).is_err());
     Ok(())
 }
+
+#[test]
+fn reconnect_wire_preserves_receipt_and_injection_fence_after_lost_ack() -> TestResult {
+    // A response and a thread acknowledgment have been lost. The next
+    // epoch carries a targeted operation query and durable thread evidence.
+    let hello = BridgeFrame::from_json(
+        br#"{
+        "v":1,"epoch":12,"kind":"hello_ack","payload":{
+            "hub_id":"hub_00000000000000000000000000","node_id":"node_00000000000000000000000000",
+            "max_inflight_commands":8,"max_inflight_threads":8,
+            "pending_op_ids":["op_00000000000000000000000000"]
+        }
+    }"#,
+    )?;
+    let roster = BridgeFrame::from_json(
+        br#"{
+        "v":1,"epoch":12,"kind":"roster_sync","payload":{
+            "chunk_index":0,"is_final":true,"participants":[],"templates":[],"workflows":[],
+            "unresolved_thread_fences":[{
+                "thread_id":"thr_00000000000000000000000000",
+                "participant_id":"part_00000000000000000000000000","highest_dispatched_seq":10
+            }],
+            "resolved_op_receipts":[{
+                "op_id":"op_00000000000000000000000000","outcome":"succeeded",
+                "resource_id":"run_00000000000000000000000001","result":{"stored":true}
+            }]
+        }
+    }"#,
+    )?;
+    assert_eq!(hello.epoch, roster.epoch);
+    let hello = hello.decode_payload::<HelloAckPayload>()?;
+    let roster = roster.decode_payload::<RosterSyncPayload>()?;
+    let result = roster
+        .resolved_op_receipts
+        .first()
+        .ok_or("missing receipt")?;
+    assert_eq!(
+        hello.pending_op_ids.as_slice(),
+        std::slice::from_ref(&result.op_id)
+    );
+    assert_eq!(result.outcome, CommandOutcome::Succeeded);
+    assert_eq!(result.result, Some(json!({"stored":true})));
+    let fence = roster
+        .unresolved_thread_fences
+        .first()
+        .ok_or("missing unresolved fence")?;
+    assert_eq!(fence.thread_id.as_str(), THREAD);
+    assert_eq!(fence.participant_id.as_str(), PART);
+    assert_eq!(fence.highest_dispatched_seq, 10);
+    Ok(())
+}

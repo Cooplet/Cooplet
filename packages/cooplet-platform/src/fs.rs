@@ -10,9 +10,7 @@ use std::{
     path::{Path, PathBuf},
 };
 
-use crate::{
-    AtomicPublish, PlatformError, PublishOutcome, PublishStage, current_euid, random_bytes,
-};
+use crate::{PlatformError, PublishStage, current_euid, random_bytes};
 
 pub(crate) const NOFOLLOW_FILE: libc::c_int = libc::O_NOFOLLOW | libc::O_NONBLOCK | libc::O_CLOEXEC;
 
@@ -104,27 +102,6 @@ impl PrivateFs {
             |file| write_private_bytes(file, bytes),
             File::sync_all,
         )
-    }
-
-    /// Create a durable private file without replacing an existing owner.
-    pub fn create_private_file_atomic(
-        dir: &Path,
-        name: &str,
-        bytes: &[u8],
-    ) -> Result<PublishOutcome, PlatformError> {
-        let name = component(name)?;
-        let (dir, fd, identity) = private_directory(dir)?;
-        let (file, mut staging) = open_staging(&fd)?;
-        write_private_bytes(&file, bytes)?;
-        verify_path(&dir, &identity)?;
-        let result = AtomicPublish::publish_noreplace_at(&fd, &staging.name, &fd, &name)?;
-        if result == PublishOutcome::Published {
-            staging.armed = false;
-            verify_published_path(&dir, &identity)?;
-        } else {
-            verify_path(&dir, &identity)?;
-        }
-        Ok(result)
     }
 
     fn write_private_file_with(
@@ -428,26 +405,6 @@ mod tests {
         assert_eq!(fs::read(live.join("cred"))?, b"replacement");
         assert_eq!(fs::read_dir(rotated)?.count(), 1);
         assert_eq!(fs::read_dir(live)?.count(), 1);
-        Ok(())
-    }
-
-    #[test]
-    fn private_create_is_no_replace_and_leaves_no_staging_file()
-    -> Result<(), Box<dyn std::error::Error>> {
-        let scratch = Scratch::new()?;
-        assert_eq!(
-            PrivateFs::create_private_file_atomic(&scratch.0, "owner", b"first")?,
-            PublishOutcome::Published
-        );
-        assert_eq!(
-            PrivateFs::create_private_file_atomic(&scratch.0, "owner", b"other")?,
-            PublishOutcome::AlreadyExists
-        );
-        assert_eq!(
-            PrivateFs::read_private_file(&scratch.0.join("owner"), 5)?,
-            b"first"
-        );
-        assert_eq!(fs::read_dir(&scratch.0)?.count(), 1);
         Ok(())
     }
 

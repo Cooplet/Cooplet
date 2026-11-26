@@ -10,7 +10,9 @@ use std::{
 };
 
 use bytes::Bytes;
-use cooplet_platform::{AtomicPublish, PlatformError, PrivateFs, PublishOutcome, current_euid};
+use cooplet_platform::{
+    AtomicPublish, FileLock, PlatformError, PrivateFs, PublishOutcome, current_euid,
+};
 use cooplet_protocol::BlobId;
 use sha2::{Digest, Sha256};
 use tokio::sync::mpsc;
@@ -260,10 +262,13 @@ impl Disk {
 
 fn bind_root(root: &Path, database_path: &Path) -> Result<(), StorageError> {
     const OWNER: &str = "database.owner";
+    // The DB sidecar excludes another instance of this database. This
+    // short-lived lock serializes claims from differently configured databases.
+    let claim = FileLock::acquire_exclusive(&root.join("database-owner.lock"))?;
     let marker = root.join(OWNER);
     let owner = database_path.as_os_str().as_encoded_bytes();
-    let read = || PrivateFs::read_private_file(&marker, owner.len().max(4096) as u64);
-    let stored = match read() {
+    let max_owner_bytes = owner.len().max(4096) as u64;
+    let stored = match PrivateFs::read_private_file(&marker, max_owner_bytes) {
         Ok(stored) => stored,
         Err(PlatformError::Io(error)) if error.kind() == io::ErrorKind::NotFound => {
             // A root with data must have a durable owner before recovery may
@@ -278,8 +283,12 @@ fn bind_root(root: &Path, database_path: &Path) -> Result<(), StorageError> {
                     ));
                 }
             }
-            PrivateFs::create_private_file_atomic(root, OWNER, owner)?;
-            read()?
+            // The marker must have one name on either side of a crash. A
+            // link/unlink fallback can leave a durable two-link intermediate.
+            claim.verify_path()?;
+            discard_interrupted_claims(root, max_owner_bytes)?;
+            PrivateFs::write_private_file_atomic(root, OWNER, owner)?;
+            PrivateFs::read_private_file(&marker, max_owner_bytes)?
         }
         Err(error) => return Err(error.into()),
     };
@@ -291,6 +300,24 @@ fn bind_root(root: &Path, database_path: &Path) -> Result<(), StorageError> {
     // Also cover a previous claim whose rename was visible but directory
     // sync did not complete before shutdown.
     PrivateFs::open_dir_nofollow(root)?.sync_all()?;
+    Ok(())
+}
+
+fn discard_interrupted_claims(root: &Path, max_owner_bytes: u64) -> Result<(), StorageError> {
+    // Only marker initialization stages files in this directory. A crash
+    // before its rename can leave a private temporary file, never a marker alias.
+    for entry in fs::read_dir(root)? {
+        let entry = entry?;
+        let name = entry.file_name();
+        if name
+            .to_str()
+            .and_then(|name| name.strip_prefix(".tmp."))
+            .is_some_and(|name| name.len() == 32 && name.bytes().all(lower_hex))
+        {
+            PrivateFs::read_private_file(&entry.path(), max_owner_bytes)?;
+            fs::remove_file(entry.path())?;
+        }
+    }
     Ok(())
 }
 

@@ -25,16 +25,7 @@ impl AtomicPublish {
     ) -> Result<PublishOutcome, PlatformError> {
         let tmp_name = component(tmp_name)?;
         let final_name = component(final_name)?;
-        Self::publish_noreplace_at(stage_dir, &tmp_name, dest_dir, &final_name)
-    }
-
-    pub(crate) fn publish_noreplace_at(
-        stage_dir: &File,
-        tmp_name: &CStr,
-        dest_dir: &File,
-        final_name: &CStr,
-    ) -> Result<PublishOutcome, PlatformError> {
-        match rename_noreplace(stage_dir, tmp_name, dest_dir, final_name) {
+        match rename_noreplace(stage_dir, &tmp_name, dest_dir, &final_name) {
             Ok(()) => {
                 sync_dir(dest_dir, PublishStage::DestinationSync)?;
                 sync_dir(stage_dir, PublishStage::StagingSync)?;
@@ -49,7 +40,7 @@ impl AtomicPublish {
                     Some(libc::ENOSYS | libc::EINVAL | libc::EOPNOTSUPP)
                 ) =>
             {
-                publish_via_link(stage_dir, tmp_name, dest_dir, final_name)
+                publish_via_link(stage_dir, &tmp_name, dest_dir, &final_name)
             }
             Err(error) => Err(error.into()),
         }
