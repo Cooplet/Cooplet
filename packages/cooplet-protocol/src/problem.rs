@@ -7,11 +7,11 @@ use crate::RequestId;
 pub const PROBLEM_JSON_MEDIA_TYPE: &str = "application/problem+json";
 
 macro_rules! error_codes {
-    ($($variant:ident: $status:literal, $retryable:literal, $slug:literal, $title:literal;)*) => {
+    ($($variant:ident => $wire:tt: $status:literal, $retryable:literal, $slug:literal, $title:literal;)*) => {
         crate::wire::wire_string_enum! {
             #[derive(Hash)]
             pub enum ErrorCode {
-                $($variant,)*
+                $($variant => $wire,)*
             }
         }
 
@@ -46,30 +46,30 @@ macro_rules! error_codes {
 }
 
 error_codes! {
-    InvalidRequest: 400, false, "invalid-request", "Invalid request";
-    Unauthorized: 401, false, "unauthorized", "Unauthorized";
-    NodeRevoked: 401, false, "node-revoked", "Node revoked";
-    Forbidden: 403, false, "forbidden", "Forbidden";
-    AdminHumanRequired: 403, false, "admin-human-required", "Human administrator required";
-    NotFound: 404, false, "not-found", "Not found";
-    OperationConflict: 409, false, "operation-conflict", "Operation conflict";
-    OperationInProgress: 409, true, "operation-in-progress", "Operation in progress";
-    ParticipantBusy: 409, true, "participant-busy", "Participant busy";
-    AwaitingApproval: 409, true, "awaiting-approval", "Awaiting approval";
-    QuestionAlreadyAnswered: 409, false, "question-already-answered", "Question already answered";
-    QuestionExpired: 409, false, "question-expired", "Question expired";
-    PinConflict: 409, true, "pin-conflict", "Pin conflict";
-    BlobDigestMismatch: 409, false, "blob-digest-mismatch", "Blob digest mismatch";
-    HubIdentityMismatch: 409, false, "hub-identity-mismatch", "Hub identity mismatch";
-    ResyncRequired: 410, false, "resync-required", "Resync required";
-    BlobTooLarge: 413, false, "blob-too-large", "Blob too large";
-    PayloadTooLarge: 413, false, "payload-too-large", "Payload too large";
-    RateLimited: 429, true, "rate-limited", "Rate limited";
-    BridgeUnavailable: 502, true, "bridge-unavailable", "Bridge unavailable";
-    DeliveryUnknown: 503, false, "delivery-unknown", "Delivery outcome unknown";
-    Overloaded: 503, true, "overloaded", "Overloaded";
-    StorageFull: 507, false, "storage-full", "Storage full";
-    InternalError: 500, true, "internal-error", "Internal error";
+    InvalidRequest => "invalid_request": 400, false, "invalid-request", "Invalid request";
+    Unauthorized => "unauthorized": 401, false, "unauthorized", "Unauthorized";
+    NodeRevoked => "node_revoked": 401, false, "node-revoked", "Node revoked";
+    Forbidden => "forbidden": 403, false, "forbidden", "Forbidden";
+    AdminHumanRequired => "admin_human_required": 403, false, "admin-human-required", "Human administrator required";
+    NotFound => "not_found": 404, false, "not-found", "Not found";
+    OperationConflict => "operation_conflict": 409, false, "operation-conflict", "Operation conflict";
+    OperationInProgress => "operation_in_progress": 409, true, "operation-in-progress", "Operation in progress";
+    ParticipantBusy => "participant_busy": 409, true, "participant-busy", "Participant busy";
+    AwaitingApproval => "awaiting_approval": 409, true, "awaiting-approval", "Awaiting approval";
+    QuestionAlreadyAnswered => "question_already_answered": 409, false, "question-already-answered", "Question already answered";
+    QuestionExpired => "question_expired": 409, false, "question-expired", "Question expired";
+    PinConflict => "pin_conflict": 409, true, "pin-conflict", "Pin conflict";
+    BlobDigestMismatch => "blob_digest_mismatch": 409, false, "blob-digest-mismatch", "Blob digest mismatch";
+    HubIdentityMismatch => "hub_identity_mismatch": 409, false, "hub-identity-mismatch", "Hub identity mismatch";
+    ResyncRequired => "resync_required": 410, false, "resync-required", "Resync required";
+    BlobTooLarge => "blob_too_large": 413, false, "blob-too-large", "Blob too large";
+    PayloadTooLarge => "payload_too_large": 413, false, "payload-too-large", "Payload too large";
+    RateLimited => "rate_limited": 429, true, "rate-limited", "Rate limited";
+    BridgeUnavailable => "bridge_unavailable": 502, true, "bridge-unavailable", "Bridge unavailable";
+    DeliveryUnknown => "delivery_unknown": 503, false, "delivery-unknown", "Delivery outcome unknown";
+    Overloaded => "overloaded": 503, true, "overloaded", "Overloaded";
+    StorageFull => "storage_full": 507, false, "storage-full", "Storage full";
+    InternalError => "internal_error": 500, true, "internal-error", "Internal error";
 }
 
 crate::wire::wire_object! {

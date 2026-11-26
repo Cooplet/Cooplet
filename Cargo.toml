@@ -43,7 +43,6 @@ toml = "1"
 tracing = "0.1"
 url = "2"
 utoipa = "5"
-webpki-roots = "0.26"
 
 [workspace.lints.rust]
 unsafe_code = "forbid"

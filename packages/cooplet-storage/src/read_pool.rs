@@ -1,6 +1,9 @@
 use std::{
     collections::VecDeque,
-    sync::{Arc, Mutex, MutexGuard},
+    sync::{
+        Arc, Mutex, MutexGuard,
+        atomic::{AtomicBool, Ordering},
+    },
 };
 
 use cooplet_platform::FileLock;
@@ -17,6 +20,7 @@ struct Pool {
     permits: Arc<Semaphore>,
     config: StorageConfig,
     lock: Mutex<Option<Arc<FileLock>>>,
+    closed: AtomicBool,
 }
 
 impl ReadPool {
@@ -41,7 +45,12 @@ impl ReadPool {
             permits: Arc::new(Semaphore::new(config.read_pool_size as usize)),
             config,
             lock: Mutex::new(Some(lock)),
+            closed: AtomicBool::new(false),
         })))
+    }
+
+    pub(crate) fn mark_closed(&self) {
+        self.0.closed.store(true, Ordering::Release);
     }
 
     /// Run one synchronous read on a blocking thread. Any transaction left
@@ -51,6 +60,9 @@ impl ReadPool {
         T: Send + 'static,
         F: FnOnce(&Connection) -> Result<T, StorageError> + Send + 'static,
     {
+        if self.0.closed.load(Ordering::Acquire) {
+            return Err(StorageError::Closed);
+        }
         let permit = self
             .0
             .permits
@@ -58,9 +70,12 @@ impl ReadPool {
             .acquire_owned()
             .await
             .map_err(|_| StorageError::Closed)?;
+        if self.0.closed.load(Ordering::Acquire) {
+            return Err(StorageError::Closed);
+        }
         let pool = self.0.clone();
         tokio::task::spawn_blocking(move || {
-            let available = pool.connections().pop_front();
+            let available = pool.connections().pop_back();
             let connection = match available {
                 Some(connection) => connection,
                 None => pragma::open_readonly(&pool.config.db_path, &pool.config)?,
@@ -77,6 +92,7 @@ impl ReadPool {
     }
 
     pub(crate) async fn close(&self) -> Result<(), StorageError> {
+        self.mark_closed();
         let all = self
             .0
             .permits
@@ -116,9 +132,11 @@ struct ReadLease {
 
 impl Drop for ReadLease {
     fn drop(&mut self) {
+        if std::thread::panicking() {
+            return;
+        }
         if let Some(connection) = self.connection.take()
             && (connection.is_autocommit() || connection.execute_batch("ROLLBACK").is_ok())
-            && connection.pragma_update(None, "query_only", true).is_ok()
         {
             self.pool.connections().push_back(connection);
         }

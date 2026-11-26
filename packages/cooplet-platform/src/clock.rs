@@ -1,4 +1,5 @@
 use std::{
+    cmp::Ordering as CmpOrdering,
     sync::{
         Arc,
         atomic::{AtomicBool, Ordering},
@@ -8,8 +9,18 @@ use std::{
 
 use crate::PlatformError;
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct MonoInstant(Option<u128>);
+
+impl PartialOrd for MonoInstant {
+    fn partial_cmp(&self, other: &Self) -> Option<CmpOrdering> {
+        match (self.0, other.0) {
+            (Some(left), Some(right)) => Some(left.cmp(&right)),
+            // INVALID must never compare less than a deadline (fail-closed).
+            _ => None,
+        }
+    }
+}
 
 impl MonoInstant {
     pub const INVALID: Self = Self(None);
@@ -71,6 +82,8 @@ fn continuous_nanos() -> Result<u128, PlatformError> {
 
 #[cfg(target_os = "macos")]
 fn continuous_nanos() -> Result<u128, PlatformError> {
+    use std::sync::OnceLock;
+
     #[repr(C)]
     struct TimebaseInfo {
         numer: u32,
@@ -82,14 +95,22 @@ fn continuous_nanos() -> Result<u128, PlatformError> {
         fn mach_continuous_time() -> u64;
     }
 
-    let mut timebase = TimebaseInfo { numer: 0, denom: 0 };
-    // SAFETY: Mach writes the conversion ratio into valid storage. The clock
-    // has no arguments and is available on supported macOS installations.
-    let (status, ticks) = unsafe { (mach_timebase_info(&mut timebase), mach_continuous_time()) };
-    if status != 0 || timebase.denom == 0 || timebase.numer == 0 {
-        return Err(PlatformError::ClockUnavailable);
-    }
-    Ok(u128::from(ticks) * u128::from(timebase.numer) / u128::from(timebase.denom))
+    static TIMEBASE: OnceLock<(u32, u32)> = OnceLock::new();
+    let &(numer, denom) = match TIMEBASE.get() {
+        Some(ratio) => ratio,
+        None => {
+            let mut timebase = TimebaseInfo { numer: 0, denom: 0 };
+            // SAFETY: Mach writes the immutable hardware conversion ratio into valid storage.
+            let status = unsafe { mach_timebase_info(&mut timebase) };
+            if status != 0 || timebase.denom == 0 || timebase.numer == 0 {
+                return Err(PlatformError::ClockUnavailable);
+            }
+            TIMEBASE.get_or_init(|| (timebase.numer, timebase.denom))
+        }
+    };
+    // SAFETY: mach_continuous_time takes no arguments and has no preconditions.
+    let ticks = unsafe { mach_continuous_time() };
+    Ok(u128::from(ticks) * u128::from(numer) / u128::from(denom))
 }
 
 #[derive(Clone, Debug)]
@@ -122,10 +143,16 @@ impl AdmissionGuard {
     }
 
     pub fn remaining_ms(&self) -> Option<u64> {
+        if self.state.expired.load(Ordering::Acquire) {
+            return None;
+        }
         self.remaining_at(MonotonicClock::now())
     }
 
     fn remaining_at(&self, now: MonoInstant) -> Option<u64> {
+        if self.state.expired.load(Ordering::Acquire) {
+            return None;
+        }
         let Some(remaining) = self.state.deadline.remaining_ms_at(now) else {
             self.state.expired.store(true, Ordering::Release);
             return None;
@@ -153,5 +180,19 @@ mod tests {
         assert_eq!(guard.clone().remaining_at(MonoInstant::INVALID), None);
         assert_eq!(guard.remaining_at(start), None);
         assert!(AdmissionGuard::new(Duration::ZERO).is_expired());
+    }
+
+    #[test]
+    fn invalid_instant_never_compares_before_a_deadline() {
+        let deadline = MonoInstant(Some(100));
+        assert!(!MonoInstant::INVALID.lt(&deadline));
+        assert!(!MonoInstant::INVALID.le(&deadline));
+        assert!(!deadline.lt(&MonoInstant::INVALID));
+        assert_eq!(MonoInstant::INVALID.partial_cmp(&deadline), None);
+        assert_eq!(
+            MonoInstant::INVALID.partial_cmp(&MonoInstant::INVALID),
+            None
+        );
+        assert!(MonoInstant(Some(50)) < deadline);
     }
 }

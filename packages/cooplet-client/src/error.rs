@@ -30,12 +30,12 @@ pub enum ClientError {
     #[error("invalid client configuration or request: {0}")]
     InvalidInput(String),
     #[error("unexpected HTTP status {status}")]
-    UnexpectedStatus { status: u16, body_preview: String },
+    UnexpectedStatus { status: u16 },
     #[error("protocol error: {0}")]
     Protocol(String),
-    #[error("HTTP transport failed")]
+    #[error("HTTP transport failed: {0}")]
     Transport(#[source] Arc<reqwest::Error>),
-    #[error("I/O failed")]
+    #[error("I/O failed: {0}")]
     Io(#[source] Arc<io::Error>),
     #[error("timed out waiting for {0}")]
     Timeout(&'static str),
@@ -44,7 +44,7 @@ pub enum ClientError {
 impl fmt::Debug for ClientError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         // Structured data remains available to callers. Formatting never
-        // includes arbitrary response bodies, details or transport sources.
+        // includes arbitrary response bodies, details, URLs or credentials.
         fmt::Display::fmt(self, formatter)
     }
 }
@@ -74,7 +74,6 @@ impl ClientError {
         // A proxy or peer can reflect a secret in its error body.
         Self::UnexpectedStatus {
             status: status.as_u16(),
-            body_preview: String::new(),
         }
     }
 

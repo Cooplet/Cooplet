@@ -8,8 +8,8 @@ use std::{
     time::Duration,
 };
 
-use bytes::Bytes;
-use cooplet_protocol::{AttachmentRef, validate_sha256};
+use bytes::{Bytes, BytesMut};
+use cooplet_protocol::{AttachmentRef, validate_media_type, validate_sha256};
 use futures_util::stream;
 use http::{
     HeaderValue, Method, StatusCode,
@@ -85,12 +85,17 @@ impl CoopletClient {
             })
             .await?;
             check_length(0, count as u64)?;
+            let sha256 = (spec.verification == UploadVerification::LocalSha256)
+                .then(|| format!("{:x}", Sha256::digest([])));
+            if let (Some(expected), Some(actual)) =
+                (spec.expected_sha256.as_deref(), sha256.as_deref())
+            {
+                check_digest(expected, actual)?;
+            }
             let response = timeout(self.config.request_timeout, "blob upload response", async {
                 Ok(request.send().await?)
             })
             .await?;
-            let sha256 = (spec.verification == UploadVerification::LocalSha256)
-                .then(|| format!("{:x}", Sha256::digest([])));
             (response, Some(SourceStats { bytes: 0, sha256 }))
         } else {
             self.transmit_upload(request, &spec, &mut reader).await?
@@ -146,7 +151,7 @@ impl CoopletClient {
         spec: &BlobUploadSpec,
         reader: &mut (impl AsyncRead + Unpin),
     ) -> Result<(reqwest::Response, Option<SourceStats>), ClientError> {
-        let (send, receive) = mpsc::channel(1);
+        let (send, receive) = mpsc::channel(4);
         let progress = Arc::new(WireProgress::default());
         let request = request.body(wire_body(receive, progress.clone()));
         let (response, stats) = {
@@ -194,9 +199,7 @@ impl UploadHeaders {
             checked_blob_size(0, length, max_bytes)?;
         }
         let invalid_mime = || ClientError::invalid("invalid blob content type");
-        if parse_media_type(spec.mime_type.as_bytes()).is_none() {
-            return Err(invalid_mime());
-        }
+        validate_media_type(&spec.mime_type).map_err(|_| invalid_mime())?;
         let content_type = HeaderValue::from_str(&spec.mime_type).map_err(|_| invalid_mime())?;
         let filename = utf8_percent_encode(&spec.filename, NON_ALPHANUMERIC).to_string();
         let filename = HeaderValue::from_str(&filename)
@@ -206,65 +209,6 @@ impl UploadHeaders {
             content_type,
         })
     }
-}
-
-// RFC 9110 media-type with HTTP token, optional whitespace and quoted-string.
-fn parse_media_type(value: &[u8]) -> Option<()> {
-    let (top, rest) = token(skip_ows(value))?;
-    let (subtype, rest) = token(rest.strip_prefix(b"/")?)?;
-    if top == b"*" || subtype == b"*" {
-        return None;
-    }
-    let mut rest = skip_ows(rest);
-    while !rest.is_empty() {
-        rest = skip_ows(rest.strip_prefix(b";")?);
-        // The HTTP parameters grammar allows an empty parameter slot.
-        if rest.is_empty() || rest.starts_with(b";") {
-            continue;
-        }
-        let (_, value) = token(rest)?;
-        let value = value.strip_prefix(b"=")?;
-        rest = skip_ows(if let Some(quoted) = value.strip_prefix(b"\"") {
-            quoted_value(quoted)?
-        } else {
-            token(value)?.1
-        });
-    }
-    Some(())
-}
-
-fn skip_ows(value: &[u8]) -> &[u8] {
-    let start = value
-        .iter()
-        .position(|&byte| !matches!(byte, b' ' | b'\t'))
-        .unwrap_or(value.len());
-    &value[start..]
-}
-
-fn token(value: &[u8]) -> Option<(&[u8], &[u8])> {
-    let end = value
-        .iter()
-        .position(|&byte| !byte.is_ascii_alphanumeric() && !b"!#$%&'*+-.^_\x60|~".contains(&byte))
-        .unwrap_or(value.len());
-    (end != 0).then(|| value.split_at(end))
-}
-
-fn quoted_value(mut value: &[u8]) -> Option<&[u8]> {
-    while let Some((&byte, rest)) = value.split_first() {
-        value = match byte {
-            b'"' => return Some(rest),
-            b'\\' => {
-                let (&escaped, remaining) = rest.split_first()?;
-                if !matches!(escaped, b'\t' | b' '..=b'~' | 0x80..=0xff) {
-                    return None;
-                }
-                remaining
-            }
-            b'\t' | b' '..=b'~' | 0x80..=0xff => rest,
-            _ => return None,
-        };
-    }
-    None
 }
 
 enum UploadChunk {
@@ -321,14 +265,17 @@ async fn produce(
     progress_timeout: Duration,
 ) -> Result<Option<SourceStats>, ClientError> {
     let mut digest = (spec.verification == UploadVerification::LocalSha256).then(Sha256::new);
-    let mut buffer = vec![0; CHUNK_BYTES];
+    let mut buffer = BytesMut::with_capacity(CHUNK_BYTES);
     let mut bytes = 0;
     let mut last = None;
     loop {
+        if buffer.capacity() < CHUNK_BYTES {
+            buffer.reserve(CHUNK_BYTES);
+        }
         let count = timeout(progress_timeout, "blob source progress", async {
             tokio::select! {
                 biased;
-                read = reader.read(&mut buffer) => Ok(Some(read?)),
+                read = reader.read_buf(&mut buffer) => Ok(Some(read?)),
                 () = send.closed() => Ok(None),
             }
         })
@@ -346,10 +293,11 @@ async fn produce(
                 actual: bytes,
             });
         }
+        let data = buffer.split().freeze();
         if let Some(digest) = &mut digest {
-            digest.update(&buffer[..count]);
+            digest.update(&data);
         }
-        let chunk = UploadChunk::Data(Bytes::copy_from_slice(&buffer[..count]));
+        let chunk = UploadChunk::Data(data);
         // The transport may stop polling when Content-Length is reached.
         // Keep that last chunk until the source independently reaches EOF.
         if spec.content_length == Some(bytes) {
@@ -361,6 +309,12 @@ async fn produce(
     if let Some(expected) = spec.content_length {
         check_length(expected, bytes)?;
     }
+    let sha256 = digest.map(|state| format!("{:x}", state.finalize()));
+    // Verify a locally proven SHA-256 against expected_sha256 BEFORE releasing
+    // the held final chunk so an early 200 OK can never mask a digest mismatch.
+    if let (Some(expected), Some(actual)) = (spec.expected_sha256.as_deref(), sha256.as_deref()) {
+        check_digest(expected, actual)?;
+    }
     if let Some(last) = last
         && !send_chunk(&send, last, progress_timeout).await?
     {
@@ -371,10 +325,7 @@ async fn produce(
     {
         return Ok(None);
     }
-    Ok(Some(SourceStats {
-        bytes,
-        sha256: digest.map(|state| format!("{:x}", state.finalize())),
-    }))
+    Ok(Some(SourceStats { bytes, sha256 }))
 }
 
 async fn send_chunk(

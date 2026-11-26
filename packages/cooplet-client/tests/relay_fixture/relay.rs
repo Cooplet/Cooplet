@@ -53,7 +53,8 @@ impl GcHooks for Registry {
 
     fn fetch_pending_blob_tombstones(
         &self,
-        _: &Transaction<'_>,
+        _: &Connection,
+        _: Option<&BlobTombstone>,
         _: usize,
     ) -> rusqlite::Result<Vec<BlobTombstone>> {
         Ok(Vec::new())

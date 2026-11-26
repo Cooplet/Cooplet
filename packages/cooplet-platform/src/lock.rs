@@ -1,7 +1,7 @@
 use std::{
-    fs::{self, File, Metadata, OpenOptions, TryLockError},
+    fs::{self, File, Metadata, OpenOptions, Permissions, TryLockError},
     io,
-    os::unix::fs::{MetadataExt, OpenOptionsExt},
+    os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt},
     path::{Path, PathBuf},
     thread,
     time::Duration,
@@ -27,19 +27,12 @@ pub struct FileLock {
 impl FileLock {
     pub fn acquire_exclusive(path: &Path) -> Result<Self, PlatformError> {
         let path = sidecar_path(path)?;
-        let file = OpenOptions::new()
-            .read(true)
-            .write(true)
-            .create(true)
-            .truncate(false)
-            .mode(0o600)
-            .custom_flags(NOFOLLOW_FILE)
-            .open(&path)?;
-        let lock = Self { file, path };
-        lock.verify_path()?;
+        let file = open_or_create_sidecar(&path)?;
+        verified_lock_metadata(&file, &path)?;
         for attempt in 0..5 {
-            match lock.file.try_lock() {
+            match file.try_lock() {
                 Ok(()) => {
+                    let lock = Self { file, path };
                     lock.verify_path()?;
                     return Ok(lock);
                 }
@@ -64,40 +57,67 @@ impl FileLock {
             Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(LockProbe::Idle),
             Err(error) => return Err(error.into()),
         };
-        let lock = Self { file, path };
-        lock.verify_path()?;
-        let state = match lock.file.try_lock_shared() {
-            Ok(()) => LockProbe::Idle,
-            Err(TryLockError::WouldBlock) => LockProbe::OwnedByLiveProcess,
-            Err(TryLockError::Error(error)) => return Err(error.into()),
-        };
-        lock.verify_path()?;
-        if state == LockProbe::Idle {
-            lock.file.unlock()?;
+        verified_lock_metadata(&file, &path)?;
+        match file.try_lock_shared() {
+            Ok(()) => {
+                let verified = verified_lock_metadata(&file, &path);
+                let unlocked = file.unlock();
+                verified?;
+                unlocked?;
+                Ok(LockProbe::Idle)
+            }
+            Err(TryLockError::WouldBlock) => {
+                verified_lock_metadata(&file, &path)?;
+                Ok(LockProbe::OwnedByLiveProcess)
+            }
+            Err(TryLockError::Error(error)) => Err(error.into()),
         }
-        Ok(state)
     }
 
     pub fn verify_path(&self) -> Result<(), PlatformError> {
-        self.verified_metadata().map(|_| ())
+        verified_lock_metadata(&self.file, &self.path).map(|_| ())
     }
 
     /// Check whether this lock already owns the file at another path.
     pub fn protects_path(&self, path: &Path) -> Result<bool, PlatformError> {
-        let opened = self.verified_metadata()?;
+        let opened = verified_lock_metadata(&self.file, &self.path)?;
         match fs::symlink_metadata(path) {
             Ok(current) => Ok((current.dev(), current.ino()) == (opened.dev(), opened.ino())),
             Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(false),
             Err(error) => Err(error.into()),
         }
     }
+}
 
-    fn verified_metadata(&self) -> Result<Metadata, PlatformError> {
-        let metadata = self.file.metadata()?;
-        verify_path(&self.path, &metadata)?;
-        verify_private_file(&self.path, &metadata, 0o600)?;
-        Ok(metadata)
+fn open_or_create_sidecar(path: &Path) -> Result<File, PlatformError> {
+    match OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create_new(true)
+        .mode(0o600)
+        .custom_flags(NOFOLLOW_FILE)
+        .open(path)
+    {
+        Ok(file) => {
+            // Ensure exact 0600 on newly created lockfiles even under a strict umask.
+            file.set_permissions(Permissions::from_mode(0o600))?;
+            Ok(file)
+        }
+        Err(error) if error.kind() == io::ErrorKind::AlreadyExists => Ok(OpenOptions::new()
+            .read(true)
+            .write(true)
+            .truncate(false)
+            .custom_flags(NOFOLLOW_FILE)
+            .open(path)?),
+        Err(error) => Err(error.into()),
     }
+}
+
+fn verified_lock_metadata(file: &File, path: &Path) -> Result<Metadata, PlatformError> {
+    let metadata = file.metadata()?;
+    verify_path(path, &metadata)?;
+    verify_private_file(path, &metadata, 0o600)?;
+    Ok(metadata)
 }
 
 impl Drop for FileLock {

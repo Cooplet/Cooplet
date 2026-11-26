@@ -49,7 +49,7 @@ impl ProcessIdentity {
         let pid = self.validated_pid()?;
         match sys::capture(pid) {
             Ok((snapshot, token)) => {
-                if !self.matches(&snapshot, &token) {
+                if !self.matches_for_probe(&snapshot, &token) {
                     Ok(ProcessProbe::IdentityMismatch)
                 } else if snapshot.exited {
                     Ok(ProcessProbe::Exited)
@@ -70,22 +70,36 @@ impl ProcessIdentity {
         Ok(pid)
     }
 
+    #[cfg(target_os = "linux")]
     fn matches(&self, snapshot: &Snapshot, token: &str) -> bool {
         u32::try_from(snapshot.pgid) == Ok(self.pgid)
             && snapshot.uid == current_euid()
             && token == self.start_token
     }
+
+    fn matches_for_probe(&self, snapshot: &Snapshot, token: &str) -> bool {
+        u32::try_from(snapshot.pgid) == Ok(self.pgid)
+            && snapshot.uid == current_euid()
+            && sys::tokens_match_for_probe(&self.start_token, token)
+    }
+}
+
+fn own_pgid() -> libc::pid_t {
+    // SAFETY: getpgrp has no arguments or caller-side preconditions.
+    unsafe { libc::getpgrp() }
 }
 
 fn group_leader(pid: u32, pgid: u32) -> Result<libc::pid_t, PlatformError> {
     if pid == pgid
         && pid > 1
+        && pid != std::process::id()
         && let Ok(pid) = libc::pid_t::try_from(pid)
+        && pid != own_pgid()
     {
         return Ok(pid);
     }
     Err(PlatformError::InvalidProcessIdentity(
-        "expected a positive group leader PID greater than one".into(),
+        "expected a positive child group leader PID distinct from this process".into(),
     ))
 }
 
@@ -154,12 +168,21 @@ impl ProcessHandle {
         command: &mut Command,
         capture: impl FnOnce(u32, u32) -> Result<ProcessIdentity, PlatformError>,
     ) -> Result<Self, SpawnError> {
-        let child = command
+        let mut child = command
             .process_group(0)
             .spawn()
             .map_err(SpawnError::Spawn)?;
         let pid = child.id();
+        let pid_os = match group_leader(pid, pid) {
+            Ok(pid_os) => pid_os,
+            Err(source) => {
+                let _ = child.kill();
+                let _ = child.wait();
+                return Err(SpawnError::Capture(source));
+            }
+        };
         let mut group = OwnedGroup {
+            pid: pid_os,
             child,
             stop: StopState::default(),
             done: None,
@@ -203,7 +226,18 @@ impl ProcessHandle {
         if self.group.done.is_some() {
             return Ok(true);
         }
-        Ok(observe_owned_exit(self.identity.validated_pid()?)?)
+        Ok(observe_owned_exit(self.group.pid)?)
+    }
+
+    /// Open a Linux `pidfd` referencing this managed group leader for async
+    /// readiness monitoring (for example with `tokio::io::unix::AsyncFd`).
+    #[cfg(target_os = "linux")]
+    pub fn try_open_pidfd(&self) -> Result<std::os::fd::OwnedFd, PlatformError> {
+        if self.group.done.is_some() {
+            return Err(io::Error::from_raw_os_error(libc::ESRCH).into());
+        }
+        observe_owned_exit(self.group.pid)?;
+        Ok(sys::open_pidfd(self.group.pid)?)
     }
 
     pub fn terminate_and_reap(&mut self, grace: Duration) -> Result<Termination, PlatformError> {
@@ -223,9 +257,25 @@ impl ProcessHandle {
 
 #[derive(Debug)]
 struct OwnedGroup {
+    pid: libc::pid_t,
     child: Child,
     stop: StopState,
     done: Option<Termination>,
+}
+
+impl Drop for OwnedGroup {
+    fn drop(&mut self) {
+        if self.done.is_some() {
+            return;
+        }
+        // Fail-safe non-blocking cleanup if the handle is dropped without an
+        // explicit terminate_and_reap: only signal when WNOWAIT still proves
+        // our private Child anchors this PID.
+        if observe_owned_exit(self.pid).is_ok() {
+            let _ = send_signal(-self.pid, libc::SIGKILL);
+            let _ = self.child.try_wait();
+        }
+    }
 }
 
 impl OwnedGroup {
@@ -233,17 +283,18 @@ impl OwnedGroup {
         if let Some(done) = self.done {
             return Ok(done);
         }
-        let pid = group_leader(self.child.id(), self.child.id())?;
+        let pid = self.pid;
         let Ok(exited) = observe_owned_exit(pid) else {
             return Ok(unverified());
         };
+        let proc_visible = sys::prepare_group_visibility().is_ok();
         let mut leader_exited = exited;
         let outcome = self.stop.drive(
             grace,
             || {
                 leader_exited = observe_owned_exit(pid)?;
                 if leader_exited {
-                    sys::group_gone(pid)
+                    sys::group_gone(pid, proc_visible)
                 } else {
                     Ok(false)
                 }
@@ -322,7 +373,8 @@ impl StopState {
         if wait_for_group(
             MonotonicClock::deadline_after(KILL_CONFIRM_TIMEOUT),
             &mut gone,
-        ) {
+        ) || gone().is_ok_and(|gone| gone)
+        {
             TerminateOutcome::KilledAfterGrace
         } else {
             TerminateOutcome::CleanupUnverified
@@ -344,13 +396,12 @@ fn after_signal_error(
 
 fn wait_for_group(deadline: MonoInstant, gone: &mut impl FnMut() -> io::Result<bool>) -> bool {
     while MonotonicClock::remaining_ms(deadline).is_some() {
-        let observed_gone = gone().is_ok_and(|gone| gone);
+        if gone().is_ok_and(|gone| gone) {
+            return true;
+        }
         let Some(remaining) = MonotonicClock::remaining_ms(deadline) else {
             return false;
         };
-        if observed_gone {
-            return true;
-        }
         thread::sleep(POLL_INTERVAL.min(Duration::from_millis(remaining)));
     }
     false
@@ -363,20 +414,27 @@ struct Snapshot {
 }
 
 fn observe_owned_exit(pid: libc::pid_t) -> io::Result<bool> {
-    let mut info = MaybeUninit::<libc::siginfo_t>::zeroed();
-    // SAFETY: the output buffer is valid and zero initialized. si_pid is
-    // accessed only after a successful WEXITED request for this child.
-    unsafe {
-        if libc::waitid(
-            libc::P_PID,
-            pid as _,
-            info.as_mut_ptr(),
-            libc::WEXITED | libc::WNOWAIT | libc::WNOHANG,
-        ) != 0
-        {
-            return Err(io::Error::last_os_error());
+    loop {
+        let mut info = MaybeUninit::<libc::siginfo_t>::zeroed();
+        // SAFETY: the output buffer is valid and zero initialized. si_pid is
+        // accessed only after a successful WEXITED request for this child.
+        let result = unsafe {
+            if libc::waitid(
+                libc::P_PID,
+                pid as _,
+                info.as_mut_ptr(),
+                libc::WEXITED | libc::WNOWAIT | libc::WNOHANG,
+            ) != 0
+            {
+                Err(io::Error::last_os_error())
+            } else {
+                Ok(info.assume_init().si_pid() == pid)
+            }
+        };
+        match result {
+            Err(error) if error.kind() == io::ErrorKind::Interrupted => continue,
+            other => return other,
         }
-        Ok(info.assume_init().si_pid() == pid)
     }
 }
 
@@ -531,17 +589,31 @@ mod tests {
     }
 
     #[test]
-    fn a_confirmation_that_finishes_after_the_kill_deadline_is_inconclusive() {
+    fn accepts_confirmation_that_completes_after_deadline() {
+        let deadline = MonotonicClock::deadline_after(Duration::from_millis(5));
+        assert!(wait_for_group(deadline, &mut || {
+            thread::sleep(Duration::from_millis(10));
+            Ok(true)
+        }));
         let deadline = MonotonicClock::deadline_after(Duration::from_millis(5));
         assert!(!wait_for_group(deadline, &mut || {
             thread::sleep(Duration::from_millis(10));
-            Ok(true)
+            Ok(false)
         }));
     }
 
     #[test]
     fn rejects_unsafe_identity_and_preserves_uncertain_cleanup_state() {
-        for (pid, pgid) in [(0, 0), (1, 1), (11, 10), (u32::MAX, u32::MAX)] {
+        let self_pid = std::process::id();
+        let self_pgid = u32::try_from(own_pgid()).unwrap_or(self_pid);
+        for (pid, pgid) in [
+            (0, 0),
+            (1, 1),
+            (11, 10),
+            (u32::MAX, u32::MAX),
+            (self_pid, self_pid),
+            (self_pgid, self_pgid),
+        ] {
             assert!(ProcessIdentity::capture(pid, pgid).is_err());
         }
         let signals = RefCell::new(Vec::new());
@@ -565,6 +637,80 @@ mod tests {
             TerminateOutcome::KilledAfterGrace
         );
         assert_eq!(*signals.borrow(), [libc::SIGTERM, libc::SIGKILL]);
+    }
+
+    #[test]
+    fn dropping_handle_kills_live_group_as_failsafe() -> TestResult {
+        let mut command = Command::new("sh");
+        command.args(["-c", "exec sleep 20"]);
+        let handle = ProcessHandle::spawn_isolated_group(&mut command)?;
+        let identity = handle.identity().clone();
+        let pgid = libc::pid_t::try_from(identity.pgid)?;
+        drop(handle);
+        let deadline = MonotonicClock::deadline_after(Duration::from_secs(2));
+        while MonotonicClock::remaining_ms(deadline).is_some() {
+            let probe = identity.probe()?;
+            if matches!(probe, ProcessProbe::Exited | ProcessProbe::Missing)
+                && sys::group_gone(pgid, true)?
+            {
+                return Ok(());
+            }
+            thread::sleep(POLL_INTERVAL);
+        }
+        Err("dropped process group remained alive".into())
+    }
+
+    #[test]
+    fn graceful_termination_survives_background_process_churn() -> TestResult {
+        use std::sync::{
+            Arc,
+            atomic::{AtomicBool, Ordering},
+        };
+
+        let stop = Arc::new(AtomicBool::new(false));
+        let workers: Vec<_> = (0..2)
+            .map(|_| {
+                let stop = Arc::clone(&stop);
+                thread::spawn(move || {
+                    while !stop.load(Ordering::Relaxed) {
+                        let _ = Command::new("true").status();
+                    }
+                })
+            })
+            .collect();
+
+        let result: TestResult = (|| {
+            for _ in 0..3 {
+                let mut command = Command::new("sh");
+                command.args(["-c", "exec sleep 20"]);
+                let mut handle = ProcessHandle::spawn_isolated_group(&mut command)?;
+                let termination = handle.terminate_and_reap(Duration::from_millis(400))?;
+                assert_eq!(termination.outcome, TerminateOutcome::TerminatedGracefully);
+                assert!(termination.leader_status.is_some());
+            }
+            Ok(())
+        })();
+
+        stop.store(true, Ordering::Relaxed);
+        for worker in workers {
+            let _ = worker.join();
+        }
+        result
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn try_open_pidfd_tracks_owned_leader_until_reaped() -> TestResult {
+        let mut command = Command::new("sh");
+        command.args(["-c", "exec sleep 20"]);
+        let mut handle = ProcessHandle::spawn_isolated_group(&mut command)?;
+        let pidfd = handle.try_open_pidfd()?;
+        assert!(!sys::pidfd_exited(&pidfd)?);
+        let outcome = handle.terminate_and_reap(Duration::from_millis(400))?;
+        assert_eq!(outcome.outcome, TerminateOutcome::TerminatedGracefully);
+        assert!(sys::pidfd_exited(&pidfd)?);
+        assert!(handle.try_open_pidfd().is_err());
+        Ok(())
     }
 
     #[cfg(target_os = "linux")]

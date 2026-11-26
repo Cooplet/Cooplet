@@ -44,9 +44,13 @@ pub trait GcHooks: Send + Sync + 'static {
         limit: usize,
     ) -> rusqlite::Result<GcBatchOutcome>;
 
+    /// Fetch up to `limit` pending tombstones ordered by `(deleted_at_ms, blob_id)`.
+    /// When `after` is `Some`, return only entries strictly after
+    /// `(after.deleted_at_ms, after.record.blob_id)`.
     fn fetch_pending_blob_tombstones(
         &self,
-        tx: &Transaction<'_>,
+        connection: &Connection,
+        after: Option<&BlobTombstone>,
         limit: usize,
     ) -> rusqlite::Result<Vec<BlobTombstone>>;
 

@@ -1,10 +1,11 @@
 mod common;
 
 use std::{
-    collections::BTreeMap,
+    collections::{BTreeMap, HashSet},
     convert::Infallible,
-    fs, io,
-    os::unix::fs::MetadataExt,
+    fs::{self, Permissions},
+    io,
+    os::unix::fs::{MetadataExt, PermissionsExt},
     path::PathBuf,
     pin::Pin,
     sync::{
@@ -45,6 +46,7 @@ struct Registry {
     failure_before_ack: Mutex<Option<Pause>>,
     pause_after_lookup: Mutex<Option<Pause>>,
     stale_candidate: Mutex<Option<BlobTombstone>>,
+    always_fail_ack: Mutex<HashSet<BlobId>>,
 }
 
 struct Pause {
@@ -71,7 +73,8 @@ impl GcHooks for Registry {
 
     fn fetch_pending_blob_tombstones(
         &self,
-        tx: &Transaction<'_>,
+        connection: &Connection,
+        after: Option<&BlobTombstone>,
         limit: usize,
     ) -> rusqlite::Result<Vec<BlobTombstone>> {
         let stale = self
@@ -82,21 +85,37 @@ impl GcHooks for Registry {
         if let Some(stale) = stale {
             return Ok(vec![stale]);
         }
-        let mut query = tx.prepare("SELECT id,path,bytes,deleted FROM objects WHERE deleted IS NOT NULL ORDER BY deleted,id LIMIT ?")?;
-        query
-            .query_map([limit], |row| {
-                let text: String = row.get(0)?;
-                let id = text.parse().map_err(|_| rusqlite::Error::InvalidQuery)?;
-                Ok(BlobTombstone {
-                    record: BlobRecord {
-                        blob_id: id,
-                        disk_rel_path: PathBuf::from(row.get::<_, String>(1)?),
-                        size_bytes: row.get(2)?,
-                    },
-                    deleted_at_ms: row.get(3)?,
-                })
-            })?
-            .collect()
+        let map_row = |row: &rusqlite::Row<'_>| -> rusqlite::Result<BlobTombstone> {
+            let text: String = row.get(0)?;
+            let id = text.parse().map_err(|_| rusqlite::Error::InvalidQuery)?;
+            Ok(BlobTombstone {
+                record: BlobRecord {
+                    blob_id: id,
+                    disk_rel_path: PathBuf::from(row.get::<_, String>(1)?),
+                    size_bytes: row.get(2)?,
+                },
+                deleted_at_ms: row.get(3)?,
+            })
+        };
+        if let Some(cursor) = after {
+            let mut query = connection.prepare(
+                "SELECT id,path,bytes,deleted FROM objects
+                 WHERE deleted IS NOT NULL AND (deleted, id) > (?1, ?2)
+                 ORDER BY deleted,id LIMIT ?3",
+            )?;
+            query
+                .query_map(
+                    params![cursor.deleted_at_ms, cursor.record.blob_id.as_str(), limit],
+                    map_row,
+                )?
+                .collect()
+        } else {
+            let mut query = connection.prepare(
+                "SELECT id,path,bytes,deleted FROM objects
+                 WHERE deleted IS NOT NULL ORDER BY deleted,id LIMIT ?1",
+            )?;
+            query.query_map([limit], map_row)?.collect()
+        }
     }
 
     fn ack_blob_tombstone(
@@ -104,6 +123,14 @@ impl GcHooks for Registry {
         tx: &Transaction<'_>,
         observed: &BlobTombstone,
     ) -> rusqlite::Result<bool> {
+        if self
+            .always_fail_ack
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .contains(&observed.record.blob_id)
+        {
+            return Err(rusqlite::Error::InvalidQuery);
+        }
         let failure = self
             .failure_before_ack
             .lock()
@@ -239,7 +266,12 @@ async fn stores_sealed_contents_only_after_valid_eof_and_checks_bounds() -> Test
     assert!(name.chars().count() <= 120 && name.len() <= 255);
     assert_eq!(safe_disk_name(&name), name);
 
-    for (original, expected) in [(" .?", "file.bin"), (" ..", "file.bin"), ("a.?", "a._")] {
+    for (original, expected) in [
+        (" .?", "file.bin"),
+        (" ..", "file.bin"),
+        (" ..txt", "file.bin"),
+        ("a.?", "a._"),
+    ] {
         let mut upload = input(BlobId::generate()?);
         upload.original_name = original.into();
         let normalized = safe_disk_name(original);
@@ -760,6 +792,7 @@ async fn lost_database_preserves_the_claimed_root_until_the_registry_is_restored
     for zero_length in [false, true] {
         if zero_length {
             fs::File::create(&config.db_path)?;
+            fs::set_permissions(&config.db_path, Permissions::from_mode(0o600))?;
         }
         for _ in 0..2 {
             assert!(matches!(
@@ -852,8 +885,10 @@ async fn interrupted_initial_claim_is_recoverable_and_concurrent_claims_have_one
     let (left_config, blobs) = configs(&scratch);
     let right_config = StorageConfig::new(scratch.0.join("second.sqlite3"));
     let root = PrivateFs::ensure_private_dir(&blobs.root)?;
-    let partial = ".tmp.0123456789abcdef0123456789abcdef";
+    let partial = ".tmp.database.owner.0123456789abcdef0123456789abcdef";
+    let unrelated = ".tmp.other.0123456789abcdef0123456789abcdef";
     PrivateFs::write_private_file_atomic(&root, partial, b"interrupted initialization")?;
+    PrivateFs::write_private_file_atomic(&root, unrelated, b"keep unrelated")?;
 
     let registry = Arc::new(Registry::default());
     let (left, right) = tokio::join!(
@@ -876,6 +911,8 @@ async fn interrupted_initial_claim_is_recoverable_and_concurrent_claims_have_one
         _ => return Err("exactly one database must provision the root".into()),
     };
     assert!(!root.join(partial).exists());
+    assert!(root.join(unrelated).is_file());
+    fs::remove_file(root.join(unrelated))?;
     let marker = root.join("database.owner");
     assert_eq!(marker.metadata()?.nlink(), 1);
     assert_eq!(marker.metadata()?.mode() & 0o777, 0o600);
@@ -902,41 +939,67 @@ async fn interrupted_initial_claim_is_recoverable_and_concurrent_claims_have_one
 }
 
 #[tokio::test]
-async fn root_claim_reuses_the_database_sidecar_if_its_path_coincides() -> TestResult {
+async fn blob_root_must_be_distinct_and_validated_before_mutating_database() -> TestResult {
     let scratch = Scratch::new()?;
-    let config = StorageConfig::new(scratch.0.join("database-owner.sqlite3"));
-    let blobs = BlobStoreConfig::new(&scratch.0);
     let registry = Arc::new(Registry::default());
-    let engine = StorageEngine::open_managed(
+
+    // Zero max_blob_bytes fails before creating the SQLite file.
+    let (config, mut zero_limit) = configs(&scratch);
+    zero_limit.max_blob_bytes = 0;
+    assert!(matches!(
+        StorageEngine::open_managed(config.clone(), SCHEMA, registry.clone(), Some(zero_limit))
+            .await,
+        Err(StorageError::InvalidConfig(_))
+    ));
+    assert!(!config.db_path.try_exists()?);
+
+    // Co-located blob_root == db_path.parent() is rejected before mutating SQLite.
+    let colocated = BlobStoreConfig::new(&scratch.0);
+    assert!(matches!(
+        StorageEngine::open_managed(config.clone(), SCHEMA, registry.clone(), Some(colocated))
+            .await,
+        Err(StorageError::InvalidConfig(_))
+    ));
+    assert!(!config.db_path.try_exists()?);
+
+    // An existing database opened with a blob root owned by another database must fail
+    // BEFORE running migrations or converting journal_mode.
+    let (_, blobs) = configs(&scratch);
+    let owner = StorageEngine::open_managed(
         config.clone(),
         SCHEMA,
         registry.clone(),
         Some(blobs.clone()),
     )
     .await?;
-    let same = StorageEngine::open_managed(
-        config.clone(),
-        SCHEMA,
-        registry.clone(),
-        Some(blobs.clone()),
-    )
-    .await;
+    owner.shutdown().await?;
+
+    let other_path = scratch.0.join("other.sqlite3");
+    let other_engine = StorageEngine::open(StorageConfig::new(&other_path), SCHEMA).await?;
+    other_engine.shutdown().await?;
+    Connection::open(&other_path)?.execute_batch("PRAGMA journal_mode=DELETE")?;
+    let before = fs::read(&other_path)?;
+    let upgraded = [
+        SCHEMA[0],
+        Migration {
+            version: 2,
+            name: "must_not_run",
+            sql: "CREATE TABLE rogue(x INTEGER)",
+        },
+    ];
     assert!(matches!(
-        same,
-        Err(StorageError::Platform(
-            cooplet_platform::PlatformError::LockBusy
+        StorageEngine::open_managed(
+            StorageConfig::new(&other_path),
+            &upgraded,
+            registry,
+            Some(blobs),
+        )
+        .await,
+        Err(StorageError::InvalidConfig(
+            "blob root belongs to another database"
         ))
     ));
-    let (stored, ()) = engine
-        .blobs()
-        .ok_or("missing store")?
-        .store(input(BlobId::generate()?), &b"hello"[..], register)
-        .await?;
-    engine.shutdown().await?;
-    let engine = StorageEngine::open_managed(config, SCHEMA, registry, Some(blobs)).await?;
-    assert_eq!(engine.blobs().ok_or("missing store")?.used_bytes(), 5);
-    assert_eq!(fs::read(stored.absolute_path)?, b"hello");
-    engine.shutdown().await?;
+    assert_eq!(fs::read(&other_path)?, before);
     Ok(())
 }
 
@@ -960,14 +1023,17 @@ async fn checked_open_requires_an_existing_nonempty_database() -> TestResult {
             Err(StorageError::DatabaseMissing)
         ));
         assert!(!path.try_exists()?);
+        assert!(!path.with_extension("lock").try_exists()?);
     }
     assert!(!missing_dir.try_exists()?);
     fs::File::create_new(&config.db_path)?;
+    fs::set_permissions(&config.db_path, Permissions::from_mode(0o600))?;
     assert!(matches!(
         open(config.clone()).await,
         Err(StorageError::IncompatibleDatabase(_))
     ));
     assert_eq!(fs::metadata(&config.db_path)?.len(), 0);
+    assert!(!config.db_path.with_extension("lock").try_exists()?);
     assert!(!blobs.root.try_exists()?);
     Ok(())
 }
@@ -1135,5 +1201,124 @@ async fn checked_open_reads_identity_committed_in_the_wal() -> TestResult {
     )
     .await?;
     engine.shutdown().await?;
+    Ok(())
+}
+
+#[tokio::test]
+async fn tombstone_gc_paginates_past_deferred_entries_and_parallel_reads_share_slots() -> TestResult
+{
+    let scratch = Scratch::new()?;
+    let (config, blobs) = configs(&scratch);
+    let registry = Arc::new(Registry::default());
+    let engine = StorageEngine::open_managed(config, SCHEMA, registry.clone(), Some(blobs)).await?;
+    let store = engine.blobs().ok_or("missing store")?;
+
+    // Concurrent open_blob reads on the same BlobId run concurrently (shared RwLock read).
+    let shared_id = BlobId::generate()?;
+    let (shared, ()) = store
+        .store(input(shared_id.clone()), &b"hello"[..], register)
+        .await?;
+    let (entered, visible) = oneshot::channel();
+    let (release, paused) = mpsc::channel();
+    *registry
+        .pause_after_lookup
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(Pause {
+        entered,
+        release: paused,
+    });
+    let s1 = store.clone();
+    let id1 = shared_id.clone();
+    let first_read = tokio::spawn(async move { s1.open_blob(&id1).await });
+    visible.await?;
+    let second_read = tokio::time::timeout(Duration::from_secs(1), store.open_blob(&shared_id))
+        .await??
+        .ok_or("second concurrent read missing")?;
+    assert_eq!(second_read.0, shared.record());
+    release.send(())?;
+    assert!(first_read.await??.is_some());
+
+    // Tombstone 202 blobs where the first fails ack; pagination must still clean #2..#202.
+    let mut stuck_id = None;
+    let mut ids = Vec::with_capacity(202);
+    for i in 0..202 {
+        let id = BlobId::generate()?;
+        let (stored, ()) = store.store(input(id.clone()), &b"x"[..], register).await?;
+        if i == 0 {
+            stuck_id = Some(id.clone());
+        }
+        ids.push(stored);
+    }
+    let stuck_id = stuck_id.ok_or("missing stuck id")?;
+    registry
+        .always_fail_ack
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .insert(stuck_id.clone());
+    engine
+        .db()
+        .write_sqlite(move |tx| {
+            for (idx, stored) in ids.iter().enumerate() {
+                tx.execute(
+                    "UPDATE objects SET deleted = ?1 WHERE id = ?2",
+                    params![(idx as i64) + 1, stored.blob_id.as_str()],
+                )?;
+            }
+            Ok(WriteOutcome::new(()))
+        })
+        .await?;
+    let report = engine.gc_once(999).await?;
+    assert_eq!(report.tombstones_deferred, 1);
+    assert_eq!(report.tombstones_completed, 201);
+    assert!(!report.has_more);
+    assert_eq!(store.used_bytes(), 5);
+    engine.shutdown().await?;
+    Ok(())
+}
+
+#[tokio::test]
+async fn recovery_unlinks_separate_sibling_and_rejects_same_inode_alias() -> TestResult {
+    let scratch = Scratch::new()?;
+    let (config, blobs) = configs(&scratch);
+    let registry = Arc::new(Registry::default());
+    let engine = StorageEngine::open_managed(
+        config.clone(),
+        SCHEMA,
+        registry.clone(),
+        Some(blobs.clone()),
+    )
+    .await?;
+    let store = engine.blobs().ok_or("missing store")?;
+    let (live, ()) = store
+        .store(input(BlobId::generate()?), &b"hello"[..], register)
+        .await?;
+    engine.shutdown().await?;
+
+    // Place a separate-inode orphan sibling in the same <blob_id> directory.
+    let sibling_dir = live.absolute_path.parent().ok_or("missing parent")?;
+    let separate_orphan = sibling_dir.join("stale.txt");
+    fs::write(&separate_orphan, b"old")?;
+    PrivateFs::seal_readonly(&fs::File::open(&separate_orphan)?)?;
+
+    let engine = StorageEngine::open_managed(
+        config.clone(),
+        SCHEMA,
+        registry.clone(),
+        Some(blobs.clone()),
+    )
+    .await?;
+    assert!(live.absolute_path.is_file());
+    assert!(!separate_orphan.try_exists()?);
+    assert_eq!(engine.blobs().ok_or("missing store")?.used_bytes(), 5);
+    engine.shutdown().await?;
+
+    // Hardlinking the live file under a second name triggers nlink > 1 / same-inode failure.
+    let alias = sibling_dir.join("alias.txt");
+    fs::hard_link(&live.absolute_path, &alias)?;
+    assert!(
+        StorageEngine::open_managed(config, SCHEMA, registry, Some(blobs))
+            .await
+            .is_err()
+    );
     Ok(())
 }

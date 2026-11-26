@@ -120,28 +120,86 @@ fn invalid_proc() -> io::Error {
     io::Error::new(io::ErrorKind::InvalidData, "inconsistent process metadata")
 }
 
-/// A conservative live-member check. Confirm the view is the caller's full
-/// PID namespace and reject observations when the process list changes
-/// during inspection. An unreaped leader can remain as a zombie.
-pub(super) fn group_gone(pgid: libc::pid_t) -> io::Result<bool> {
+pub(super) fn tokens_match_for_probe(stored: &str, live: &str) -> bool {
+    stored == live
+}
+
+pub(super) fn prepare_group_visibility() -> io::Result<()> {
+    verify_proc_visibility()
+}
+
+/// A conservative live-member check. Scans `/proc` without failing on unrelated
+/// process exits and converges over newly spawned PIDs so background workspace
+/// activity never causes false `CleanupUnverified` outcomes.
+pub(super) fn group_gone(pgid: libc::pid_t, proc_visible: bool) -> io::Result<bool> {
     if group_absent(pgid)? {
         return Ok(true);
     }
-    verify_proc_visibility()?;
-    let pids = list_pids()?;
-    // An empty or filtered list cannot prove absence of live members.
-    if pids.is_empty() {
-        return Err(invalid_proc());
+    if !proc_visible {
+        return Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            "full process group visibility is unavailable",
+        ));
     }
-    for pid in &pids {
-        let dir = format!("/proc/{pid}");
-        let dir = Path::new(&dir);
-        let stat = read_stat(dir)?;
-        if stat.pgid == pgid && !stat.exited {
-            return Ok(false);
+    const MAX_PASSES: usize = 8;
+    let mut confirmed = BTreeSet::new();
+    let mut path = String::with_capacity(32);
+    let mut buffer = [0u8; 512];
+
+    for _ in 0..MAX_PASSES {
+        let current = list_pids()?;
+        if current.is_empty() {
+            return Err(invalid_proc());
+        }
+        // Drop exited PIDs from `confirmed` so a recycled PID is always re-checked.
+        confirmed.retain(|pid| current.contains(pid));
+        let pending: Vec<_> = current.difference(&confirmed).copied().collect();
+        if pending.is_empty() {
+            return Ok(true);
+        }
+        for pid in pending {
+            match read_stat_into(pid, &mut path, &mut buffer) {
+                Ok(stat) => {
+                    if stat.pgid == pgid && !stat.exited {
+                        return Ok(false);
+                    }
+                    confirmed.insert(pid);
+                }
+                Err(error)
+                    if error.kind() == io::ErrorKind::NotFound
+                        || error.raw_os_error() == Some(libc::ESRCH) =>
+                {
+                    // An unrelated process exited mid-scan. Leave it out of `confirmed`
+                    // so any child it spawned or recycled PID is checked on the next pass.
+                }
+                Err(error) => return Err(error),
+            }
         }
     }
-    Ok(pids == list_pids()?)
+    Ok(false)
+}
+
+fn read_stat_into(pid: libc::pid_t, path: &mut String, buffer: &mut [u8; 512]) -> io::Result<Stat> {
+    use std::fmt::Write as _;
+    use std::io::Read as _;
+
+    path.clear();
+    let _ = write!(path, "/proc/{pid}/stat");
+    let mut file = fs::File::open(path.as_str())?;
+    let mut len = 0;
+    loop {
+        if len == buffer.len() {
+            let mut rest = Vec::from(&buffer[..]);
+            file.read_to_end(&mut rest)?;
+            return parse_stat(&rest);
+        }
+        match file.read(&mut buffer[len..]) {
+            Ok(0) => return parse_stat(&buffer[..len]),
+            Ok(n) => len += n,
+            Err(error) if error.kind() == io::ErrorKind::Interrupted => continue,
+            Err(error) => return Err(error),
+        }
+    }
 }
 
 fn list_pids() -> io::Result<BTreeSet<libc::pid_t>> {
@@ -163,24 +221,7 @@ fn verify_proc_visibility() -> io::Result<()> {
     let own_pid = std::process::id().to_string();
     let current = fs::read_link("/proc/self")?;
     let mountinfo = fs::read_to_string("/proc/self/mountinfo")?;
-    let visible = mountinfo
-        .lines()
-        .filter_map(|line| line.split_once(" - "))
-        .any(|(entry, system)| {
-            let mut fields = entry.split_ascii_whitespace();
-            if fields.nth(3) != Some("/") || fields.next() != Some("/proc") {
-                return false;
-            }
-            let mut system = system.split_ascii_whitespace();
-            system.next() == Some("proc")
-                && system.nth(1).is_some_and(|options| {
-                    options.split(',').all(|option| {
-                        !option.starts_with("hidepid=")
-                            || matches!(option, "hidepid=0" | "hidepid=off")
-                    })
-                })
-        });
-    if current == Path::new(&own_pid) && visible {
+    if current == Path::new(&own_pid) && proc_mount_visible(&mountinfo) {
         Ok(())
     } else {
         Err(io::Error::new(
@@ -188,6 +229,25 @@ fn verify_proc_visibility() -> io::Result<()> {
             "full process group visibility is unavailable",
         ))
     }
+}
+
+fn proc_mount_visible(mountinfo: &str) -> bool {
+    // Use the topmost (last) mount on /proc so an overmount cannot be bypassed.
+    // Within a single-UID sandbox (D02), own-UID children remain visible under hidepid=1|2;
+    // reject subset=pid, non-root proc mounts, or non-proc mounts.
+    mountinfo
+        .lines()
+        .filter_map(|line| line.split_once(" - "))
+        .rfind(|(entry, _)| entry.split_ascii_whitespace().nth(4) == Some("/proc"))
+        .is_some_and(|(entry, system)| {
+            let root = entry.split_ascii_whitespace().nth(3);
+            let mut system = system.split_ascii_whitespace();
+            root == Some("/")
+                && system.next() == Some("proc")
+                && system
+                    .nth(1)
+                    .is_some_and(|options| options.split(',').all(|option| option != "subset=pid"))
+        })
 }
 
 pub(super) fn terminate_detached(
@@ -216,7 +276,7 @@ pub(super) fn terminate_detached(
         grace,
         pidfd_signal,
         pidfd_exited,
-        || group_gone(pid),
+        || group_gone(pid, true),
     ))
 }
 
@@ -282,7 +342,7 @@ fn signal_scope(probe: impl FnOnce(libc::c_uint) -> io::Result<()>) -> io::Resul
     }
 }
 
-fn open_pidfd(pid: libc::pid_t) -> io::Result<OwnedFd> {
+pub(super) fn open_pidfd(pid: libc::pid_t) -> io::Result<OwnedFd> {
     // SAFETY: pidfd_open takes a validated PID and zero flags, and on
     // success transfers a new fd exclusively to this caller.
     unsafe {
@@ -295,18 +355,26 @@ fn open_pidfd(pid: libc::pid_t) -> io::Result<OwnedFd> {
     }
 }
 
-fn pidfd_exited(fd: &OwnedFd) -> io::Result<bool> {
+pub(super) fn pidfd_exited(fd: &OwnedFd) -> io::Result<bool> {
     let mut target = libc::pollfd {
         fd: fd.as_raw_fd(),
         events: libc::POLLIN,
         revents: 0,
     };
-    // SAFETY: poll receives one valid writable pollfd and a nonblocking timeout.
-    match unsafe { libc::poll(&mut target, 1, 0) } {
-        0 => Ok(false),
-        1 if target.revents & (libc::POLLIN | libc::POLLHUP) != 0 => Ok(true),
-        1 => Err(invalid_proc()),
-        _ => Err(io::Error::last_os_error()),
+    loop {
+        target.revents = 0;
+        // SAFETY: poll receives one valid writable pollfd and a nonblocking timeout.
+        match unsafe { libc::poll(&mut target, 1, 0) } {
+            0 => return Ok(false),
+            1 if target.revents & (libc::POLLIN | libc::POLLHUP) != 0 => return Ok(true),
+            1 => return Err(invalid_proc()),
+            _ => {
+                let error = io::Error::last_os_error();
+                if error.kind() != io::ErrorKind::Interrupted {
+                    return Err(error);
+                }
+            }
+        }
     }
 }
 
@@ -376,6 +444,27 @@ mod tests {
         assert!(signal_scope(|_| Err(io::Error::from_raw_os_error(libc::EPERM))).is_err());
         assert!(signal_scope(|_| Err(io::Error::from_raw_os_error(libc::ESRCH))).is_err());
         Ok(())
+    }
+
+    #[test]
+    fn proc_mount_visibility_uses_topmost_mount_and_allows_hidepid() {
+        let clean = "24 1 0:21 / /proc rw,nosuid,nodev,noexec,relatime - proc proc rw\n";
+        let hidepid =
+            "24 1 0:21 / /proc rw,nosuid,nodev,noexec,relatime - proc proc rw,hidepid=2\n";
+        let subset =
+            "24 1 0:21 / /proc rw,nosuid,nodev,noexec,relatime - proc proc rw,subset=pid\n";
+        let overmounted_bad = format!("{clean}{subset}");
+        let overmounted_good = format!("{subset}{clean}");
+        let non_root = "24 1 0:21 /sub /proc rw - proc proc rw\n";
+        let non_proc = "24 1 0:21 / /proc rw - tmpfs tmpfs rw\n";
+
+        assert!(proc_mount_visible(clean));
+        assert!(proc_mount_visible(hidepid));
+        assert!(!proc_mount_visible(subset));
+        assert!(!proc_mount_visible(&overmounted_bad));
+        assert!(proc_mount_visible(&overmounted_good));
+        assert!(!proc_mount_visible(non_root));
+        assert!(!proc_mount_visible(non_proc));
     }
 }
 

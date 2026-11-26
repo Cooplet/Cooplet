@@ -52,26 +52,52 @@ impl<'de, M: MapAccess<'de>> MapAccess<'de> for TaggedFields<M> {
 }
 
 // Serde's default unit-enum decoder also accepts externally tagged objects.
-// Use the same variant declaration for serialization, schema and string lookup.
+// Declare each variant's canonical wire label once for serde, OpenAPI, Display and FromStr.
 macro_rules! wire_string_enum {
-    ($(#[$attr:meta])* pub enum $name:ident $variants:tt) => {
+    (
+        $(#[$attr:meta])*
+        pub enum $name:ident {
+            $($variant:ident => $wire:tt),+ $(,)?
+        }
+    ) => {
         #[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, utoipa::ToSchema)]
         $(#[$attr])*
-        #[serde(rename_all = "snake_case")]
-        pub enum $name $variants
+        pub enum $name {
+            $(#[serde(rename = $wire)] $variant,)+
+        }
+
+        impl $name {
+            pub const fn as_str(self) -> &'static str {
+                match self {
+                    $(Self::$variant => $wire,)+
+                }
+            }
+        }
+
+        impl std::fmt::Display for $name {
+            fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                formatter.write_str(self.as_str())
+            }
+        }
+
+        impl std::str::FromStr for $name {
+            type Err = $crate::ValidationError;
+
+            fn from_str(value: &str) -> Result<Self, Self::Err> {
+                match value {
+                    $($wire => Ok(Self::$variant),)+
+                    _ => Err($crate::ValidationError(stringify!($name))),
+                }
+            }
+        }
 
         const _: () = {
             type Label = $name;
 
-            #[allow(dead_code, reason = "Serde's remote derive maps wire names to existing variants")]
-            #[derive(serde::Deserialize)]
-            #[serde(remote = "Label", rename_all = "snake_case")]
-            enum Variants $variants
-
             impl<'de> serde::Deserialize<'de> for Label {
                 fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
                     let text = <$crate::wire::WireString as serde::Deserialize>::deserialize(deserializer)?;
-                    Variants::deserialize(serde::de::IntoDeserializer::into_deserializer(text.0))
+                    std::str::FromStr::from_str(text.0.as_ref()).map_err(serde::de::Error::custom)
                 }
             }
         };
@@ -130,16 +156,21 @@ macro_rules! wire_object {
 
         $crate::wire::object_serde! { $(#[$attr])* struct $name $fields }
     };
-    (#[serde(tag = $tag:tt, $($rule:tt)+)] pub enum $name:ident { $($variant:ident $fields:tt),+ $(,)? }) => {
+    (
+        $(#[doc = $doc:literal])*
+        #[serde(tag = $tag:tt, rename_all = $rename:tt, deny_unknown_fields)]
+        pub enum $name:ident { $($variant:ident $fields:tt),+ $(,)? }
+    ) => {
+        $(#[doc = $doc])*
         #[derive(Clone, Debug, PartialEq, Eq, utoipa::ToSchema)]
-        #[serde(tag = $tag, $($rule)+)]
+        #[serde(tag = $tag, rename_all = $rename, deny_unknown_fields)]
         pub enum $name {
             // Utoipa reads the variant's attributes when generating each oneOf object.
             $(#[serde(deny_unknown_fields)] $variant $fields,)+
         }
 
         $crate::wire::object_serde! {
-            #[serde(tag = $tag, $($rule)+)]
+            #[serde(tag = $tag, rename_all = $rename, deny_unknown_fields)]
             enum $name { $($variant $fields,)+ } tag = $tag
         }
     };

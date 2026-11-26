@@ -47,10 +47,24 @@ pub(super) fn capture(pid: libc::pid_t) -> Result<(Snapshot, String), PlatformEr
     ))
 }
 
+pub(super) fn tokens_match_for_probe(stored: &str, live: &str) -> bool {
+    // Calendar KERN_BOOTTIME can shift across NTP adjustments or sleep/wake on Darwin.
+    // Match the process start timestamp while keeping terminate_detached fail-closed.
+    start_suffix(stored).is_some_and(|s| start_suffix(live) == Some(s))
+}
+
+fn start_suffix(token: &str) -> Option<&str> {
+    token.strip_prefix("darwin:")?.split_once(':')?.1.into()
+}
+
+pub(super) fn prepare_group_visibility() -> io::Result<()> {
+    Ok(())
+}
+
 fn process_info(pid: libc::pid_t) -> io::Result<libc::proc_bsdinfo> {
-    let mut info = MaybeUninit::<libc::proc_bsdinfo>::uninit();
+    let mut info = MaybeUninit::<libc::proc_bsdinfo>::zeroed();
     let size = size_of::<libc::proc_bsdinfo>() as libc::c_int;
-    // SAFETY: the output points to appropriately sized, aligned storage and
+    // SAFETY: the output points to zero-initialized, aligned storage and
     // proc_pidinfo documents that a full-size return initializes that buffer.
     unsafe {
         match libc::proc_pidinfo(
@@ -95,7 +109,7 @@ fn boot_time() -> io::Result<u64> {
     u64::try_from(time.tv_sec).map_err(|_| invalid_proc())
 }
 
-pub(super) fn group_gone(pgid: libc::pid_t) -> io::Result<bool> {
+pub(super) fn group_gone(pgid: libc::pid_t, _proc_visible: bool) -> io::Result<bool> {
     match group_absent(pgid) {
         Ok(true) => return Ok(true),
         Ok(false) => {}
@@ -130,8 +144,12 @@ fn group_pids(pgid: libc::pid_t) -> io::Result<Vec<libc::pid_t>> {
             let count = libc::proc_listpgrppids(pgid, pids.as_mut_ptr().cast(), bytes);
             (count, *errno)
         };
-        if count == 0 && errno != 0 {
-            return Err(io::Error::from_raw_os_error(errno));
+        if count < 0 || (count == 0 && errno != 0) {
+            return Err(if errno != 0 {
+                io::Error::from_raw_os_error(errno)
+            } else {
+                invalid_proc()
+            });
         }
         let count = usize::try_from(count).map_err(|_| invalid_proc())?;
         if count < capacity {

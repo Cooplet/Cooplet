@@ -1,14 +1,16 @@
 use std::collections::HashSet;
+use std::io;
 use std::time::Duration;
 
 use serde::{Serialize, de::DeserializeOwned};
-use serde_json::Value;
+use serde_json::{Map, Value};
 
 use crate::{
     AnswerPayload, ApprovalDecision, ApprovalWaitKind, AttachmentRef, DeliveryMode, HubId,
     MessageId, NodeId, OperationId, ParticipantId, ParticipantKind, ParticipantState,
     ProblemDetails, ProtocolError, QuestionPayload, RunId, ThreadId, ValidationError,
-    domain::validate_approval_fields,
+    WorkflowLogLevel, WorkflowRunState, WorkflowStepStatus, domain::validate_approval_fields,
+    validate_step_key,
 };
 
 pub const BRIDGE_PROTOCOL_VERSION: u8 = 1;
@@ -18,16 +20,20 @@ pub const MAX_ROSTER_FRAMES: u32 = 512;
 pub const ROSTER_TIMEOUT: Duration = Duration::from_secs(30);
 pub const MAX_PENDING_OP_IDS: usize = 512;
 
+fn default_empty_object() -> Value {
+    Value::Object(Map::new())
+}
+
 crate::wire::wire_string_enum! {
     #[derive(Hash)]
     pub enum FrameKind {
-        HelloAck,
-        CommandReq,
-        ThreadDeliver,
-        RosterSync,
-        CommandRes,
-        ThreadAck,
-        NodeEvent,
+        HelloAck => "hello_ack",
+        CommandReq => "command_req",
+        ThreadDeliver => "thread_deliver",
+        RosterSync => "roster_sync",
+        CommandRes => "command_res",
+        ThreadAck => "thread_ack",
+        NodeEvent => "node_event",
     }
 }
 
@@ -51,17 +57,109 @@ pub trait BridgePayload: Serialize + DeserializeOwned {
     }
 }
 
+#[derive(Serialize)]
+struct BorrowedFrame<'a, P: ?Sized> {
+    v: u8,
+    epoch: u64,
+    kind: FrameKind,
+    payload: &'a P,
+}
+
+struct BoundedWriter {
+    buffer: Vec<u8>,
+    written: usize,
+    limit: usize,
+    store: bool,
+}
+
+impl BoundedWriter {
+    fn counting(limit: usize) -> Self {
+        Self {
+            buffer: Vec::new(),
+            written: 0,
+            limit,
+            store: false,
+        }
+    }
+
+    fn buffering(limit: usize) -> Self {
+        Self {
+            buffer: Vec::new(),
+            written: 0,
+            limit,
+            store: true,
+        }
+    }
+}
+
+impl io::Write for BoundedWriter {
+    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+        let next = self.written.saturating_add(buf.len());
+        if next > self.limit {
+            self.written = next;
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "bridge frame exceeds limit",
+            ));
+        }
+        if self.store {
+            self.buffer.extend_from_slice(buf);
+        }
+        self.written = next;
+        Ok(buf.len())
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        Ok(())
+    }
+}
+
+fn serialize_bounded<T: Serialize>(
+    value: &T,
+    mut writer: BoundedWriter,
+) -> Result<Vec<u8>, ProtocolError> {
+    match serde_json::to_writer(&mut writer, value) {
+        Ok(()) => Ok(writer.buffer),
+        Err(_) if writer.written > writer.limit => Err(ProtocolError::BridgeFrameTooLarge {
+            actual: writer.written,
+        }),
+        Err(error) => Err(ProtocolError::Json(error)),
+    }
+}
+
 impl BridgeFrame {
+    /// Validate and serialize a typed bridge frame directly into bounded JSON bytes
+    /// in a single pass without building an intermediate `serde_json::Value`.
+    pub fn encode_json<P: BridgePayload>(
+        epoch: u64,
+        payload: &P,
+    ) -> Result<Vec<u8>, ProtocolError> {
+        payload.validate()?;
+        let envelope = BorrowedFrame {
+            v: BRIDGE_PROTOCOL_VERSION,
+            epoch,
+            kind: P::KIND,
+            payload,
+        };
+        serialize_bounded(&envelope, BoundedWriter::buffering(MAX_WS_FRAME_BYTES))
+    }
+
     pub fn encode<P: BridgePayload>(epoch: u64, payload: &P) -> Result<Self, ProtocolError> {
         payload.validate()?;
-        let frame = Self {
+        let envelope = BorrowedFrame {
+            v: BRIDGE_PROTOCOL_VERSION,
+            epoch,
+            kind: P::KIND,
+            payload,
+        };
+        // Check the serialized byte limit before allocating a DOM tree for oversized payloads.
+        serialize_bounded(&envelope, BoundedWriter::counting(MAX_WS_FRAME_BYTES))?;
+        Ok(Self {
             v: BRIDGE_PROTOCOL_VERSION,
             epoch,
             kind: P::KIND,
             payload: serde_json::to_value(payload)?,
-        };
-        frame.to_json()?;
-        Ok(frame)
+        })
     }
 
     pub fn decode_payload<P: BridgePayload>(&self) -> Result<P, ProtocolError> {
@@ -86,9 +184,7 @@ impl BridgeFrame {
 
     pub fn to_json(&self) -> Result<Vec<u8>, ProtocolError> {
         self.validate_version()?;
-        let bytes = serde_json::to_vec(self)?;
-        check_frame_size(bytes.len())?;
-        Ok(bytes)
+        serialize_bounded(self, BoundedWriter::buffering(MAX_WS_FRAME_BYTES))
     }
 
     fn validate_version(&self) -> Result<(), ProtocolError> {
@@ -106,6 +202,28 @@ fn check_frame_size(actual: usize) -> Result<(), ProtocolError> {
     } else {
         Ok(())
     }
+}
+
+fn validate_message_extras(
+    attachments: &[AttachmentRef],
+    question: Option<&QuestionPayload>,
+    answer: Option<&AnswerPayload>,
+) -> Result<(), ValidationError> {
+    if question.is_some() && answer.is_some() {
+        return Err(ValidationError(
+            "message cannot carry both question and answer",
+        ));
+    }
+    for attachment in attachments {
+        attachment.validate()?;
+    }
+    if let Some(question) = question {
+        question.validate()?;
+    }
+    if let Some(answer) = answer {
+        answer.validate()?;
+    }
+    Ok(())
 }
 
 macro_rules! payload_kind {
@@ -155,6 +273,17 @@ crate::wire::wire_object! {
     }
 }
 
+impl BridgePayload for CommandReqPayload {
+    const KIND: FrameKind = FrameKind::CommandReq;
+
+    fn validate(&self) -> Result<(), ValidationError> {
+        if self.actor_id.trim().is_empty() {
+            return Err(ValidationError("command actor ID"));
+        }
+        self.command.validate()
+    }
+}
+
 crate::wire::wire_object! {
     #[serde(tag = "type", rename_all = "snake_case", deny_unknown_fields)]
     pub enum BridgeCommand {
@@ -195,7 +324,7 @@ crate::wire::wire_object! {
         RunWorkflow {
             workflow_name: String,
             workspace_dir: String,
-            #[serde(default)]
+            #[serde(default = "default_empty_object")]
             params: Value,
         },
         CancelWorkflow {
@@ -207,17 +336,48 @@ crate::wire::wire_object! {
     }
 }
 
+impl BridgeCommand {
+    pub fn validate(&self) -> Result<(), ValidationError> {
+        match self {
+            Self::SendMessage {
+                attachments,
+                question,
+                answer,
+                ..
+            } => validate_message_extras(attachments, question.as_ref(), answer.as_ref()),
+            Self::RespondApproval { decision, .. } => decision.validate(),
+            Self::RunWorkflow {
+                workflow_name,
+                workspace_dir,
+                ..
+            } => {
+                if workflow_name.trim().is_empty() {
+                    return Err(ValidationError("workflow name"));
+                }
+                if workspace_dir.trim().is_empty() {
+                    return Err(ValidationError("workspace dir"));
+                }
+                Ok(())
+            }
+            Self::CreateAgent { .. }
+            | Self::StopAgent { .. }
+            | Self::CancelWorkflow { .. }
+            | Self::InspectAgent { .. } => Ok(()),
+        }
+    }
+}
+
 crate::wire::wire_string_enum! {
     pub enum CommandOutcome {
-        Delivered,
-        Succeeded,
-        Queued,
-        Busy,
-        AwaitingApproval,
-        Unavailable,
-        Rejected,
-        Unknown,
-        Expired,
+        Delivered => "delivered",
+        Succeeded => "succeeded",
+        Queued => "queued",
+        Busy => "busy",
+        AwaitingApproval => "awaiting_approval",
+        Unavailable => "unavailable",
+        Rejected => "rejected",
+        Unknown => "unknown",
+        Expired => "expired",
     }
 }
 
@@ -251,6 +411,28 @@ crate::wire::wire_object! {
     }
 }
 
+impl BridgePayload for ThreadDeliverPayload {
+    const KIND: FrameKind = FrameKind::ThreadDeliver;
+
+    fn validate(&self) -> Result<(), ValidationError> {
+        if self.from_seq == 0 || self.from_seq > self.to_seq {
+            return Err(ValidationError("thread delivery sequence range"));
+        }
+        let mut previous = None;
+        for post in &self.posts {
+            if post.seq < self.from_seq || post.seq > self.to_seq {
+                return Err(ValidationError("thread post sequence out of range"));
+            }
+            if previous.is_some_and(|prev| post.seq <= prev) {
+                return Err(ValidationError("thread post sequence order"));
+            }
+            previous = Some(post.seq);
+            post.validate()?;
+        }
+        Ok(())
+    }
+}
+
 crate::wire::wire_object! {
     #[serde(deny_unknown_fields)]
     pub struct ThreadPostWire {
@@ -273,15 +455,31 @@ crate::wire::wire_object! {
     }
 }
 
+impl ThreadPostWire {
+    pub fn validate(&self) -> Result<(), ValidationError> {
+        if self.author_actor_id.trim().is_empty() {
+            return Err(ValidationError("thread post author actor ID"));
+        }
+        if self.author_handle.trim().is_empty() {
+            return Err(ValidationError("thread post author handle"));
+        }
+        validate_message_extras(
+            &self.attachments,
+            self.question.as_ref(),
+            self.answer.as_ref(),
+        )
+    }
+}
+
 crate::wire::wire_string_enum! {
     pub enum ThreadDeliveryOutcome {
-        Delivered,
-        Busy,
-        AwaitingApproval,
-        Unavailable,
-        Rejected,
-        Unknown,
-        Expired,
+        Delivered => "delivered",
+        Busy => "busy",
+        AwaitingApproval => "awaiting_approval",
+        Unavailable => "unavailable",
+        Rejected => "rejected",
+        Unknown => "unknown",
+        Expired => "expired",
     }
 }
 
@@ -342,7 +540,7 @@ crate::wire::wire_object! {
         #[serde(skip_serializing_if = "Option::is_none")]
         pub workspace_dir: Option<String>,
         pub state: ParticipantState,
-        #[serde(default)]
+        #[serde(default = "default_empty_object")]
         pub capabilities: Value,
         #[serde(skip_serializing_if = "Option::is_none")]
         pub wait_kind: Option<ApprovalWaitKind>,
@@ -430,12 +628,12 @@ crate::wire::wire_object! {
         WorkflowStepCompleted {
             run_id: RunId,
             step_key: String,
-            status: String,
+            status: WorkflowStepStatus,
         },
         WorkflowRunFinished {
             run_id: RunId,
             workflow_name: String,
-            state: String,
+            state: WorkflowRunState,
             #[serde(skip_serializing_if = "Option::is_none")]
             result: Option<Value>,
             #[serde(skip_serializing_if = "Option::is_none")]
@@ -443,7 +641,7 @@ crate::wire::wire_object! {
         },
         WorkflowLog {
             run_id: RunId,
-            level: String,
+            level: WorkflowLogLevel,
             message: String,
         },
     }
@@ -453,22 +651,40 @@ impl BridgePayload for NodeEventPayload {
     const KIND: FrameKind = FrameKind::NodeEvent;
 
     fn validate(&self) -> Result<(), ValidationError> {
-        if let Self::ParticipantStateChanged {
-            state,
-            can_respond_remotely,
-            approval_id,
-            ..
-        } = self
-        {
-            validate_approval_fields(*state, *can_respond_remotely, approval_id.as_deref())?;
+        match self {
+            Self::ParticipantStateChanged {
+                state,
+                can_respond_remotely,
+                approval_id,
+                ..
+            } => validate_approval_fields(*state, *can_respond_remotely, approval_id.as_deref()),
+            Self::AgentReplyCreated {
+                recipient_id,
+                attachments,
+                question,
+                answer,
+                ..
+            } => {
+                if recipient_id.trim().is_empty() {
+                    return Err(ValidationError("agent reply recipient ID"));
+                }
+                validate_message_extras(attachments, question.as_ref(), answer.as_ref())
+            }
+            Self::WorkflowRunStarted { workflow_name, .. }
+            | Self::WorkflowRunFinished { workflow_name, .. } => {
+                if workflow_name.trim().is_empty() {
+                    return Err(ValidationError("workflow name"));
+                }
+                Ok(())
+            }
+            Self::WorkflowStepStarted { step_key, .. }
+            | Self::WorkflowStepCompleted { step_key, .. } => validate_step_key(step_key),
+            Self::WorkflowLog { .. } => Ok(()),
         }
-        Ok(())
     }
 }
 
 payload_kind!(
-    CommandReqPayload => CommandReq,
     CommandResPayload => CommandRes,
-    ThreadDeliverPayload => ThreadDeliver,
     ThreadAckPayload => ThreadAck,
 );

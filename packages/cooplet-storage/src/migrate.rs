@@ -55,6 +55,12 @@ pub(crate) fn migrate(
     for migration in migrations.iter().skip(from as usize) {
         let tx = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
         tx.execute_batch(migration.sql)?;
+        if tx.is_autocommit() {
+            return Err(StorageError::IncompatibleDatabase(format!(
+                "migration {} ended the transaction early",
+                migration.version
+            )));
+        }
         schema_hygiene(&tx)?;
         tx.pragma_update(None, "user_version", migration.version)?;
         tx.commit()?;

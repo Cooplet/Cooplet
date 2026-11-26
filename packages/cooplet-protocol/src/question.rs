@@ -4,9 +4,9 @@ use crate::ValidationError;
 
 crate::wire::wire_string_enum! {
     pub enum QuestionMode {
-        Single,
-        Multi,
-        Text,
+        Single => "single",
+        Multi => "multi",
+        Text => "text",
     }
 }
 
@@ -34,10 +34,17 @@ crate::wire::wire_object! {
     }
 }
 
+fn valid_option_id(id: &str) -> bool {
+    (1..=64).contains(&id.len()) && id.bytes().all(|byte| byte.is_ascii_graphic())
+}
+
 impl QuestionPayload {
     pub fn validate(&self) -> Result<(), ValidationError> {
         if self.prompt.len() > 2000 || self.prompt.trim().is_empty() {
             return Err(ValidationError("question prompt"));
+        }
+        if self.expires_at_ms.is_some_and(|ms| ms <= 0) {
+            return Err(ValidationError("question expiry"));
         }
         if self.mode == QuestionMode::Text {
             return if self.options.is_empty() {
@@ -51,10 +58,7 @@ impl QuestionPayload {
         }
         let mut ids = HashSet::with_capacity(self.options.len());
         for option in &self.options {
-            if !(1..=64).contains(&option.id.len())
-                || !option.id.bytes().all(|byte| byte.is_ascii_graphic())
-                || !ids.insert(&option.id)
-            {
+            if !valid_option_id(&option.id) || !ids.insert(&option.id) {
                 return Err(ValidationError("question option ID"));
             }
             if option.label.trim().is_empty() || option.label.chars().count() > 64 {
@@ -83,12 +87,33 @@ crate::wire::wire_object! {
 }
 
 impl AnswerPayload {
-    pub fn validate_against(&self, question: &QuestionPayload) -> Result<(), ValidationError> {
-        question.validate()?;
-        let text = self.text.as_deref();
-        if text.is_some_and(|text| text.trim().is_empty() || text.len() > 8000) {
+    pub fn validate(&self) -> Result<(), ValidationError> {
+        if self
+            .text
+            .as_deref()
+            .is_some_and(|text| text.trim().is_empty() || text.len() > 8000)
+        {
             return Err(ValidationError("answer text"));
         }
+        if self.selected_option_ids.len() > 16 {
+            return Err(ValidationError("answer option count"));
+        }
+        let mut ids = HashSet::with_capacity(self.selected_option_ids.len());
+        for id in &self.selected_option_ids {
+            if !valid_option_id(id) || !ids.insert(id) {
+                return Err(ValidationError("answer option ID"));
+            }
+        }
+        if self.selected_option_ids.is_empty() && self.text.is_none() {
+            return Err(ValidationError("empty answer"));
+        }
+        Ok(())
+    }
+
+    pub fn validate_against(&self, question: &QuestionPayload) -> Result<(), ValidationError> {
+        question.validate()?;
+        self.validate()?;
+        let text = self.text.as_deref();
         let count = self.selected_option_ids.len();
         let valid_shape = match question.mode {
             QuestionMode::Single => {
@@ -101,9 +126,8 @@ impl AnswerPayload {
         if !valid_shape || count > question.options.len() {
             return Err(ValidationError("answer shape"));
         }
-        let mut ids = HashSet::with_capacity(count);
         for id in &self.selected_option_ids {
-            if !ids.insert(id) || !question.options.iter().any(|option| option.id == *id) {
+            if !question.options.iter().any(|option| option.id == *id) {
                 return Err(ValidationError("answer option ID"));
             }
         }

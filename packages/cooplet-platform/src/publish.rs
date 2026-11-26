@@ -34,16 +34,28 @@ impl AtomicPublish {
             Err(error) if error.raw_os_error() == Some(libc::EEXIST) => {
                 Ok(PublishOutcome::AlreadyExists)
             }
-            Err(error)
-                if matches!(
-                    error.raw_os_error(),
-                    Some(libc::ENOSYS | libc::EINVAL | libc::EOPNOTSUPP)
-                ) =>
-            {
+            Err(error) if is_noreplace_unsupported(&error) => {
                 publish_via_link(stage_dir, &tmp_name, dest_dir, &final_name)
             }
             Err(error) => Err(error.into()),
         }
+    }
+}
+
+fn is_noreplace_unsupported(error: &io::Error) -> bool {
+    #[cfg(target_os = "macos")]
+    {
+        matches!(
+            error.raw_os_error(),
+            Some(libc::ENOSYS | libc::EINVAL | libc::EOPNOTSUPP | libc::ENOTSUP)
+        )
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        matches!(
+            error.raw_os_error(),
+            Some(libc::ENOSYS | libc::EINVAL | libc::EOPNOTSUPP)
+        )
     }
 }
 
@@ -106,7 +118,12 @@ fn publish_via_link(
             Err(error.into())
         };
     }
-    sync_dir(dest_dir, PublishStage::DestinationSync)?;
+    if let Err(error) = sync_dir(dest_dir, PublishStage::DestinationSync) {
+        // Avoid leaving an extra staging hardlink (nlink == 2) that would block
+        // open_sealed_file if the destination entry persists after the sync failure.
+        let _ = unlink_entry(stage_dir, tmp);
+        return Err(error);
+    }
     if let Err(source) = unlink_entry(stage_dir, tmp)
         && source.kind() != io::ErrorKind::NotFound
     {
@@ -127,6 +144,7 @@ fn sync_dir(dir: &File, stage: PublishStage) -> Result<(), PlatformError> {
 #[cfg(test)]
 mod tests {
     use std::fs;
+    use std::os::unix::fs::MetadataExt;
 
     use super::*;
     use crate::{PrivateFs, test_support::Scratch};
@@ -149,11 +167,27 @@ mod tests {
             fs::write(stage.join(name), b"first")?;
             assert_eq!(publish()?, PublishOutcome::Published);
             assert!(!stage.join(name).exists());
+            assert_eq!(fs::metadata(dest.join(name))?.nlink(), 1);
             fs::write(stage.join(name), b"second")?;
             assert_eq!(publish()?, PublishOutcome::AlreadyExists);
             assert_eq!(fs::read(dest.join(name))?, b"first");
             assert_eq!(fs::read(stage.join(name))?, b"second");
         }
         Ok(())
+    }
+
+    #[test]
+    fn noreplace_unsupported_classifies_fallback_errnos() {
+        for errno in [libc::ENOSYS, libc::EINVAL, libc::EOPNOTSUPP, libc::ENOTSUP] {
+            assert!(is_noreplace_unsupported(&io::Error::from_raw_os_error(
+                errno
+            )));
+        }
+        assert!(!is_noreplace_unsupported(&io::Error::from_raw_os_error(
+            libc::EEXIST
+        )));
+        assert!(!is_noreplace_unsupported(&io::Error::from_raw_os_error(
+            libc::EXDEV
+        )));
     }
 }

@@ -477,3 +477,162 @@ async fn valid_http_media_types_keep_ows_and_quoted_parameters() -> TestResult {
     a?;
     b
 }
+
+#[tokio::test]
+async fn local_sha256_mismatch_is_rejected_before_final_chunk_even_on_early_200_ok() -> TestResult {
+    let server = Server::bind().await?;
+    let client = CoopletClient::new(settings(&server))?;
+
+    // Empty body with mismatched expected_sha256 fails before any network call.
+    let mut empty_wrong = spec(Some(0));
+    empty_wrong.expected_sha256 = Some(HELLO_SHA.into());
+    empty_wrong.idempotency_key = Some("empty-mismatch-key".into());
+    assert!(matches!(
+        client.upload_blob(empty_wrong, &b""[..]).await,
+        Err(ClientError::BlobDigestMismatch { .. })
+    ));
+    assert!(
+        tokio::time::timeout(Duration::from_millis(20), server.listener.accept())
+            .await
+            .is_err()
+    );
+
+    // HubReceipt on LocalNode is rejected before any network call.
+    let mut local_receipt = spec(Some(5));
+    local_receipt.verification = UploadVerification::HubReceipt;
+    assert!(matches!(
+        client.upload_blob(local_receipt, &b"hello"[..]).await,
+        Err(ClientError::InvalidInput(_))
+    ));
+
+    // Fast mismatched reader fails locally with BlobDigestMismatch before completing the request.
+    let mut fast_wrong = spec(Some(5));
+    fast_wrong.idempotency_key = Some("fast-mismatch-key".into());
+    fast_wrong.expected_sha256 = Some(HELLO_SHA.into());
+    assert!(matches!(
+        client.upload_blob(fast_wrong, &b"jello"[..]).await,
+        Err(ClientError::BlobDigestMismatch { .. })
+    ));
+
+    // Streaming upload whose local bytes do not match expected_sha256 must fail with
+    // BlobDigestMismatch before releasing the final held chunk, even when headers were
+    // already accepted by the server.
+    let (accepted_tx, accepted_rx) = tokio::sync::oneshot::channel();
+    let serve = async {
+        let (head, mut peer) = server.accept().await?;
+        assert_eq!(head.header("x-cooplet-sha256"), Some(HELLO_SHA));
+        let _ = accepted_tx.send(());
+        // Read any partial bytes sent; the client must abort before delivering all 5 bytes.
+        let mut received = Vec::new();
+        let _ = tokio::time::timeout(
+            Duration::from_millis(150),
+            peer.0.read_to_end(&mut received),
+        )
+        .await;
+        assert!(received.len() < 5);
+        Ok::<_, Box<dyn std::error::Error + Send + Sync>>(())
+    };
+    let call = async {
+        let mut wrong = spec(Some(5));
+        wrong.idempotency_key = Some("replay-mismatch-key".into());
+        wrong.expected_sha256 = Some(HELLO_SHA.into());
+        let (mut writer, reader) = tokio::io::duplex(32);
+        let feed = tokio::spawn(async move {
+            writer.write_all(b"jell").await?;
+            let _ = accepted_rx.await;
+            writer.write_all(b"o").await?;
+            writer.shutdown().await
+        });
+        let outcome = client.upload_blob(wrong, reader).await;
+        assert!(matches!(
+            outcome,
+            Err(ClientError::BlobDigestMismatch { .. })
+        ));
+        feed.await??;
+        Ok::<_, Box<dyn std::error::Error + Send + Sync>>(())
+    };
+    let (a, b) = tokio::join!(call, serve);
+    a?;
+    b
+}
+
+#[tokio::test]
+async fn download_enforces_config_cap_chunk_timeout_duplicate_etag_and_truncation() -> TestResult {
+    let server = Server::bind().await?;
+    let mut config = settings(&server);
+    config.max_blob_bytes = 4;
+    config.request_timeout = Duration::from_millis(80);
+    let client = CoopletClient::new(config)?;
+    let id: BlobId = BLOB_ID.parse()?;
+    let tag = format!("\"{HELLO_SHA}\"");
+
+    let serve = async {
+        // 1. Config max_blob_bytes (4) caps caller's larger max_bytes (100).
+        let (_, peer) = server.accept().await?;
+        peer.respond("200 OK", &[("etag", tag.as_str())], b"hello")
+            .await?;
+
+        // 2. Duplicate ETag headers are rejected.
+        let (_, peer) = server.accept().await?;
+        peer.respond(
+            "200 OK",
+            &[("etag", tag.as_str()), ("etag", tag.as_str())],
+            b"hi",
+        )
+        .await?;
+
+        // 3. Content-Length truncation triggers BlobLengthMismatch (not silent short read).
+        let (_, mut peer) = server.accept().await?;
+        peer.raw(
+            format!(
+                "HTTP/1.1 200 OK\r\nConnection: close\r\nContent-Length: 4\r\nETag: {tag}\r\n\r\nhi"
+            )
+            .as_bytes(),
+        )
+        .await?;
+        drop(peer);
+
+        // 4. Stalled chunk stream triggers BlobDownload progress timeout.
+        let (_, mut peer) = server.accept().await?;
+        peer.start_chunks("application/octet-stream", &[("etag", tag.as_str())])
+            .await?;
+        peer.chunk(b"h").await?;
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        drop(peer);
+        Ok::<_, Box<dyn std::error::Error + Send + Sync>>(())
+    };
+
+    let call = async {
+        assert!(matches!(
+            client.open_blob_download(&id, None, 100).await,
+            Err(ClientError::BlobTooLarge { max_bytes: 4 })
+        ));
+        assert!(matches!(
+            client.open_blob_download(&id, None, 100).await,
+            Err(ClientError::Protocol(_))
+        ));
+        let mut sink = Vec::new();
+        let trunc = client
+            .download_blob_to_writer(&id, None, 4, &mut sink)
+            .await;
+        assert!(matches!(
+            trunc,
+            Err(ClientError::BlobLengthMismatch {
+                expected: 4,
+                actual: 2
+            }) | Err(ClientError::Transport(_))
+        ));
+        let mut stalled_sink = Vec::new();
+        let timed = client
+            .download_blob_to_writer(&id, None, 4, &mut stalled_sink)
+            .await;
+        assert!(matches!(
+            timed,
+            Err(ClientError::Timeout("blob download progress"))
+        ));
+        Ok::<_, Box<dyn std::error::Error + Send + Sync>>(())
+    };
+    let (a, b) = tokio::join!(call, serve);
+    a?;
+    b
+}

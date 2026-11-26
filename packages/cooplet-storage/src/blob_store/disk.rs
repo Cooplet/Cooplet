@@ -1,7 +1,7 @@
 use std::{
-    fs::{self, File, Metadata, OpenOptions, ReadDir},
+    fs::{self, File, ReadDir},
     io::{self, Write},
-    os::unix::fs::{MetadataExt, OpenOptionsExt},
+    os::unix::fs::MetadataExt,
     path::{Component, Path, PathBuf},
     sync::{
         Arc,
@@ -22,6 +22,15 @@ use crate::{BlobRecord, BlobStoreConfig, StorageError};
 
 pub(super) const CHUNK_BYTES: usize = 64 * 1024;
 
+pub(crate) fn validate_config(config: &BlobStoreConfig) -> Result<(), StorageError> {
+    if config.max_blob_bytes == 0 {
+        return Err(StorageError::InvalidConfig(
+            "blob size limit must be positive",
+        ));
+    }
+    Ok(())
+}
+
 pub(super) enum InputChunk {
     Data(Bytes),
     Finish,
@@ -40,15 +49,12 @@ impl Disk {
     pub(super) fn open(
         config: BlobStoreConfig,
         database_path: &Path,
-        database_sidecar: &FileLock,
     ) -> Result<Self, StorageError> {
-        if config.max_blob_bytes == 0 {
-            return Err(StorageError::InvalidConfig(
-                "blob size limit must be positive",
-            ));
-        }
+        validate_config(&config)?;
+        validate_root_disjoint(&config.root, database_path)?;
         let root = PrivateFs::ensure_private_dir(&config.root)?;
-        check_or_claim_root(&root, database_path, database_sidecar, RootUse::Bind)?;
+        validate_root_disjoint(&root, database_path)?;
+        check_or_claim_root(&root, database_path, RootUse::Bind)?;
         let staging = PrivateFs::ensure_private_dir(&root.join("staging"))?;
         let objects = PrivateFs::ensure_private_dir(&root.join("objects"))?;
         Ok(Self {
@@ -90,12 +96,17 @@ impl Disk {
 
     pub(super) fn clean_staging(&self) -> Result<(), StorageError> {
         let dir = PrivateFs::open_dir_nofollow(&self.staging)?;
+        let mut removed = false;
         for item in fs::read_dir(&self.staging)? {
             let item = item?;
             let name = item.file_name();
-            let ours = name
-                .to_str()
-                .and_then(|name| name.strip_suffix(".part"))
+            let Some(name_str) = name.to_str() else {
+                return Err(StorageError::InvalidBlobPath(
+                    item.path().display().to_string(),
+                ));
+            };
+            let ours = name_str
+                .strip_suffix(".part")
                 .is_some_and(|stem| stem.len() == 32 && stem.bytes().all(lower_hex));
             if !ours || !item.file_type()?.is_file() {
                 return Err(StorageError::InvalidBlobPath(
@@ -104,9 +115,13 @@ impl Disk {
             }
             // A failed link-and-unlink publication may still share this
             // inode with the destination. Remove the staging name only.
-            fs::remove_file(item.path())?;
+            if PrivateFs::unlink_file_at(&dir, name_str)? {
+                removed = true;
+            }
         }
-        dir.sync_all()?;
+        if removed {
+            dir.sync_all()?;
+        }
         Ok(())
     }
 
@@ -117,6 +132,7 @@ impl Disk {
     ) -> Result<StagedBlob, StorageError> {
         let mut writer =
             tokio::task::spawn_blocking(move || StageWriter::new(self, input)).await??;
+        let mut batch = Vec::with_capacity(super::STAGING_QUEUE);
         loop {
             let Some(first) = chunks.recv().await else {
                 tokio::task::spawn_blocking(move || drop(writer)).await?;
@@ -124,7 +140,7 @@ impl Disk {
             };
             // Only hand ready input to the blocking pool. A reader can itself
             // need that pool (for example an async file with one blocking slot).
-            let mut batch = Vec::with_capacity(super::STAGING_QUEUE);
+            batch.clear();
             batch.push(first);
             while batch.len() < super::STAGING_QUEUE {
                 match chunks.try_recv() {
@@ -132,8 +148,12 @@ impl Disk {
                     Err(_) => break,
                 }
             }
-            match tokio::task::spawn_blocking(move || writer.write_batch(batch)).await?? {
-                StageProgress::Receiving(next) => writer = next,
+            let ready = std::mem::take(&mut batch);
+            match tokio::task::spawn_blocking(move || writer.write_batch(ready)).await?? {
+                StageProgress::Receiving(next, reused) => {
+                    writer = next;
+                    batch = reused;
+                }
                 StageProgress::Finished(staged) => return Ok(staged),
             }
         }
@@ -141,10 +161,22 @@ impl Disk {
 
     pub(super) fn publish(&self, stage: &StagedBlob) -> Result<PublishOutcome, StorageError> {
         let path = validate_path(&stage.info.disk_rel_path, &stage.info.blob_id)?;
-        let shard = PrivateFs::ensure_private_dir(&self.objects.join(path.shard))?;
-        let destination = PrivateFs::ensure_private_dir(&shard.join(stage.info.blob_id.as_str()))?;
+        let objects_fd = PrivateFs::open_dir_nofollow(&self.objects)?;
+        let shard_fd = match PrivateFs::open_dir_at(&objects_fd, path.shard) {
+            Ok(fd) => fd,
+            Err(PlatformError::Io(error)) if error.kind() == io::ErrorKind::NotFound => {
+                PrivateFs::ensure_private_dir(&self.objects.join(path.shard))?;
+                PrivateFs::open_dir_at(&objects_fd, path.shard)?
+            }
+            Err(error) => return Err(error.into()),
+        };
+        let dest_path = self
+            .objects
+            .join(path.shard)
+            .join(stage.info.blob_id.as_str());
+        PrivateFs::ensure_private_dir(&dest_path)?;
+        let dest_dir = PrivateFs::open_dir_at(&shard_fd, stage.info.blob_id.as_str())?;
         let stage_dir = PrivateFs::open_dir_nofollow(&self.staging)?;
-        let dest_dir = PrivateFs::open_dir_nofollow(&destination)?;
         Ok(AtomicPublish::publish_noreplace(
             &stage_dir,
             &stage.name,
@@ -158,7 +190,8 @@ impl Disk {
     }
 
     fn discard_name(&self, name: &str, reserved: u64) -> Result<(), StorageError> {
-        remove_file_if_present(&self.staging.join(name))?;
+        let stage_dir = PrivateFs::open_dir_nofollow(&self.staging)?;
+        PrivateFs::unlink_file_at(&stage_dir, name)?;
         self.release(reserved)
     }
 
@@ -166,33 +199,49 @@ impl Disk {
     /// registration. Debit bytes only if this call removed the file.
     pub(super) fn unlink(&self, record: &BlobRecord, account: bool) -> Result<(), StorageError> {
         let path = validate_path(&record.disk_rel_path, &record.blob_id)?;
-        let shard = self.objects.join(path.shard);
-        let Some(shard_fd) = checked_dir(&shard)? else {
-            PrivateFs::open_dir_nofollow(&self.objects)?.sync_all()?;
-            return Ok(());
-        };
-        let object = shard.join(record.blob_id.as_str());
-        if let Some(object_fd) = checked_dir(&object)? {
-            let full_path = object.join(path.name);
-            if let Some(metadata) = checked_object(&full_path)? {
-                if metadata.len() != record.size_bytes {
-                    return Err(StorageError::BlobUnverified(format!(
-                        "object size differs for {}",
-                        record.blob_id
-                    )));
-                }
-                if remove_file_if_present(&full_path)? && account {
-                    self.release(metadata.len())?;
-                }
+        let objects_fd = PrivateFs::open_dir_nofollow(&self.objects)?;
+        let shard_fd = match PrivateFs::open_dir_at(&objects_fd, path.shard) {
+            Ok(fd) => fd,
+            Err(PlatformError::Io(error)) if error.kind() == io::ErrorKind::NotFound => {
+                objects_fd.sync_all()?;
+                return Ok(());
             }
-            object_fd.sync_all()?;
-            match fs::remove_dir(&object) {
-                Ok(()) => {}
-                Err(error)
+            Err(error) => return Err(error.into()),
+        };
+        let object_fd = match PrivateFs::open_dir_at(&shard_fd, record.blob_id.as_str()) {
+            Ok(fd) => Some(fd),
+            Err(PlatformError::Io(error)) if error.kind() == io::ErrorKind::NotFound => None,
+            Err(error) => return Err(error.into()),
+        };
+        if let Some(object_fd) = object_fd {
+            match PrivateFs::open_sealed_at(&object_fd, path.name) {
+                Ok(file) => {
+                    let size = file.metadata()?.len();
+                    drop(file);
+                    if size != record.size_bytes {
+                        return Err(StorageError::BlobUnverified(format!(
+                            "object size differs for {}",
+                            record.blob_id
+                        )));
+                    }
+                    if PrivateFs::unlink_file_at(&object_fd, path.name)? && account {
+                        self.release(size)?;
+                    }
+                }
+                Err(PlatformError::Io(error)) if error.kind() == io::ErrorKind::NotFound => {}
+                Err(error) => return Err(error.into()),
+            }
+            match PrivateFs::remove_dir_at(&shard_fd, record.blob_id.as_str()) {
+                Ok(_) => {}
+                Err(PlatformError::Io(error))
                     if matches!(
                         error.kind(),
-                        io::ErrorKind::NotFound | io::ErrorKind::DirectoryNotEmpty
-                    ) => {}
+                        io::ErrorKind::DirectoryNotEmpty | io::ErrorKind::AlreadyExists
+                    ) =>
+                {
+                    // Another entry still lives in this directory; sync the unlink before moving on.
+                    object_fd.sync_all()?;
+                }
                 Err(error) => return Err(error.into()),
             }
         }
@@ -202,12 +251,28 @@ impl Disk {
 
     pub(super) fn open_live(&self, record: &BlobRecord) -> Result<File, StorageError> {
         let path = validate_path(&record.disk_rel_path, &record.blob_id)?;
-        let shard = self.objects.join(path.shard);
-        let object = shard.join(record.blob_id.as_str());
-        let _shard = checked_dir(&shard)?.ok_or_else(|| object_missing(record))?;
-        let _object = checked_dir(&object)?.ok_or_else(|| object_missing(record))?;
-        let full_path = object.join(path.name);
-        let file = PrivateFs::open_sealed_file(&full_path)?;
+        let objects_fd = PrivateFs::open_dir_nofollow(&self.objects)?;
+        let shard_fd = match PrivateFs::open_dir_at(&objects_fd, path.shard) {
+            Ok(fd) => fd,
+            Err(PlatformError::Io(error)) if error.kind() == io::ErrorKind::NotFound => {
+                return Err(object_missing(record));
+            }
+            Err(error) => return Err(error.into()),
+        };
+        let object_fd = match PrivateFs::open_dir_at(&shard_fd, record.blob_id.as_str()) {
+            Ok(fd) => fd,
+            Err(PlatformError::Io(error)) if error.kind() == io::ErrorKind::NotFound => {
+                return Err(object_missing(record));
+            }
+            Err(error) => return Err(error.into()),
+        };
+        let file = match PrivateFs::open_sealed_at(&object_fd, path.name) {
+            Ok(file) => file,
+            Err(PlatformError::Io(error)) if error.kind() == io::ErrorKind::NotFound => {
+                return Err(object_missing(record));
+            }
+            Err(error) => return Err(error.into()),
+        };
         if file.metadata()?.len() != record.size_bytes {
             return Err(StorageError::BlobUnverified(format!(
                 "object changed for {}",
@@ -218,9 +283,14 @@ impl Disk {
     }
 
     pub(super) fn scan(&self) -> Result<ObjectScanner, StorageError> {
+        let objects_fd = PrivateFs::open_dir_nofollow(&self.objects)?;
         Ok(ObjectScanner {
             root: self.root.clone(),
-            directories: vec![(PathBuf::from("objects"), fs::read_dir(&self.objects)?)],
+            directories: vec![(
+                PathBuf::from("objects"),
+                objects_fd,
+                fs::read_dir(&self.objects)?,
+            )],
         })
     }
 
@@ -229,10 +299,8 @@ impl Disk {
         candidate: &BlobRecord,
         registered: &BlobRecord,
     ) -> Result<(), StorageError> {
-        let file = self.open_live(registered)?;
-        let registered = file.metadata()?;
-        let candidate = checked_object(&self.root.join(&candidate.disk_rel_path))?
-            .ok_or_else(|| object_missing(candidate))?;
+        let registered = self.open_live(registered)?.metadata()?;
+        let candidate = self.open_live(candidate)?.metadata()?;
         if (registered.dev(), registered.ino()) == (candidate.dev(), candidate.ino()) {
             return Err(StorageError::BlobUnverified(
                 "object paths resolve to the same inode".into(),
@@ -242,18 +310,14 @@ impl Disk {
     }
 
     fn make_part(&self) -> Result<(File, String), StorageError> {
+        let stage_dir = PrivateFs::open_dir_nofollow(&self.staging)?;
         for _ in 0..16 {
             let mut random = [0; 16];
             cooplet_platform::random_bytes(&mut random)?;
             let name = format!("{:032x}.part", u128::from_be_bytes(random));
-            match OpenOptions::new()
-                .write(true)
-                .create_new(true)
-                .mode(0o600)
-                .open(self.staging.join(&name))
-            {
+            match PrivateFs::create_private_file_at(&stage_dir, &name) {
                 Ok(file) => return Ok((file, name)),
-                Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {}
+                Err(PlatformError::Io(error)) if error.kind() == io::ErrorKind::AlreadyExists => {}
                 Err(error) => return Err(error.into()),
             }
         }
@@ -263,21 +327,54 @@ impl Disk {
 
 enum RootUse {
     BeforeDatabaseCreate,
+    BeforeDatabaseOpen,
     Bind,
 }
 
-pub(crate) fn check_before_database_create(
+fn validate_root_disjoint(root: &Path, database_path: &Path) -> Result<(), StorageError> {
+    let db_parent = database_path
+        .parent()
+        .ok_or(StorageError::InvalidConfig("database path has no parent"))?;
+    let db_parent_meta = fs::symlink_metadata(db_parent)?;
+    let normalized_root: PathBuf = root.components().collect();
+    if normalized_root == db_parent || db_parent.starts_with(&normalized_root) {
+        return Err(StorageError::InvalidConfig(
+            "blob root must be a dedicated directory distinct from the database directory",
+        ));
+    }
+    if let Ok(root_meta) = fs::symlink_metadata(&normalized_root) {
+        if (root_meta.dev(), root_meta.ino()) == (db_parent_meta.dev(), db_parent_meta.ino()) {
+            return Err(StorageError::InvalidConfig(
+                "blob root must be a dedicated directory distinct from the database directory",
+            ));
+        }
+        if root_meta.is_dir() {
+            let canonical_root = fs::canonicalize(&normalized_root)?;
+            if canonical_root == db_parent || db_parent.starts_with(&canonical_root) {
+                return Err(StorageError::InvalidConfig(
+                    "blob root must be a dedicated directory distinct from the database directory",
+                ));
+            }
+        }
+    }
+    Ok(())
+}
+
+pub(crate) fn check_before_database_open(
     root: &Path,
     database_path: &Path,
-    database_sidecar: &FileLock,
+    fresh: bool,
 ) -> Result<(), StorageError> {
+    validate_root_disjoint(root, database_path)?;
     if checked_dir(root)?.is_some() {
-        check_or_claim_root(
-            root,
-            database_path,
-            database_sidecar,
-            RootUse::BeforeDatabaseCreate,
-        )?;
+        let canonical = PrivateFs::validate_private_dir(root)?;
+        validate_root_disjoint(&canonical, database_path)?;
+        let usage = if fresh {
+            RootUse::BeforeDatabaseCreate
+        } else {
+            RootUse::BeforeDatabaseOpen
+        };
+        check_or_claim_root(&canonical, database_path, usage)?;
     }
     Ok(())
 }
@@ -285,18 +382,14 @@ pub(crate) fn check_before_database_create(
 fn check_or_claim_root(
     root: &Path,
     database_path: &Path,
-    database_sidecar: &FileLock,
     usage: RootUse,
 ) -> Result<(), StorageError> {
     const OWNER: &str = "database.owner";
-    // The DB sidecar excludes another instance of this database. This
-    // short-lived lock serializes claims from differently configured databases.
+    // The DB sidecar excludes another instance of this database. Because blob_root
+    // is guaranteed distinct from the database directory, this dedicated claim lock
+    // serializes initialization across differently configured databases.
     let claim_path = root.join("database-owner.lock");
-    // A database in this root can already hold this exact sidecar.
-    let separate_claim = (!database_sidecar.protects_path(&claim_path)?)
-        .then(|| FileLock::acquire_exclusive(&claim_path))
-        .transpose()?;
-    let claim = separate_claim.as_ref().unwrap_or(database_sidecar);
+    let claim = FileLock::acquire_exclusive(&claim_path)?;
     claim.verify_path()?;
     let marker = root.join(OWNER);
     let owner = database_path.as_os_str().as_encoded_bytes();
@@ -316,13 +409,15 @@ fn check_or_claim_root(
                     ));
                 }
             }
-            if matches!(usage, RootUse::BeforeDatabaseCreate) {
+            if matches!(
+                usage,
+                RootUse::BeforeDatabaseCreate | RootUse::BeforeDatabaseOpen
+            ) {
                 return Ok(());
             }
-            // The marker must have one name on either side of a crash. A
-            // link/unlink fallback can leave a durable two-link intermediate.
+            // Remove only interrupted staging files targeting `database.owner`.
             claim.verify_path()?;
-            discard_interrupted_claims(root, max_owner_bytes)?;
+            PrivateFs::clean_interrupted_writes(root, OWNER)?;
             PrivateFs::write_private_file_atomic(root, OWNER, owner)?;
             PrivateFs::read_private_file(&marker, max_owner_bytes)?
         }
@@ -340,26 +435,10 @@ fn check_or_claim_root(
             "missing or empty database for an existing blob root".into(),
         ));
     }
-    // Also cover a previous claim whose rename was visible but directory
-    // sync did not complete before shutdown.
-    PrivateFs::open_dir_nofollow(root)?.sync_all()?;
-    Ok(())
-}
-
-fn discard_interrupted_claims(root: &Path, max_owner_bytes: u64) -> Result<(), StorageError> {
-    // Only marker initialization stages files in this directory. A crash
-    // before its rename can leave a private temporary file, never a marker alias.
-    for entry in fs::read_dir(root)? {
-        let entry = entry?;
-        let name = entry.file_name();
-        if name
-            .to_str()
-            .and_then(|name| name.strip_prefix(".tmp."))
-            .is_some_and(|name| name.len() == 32 && name.bytes().all(lower_hex))
-        {
-            PrivateFs::read_private_file(&entry.path(), max_owner_bytes)?;
-            fs::remove_file(entry.path())?;
-        }
+    if matches!(usage, RootUse::Bind) {
+        // Also cover a previous claim whose rename was visible but directory
+        // sync did not complete before shutdown.
+        PrivateFs::open_dir_nofollow(root)?.sync_all()?;
     }
     Ok(())
 }
@@ -378,7 +457,7 @@ struct StageWriter {
 }
 
 enum StageProgress {
-    Receiving(StageWriter),
+    Receiving(StageWriter, Vec<InputChunk>),
     Finished(StagedBlob),
 }
 
@@ -395,26 +474,39 @@ impl StageWriter {
         })
     }
 
-    fn write_batch(mut self, batch: Vec<InputChunk>) -> Result<StageProgress, StorageError> {
-        for chunk in batch {
+    fn write_batch(mut self, mut batch: Vec<InputChunk>) -> Result<StageProgress, StorageError> {
+        let mut batch_bytes = 0u64;
+        let mut projected = self.reserved;
+        for chunk in &batch {
+            if let InputChunk::Data(data) = chunk {
+                let bytes = data.len() as u64;
+                projected = checked_blob_size(
+                    projected,
+                    bytes,
+                    self.disk.max_blob_bytes,
+                    self.input.expected_size,
+                )?;
+                batch_bytes = batch_bytes
+                    .checked_add(bytes)
+                    .ok_or(StorageError::BlobTooLarge {
+                        limit_bytes: self.disk.max_blob_bytes,
+                    })?;
+            }
+        }
+        if batch_bytes > 0 {
+            self.disk.reserve(batch_bytes)?;
+            self.reserved = projected;
+        }
+        for chunk in batch.drain(..) {
             match chunk {
                 InputChunk::Data(data) => {
-                    let bytes = data.len() as u64;
-                    let size = checked_blob_size(
-                        self.reserved,
-                        bytes,
-                        self.disk.max_blob_bytes,
-                        self.input.expected_size,
-                    )?;
-                    self.disk.reserve(bytes)?;
-                    self.reserved = size;
                     self.digest.update(&data);
                     self.file.write_all(&data)?;
                 }
                 InputChunk::Finish => return self.finish().map(StageProgress::Finished),
             }
         }
-        Ok(StageProgress::Receiving(self))
+        Ok(StageProgress::Receiving(self, batch))
     }
 
     fn finish(mut self) -> Result<StagedBlob, StorageError> {
@@ -559,13 +651,14 @@ pub fn safe_disk_name(input: &str) -> String {
         prev_dot = c == '.';
         replaced |= substitute;
     }
-    if replaced && safe.chars().all(|c| c == '_' || c.is_whitespace()) {
-        return "file.bin".into();
-    }
     // A dot left at the end of a stem would join the extension as '..'.
     if !suffix.is_empty() && safe.ends_with('.') {
         safe.pop();
         safe.push('_');
+        replaced = true;
+    }
+    if replaced && safe.chars().all(|c| c == '_' || c.is_whitespace()) {
+        return "file.bin".into();
     }
     safe.push_str(suffix);
     // Substitution or truncation can turn an invalid extension into a valid
@@ -613,33 +706,9 @@ fn checked_dir(path: &Path) -> Result<Option<File>, StorageError> {
     }
 }
 
-fn checked_object(path: &Path) -> Result<Option<Metadata>, StorageError> {
-    match fs::symlink_metadata(path) {
-        Ok(metadata)
-            if metadata.is_file()
-                && metadata.nlink() == 1
-                && metadata.uid() == current_euid()
-                && metadata.mode() & 0o7777 == 0o400 =>
-        {
-            Ok(Some(metadata))
-        }
-        Ok(_) => Err(invalid_path(path)),
-        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(None),
-        Err(error) => Err(error.into()),
-    }
-}
-
-fn remove_file_if_present(path: &Path) -> io::Result<bool> {
-    match fs::remove_file(path) {
-        Ok(()) => Ok(true),
-        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(false),
-        Err(error) => Err(error),
-    }
-}
-
 pub(super) struct ObjectScanner {
     root: PathBuf,
-    directories: Vec<(PathBuf, ReadDir)>,
+    directories: Vec<(PathBuf, File, ReadDir)>,
 }
 
 impl ObjectScanner {
@@ -647,7 +716,7 @@ impl ObjectScanner {
         let mut batch = Vec::new();
         while batch.len() < limit {
             let depth = self.directories.len();
-            let Some((parent, entries)) = self.directories.last_mut() else {
+            let Some((parent, parent_fd, entries)) = self.directories.last_mut() else {
                 break;
             };
             let Some(entry) = entries.next().transpose()? else {
@@ -657,15 +726,22 @@ impl ObjectScanner {
             let name = entry.file_name();
             let relative = parent.join(&name);
             let full = self.root.join(&relative);
+            let name = name.to_str().ok_or_else(|| invalid_path(&relative))?;
             if depth == 1 || depth == 2 {
-                let name = name.to_str().ok_or_else(|| invalid_path(&relative))?;
                 if (depth == 1 && !valid_shard(name))
                     || (depth == 2 && BlobId::parse(name).is_err())
                 {
                     return Err(invalid_path(&relative));
                 }
-                checked_dir(&full)?.ok_or_else(|| invalid_path(&relative))?;
-                self.directories.push((relative, fs::read_dir(full)?));
+                let child_fd =
+                    PrivateFs::open_dir_at(parent_fd, name).map_err(|_| invalid_path(&relative))?;
+                let child_meta = child_fd.metadata()?;
+                let path_meta = fs::symlink_metadata(&full)?;
+                if (child_meta.dev(), child_meta.ino()) != (path_meta.dev(), path_meta.ino()) {
+                    return Err(invalid_path(&relative));
+                }
+                self.directories
+                    .push((relative, child_fd, fs::read_dir(full)?));
             } else {
                 let id = relative
                     .components()
@@ -677,7 +753,9 @@ impl ObjectScanner {
                     .and_then(|id| BlobId::parse(id).ok())
                     .ok_or_else(|| invalid_path(&relative))?;
                 validate_path(&relative, &id)?;
-                let metadata = checked_object(&full)?.ok_or_else(|| invalid_path(&relative))?;
+                let file = PrivateFs::open_sealed_at(parent_fd, name)
+                    .map_err(|_| invalid_path(&relative))?;
+                let metadata = file.metadata()?;
                 batch.push(BlobRecord {
                     blob_id: id,
                     disk_rel_path: relative,

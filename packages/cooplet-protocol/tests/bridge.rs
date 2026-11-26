@@ -8,6 +8,11 @@ const THREAD: &str = "thr_00000000000000000000000000";
 
 fn strict_round_trip<P: BridgePayload + PartialEq + std::fmt::Debug>(value: Value) -> TestResult {
     let payload: P = serde_json::from_value(value)?;
+    let direct_bytes = BridgeFrame::encode_json(3, &payload)?;
+    assert_eq!(
+        BridgeFrame::from_json(&direct_bytes)?.decode_payload::<P>()?,
+        payload
+    );
     let mut frame = BridgeFrame::encode(3, &payload)?;
     assert_eq!(
         BridgeFrame::from_json(&frame.to_json()?)?.decode_payload::<P>()?,
@@ -423,5 +428,211 @@ fn bridge_and_event_require_string_kinds_and_preserve_untyped_payloads() -> Test
     assert_eq!(event.payload, frame["event"]["payload"]);
     frame["event"]["kind"] = json!({"node.status":null});
     assert!(serde_json::from_value::<EventStreamFrame>(frame).is_err());
+    Ok(())
+}
+
+#[test]
+fn bridge_and_event_nested_validation_and_object_defaults() -> TestResult {
+    // RunWorkflow.params and ParticipantWire.capabilities default to {} instead of null
+    let cmd: CommandReqPayload = serde_json::from_value(json!({
+        "op_id": OP,
+        "actor_id": "operator:alfa",
+        "admission_budget_ms": 100,
+        "delivery_mode": "direct_now",
+        "command": {"type": "run_workflow", "workflow_name": "deploy", "workspace_dir": "/work"}
+    }))?;
+    assert!(matches!(
+        &cmd.command,
+        BridgeCommand::RunWorkflow { params, .. } if params.is_object()
+    ));
+    BridgeFrame::encode_json(1, &cmd)?;
+
+    let participant: ParticipantWire = serde_json::from_value(json!({
+        "participant_id": PART,
+        "kind": "agent",
+        "name": "coder",
+        "state": "idle"
+    }))?;
+    assert!(participant.capabilities.is_object());
+
+    // Reject stale approval fields on non-awaiting participant
+    let mut bad_roster: RosterSyncPayload = serde_json::from_value(empty_roster())?;
+    let mut stale_participant = participant;
+    stale_participant.approval_id = Some("old".into());
+    bad_roster.participants.push(stale_participant);
+    assert!(BridgeFrame::encode_json(1, &bad_roster).is_err());
+
+    // Reject bad nested attachment, question+answer, empty approval_id, bad step_key, bad seq range
+    let bad_send: CommandReqPayload = serde_json::from_value(json!({
+        "op_id": OP,
+        "actor_id": "operator:alfa",
+        "admission_budget_ms": 100,
+        "delivery_mode": "direct_now",
+        "command": {
+            "type": "send_message",
+            "message_id": "msg_00000000000000000000000000",
+            "recipient_id": PART,
+            "body": "hi",
+            "attachments": [{
+                "blob_id": "blob_00000000000000000000000000",
+                "name": "bad\nname",
+                "mime_type": "text/plain",
+                "size_bytes": 1,
+                "sha256": "a".repeat(64)
+            }]
+        }
+    }))?;
+    assert!(BridgeFrame::encode_json(1, &bad_send).is_err());
+
+    let both_qa: CommandReqPayload = serde_json::from_value(json!({
+        "op_id": OP,
+        "actor_id": "operator:alfa",
+        "admission_budget_ms": 100,
+        "delivery_mode": "direct_now",
+        "command": {
+            "type": "send_message",
+            "message_id": "msg_00000000000000000000000000",
+            "recipient_id": PART,
+            "body": "hi",
+            "question": {"prompt": "q?", "mode": "text"},
+            "answer": {"text": "a"}
+        }
+    }))?;
+    assert!(BridgeFrame::encode_json(1, &both_qa).is_err());
+
+    let bad_approval: CommandReqPayload = serde_json::from_value(json!({
+        "op_id": OP,
+        "actor_id": "operator:alfa",
+        "admission_budget_ms": 100,
+        "delivery_mode": "direct_now",
+        "command": {
+            "type": "respond_approval",
+            "participant_id": PART,
+            "decision": {"approval_id": " ", "action": "approve"}
+        }
+    }))?;
+    assert!(BridgeFrame::encode_json(1, &bad_approval).is_err());
+
+    let bad_thread: ThreadDeliverPayload = serde_json::from_value(json!({
+        "delivery_id": OP,
+        "thread_id": THREAD,
+        "member_id": PART,
+        "from_seq": 10,
+        "to_seq": 6,
+        "posts": [],
+        "delivery_mode": "queue_until_idle",
+        "admission_budget_ms": 100
+    }))?;
+    assert!(BridgeFrame::encode_json(1, &bad_thread).is_err());
+
+    let bad_step: NodeEventPayload = serde_json::from_value(json!({
+        "type": "workflow_step_completed",
+        "run_id": "run_00000000000000000000000000",
+        "step_key": "bad key with spaces",
+        "status": "completed"
+    }))?;
+    assert!(BridgeFrame::encode_json(1, &bad_step).is_err());
+    assert!(
+        serde_json::from_value::<NodeEventPayload>(json!({
+            "type": "workflow_log",
+            "run_id": "run_00000000000000000000000000",
+            "level": "unknown_level",
+            "message": "hi"
+        }))
+        .is_err()
+    );
+    let good_wf = NodeEventPayload::WorkflowRunFinished {
+        run_id: "run_00000000000000000000000000".parse()?,
+        workflow_name: "deploy".into(),
+        state: WorkflowRunState::Completed,
+        result: None,
+        error: None,
+    };
+    BridgeFrame::encode_json(1, &good_wf)?;
+
+    // EventEnvelope validation negative cases
+    let base_event = json!({
+        "seq": 1,
+        "event_id": "evt_00000000000000000000000000",
+        "source_kind": "node",
+        "source_id": "node_00000000000000000000000000",
+        "kind": "node.status",
+        "aggregate_type": "node",
+        "aggregate_id": "node_00000000000000000000000000",
+        "actor_id": null,
+        "created_at_ms": 1,
+        "payload": {}
+    });
+    serde_json::from_value::<EventEnvelope>(base_event.clone())?.validate()?;
+
+    let mut wrong_source = base_event.clone();
+    wrong_source["source_kind"] = json!("hub");
+    assert!(
+        serde_json::from_value::<EventEnvelope>(wrong_source)?
+            .validate()
+            .is_err()
+    );
+
+    let mut blank_agg = base_event.clone();
+    blank_agg["aggregate_id"] = json!("   ");
+    assert!(
+        serde_json::from_value::<EventEnvelope>(blank_agg)?
+            .validate()
+            .is_err()
+    );
+
+    let mut non_obj = base_event.clone();
+    non_obj["payload"] = Value::Null;
+    assert!(
+        serde_json::from_value::<EventEnvelope>(non_obj)?
+            .validate()
+            .is_err()
+    );
+
+    let mut wrong_state = base_event.clone();
+    wrong_state["kind"] = json!("participant.awaiting_approval");
+    wrong_state["payload"] = json!({"state": "idle"});
+    assert!(
+        serde_json::from_value::<EventEnvelope>(wrong_state)?
+            .validate()
+            .is_err()
+    );
+
+    let mut stale_state = base_event.clone();
+    stale_state["kind"] = json!("participant.state_changed");
+    stale_state["payload"] =
+        json!({"state": "idle", "can_respond_remotely": true, "approval_id": "a1"});
+    assert!(
+        serde_json::from_value::<EventEnvelope>(stale_state)?
+            .validate()
+            .is_err()
+    );
+
+    let mut bad_answered = base_event;
+    bad_answered["kind"] = json!("question.answered");
+    bad_answered["payload"] = json!({
+        "question_message_id": "msg_00000000000000000000000000",
+        "answer_message_id": "msg_00000000000000000000000001",
+        "answered_by": "operator",
+        "answer": {"selected_option_ids": ["a"], "text": "   "}
+    });
+    assert!(
+        serde_json::from_value::<EventEnvelope>(bad_answered.clone())?
+            .validate()
+            .is_err()
+    );
+    bad_answered["payload"]["answer"] = json!({"selected_option_ids": ["a", "a"]});
+    assert!(
+        serde_json::from_value::<EventEnvelope>(bad_answered.clone())?
+            .validate()
+            .is_err()
+    );
+    bad_answered["payload"]["answer"] = json!({"text": "x".repeat(8001)});
+    assert!(
+        serde_json::from_value::<EventEnvelope>(bad_answered)?
+            .validate()
+            .is_err()
+    );
+
     Ok(())
 }

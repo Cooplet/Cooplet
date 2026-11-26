@@ -25,14 +25,22 @@ impl PrivateFs {
     /// Verify and canonicalize an existing private directory.
     pub fn validate_private_dir(path: &Path) -> Result<PathBuf, PlatformError> {
         let path: PathBuf = path.components().collect();
-        canonical_private_directory(&path).map(|(canonical, _)| canonical)
+        canonical_private_directory(&path, false).map(|(canonical, _, _)| canonical)
     }
 
     fn ensure_private_dir_with(
         path: &Path,
         sync_parent: impl FnOnce(&File) -> io::Result<()>,
     ) -> Result<PathBuf, PlatformError> {
+        Self::ensure_private_dir_fd_with(path, sync_parent).map(|(canonical, _, _)| canonical)
+    }
+
+    fn ensure_private_dir_fd_with(
+        path: &Path,
+        sync_parent: impl FnOnce(&File) -> io::Result<()>,
+    ) -> Result<(PathBuf, File, Metadata), PlatformError> {
         let path: PathBuf = path.components().collect();
+        let mut created = false;
         match fs::symlink_metadata(&path) {
             Ok(metadata) if metadata.file_type().is_symlink() => {
                 return Err(PlatformError::insecure(&path, "symbolic link"));
@@ -40,21 +48,27 @@ impl PrivateFs {
             Ok(_) => {}
             Err(error) if error.kind() == io::ErrorKind::NotFound => {
                 match DirBuilder::new().mode(0o700).create(&path) {
-                    Ok(()) => {}
+                    Ok(()) => created = true,
                     Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {}
                     Err(error) => return Err(error.into()),
                 }
             }
             Err(error) => return Err(error.into()),
         }
-        let (canonical, metadata) = canonical_private_directory(&path)?;
+        let (canonical, dir_fd, metadata) = canonical_private_directory(&path, created)?;
         // An existing entry might have just been created by another caller
-        // or left behind after its parent sync failed. Complete that sync.
-        if let Some(parent) = canonical.parent() {
-            sync_parent(&Self::open_dir_nofollow(parent)?)?;
+        // or left behind after its parent sync failed. Complete that sync
+        // when the parent resides on the same filesystem.
+        if let Some(parent) = canonical.parent()
+            && parent != canonical
+        {
+            let parent_dir = Self::open_dir_nofollow(parent)?;
+            if parent_dir.metadata()?.dev() == metadata.dev() {
+                sync_parent(&parent_dir)?;
+            }
         }
         verify_path(&canonical, &metadata)?;
-        Ok(canonical)
+        Ok((canonical, dir_fd, metadata))
     }
 
     pub fn open_dir_nofollow(path: &Path) -> Result<File, PlatformError> {
@@ -63,6 +77,87 @@ impl PrivateFs {
             .read(true)
             .custom_flags(libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC)
             .open(path)?)
+    }
+
+    /// Open a direct private child directory relative to an already-verified parent fd.
+    pub fn open_dir_at(parent: &File, name: &str) -> Result<File, PlatformError> {
+        let c_name = component(name)?;
+        let flags = libc::O_RDONLY | libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC;
+        let dir = openat_entry(parent, &c_name, flags, 0)?;
+        let metadata = dir.metadata()?;
+        verify_private_dir(Path::new(name), &metadata)?;
+        Ok(dir)
+    }
+
+    /// Create a new private file (`0600`) exclusively inside an open directory fd.
+    pub fn create_private_file_at(dir: &File, name: &str) -> Result<File, PlatformError> {
+        let c_name = component(name)?;
+        let file = create_entry(dir, &c_name)?;
+        if let Err(error) = file.set_permissions(Permissions::from_mode(0o600)) {
+            let _ = unlink_entry(dir, &c_name);
+            return Err(error.into());
+        }
+        Ok(file)
+    }
+
+    /// Open a sealed read-only (`0400`) regular file relative to an open directory fd.
+    pub fn open_sealed_at(dir: &File, name: &str) -> Result<File, PlatformError> {
+        let c_name = component(name)?;
+        let file = openat_entry(dir, &c_name, libc::O_RDONLY | NOFOLLOW_FILE, 0)?;
+        let metadata = file.metadata()?;
+        verify_private_file(Path::new(name), &metadata, 0o400)?;
+        Ok(file)
+    }
+
+    /// Unlink a non-directory entry relative to an open directory fd.
+    /// Returns `Ok(false)` when the entry is already absent.
+    pub fn unlink_file_at(dir: &File, name: &str) -> Result<bool, PlatformError> {
+        let c_name = component(name)?;
+        match unlink_entry_flags(dir, &c_name, 0) {
+            Ok(()) => Ok(true),
+            Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(false),
+            Err(error) => Err(error.into()),
+        }
+    }
+
+    /// Remove an empty child directory relative to an open directory fd.
+    /// Returns `Ok(false)` when the directory is already absent.
+    pub fn remove_dir_at(dir: &File, name: &str) -> Result<bool, PlatformError> {
+        let c_name = component(name)?;
+        match unlink_entry_flags(dir, &c_name, libc::AT_REMOVEDIR) {
+            Ok(()) => Ok(true),
+            Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(false),
+            Err(error) => Err(error.into()),
+        }
+    }
+
+    /// Remove stale staging files left by an interrupted `write_private_file_atomic`
+    /// call for `target` inside an existing private directory.
+    pub fn clean_interrupted_writes(dir: &Path, target: &str) -> Result<usize, PlatformError> {
+        let prefix = staging_prefix(target)?;
+        let path: PathBuf = dir.components().collect();
+        let (canonical, dir_fd, identity) = canonical_private_directory(&path, false)?;
+        let mut removed = 0usize;
+        for entry in fs::read_dir(&canonical)? {
+            let entry = entry?;
+            let Some(name) = entry.file_name().to_str().map(str::to_owned) else {
+                continue;
+            };
+            if !is_staging_name(&name, &prefix) {
+                continue;
+            }
+            if !entry.file_type()?.is_file() {
+                continue;
+            }
+            if Self::unlink_file_at(&dir_fd, &name)? {
+                removed += 1;
+            }
+        }
+        if removed > 0 {
+            dir_fd.sync_all()?;
+            verify_path(&canonical, &identity)?;
+        }
+        Ok(removed)
     }
 
     pub fn read_private_file(path: &Path, max_bytes: u64) -> Result<Vec<u8>, PlatformError> {
@@ -111,12 +206,12 @@ impl PrivateFs {
         write_staging: impl FnOnce(&File) -> io::Result<()>,
         sync_dir: impl FnOnce(&File) -> io::Result<()>,
     ) -> Result<(), PlatformError> {
-        let name = component(name)?;
+        let target = component(name)?;
         let (dir, dir_fd, identity) = private_directory(dir)?;
-        let (file, mut staging) = open_staging(&dir_fd)?;
+        let (file, mut staging) = open_staging(&dir_fd, name)?;
         write_staging(&file)?;
         verify_path(&dir, &identity)?;
-        replace_entry(&dir_fd, &staging.name, &name)?;
+        replace_entry(&dir_fd, &staging.name, &target)?;
         staging.armed = false;
         sync_dir(&dir_fd).map_err(|source| PlatformError::PublishedDurabilityUnknown {
             stage: PublishStage::RenameDirectorySync,
@@ -132,34 +227,49 @@ impl PrivateFs {
     }
 
     pub fn open_sealed_file(path: &Path) -> Result<File, PlatformError> {
+        let path: PathBuf = path.components().collect();
         let file = OpenOptions::new()
             .read(true)
             .custom_flags(NOFOLLOW_FILE)
-            .open(path)?;
+            .open(&path)?;
         let metadata = file.metadata()?;
-        verify_private_file(path, &metadata, 0o400)?;
-        verify_path(path, &metadata)?;
+        verify_private_file(&path, &metadata, 0o400)?;
+        verify_path(&path, &metadata)?;
         Ok(file)
     }
 }
 
-fn canonical_private_directory(path: &Path) -> Result<(PathBuf, Metadata), PlatformError> {
+fn canonical_private_directory(
+    path: &Path,
+    clear_created_mode: bool,
+) -> Result<(PathBuf, File, Metadata), PlatformError> {
     let dir = PrivateFs::open_dir_nofollow(path)?;
-    let metadata = dir.metadata()?;
+    let mut metadata = dir.metadata()?;
+    if clear_created_mode
+        && metadata.is_dir()
+        && metadata.uid() == current_euid()
+        && metadata.mode() & 0o5077 == 0
+        && metadata.mode() & 0o7777 != 0o700
+    {
+        dir.set_permissions(Permissions::from_mode(0o700))?;
+        metadata = dir.metadata()?;
+    }
     verify_private_dir(path, &metadata)?;
     verify_path(path, &metadata)?;
     let canonical = fs::canonicalize(path)?;
     verify_path(&canonical, &metadata)?;
-    Ok((canonical, metadata))
+    Ok((canonical, dir, metadata))
 }
 
 fn private_directory(path: &Path) -> Result<(PathBuf, File, Metadata), PlatformError> {
-    let path = PrivateFs::ensure_private_dir(path)?;
-    let file = PrivateFs::open_dir_nofollow(&path)?;
-    let identity = file.metadata()?;
-    verify_private_dir(&path, &identity)?;
-    verify_path(&path, &identity)?;
-    Ok((path, file, identity))
+    let path: PathBuf = path.components().collect();
+    match canonical_private_directory(&path, false) {
+        Ok(result) => Ok(result),
+        Err(PlatformError::Io(error)) if error.kind() == io::ErrorKind::NotFound => {
+            PrivateFs::ensure_private_dir_fd_with(&path, File::sync_all)
+        }
+        Err(error) => Err(error),
+    }
 }
 
 fn verify_private_dir(path: &Path, metadata: &Metadata) -> Result<(), PlatformError> {
@@ -218,11 +328,31 @@ pub(crate) fn verify_path(path: &Path, opened: &Metadata) -> Result<(), Platform
     }
 }
 
-fn open_staging(dir: &File) -> Result<(File, StagingName<'_>), PlatformError> {
+fn staging_prefix(target: &str) -> Result<String, PlatformError> {
+    let _ = component(target)?;
+    // Reserve space for `.tmp.` (5) + `.` (1) + 32 hex chars within POSIX NAME_MAX (255).
+    if target.len() <= 200 {
+        Ok(format!(".tmp.{target}."))
+    } else {
+        Ok(".tmp.".into())
+    }
+}
+
+fn is_staging_name(name: &str, prefix: &str) -> bool {
+    name.strip_prefix(prefix).is_some_and(|suffix| {
+        suffix.len() == 32
+            && suffix
+                .bytes()
+                .all(|byte| matches!(byte, b'0'..=b'9' | b'a'..=b'f'))
+    })
+}
+
+fn open_staging<'a>(dir: &'a File, target: &str) -> Result<(File, StagingName<'a>), PlatformError> {
+    let prefix = staging_prefix(target)?;
     for _ in 0..16 {
         let mut bytes = [0; 16];
         random_bytes(&mut bytes)?;
-        let name = component(&format!(".tmp.{:032x}", u128::from_be_bytes(bytes)))?;
+        let name = component(&format!("{prefix}{:032x}", u128::from_be_bytes(bytes)))?;
         match create_entry(dir, &name) {
             Ok(file) => {
                 let staging = StagingName {
@@ -258,18 +388,34 @@ impl Drop for StagingName<'_> {
     }
 }
 
-fn create_entry(dir: &File, name: &CStr) -> io::Result<File> {
-    let flags = libc::O_WRONLY | libc::O_CREAT | libc::O_EXCL | libc::O_NOFOLLOW | libc::O_CLOEXEC;
-    // SAFETY: the descriptor and C string remain valid, and openat owns a
-    // newly allocated fd on success. The variadic mode is integer-promoted.
-    unsafe {
-        let fd = libc::openat(dir.as_raw_fd(), name.as_ptr(), flags, 0o600 as libc::c_uint);
-        if fd < 0 {
-            Err(io::Error::last_os_error())
-        } else {
-            Ok(File::from_raw_fd(fd))
+fn openat_entry(
+    dir: &File,
+    name: &CStr,
+    flags: libc::c_int,
+    mode: libc::c_uint,
+) -> io::Result<File> {
+    loop {
+        // SAFETY: the descriptor and C string remain valid across openat,
+        // the variadic mode is integer-promoted, and a non-negative return
+        // transfers exclusive ownership of a new fd to File::from_raw_fd.
+        let result = unsafe {
+            let fd = libc::openat(dir.as_raw_fd(), name.as_ptr(), flags, mode);
+            if fd < 0 {
+                Err(io::Error::last_os_error())
+            } else {
+                Ok(File::from_raw_fd(fd))
+            }
+        };
+        match result {
+            Err(error) if error.kind() == io::ErrorKind::Interrupted => continue,
+            other => return other,
         }
     }
+}
+
+fn create_entry(dir: &File, name: &CStr) -> io::Result<File> {
+    let flags = libc::O_WRONLY | libc::O_CREAT | libc::O_EXCL | libc::O_NOFOLLOW | libc::O_CLOEXEC;
+    openat_entry(dir, name, flags, 0o600 as libc::c_uint)
 }
 
 fn replace_entry(dir: &File, source: &CStr, target: &CStr) -> io::Result<()> {
@@ -289,13 +435,17 @@ fn replace_entry(dir: &File, source: &CStr, target: &CStr) -> io::Result<()> {
     }
 }
 
-pub(crate) fn unlink_entry(dir: &File, name: &CStr) -> io::Result<()> {
+pub(crate) fn unlink_entry_flags(dir: &File, name: &CStr, flags: libc::c_int) -> io::Result<()> {
     // SAFETY: the borrowed directory fd and validated C string live through unlinkat.
-    if unsafe { libc::unlinkat(dir.as_raw_fd(), name.as_ptr(), 0) } == 0 {
+    if unsafe { libc::unlinkat(dir.as_raw_fd(), name.as_ptr(), flags) } == 0 {
         Ok(())
     } else {
         Err(io::Error::last_os_error())
     }
+}
+
+pub(crate) fn unlink_entry(dir: &File, name: &CStr) -> io::Result<()> {
+    unlink_entry_flags(dir, name, 0)
 }
 
 pub(crate) fn sidecar_path(path: &Path) -> Result<PathBuf, PlatformError> {
@@ -440,6 +590,73 @@ mod tests {
         });
         assert!(matches!(second, Err(PlatformError::Io(_))));
         PrivateFs::ensure_private_dir(&child)?;
+        Ok(())
+    }
+
+    #[test]
+    fn clears_inherited_setgid_on_newly_created_private_dir()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let scratch = Scratch::new()?;
+        let parent = scratch.0.join("sgid-parent");
+        DirBuilder::new().mode(0o755).create(&parent)?;
+        fs::set_permissions(&parent, Permissions::from_mode(0o2755))?;
+        let child = parent.join("state");
+        let canonical = PrivateFs::ensure_private_dir(&child)?;
+        assert_eq!(fs::metadata(&canonical)?.mode() & 0o7777, 0o700);
+        // Existing directories with setgid remain rejected.
+        let preexisting = parent.join("preexisting");
+        DirBuilder::new().mode(0o700).create(&preexisting)?;
+        fs::set_permissions(&preexisting, Permissions::from_mode(0o2700))?;
+        assert!(matches!(
+            PrivateFs::ensure_private_dir(&preexisting),
+            Err(PlatformError::InsecurePermissions { .. })
+        ));
+        Ok(())
+    }
+
+    #[test]
+    fn fd_relative_operations_and_scoped_interrupted_cleanup()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let scratch = Scratch::new()?;
+        let root = PrivateFs::ensure_private_dir(&scratch.0.join("root"))?;
+        let sub = PrivateFs::ensure_private_dir(&root.join("sub"))?;
+        let root_fd = PrivateFs::open_dir_nofollow(&root)?;
+        let sub_fd = PrivateFs::open_dir_at(&root_fd, "sub")?;
+
+        let mut file = PrivateFs::create_private_file_at(&sub_fd, "blob.bin")?;
+        file.write_all(b"sealed-data")?;
+        PrivateFs::seal_readonly(&file)?;
+        drop(file);
+
+        let mut opened = PrivateFs::open_sealed_at(&sub_fd, "blob.bin")?;
+        let mut buf = Vec::new();
+        opened.read_to_end(&mut buf)?;
+        assert_eq!(buf, b"sealed-data");
+
+        let mut by_path = PrivateFs::open_sealed_file(&sub.join("./blob.bin"))?;
+        buf.clear();
+        by_path.read_to_end(&mut buf)?;
+        assert_eq!(buf, b"sealed-data");
+
+        assert!(PrivateFs::unlink_file_at(&sub_fd, "blob.bin")?);
+        assert!(!PrivateFs::unlink_file_at(&sub_fd, "blob.bin")?);
+        assert!(PrivateFs::remove_dir_at(&root_fd, "sub")?);
+        assert!(!PrivateFs::remove_dir_at(&root_fd, "sub")?);
+
+        // Scoped interrupted-write cleanup only touches `.tmp.<target>.<32hex>` files.
+        let target_tmp = root.join(format!(".tmp.database.owner.{:032x}", 1u128));
+        let other_tmp = root.join(format!(".tmp.other.file.{:032x}", 2u128));
+        let keep_file = root.join("database.owner");
+        fs::write(&target_tmp, b"partial")?;
+        fs::write(&other_tmp, b"other")?;
+        fs::write(&keep_file, b"owner")?;
+        assert_eq!(
+            PrivateFs::clean_interrupted_writes(&root, "database.owner")?,
+            1
+        );
+        assert!(!target_tmp.exists());
+        assert!(other_tmp.exists());
+        assert!(keep_file.exists());
         Ok(())
     }
 }

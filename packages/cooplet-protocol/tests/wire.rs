@@ -348,6 +348,15 @@ fn wire_enum_labels_accept_only_strings_in_every_json_representation() -> TestRe
     check(ThreadDeliveryOutcome::Delivered, "delivered")?;
     check(EventKind::WorkflowLog, "workflow.log")?;
     check(ErrorCode::DeliveryUnknown, "delivery_unknown")?;
+    check(WorkflowRunState::Interrupted, "interrupted")?;
+    check(WorkflowStepStatus::Completed, "completed")?;
+    check(WorkflowLogLevel::Warn, "warn")?;
+    assert_eq!(ErrorCode::DeliveryUnknown.as_str(), "delivery_unknown");
+    assert_eq!(ErrorCode::DeliveryUnknown.to_string(), "delivery_unknown");
+    assert_eq!(
+        "delivery_unknown".parse::<ErrorCode>()?,
+        ErrorCode::DeliveryUnknown
+    );
     assert_eq!(
         serde_json::from_str::<EventKind>(r#""workflow\u002elog""#)?,
         EventKind::WorkflowLog
@@ -372,5 +381,116 @@ fn wire_enum_labels_accept_only_strings_in_every_json_representation() -> TestRe
         assert!(Frame::deserialize(&frame).is_err());
         assert!(serde_json::from_slice::<Frame>(&serde_json::to_vec(&frame)?).is_err());
     }
+    Ok(())
+}
+
+#[test]
+fn attachment_approval_question_and_canonical_edge_cases() -> TestResult {
+    use std::collections::BTreeMap;
+
+    // Borrow<str> lookup and SourceId conversions
+    let node: NodeId = "node_00000000000000000000000000".parse()?;
+    let hub: HubId = "hub_00000000000000000000000000".parse()?;
+    let mut nodes = BTreeMap::new();
+    nodes.insert(node.clone(), 1u8);
+    assert_eq!(nodes.get(node.as_str()), Some(&1));
+    let source: SourceId = node.into();
+    assert_eq!(source.as_ref(), "node_00000000000000000000000000");
+    let hub_source: SourceId = hub.into();
+    assert!(hub_source < source);
+
+    // AttachmentRef & RFC 9110 media type validation
+    let valid_att = AttachmentRef {
+        blob_id: "blob_00000000000000000000000000".parse()?,
+        name: "spec.md".into(),
+        mime_type: "text/markdown; charset=utf-8".into(),
+        size_bytes: 12,
+        sha256: "a".repeat(64),
+    };
+    valid_att.validate()?;
+    for bad_mime in [
+        "",
+        "   ",
+        "not-a-mime",
+        "text/plain\r\nX-Injected: 1",
+        "text/plain\0",
+        "*/*",
+        "text/*",
+        &format!("text/{}", "a".repeat(255)),
+    ] {
+        let mut att = valid_att.clone();
+        att.mime_type = bad_mime.into();
+        assert!(att.validate().is_err(), "accepted bad mime {bad_mime:?}");
+    }
+    for bad_name in ["", "   ", "a\0b", "a\nb", "a\x1bb", &"a".repeat(256)] {
+        let mut att = valid_att.clone();
+        att.name = bad_name.into();
+        assert!(att.validate().is_err(), "accepted bad name {bad_name:?}");
+    }
+    for bad_sha in ["", &"A".repeat(64), &"a".repeat(63), &"g".repeat(64)] {
+        assert!(validate_sha256(bad_sha).is_err());
+    }
+
+    // ApprovalWait & ApprovalDecision validation
+    let wait = ApprovalWait {
+        approval_id: Some("a1".into()),
+        kind: ApprovalWaitKind::Permission,
+        summary: None,
+        can_respond_remotely: true,
+        action_hint: None,
+    };
+    wait.validate()?;
+    let mut bad_wait = wait.clone();
+    bad_wait.approval_id = Some("  ".into());
+    assert!(bad_wait.validate().is_err());
+    bad_wait.can_respond_remotely = false;
+    assert!(bad_wait.validate().is_err());
+    bad_wait.approval_id = None;
+    bad_wait.validate()?;
+    assert!(
+        ApprovalDecision {
+            approval_id: " ".into(),
+            action: ApprovalAction::Approve,
+        }
+        .validate()
+        .is_err()
+    );
+
+    // QuestionPayload.expires_at_ms & key boundary checks
+    let mut q = QuestionPayload {
+        prompt: "Proceed?".into(),
+        mode: QuestionMode::Text,
+        options: Vec::new(),
+        allow_free_text: true,
+        expires_at_ms: Some(1),
+    };
+    q.validate()?;
+    for bad_expiry in [0, -1, i64::MIN] {
+        q.expires_at_ms = Some(bad_expiry);
+        assert!(q.validate().is_err());
+    }
+    assert!(validate_idempotency_key(&"a".repeat(7)).is_err());
+    assert!(validate_idempotency_key(&"a".repeat(8)).is_ok());
+    assert!(validate_idempotency_key(&"a".repeat(128)).is_ok());
+    assert!(validate_idempotency_key(&"a".repeat(129)).is_err());
+    assert!(validate_idempotency_key("has space!").is_err());
+    assert!(validate_step_key("").is_err());
+    assert!(validate_step_key("a._:-9").is_ok());
+    assert!(validate_step_key(&"a".repeat(128)).is_ok());
+    assert!(validate_step_key(&"a".repeat(129)).is_err());
+
+    // Canonical JSON rejects non-finite floats instead of collapsing them to null
+    assert!(canonical_json_bytes(&f64::NAN).is_err());
+    assert!(canonical_json_bytes(&f64::INFINITY).is_err());
+    assert!(canonical_json_bytes(&f32::NEG_INFINITY).is_err());
+    assert!(canonical_sha256(&vec![1.0_f64, f64::NAN]).is_err());
+    assert_eq!(canonical_json_bytes(&1.5_f64)?, b"1.5");
+
+    // ProblemDetails OpenAPI schema allows RFC 9457 top-level extensions
+    let problem_schema = serde_json::to_value(ProblemDetails::schema())?;
+    assert_eq!(problem_schema["type"], "object");
+    assert!(problem_schema.get("additionalProperties").is_none());
+    assert!(problem_schema["properties"].get("type").is_some());
+    assert!(problem_schema["properties"].get("extensions").is_some());
     Ok(())
 }

@@ -1,28 +1,28 @@
 use serde::{Deserialize, Serialize};
 use utoipa::ToSchema;
 
-use crate::{BlobId, HubId, NodeId, ParticipantId, ValidationError};
+use crate::{BlobId, HubId, NodeId, ParticipantId, ValidationError, validate_media_type};
 
 crate::wire::wire_string_enum! {
     #[derive(Hash)]
     pub enum ParticipantKind {
-        Agent,
-        Human,
-        System,
+        Agent => "agent",
+        Human => "human",
+        System => "system",
     }
 }
 
 crate::wire::wire_string_enum! {
     #[derive(Hash)]
     pub enum ParticipantState {
-        Starting,
-        Idle,
-        Working,
-        AwaitingApproval,
-        Stopping,
-        Stopped,
-        Unavailable,
-        Unknown,
+        Starting => "starting",
+        Idle => "idle",
+        Working => "working",
+        AwaitingApproval => "awaiting_approval",
+        Stopping => "stopping",
+        Stopped => "stopped",
+        Unavailable => "unavailable",
+        Unknown => "unknown",
     }
 }
 
@@ -43,34 +43,63 @@ impl ParticipantState {
 crate::wire::wire_string_enum! {
     #[derive(Hash)]
     pub enum IntakeState {
-        Ready,
-        Busy,
-        AwaitingApproval,
-        Unavailable,
-        Unknown,
+        Ready => "ready",
+        Busy => "busy",
+        AwaitingApproval => "awaiting_approval",
+        Unavailable => "unavailable",
+        Unknown => "unknown",
     }
 }
 
 crate::wire::wire_string_enum! {
     #[derive(Hash)]
     pub enum DeliveryMode {
-        DirectNow,
-        QueueUntilIdle,
+        DirectNow => "direct_now",
+        QueueUntilIdle => "queue_until_idle",
     }
 }
 
 crate::wire::wire_string_enum! {
     #[derive(Hash)]
     pub enum DeliveryState {
-        Accepted,
-        Queued,
-        Dispatched,
-        Delivered,
-        Busy,
-        AwaitingApproval,
-        Expired,
-        Unavailable,
-        Unknown,
+        Accepted => "accepted",
+        Queued => "queued",
+        Dispatched => "dispatched",
+        Delivered => "delivered",
+        Busy => "busy",
+        AwaitingApproval => "awaiting_approval",
+        Expired => "expired",
+        Unavailable => "unavailable",
+        Unknown => "unknown",
+    }
+}
+
+crate::wire::wire_string_enum! {
+    #[derive(Hash)]
+    pub enum WorkflowRunState {
+        Running => "running",
+        Completed => "completed",
+        Failed => "failed",
+        Cancelled => "cancelled",
+        Interrupted => "interrupted",
+    }
+}
+
+crate::wire::wire_string_enum! {
+    #[derive(Hash)]
+    pub enum WorkflowStepStatus {
+        Completed => "completed",
+        Failed => "failed",
+    }
+}
+
+crate::wire::wire_string_enum! {
+    #[derive(Hash)]
+    pub enum WorkflowLogLevel {
+        Debug => "debug",
+        Info => "info",
+        Warn => "warn",
+        Error => "error",
     }
 }
 
@@ -87,12 +116,15 @@ crate::wire::wire_object! {
 
 impl AttachmentRef {
     pub fn validate(&self) -> Result<(), ValidationError> {
-        if self.name.is_empty() || self.name.len() > 255 || self.name.contains('\0') {
+        if self.name.is_empty()
+            || self.name.len() > 255
+            || self.name.trim().is_empty()
+            || self.name.bytes().any(|byte| byte < 0x20 || byte == 0x7f)
+        {
             return Err(ValidationError("attachment name"));
         }
-        if self.mime_type.trim().is_empty() {
-            return Err(ValidationError("attachment MIME type"));
-        }
+        validate_media_type(&self.mime_type)
+            .map_err(|_| ValidationError("attachment MIME type"))?;
         validate_sha256(&self.sha256)
     }
 }
@@ -112,9 +144,9 @@ pub fn validate_sha256(sha256: &str) -> Result<(), ValidationError> {
 crate::wire::wire_string_enum! {
     #[derive(Hash)]
     pub enum ApprovalWaitKind {
-        Permission,
-        Question,
-        Unspecified,
+        Permission => "permission",
+        Question => "question",
+        Unspecified => "unspecified",
     }
 }
 
@@ -147,11 +179,18 @@ pub(crate) fn validate_approval_fields(
     can_respond_remotely: Option<bool>,
     approval_id: Option<&str>,
 ) -> Result<(), ValidationError> {
-    if state == ParticipantState::AwaitingApproval && can_respond_remotely.is_none() {
-        return Err(ValidationError("missing can_respond_remotely"));
+    if approval_id.is_some_and(|id| id.trim().is_empty()) {
+        return Err(ValidationError("approval ID"));
     }
-    if can_respond_remotely == Some(true) && approval_id.is_none_or(|id| id.trim().is_empty()) {
-        return Err(ValidationError("approval ID for remote response"));
+    if state == ParticipantState::AwaitingApproval {
+        let Some(remote) = can_respond_remotely else {
+            return Err(ValidationError("missing can_respond_remotely"));
+        };
+        if remote && approval_id.is_none() {
+            return Err(ValidationError("approval ID for remote response"));
+        }
+    } else if can_respond_remotely.is_some() || approval_id.is_some() {
+        return Err(ValidationError("approval fields outside awaiting_approval"));
     }
     Ok(())
 }
@@ -159,8 +198,8 @@ pub(crate) fn validate_approval_fields(
 crate::wire::wire_string_enum! {
     #[derive(Hash)]
     pub enum ApprovalAction {
-        Approve,
-        Deny,
+        Approve => "approve",
+        Deny => "deny",
     }
 }
 
@@ -172,26 +211,35 @@ crate::wire::wire_object! {
     }
 }
 
+impl ApprovalDecision {
+    pub fn validate(&self) -> Result<(), ValidationError> {
+        if self.approval_id.trim().is_empty() {
+            return Err(ValidationError("approval decision ID"));
+        }
+        Ok(())
+    }
+}
+
 crate::wire::wire_string_enum! {
     #[derive(PartialOrd, Ord, Hash)]
     pub enum ServiceScope {
-        Read,
-        Collaborate,
-        Manage,
+        Read => "read",
+        Collaborate => "collaborate",
+        Manage => "manage",
     }
 }
 
 crate::wire::wire_string_enum! {
     #[derive(Hash)]
     pub enum PrincipalKind {
-        Participant,
-        Operator,
-        Adapter,
-        WorkflowRun,
-        HumanAdmin,
-        HumanMember,
-        Service,
-        Node,
+        Participant => "participant",
+        Operator => "operator",
+        Adapter => "adapter",
+        WorkflowRun => "workflow_run",
+        HumanAdmin => "human_admin",
+        HumanMember => "human_member",
+        Service => "service",
+        Node => "node",
     }
 }
 

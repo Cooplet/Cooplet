@@ -91,12 +91,22 @@ fn event_query(after: u64, kinds: &[EventKind]) -> Vec<(&'static str, String)> {
     query
 }
 
+const LINE_SHRINK_THRESHOLD: usize = 64 * 1024;
+
 /// Decode one frame without mapping a terminal resync frame to an error.
 pub fn parse_ndjson_line(line: &[u8]) -> Result<EventStreamFrame, ClientError> {
     let frame =
         serde_json::from_slice(line).map_err(|_| ClientError::protocol("invalid NDJSON frame"))?;
-    if let EventStreamFrame::Event { event } = &frame {
-        validate_event(event)?;
+    match &frame {
+        EventStreamFrame::Event { event } => validate_event(event)?,
+        EventStreamFrame::ResyncRequired {
+            oldest_available_seq,
+            latest_seq,
+            ..
+        } if *oldest_available_seq == 0 || *oldest_available_seq > latest_seq.saturating_add(1) => {
+            return Err(ClientError::protocol("inconsistent EventBus watermarks"));
+        }
+        EventStreamFrame::ResyncRequired { .. } | EventStreamFrame::Ping {} => {}
     }
     Ok(frame)
 }
@@ -125,7 +135,7 @@ impl EventStream {
     ) -> Poll<Option<Result<EventStreamFrame, ClientError>>> {
         self.chunks = None;
         self.current = Bytes::new();
-        self.line.clear();
+        self.line = Vec::new();
         Poll::Ready(Some(Err(error)))
     }
 }
@@ -154,6 +164,34 @@ impl Stream for EventStream {
                 }
             }
             let newline = stream.current.iter().position(|&byte| byte == b'\n');
+            if stream.line.is_empty()
+                && let Some(pos) = newline
+            {
+                let segment = &stream.current[..pos];
+                let trimmed = segment.strip_suffix(b"\r").unwrap_or(segment);
+                if trimmed.len() > stream.limit {
+                    return stream.terminate(ClientError::protocol("NDJSON line exceeds limit"));
+                }
+                if trimmed.is_empty() {
+                    stream.current.advance(pos + 1);
+                    continue;
+                }
+                let frame = parse_ndjson_line(trimmed);
+                stream.current.advance(pos + 1);
+                return match frame {
+                    Ok(EventStreamFrame::ResyncRequired {
+                        oldest_available_seq,
+                        latest_seq,
+                        reason,
+                    }) => stream.terminate(ClientError::resync(
+                        oldest_available_seq,
+                        latest_seq,
+                        reason,
+                    )),
+                    Ok(frame) => Poll::Ready(Some(Ok(frame))),
+                    Err(error) => stream.terminate(error),
+                };
+            }
             let line_bytes = newline.unwrap_or(stream.current.len());
             let segment = &stream.current[..line_bytes];
             let cr = segment.last().or_else(|| stream.line.last()) == Some(&b'\r');
@@ -176,6 +214,9 @@ impl Stream for EventStream {
             }
             let frame = parse_ndjson_line(&stream.line);
             stream.line.clear();
+            if stream.line.capacity() > LINE_SHRINK_THRESHOLD {
+                stream.line = Vec::new();
+            }
             return match frame {
                 Ok(EventStreamFrame::ResyncRequired {
                     oldest_available_seq,

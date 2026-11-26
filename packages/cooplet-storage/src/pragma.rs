@@ -1,7 +1,7 @@
 use std::{
-    fs::{self, Metadata, OpenOptions},
+    fs::{self, Metadata, OpenOptions, Permissions},
     io,
-    os::unix::fs::{MetadataExt, OpenOptionsExt},
+    os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt},
     path::{Path, PathBuf},
 };
 
@@ -12,6 +12,7 @@ use crate::{Migration, StorageConfig, StorageError, SynchronousMode, migrate};
 
 const PAGE_SIZE: u32 = 4096;
 const MAX_SQLITE_PAGES: u32 = 4_294_967_294;
+const STATEMENT_CACHE_CAPACITY: usize = 128;
 
 pub(crate) type ExistingDatabaseCheck =
     Box<dyn FnOnce(&Connection) -> Result<(), StorageError> + Send>;
@@ -27,6 +28,7 @@ pub(crate) fn validate_config(config: &StorageConfig) -> Result<(), StorageError
         || config.max_page_count == 0
         || config.max_page_count > MAX_SQLITE_PAGES
         || config.journal_size_limit_bytes > i64::MAX as u64
+        || config.wal_autocheckpoint_pages > i32::MAX as u32
         || config.busy_timeout.as_millis() > i32::MAX as u128
     {
         return Err(StorageError::InvalidConfig(
@@ -69,6 +71,18 @@ pub(crate) fn open_writer(
         PrivateFs::ensure_private_dir(parent)?
     };
     let path = parent.join(file);
+    if existing_only {
+        // Avoid creating an orphan sidecar lock when the database is missing or empty.
+        match database_metadata(&path)?.map(|meta| meta.len()) {
+            None => return Err(StorageError::DatabaseMissing),
+            Some(0) => {
+                return Err(StorageError::IncompatibleDatabase(
+                    "expected a non-empty existing database".into(),
+                ));
+            }
+            Some(_) => {}
+        }
+    }
     let lock = FileLock::acquire_exclusive(&path.with_extension("lock"))?;
     let metadata = database_metadata(&path)?;
     let size = metadata.as_ref().map(Metadata::len);
@@ -87,14 +101,15 @@ pub(crate) fn open_writer(
     let fresh = size.unwrap_or(0) == 0;
     let from = if fresh {
         if let Some(root) = blob_root {
-            crate::blob_store::check_before_database_create(root, &path, &lock)?;
+            crate::blob_store::check_before_database_open(root, &path, true)?;
         }
         if size.is_none() {
-            OpenOptions::new()
+            let file = OpenOptions::new()
                 .write(true)
                 .create_new(true)
                 .mode(0o600)
                 .open(&path)?;
+            file.set_permissions(Permissions::from_mode(0o600))?;
         }
         0
     } else {
@@ -111,11 +126,14 @@ pub(crate) fn open_writer(
         if let Some(check) = existing_check {
             check(&preflight)?;
         }
+        if let Some(root) = blob_root {
+            crate::blob_store::check_before_database_open(root, &path, false)?;
+        }
         from as u32
     };
 
     lock.verify_path()?;
-    if existing_only
+    if !fresh
         && database_metadata(&path)?.as_ref().map(file_identity)
             != metadata.as_ref().map(file_identity)
     {
@@ -175,12 +193,15 @@ pub(crate) fn open_writer(
 fn database_metadata(path: &Path) -> Result<Option<Metadata>, StorageError> {
     match fs::symlink_metadata(path) {
         Ok(metadata)
-            if metadata.is_file() && metadata.nlink() == 1 && metadata.uid() == current_euid() =>
+            if metadata.is_file()
+                && metadata.nlink() == 1
+                && metadata.uid() == current_euid()
+                && metadata.mode() & 0o7777 == 0o600 =>
         {
             Ok(Some(metadata))
         }
         Ok(_) => Err(StorageError::IncompatibleDatabase(
-            "expected a regular single-link database owned by the current user".into(),
+            "expected a regular single-link 0600 database owned by the current user".into(),
         )),
         Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(None),
         Err(error) => Err(error.into()),
@@ -207,6 +228,7 @@ pub(crate) fn open_readonly(
 }
 
 fn common_pragmas(connection: &Connection, config: &StorageConfig) -> Result<(), StorageError> {
+    connection.set_prepared_statement_cache_capacity(STATEMENT_CACHE_CAPACITY);
     connection.busy_timeout(config.busy_timeout)?;
     connection.pragma_update(None, "foreign_keys", true)?;
     connection.pragma_update(None, "temp_store", "MEMORY")?;

@@ -1,5 +1,3 @@
-use std::str::FromStr;
-
 use serde::Deserialize;
 use serde_json::Value;
 
@@ -13,29 +11,12 @@ macro_rules! event_kinds {
         crate::wire::wire_string_enum! {
             #[derive(Hash)]
             pub enum EventKind {
-                $(#[serde(rename = $value)] $variant,)*
+                $($variant => $value,)*
             }
         }
 
         impl EventKind {
             pub const ALL: &'static [Self] = &[$(Self::$variant,)*];
-
-            pub const fn as_str(self) -> &'static str {
-                match self {
-                    $(Self::$variant => $value,)*
-                }
-            }
-        }
-
-        impl FromStr for EventKind {
-            type Err = ValidationError;
-
-            fn from_str(value: &str) -> Result<Self, Self::Err> {
-                match value {
-                    $($value => Ok(Self::$variant),)*
-                    _ => Err(ValidationError("event kind")),
-                }
-            }
         }
     };
 }
@@ -89,6 +70,12 @@ impl EventEnvelope {
         if self.source_kind != self.source_id.kind() {
             return Err(ValidationError("event source kind").into());
         }
+        if self.aggregate_id.trim().is_empty() {
+            return Err(ValidationError("event aggregate ID").into());
+        }
+        if !self.payload.is_object() {
+            return Err(ValidationError("event payload object").into());
+        }
         match self.kind {
             EventKind::ParticipantAwaitingApproval | EventKind::ParticipantStateChanged => {
                 #[derive(Deserialize)]
@@ -97,7 +84,7 @@ impl EventEnvelope {
                     approval_id: Option<&'a str>,
                     can_respond_remotely: Option<bool>,
                 }
-                let fields: ApprovalFields<'_> = self.payload_fields()?;
+                let fields: ApprovalFields<'_> = T_deserialize_object(&self.payload)?;
                 if self.kind == EventKind::ParticipantAwaitingApproval
                     && fields.state != ParticipantState::AwaitingApproval
                 {
@@ -124,28 +111,21 @@ impl EventEnvelope {
                     thread_id: _thread_id,
                     answered_by,
                     answer,
-                } = self.payload_fields()?;
-                if answered_by.trim().is_empty()
-                    || (answer.selected_option_ids.is_empty()
-                        && answer
-                            .text
-                            .as_deref()
-                            .is_none_or(|text| text.trim().is_empty()))
-                {
+                } = T_deserialize_object(&self.payload)?;
+                if answered_by.trim().is_empty() {
                     return Err(ValidationError("question answer event").into());
                 }
+                answer.validate()?;
             }
             _ => {}
         }
         Ok(())
     }
+}
 
-    fn payload_fields<'de, T: Deserialize<'de>>(&'de self) -> Result<T, ProtocolError> {
-        if !self.payload.is_object() {
-            return Err(ValidationError("event payload object").into());
-        }
-        Ok(T::deserialize(&self.payload)?)
-    }
+#[allow(non_snake_case)]
+fn T_deserialize_object<'de, T: Deserialize<'de>>(payload: &'de Value) -> Result<T, ProtocolError> {
+    Ok(T::deserialize(payload)?)
 }
 
 crate::wire::wire_object! {

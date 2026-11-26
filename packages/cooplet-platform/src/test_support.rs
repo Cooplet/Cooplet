@@ -1,7 +1,7 @@
 use std::{
-    fs::{self, DirBuilder},
+    fs::{self, DirBuilder, Permissions},
     io,
-    os::unix::fs::DirBuilderExt,
+    os::unix::fs::{DirBuilderExt, PermissionsExt},
     path::PathBuf,
 };
 
@@ -14,6 +14,7 @@ impl Scratch {
         let path =
             std::env::temp_dir().join(format!("cooplet-test-{:032x}", u128::from_be_bytes(random)));
         DirBuilder::new().mode(0o700).create(&path)?;
+        fs::set_permissions(&path, Permissions::from_mode(0o700))?;
         Ok(Self(path))
     }
 }

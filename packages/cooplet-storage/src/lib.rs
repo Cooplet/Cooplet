@@ -33,6 +33,7 @@ pub use migrate::Migration;
 pub use read_pool::ReadPool;
 
 const GC_BATCHES_PER_CYCLE: usize = 50;
+const GC_TOMBSTONE_BATCHES_PER_CYCLE: usize = 10;
 
 pub struct StorageEngine {
     db: DbActor,
@@ -112,6 +113,9 @@ impl StorageEngine {
         blob_config: Option<BlobStoreConfig>,
         existing_check: Option<pragma::ExistingDatabaseCheck>,
     ) -> Result<Self, StorageError> {
+        if let Some(blob_config) = &blob_config {
+            blob_store::validate_config(blob_config)?;
+        }
         let interval = config.gc_interval;
         let blob_root = blob_config.as_ref().map(|config| config.root.clone());
         let mut engine = Self::open_database(config, migrations, blob_root, existing_check).await?;
@@ -135,7 +139,7 @@ impl StorageEngine {
             db: engine.db.clone(),
             hooks,
             blobs: engine.blobs.clone(),
-            cycle: Mutex::new(()),
+            cycle: Mutex::new(GcState::default()),
         });
         let (stop, stopped) = watch::channel(());
         engine.gc_task = Some(tokio::spawn(driver.clone().run(stopped, interval)));
@@ -161,7 +165,7 @@ impl StorageEngine {
             .gc
             .as_ref()
             .ok_or(StorageError::InvalidConfig("GC hooks are not configured"))?;
-        gc.cycle(now_ms).await
+        gc.cycle(now_ms, None).await
     }
 
     /// Stop GC, drain accepted blob and SQLite operations, and close the
@@ -178,8 +182,10 @@ impl StorageEngine {
         if let Some(blobs) = &self.blobs {
             blobs.close().await;
         }
-        self.db.close();
+        // Close every read-only handle before the writer so SQLite treats the
+        // writer as the final connection and checkpoints the WAL cleanly.
         let reads = self.reads.close().await;
+        self.db.close();
         let writer = if let Some(thread) = self.writer.take() {
             tokio::task::spawn_blocking(move || {
                 thread.join().map_err(|_| StorageError::WriterPanicked)
@@ -200,15 +206,21 @@ impl Drop for StorageEngine {
         if let Some(blobs) = &self.blobs {
             blobs.stop_admission();
         }
+        self.reads.mark_closed();
         self.db.close();
     }
+}
+
+#[derive(Default)]
+struct GcState {
+    tombstone_cursor: Option<BlobTombstone>,
 }
 
 struct GcDriver {
     db: DbActor,
     hooks: Arc<dyn GcHooks>,
     blobs: Option<BlobDiskStore>,
-    cycle: Mutex<()>,
+    cycle: Mutex<GcState>,
 }
 
 impl GcDriver {
@@ -218,13 +230,8 @@ impl GcDriver {
                 biased;
                 _ = stop.changed() => break,
                 () = tokio::time::sleep(interval) => {
-                    let result = unix_millis();
-                    match result {
-                        Ok(now) => {
-                            if let Err(error) = self.cycle(now).await {
-                                tracing::warn!(%error, "storage maintenance failed");
-                            }
-                        }
+                    match unix_millis() {
+                        Ok(now) => self.run_background_cycle(now, &stop).await,
                         Err(error) => tracing::warn!(%error, "could not obtain storage maintenance time"),
                     }
                 }
@@ -232,11 +239,55 @@ impl GcDriver {
         }
     }
 
-    async fn cycle(&self, now: i64) -> Result<GcReport, StorageError> {
-        let _guard = self.cycle.lock().await;
+    async fn run_background_cycle(&self, now: i64, stop: &watch::Receiver<()>) {
+        let mut state = self.cycle.lock().await;
+        if let Err(error) = self.run_prune(now, Some(stop)).await {
+            tracing::warn!(%error, "storage prune maintenance failed");
+        }
+        if stopping(Some(stop)) {
+            return;
+        }
+        if let Err(error) = self.run_tombstones(&mut state, Some(stop)).await {
+            tracing::warn!(%error, "storage blob tombstone maintenance failed");
+        }
+        if stopping(Some(stop)) {
+            return;
+        }
+        if let Err(error) = self.db.checkpoint().await {
+            tracing::warn!(%error, "storage WAL checkpoint maintenance failed");
+        }
+    }
+
+    async fn cycle(
+        &self,
+        now: i64,
+        stop: Option<&watch::Receiver<()>>,
+    ) -> Result<GcReport, StorageError> {
+        let mut state = self.cycle.lock().await;
+        let (prune_batches, prune_has_more) = self.run_prune(now, stop).await?;
+        let (tombstones_completed, tombstones_deferred, tombstones_has_more) =
+            self.run_tombstones(&mut state, stop).await?;
+        let checkpoint = self.db.checkpoint().await?;
+        Ok(GcReport {
+            prune_batches,
+            has_more: prune_has_more || tombstones_has_more,
+            tombstones_completed,
+            tombstones_deferred,
+            checkpoint,
+        })
+    }
+
+    async fn run_prune(
+        &self,
+        now: i64,
+        stop: Option<&watch::Receiver<()>>,
+    ) -> Result<(usize, bool), StorageError> {
         let mut prune_batches = 0;
         let mut has_more = true;
         while has_more && prune_batches < GC_BATCHES_PER_CYCLE {
+            if stopping(stop) {
+                break;
+            }
             let hooks = self.hooks.clone();
             has_more = self
                 .db
@@ -247,29 +298,74 @@ impl GcDriver {
                 .await?;
             prune_batches += 1;
         }
+        Ok((prune_batches, has_more))
+    }
 
-        let (mut tombstones_completed, mut tombstones_deferred) = (0, 0);
-        if let Some(blobs) = &self.blobs {
-            for candidate in blobs.pending_tombstones().await? {
+    async fn run_tombstones(
+        &self,
+        state: &mut GcState,
+        stop: Option<&watch::Receiver<()>>,
+    ) -> Result<(usize, usize, bool), StorageError> {
+        let Some(blobs) = &self.blobs else {
+            return Ok((0, 0, false));
+        };
+        let (mut completed, mut deferred) = (0, 0);
+        let mut has_more = false;
+        for _ in 0..GC_TOMBSTONE_BATCHES_PER_CYCLE {
+            if stopping(stop) {
+                break;
+            }
+            let previous_cursor = state.tombstone_cursor.clone();
+            let candidates = blobs.pending_tombstones(previous_cursor.clone()).await?;
+            let batch_full = candidates.len() == GC_BATCH_SIZE;
+            let last = candidates.last().cloned();
+            let mut interrupted = false;
+            for candidate in candidates {
+                if stopping(stop) {
+                    interrupted = true;
+                    break;
+                }
                 match blobs.collect_tombstone(candidate).await {
-                    Ok(true) => tombstones_completed += 1,
+                    Ok(true) => completed += 1,
                     Ok(false) => {}
                     Err(error) => {
-                        tombstones_deferred += 1;
+                        deferred += 1;
                         tracing::warn!(%error, "blob tombstone cleanup deferred");
                     }
                 }
             }
+            if interrupted {
+                has_more = true;
+                break;
+            }
+            if !batch_full {
+                // Reached the end of the pending set; wrap to the oldest entry next cycle.
+                state.tombstone_cursor = None;
+                has_more = false;
+                break;
+            }
+            let advanced = match (&previous_cursor, &last) {
+                (Some(prev), Some(next)) => {
+                    (next.deleted_at_ms, &next.record.blob_id)
+                        > (prev.deleted_at_ms, &prev.record.blob_id)
+                }
+                (None, Some(_)) => true,
+                (_, None) => false,
+            };
+            if !advanced {
+                state.tombstone_cursor = None;
+                has_more = true;
+                break;
+            }
+            state.tombstone_cursor = last;
+            has_more = true;
         }
-        let checkpoint = self.db.checkpoint().await?;
-        Ok(GcReport {
-            prune_batches,
-            has_more,
-            tombstones_completed,
-            tombstones_deferred,
-            checkpoint,
-        })
+        Ok((completed, deferred, has_more))
     }
+}
+
+fn stopping(stop: Option<&watch::Receiver<()>>) -> bool {
+    stop.is_some_and(|signal| signal.has_changed().unwrap_or(true))
 }
 
 fn unix_millis() -> Result<i64, StorageError> {

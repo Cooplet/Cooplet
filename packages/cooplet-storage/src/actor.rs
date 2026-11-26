@@ -42,6 +42,13 @@ enum Job {
     Barrier(oneshot::Sender<()>),
 }
 
+struct WriterHandle {
+    // Rust drops fields in declaration order, ensuring SQLite closes before
+    // the sidecar lock is released on every exit path, including unwinds.
+    conn: Connection,
+    lock: Arc<FileLock>,
+}
+
 #[derive(Clone)]
 pub struct DbActor {
     inbox: Arc<Mutex<Option<mpsc::Sender<Job>>>>,
@@ -64,17 +71,20 @@ impl DbActor {
             .name("cooplet-db-writer".into())
             .spawn(move || {
                 let result = (|| {
-                    let (connection, lock) = pragma::open_writer(
+                    let (conn, lock) = pragma::open_writer(
                         &mut config,
                         &migrations,
                         blob_root.as_deref(),
                         existing_check,
                     )?;
-                    let lock = Arc::new(lock);
-                    let reads = ReadPool::open(config.clone(), lock.clone())?;
-                    Ok::<_, StorageError>((connection, lock, reads))
+                    let handle = WriterHandle {
+                        conn,
+                        lock: Arc::new(lock),
+                    };
+                    let reads = ReadPool::open(config.clone(), handle.lock.clone())?;
+                    Ok::<_, StorageError>((handle, reads))
                 })();
-                let (mut conn, lock, reads) = match result {
+                let (mut handle, reads) = match result {
                     Ok(opened) => opened,
                     Err(error) => {
                         let _ = started.send(Err(error));
@@ -86,12 +96,30 @@ impl DbActor {
                 }
                 while let Some(job) = receiver.blocking_recv() {
                     match job {
-                        Job::Write(write) => write(&mut conn, &lock),
+                        Job::Write(write) => {
+                            write(&mut handle.conn, &handle.lock);
+                            if !handle.conn.is_autocommit() {
+                                if let Err(error) = handle.conn.execute_batch("ROLLBACK") {
+                                    tracing::error!(
+                                        %error,
+                                        "database writer could not roll back active transaction; stopping writer"
+                                    );
+                                    break;
+                                }
+                                if !handle.conn.is_autocommit() {
+                                    tracing::error!(
+                                        "database writer stayed outside autocommit after rollback; stopping writer"
+                                    );
+                                    break;
+                                }
+                            }
+                        }
                         Job::Checkpoint(reply) => {
-                            let result = lock
+                            let result = handle
+                                .lock
                                 .verify_path()
                                 .map_err(StorageError::from)
-                                .and_then(|()| checkpoint(&conn, &config));
+                                .and_then(|()| checkpoint(&handle.conn, &config));
                             let _ = reply.send(result);
                         }
                         Job::Barrier(reply) => {
@@ -99,8 +127,7 @@ impl DbActor {
                         }
                     }
                 }
-                drop(conn);
-                drop(lock);
+                drop(handle);
             })?;
         let reads = startup.await.map_err(|_| StorageError::WriterPanicked)??;
         let actor = Self {
@@ -142,11 +169,18 @@ impl DbActor {
                         return Err(error.into());
                     }
                 };
-                tx.commit()
-                    .map_err(|error| match StorageError::from(error) {
-                        StorageError::Sqlite(error) => StorageError::CommitFailed(error),
-                        error => error,
-                    })?;
+                if let Err(error) = tx.commit() {
+                    if !conn.is_autocommit() {
+                        let _ = conn.execute_batch("ROLLBACK");
+                        if !conn.is_autocommit() {
+                            return Err(StorageError::WriteOutcomeUnknown.into());
+                        }
+                    }
+                    return Err(match StorageError::from(error) {
+                        StorageError::Sqlite(error) => StorageError::CommitFailed(error).into(),
+                        error => error.into(),
+                    });
+                }
                 for event in committed {
                     let _ = events.send(event);
                 }
@@ -181,8 +215,17 @@ impl DbActor {
     }
 
     pub(crate) async fn barrier(&self) -> Result<(), StorageError> {
+        let sender = self
+            .inbox
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone()
+            .ok_or(StorageError::Closed)?;
         let (reply, result) = oneshot::channel();
-        self.submit(Job::Barrier(reply))?;
+        sender
+            .send(Job::Barrier(reply))
+            .await
+            .map_err(|_| StorageError::Closed)?;
         result.await.map_err(|_| StorageError::WriteOutcomeUnknown)
     }
 

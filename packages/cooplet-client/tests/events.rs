@@ -2,7 +2,9 @@ mod support;
 
 use std::time::Duration;
 
-use cooplet_client::{ClientConfig, ClientError, CoopletClient, Destination, EventsQuery};
+use cooplet_client::{
+    ClientConfig, ClientError, CoopletClient, Destination, EventsQuery, parse_ndjson_line,
+};
 use cooplet_protocol::{EventKind, EventStreamFrame};
 
 use support::*;
@@ -265,6 +267,29 @@ async fn both_resync_forms_reject_zero_floor_but_admit_an_empty_journal() -> Tes
                 latest_seq: 0,
                 ..
             }))
+        ));
+        // Direct parse_ndjson_line must also validate resync watermarks.
+        assert!(matches!(
+            parse_ndjson_line(
+                br#"{"type":"resync_required","oldest_available_seq":0,"latest_seq":0,"reason":"bad"}"#
+            ),
+            Err(ClientError::Protocol(_))
+        ));
+        assert!(matches!(
+            parse_ndjson_line(
+                br#"{"type":"resync_required","oldest_available_seq":10,"latest_seq":5,"reason":"bad"}"#
+            ),
+            Err(ClientError::Protocol(_))
+        ));
+        assert!(matches!(
+            parse_ndjson_line(
+                br#"{"type":"resync_required","oldest_available_seq":1,"latest_seq":0,"reason":"ok"}"#
+            )?,
+            EventStreamFrame::ResyncRequired {
+                oldest_available_seq: 1,
+                latest_seq: 0,
+                ..
+            }
         ));
         Ok::<_, Box<dyn std::error::Error + Send + Sync>>(())
     };

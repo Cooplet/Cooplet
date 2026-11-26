@@ -330,8 +330,10 @@ async fn problem_details_are_structured_and_their_display_is_safe() -> TestResul
             matches!(client.get_json::<Value>("/v1/thread_read",&[]).await,
             Err(ClientError::Problem(problem)) if problem.extensions["floor_seq"] == 42)
         );
-        assert!(matches!(client.get_json::<Value>("/v1/health",&[]).await,
-            Err(ClientError::UnexpectedStatus { status:502, body_preview }) if body_preview.is_empty()));
+        assert!(matches!(
+            client.get_json::<Value>("/v1/health", &[]).await,
+            Err(ClientError::UnexpectedStatus { status: 502 })
+        ));
         assert!(matches!(
             client.get_json::<Value>("/v1/health", &[]).await,
             Err(ClientError::Protocol(_))
@@ -341,4 +343,176 @@ async fn problem_details_are_structured_and_their_display_is_safe() -> TestResul
     let (a, b) = tokio::join!(call, serve);
     a?;
     b
+}
+
+#[tokio::test]
+async fn post_pin_hub_mismatch_invalidates_pin_before_next_protected_call() -> TestResult {
+    let server = Server::bind().await?;
+    let client = pinned(server.url.clone(), Some(BearerToken::new("top-secret")?))?;
+    let mismatch_problem = format!(
+        r#"{{"type":"https://cooplet.dev/problems/hub-identity-mismatch","title":"Hub mismatch","status":409,"detail":"restarted","code":"hub_identity_mismatch","retryable":false,"extensions":{{"actual_hub_id":"{OTHER_HUB_ID}"}}}}"#
+    );
+    let other_hub_info =
+        format!(r#"{{"hub_id":"{OTHER_HUB_ID}","display_name":"New Hub","protocol_version":1}}"#);
+    let serve = async {
+        // Initial pin succeeds.
+        let (head, peer) = server.accept().await?;
+        assert_eq!(head.request, "GET /v1/info HTTP/1.1");
+        peer.respond("200 OK", &[], HUB_INFO).await?;
+
+        // Next call hits restarted hub -> 409 hub_identity_mismatch must reset pin!
+        let (head, peer) = server.accept().await?;
+        assert_eq!(head.request, "GET /v1/health HTTP/1.1");
+        assert_eq!(head.header("x-cooplet-hub"), Some(HUB_ID));
+        peer.respond(
+            "409 Conflict",
+            &[("content-type", "application/problem+json")],
+            mismatch_problem.as_bytes(),
+        )
+        .await?;
+
+        // Subsequent protected POST must re-check /v1/info with NO Authorization and NEVER receive the POST!
+        let (head, peer) = server.accept().await?;
+        assert_eq!(head.request, "GET /v1/info HTTP/1.1");
+        assert_eq!(head.count("authorization"), 0);
+        assert_eq!(head.count("x-cooplet-hub"), 0);
+        peer.respond("200 OK", &[], other_hub_info.as_bytes())
+            .await?;
+        assert!(
+            tokio::time::timeout(Duration::from_millis(20), server.listener.accept())
+                .await
+                .is_err()
+        );
+        Ok::<_, Box<dyn std::error::Error + Send + Sync>>(())
+    };
+    let serialized = AtomicUsize::new(0);
+    let call = async {
+        let err = client.health().await.err().ok_or("expected 409 mismatch")?;
+        assert!(matches!(
+            err,
+            ClientError::HubIdentityMismatch {
+                actual: Some(ref actual),
+                ..
+            } if actual == OTHER_HUB_ID
+        ));
+        let post_err = client
+            .post_json::<_, Value>("/v1/enroll", &SecretBody(&serialized), None)
+            .await
+            .err()
+            .ok_or("expected post-reset mismatch")?;
+        assert!(matches!(
+            post_err,
+            ClientError::HubIdentityMismatch {
+                actual: Some(ref actual),
+                ..
+            } if actual == OTHER_HUB_ID
+        ));
+        assert_eq!(serialized.load(Ordering::Relaxed), 0);
+        Ok::<_, Box<dyn std::error::Error + Send + Sync>>(())
+    };
+    let (a, b) = tokio::join!(call, serve);
+    a?;
+    b
+}
+
+#[tokio::test]
+async fn patch_delete_discover_whoami_token_and_sanitized_errors() -> TestResult {
+    // BearerToken validation and redaction.
+    assert!(BearerToken::new("").is_err());
+    assert!(BearerToken::new("has space").is_err());
+    assert!(BearerToken::new("bad\nline").is_err());
+    let token = BearerToken::new("my-secret-token")?;
+    assert_eq!(format!("{token:?}"), "BearerToken([REDACTED])");
+
+    // Invalid or empty root certificate PEM (and malformed DER inside PEM) is rejected at construction.
+    let server = Server::bind().await?;
+    for bad in [
+        b"not a pem cert".as_slice(),
+        b"-----BEGIN CERTIFICATE-----\nAAAA\n-----END CERTIFICATE-----\n".as_slice(),
+    ] {
+        let mut bad_pem = ClientConfig::new(server.url.clone(), Destination::LocalNode, None);
+        bad_pem.root_certificates_pem.push(bad.to_vec());
+        assert!(matches!(
+            CoopletClient::new(bad_pem),
+            Err(ClientError::InvalidInput(_))
+        ));
+    }
+
+    let client = CoopletClient::new(ClientConfig::new(
+        server.url.clone(),
+        Destination::LocalNode,
+        Some(token),
+    ))?;
+    let serve = async {
+        let (head, peer) = server.accept().await?;
+        assert_eq!(head.request, "GET /v1/info HTTP/1.1");
+        assert_eq!(head.count("authorization"), 0);
+        peer.respond("200 OK", &[], HUB_INFO).await?;
+
+        let (head, peer) = server.accept().await?;
+        assert_eq!(head.request, "GET /v1/whoami HTTP/1.1");
+        assert_eq!(head.header("authorization"), Some("Bearer my-secret-token"));
+        peer.respond(
+            "200 OK",
+            &[],
+            br#"{"actor_id":"sp_00000000000000000000000001","principal_kind":"service","node_id":null,"participant_id":null,"name":"bot","scopes":["read"]}"#,
+        )
+        .await?;
+
+        let (head, mut peer) = server.accept().await?;
+        assert_eq!(head.request, "PATCH /v1/threads/t1 HTTP/1.1");
+        assert_eq!(peer.read_body(&head).await?, br#"{"title":"hi"}"#);
+        peer.respond("200 OK", &[], br#"{"status":"ok"}"#).await?;
+
+        let (head, peer) = server.accept().await?;
+        assert_eq!(head.request, "DELETE /v1/threads/t1 HTTP/1.1");
+        peer.respond("200 OK", &[], br#"{"deleted":true}"#).await?;
+
+        let (head, peer) = server.accept().await?;
+        assert_eq!(head.request, "DELETE /v1/pins/p1 HTTP/1.1");
+        peer.respond("204 No Content", &[], b"").await?;
+
+        let (head, peer) = server.accept().await?;
+        assert_eq!(head.request, "DELETE /v1/pins/p2 HTTP/1.1");
+        peer.respond("200 OK", &[], b"unexpected").await
+    };
+    let call = async {
+        assert!(matches!(
+            CoopletClient::discover_info(&server.url).await?,
+            InfoResponse::Hub(_)
+        ));
+        let who = client.whoami().await?;
+        assert_eq!(who.name, "bot");
+        let patched: HealthResponse = client
+            .patch_json("/v1/threads/t1", &serde_json::json!({"title": "hi"}), None)
+            .await?;
+        assert_eq!(patched.status, "ok");
+        let deleted: Value = client.delete_json("/v1/threads/t1", None).await?;
+        assert_eq!(deleted["deleted"], true);
+        client.delete_no_content("/v1/pins/p1", None).await?;
+        assert!(matches!(
+            client.delete_no_content("/v1/pins/p2", None).await,
+            Err(ClientError::Protocol(_))
+        ));
+        Ok::<_, Box<dyn std::error::Error + Send + Sync>>(())
+    };
+    let (a, b) = tokio::join!(call, serve);
+    a?;
+    b?;
+
+    // Closed server produces a Transport error whose Display includes the cause without secrets.
+    let closed_url = server.url.clone();
+    drop(server);
+    let err = client
+        .health()
+        .await
+        .err()
+        .ok_or("expected transport error")?;
+    assert!(matches!(err, ClientError::Transport(_)));
+    let rendered = format!("{err}");
+    assert!(rendered.starts_with("HTTP transport failed: "));
+    assert!(rendered.len() > "HTTP transport failed: ".len());
+    assert!(!rendered.contains("my-secret-token"));
+    assert!(!rendered.contains(closed_url.as_str()));
+    Ok(())
 }

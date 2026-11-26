@@ -1,8 +1,9 @@
 mod common;
 
 use std::{
-    fs,
+    fs::{self, Permissions},
     future::{Future, poll_fn},
+    os::unix::fs::{MetadataExt, PermissionsExt, symlink},
     sync::mpsc,
     task::Poll,
     time::Duration,
@@ -138,6 +139,7 @@ async fn incompatible_preflight_preserves_database_bytes_and_ddl() -> TestResult
         )?;
         connection.execute_batch(extra)?;
         drop(connection);
+        fs::set_permissions(&path, Permissions::from_mode(0o600))?;
         let before = fs::read(&path)?;
         let rejected = StorageEngine::open(StorageConfig::new(&path), &[BASE]).await;
         assert!(
@@ -417,5 +419,133 @@ async fn sqlite_full_inside_composed_write_rolls_back_and_stays_usable() -> Test
         })
         .await?;
     engine.shutdown().await?;
+    Ok(())
+}
+
+#[tokio::test]
+async fn shutdown_checkpoints_wal_after_readonly_queries() -> TestResult {
+    let scratch = Scratch::new()?;
+    let path = scratch.0.join("node.sqlite3");
+    let mut config = StorageConfig::new(&path);
+    config.wal_autocheckpoint_pages = 0;
+    let engine = StorageEngine::open(config, &[BASE]).await?;
+    engine
+        .db()
+        .write_sqlite(|tx| {
+            tx.execute("INSERT INTO rows VALUES(1, zeroblob(8192))", [])?;
+            Ok(WriteOutcome::new(()))
+        })
+        .await?;
+    let count = engine
+        .reads()
+        .read(|db| Ok(db.query_row("SELECT count(*) FROM rows", [], |r| r.get::<_, i64>(0))?))
+        .await?;
+    assert_eq!(count, 1);
+    let wal = path.with_extension("sqlite3-wal");
+    assert!(wal.try_exists()? && fs::metadata(&wal)?.len() > 0);
+    engine.shutdown().await?;
+    assert!(!wal.try_exists()? || fs::metadata(&wal)?.len() == 0);
+    assert!(!path.with_extension("sqlite3-shm").try_exists()?);
+    let check = Connection::open(&path)?;
+    assert_eq!(
+        check.query_row("SELECT count(*) FROM rows", [], |r| r.get::<_, i64>(0))?,
+        1
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn rejects_insecure_database_modes_links_and_invalid_pragmas() -> TestResult {
+    let scratch = Scratch::new()?;
+    let path = scratch.0.join("node.sqlite3");
+    let engine = StorageEngine::open(StorageConfig::new(&path), &[BASE]).await?;
+    engine.shutdown().await?;
+    assert_eq!(fs::metadata(&path)?.mode() & 0o7777, 0o600);
+
+    // Non-0600 database is rejected.
+    fs::set_permissions(&path, Permissions::from_mode(0o644))?;
+    assert!(matches!(
+        StorageEngine::open(StorageConfig::new(&path), &[BASE]).await,
+        Err(StorageError::IncompatibleDatabase(_))
+    ));
+    fs::set_permissions(&path, Permissions::from_mode(0o600))?;
+
+    // Symlink database is rejected.
+    let link = scratch.0.join("alias.sqlite3");
+    symlink(&path, &link)?;
+    assert!(matches!(
+        StorageEngine::open(StorageConfig::new(&link), &[BASE]).await,
+        Err(StorageError::IncompatibleDatabase(_))
+    ));
+    fs::remove_file(&link)?;
+
+    // Hardlinked database is rejected.
+    let hard = scratch.0.join("hard.sqlite3");
+    fs::hard_link(&path, &hard)?;
+    assert!(matches!(
+        StorageEngine::open(StorageConfig::new(&path), &[BASE]).await,
+        Err(StorageError::IncompatibleDatabase(_))
+    ));
+    fs::remove_file(&hard)?;
+
+    // wal_autocheckpoint_pages > i32::MAX is rejected.
+    let mut bad_config = StorageConfig::new(&path);
+    bad_config.wal_autocheckpoint_pages = (i32::MAX as u32) + 1;
+    assert!(matches!(
+        StorageEngine::open(bad_config, &[BASE]).await,
+        Err(StorageError::InvalidConfig(_))
+    ));
+
+    // Migration ending its transaction early is rejected.
+    let early_commit = Migration {
+        version: 2,
+        name: "early-commit",
+        sql: "COMMIT; CREATE TABLE rogue(x INTEGER);",
+    };
+    assert!(matches!(
+        StorageEngine::open(StorageConfig::new(&path), &[BASE, early_commit]).await,
+        Err(StorageError::IncompatibleDatabase(_))
+    ));
+    Ok(())
+}
+
+#[tokio::test]
+async fn reader_and_writer_panics_recover_cleanly_without_holding_sidecar() -> TestResult {
+    let scratch = Scratch::new()?;
+    let path = scratch.0.join("node.sqlite3");
+    let mut config = StorageConfig::new(&path);
+    config.read_pool_size = 1;
+    let engine = StorageEngine::open(config.clone(), &[BASE]).await?;
+
+    // A panicking reader discards its connection and returns its permit cleanly.
+    let panicked_read = engine
+        .reads()
+        .read::<(), _>(|_| std::panic::resume_unwind(Box::new("intentional reader panic")))
+        .await;
+    assert!(matches!(panicked_read, Err(StorageError::Task(_))));
+    assert_eq!(
+        engine
+            .reads()
+            .read(|db| Ok(db.query_row("SELECT count(*) FROM rows", [], |r| r.get::<_, i64>(0))?))
+            .await?,
+        0
+    );
+
+    // A panicking writer unwinds Connection before FileLock, reports WriterPanicked on shutdown,
+    // and allows immediate clean reopen.
+    let panicked_write = engine
+        .db()
+        .write_sqlite::<(), _>(|_| std::panic::resume_unwind(Box::new("intentional writer panic")))
+        .await;
+    assert!(matches!(
+        panicked_write,
+        Err(StorageError::WriteOutcomeUnknown)
+    ));
+    assert!(matches!(
+        engine.shutdown().await,
+        Err(StorageError::WriterPanicked)
+    ));
+    let reopened = StorageEngine::open(config, &[BASE]).await?;
+    reopened.shutdown().await?;
     Ok(())
 }

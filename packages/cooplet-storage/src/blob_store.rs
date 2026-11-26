@@ -11,22 +11,22 @@ use std::{
     },
 };
 
-use bytes::Bytes;
+use bytes::BytesMut;
 use cooplet_platform::{PlatformError, PublishOutcome};
 use cooplet_protocol::{BlobId, validate_sha256};
 use rusqlite::Transaction;
 use tokio::{
     io::{AsyncRead, AsyncReadExt},
-    sync::{Mutex, OwnedRwLockReadGuard, RwLock, mpsc},
+    sync::{OwnedRwLockReadGuard, RwLock, mpsc},
 };
 
 use crate::{
     BlobRecord, BlobState, BlobStoreConfig, BlobTombstone, DbActor, GC_BATCH_SIZE, GcHooks,
     ReadPool, StorageError, WriteError, WriteFailure, WriteOutcome,
 };
-pub(crate) use disk::check_before_database_create;
 pub use disk::safe_disk_name;
 use disk::{CHUNK_BYTES, Disk, InputChunk, StagedBlob, checked_blob_size, validate_path};
+pub(crate) use disk::{check_before_database_open, validate_config};
 
 const MUTATION_SLOTS: usize = 64;
 const STAGING_QUEUE: usize = 8;
@@ -60,6 +60,34 @@ impl StoredBlob {
     }
 }
 
+struct MutationSlot {
+    gate: Arc<RwLock<()>>,
+    quarantined: std::sync::Mutex<HashSet<BlobId>>,
+}
+
+impl MutationSlot {
+    fn new() -> Self {
+        Self {
+            gate: Arc::new(RwLock::new(())),
+            quarantined: std::sync::Mutex::new(HashSet::new()),
+        }
+    }
+
+    fn is_quarantined(&self, id: &BlobId) -> bool {
+        self.quarantined
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .contains(id)
+    }
+
+    fn quarantine(&self, id: BlobId) {
+        self.quarantined
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .insert(id);
+    }
+}
+
 #[derive(Clone)]
 pub struct BlobDiskStore(Arc<Store>);
 
@@ -68,7 +96,7 @@ struct Store {
     db: DbActor,
     reads: ReadPool,
     hooks: Arc<dyn GcHooks>,
-    slots: [Arc<Mutex<HashSet<BlobId>>>; MUTATION_SLOTS],
+    slots: [MutationSlot; MUTATION_SLOTS],
     hasher: RandomState,
     admission: Arc<RwLock<()>>,
     closed: AtomicBool,
@@ -84,7 +112,8 @@ impl BlobDiskStore {
         let startup_reads = reads.clone();
         let disk = tokio::task::spawn_blocking(move || {
             let (database_path, sidecar) = startup_reads.database_and_sidecar()?;
-            Disk::open(config, database_path, &sidecar)
+            sidecar.verify_path()?;
+            Disk::open(config, database_path)
         })
         .await??;
         let store = Self(Arc::new(Store {
@@ -92,7 +121,7 @@ impl BlobDiskStore {
             db,
             reads,
             hooks,
-            slots: std::array::from_fn(|_| Arc::new(Mutex::new(HashSet::new()))),
+            slots: std::array::from_fn(|_| MutationSlot::new()),
             hasher: RandomState::new(),
             admission: Arc::new(RwLock::new(())),
             closed: AtomicBool::new(false),
@@ -110,13 +139,13 @@ impl BlobDiskStore {
     pub async fn open_blob(&self, id: &BlobId) -> Result<Option<(BlobRecord, File)>, StorageError> {
         let admission = self.enter().await?;
         let store = self.0.clone();
-        let slot = store.slot(id).clone().lock_owned().await;
+        let slot_guard = store.slot(id).gate.clone().read_owned().await;
         let BlobState::Live(record) = self.0.lookup_one(id.clone()).await? else {
             return Ok(None);
         };
         tokio::task::spawn_blocking(move || {
             let _admission = admission;
-            let _slot = slot;
+            let _slot = slot_guard;
             let file = store.disk.open_live(&record)?;
             Ok(Some((record, file)))
         })
@@ -163,6 +192,9 @@ impl BlobDiskStore {
     }
 
     async fn enter(&self) -> Result<OwnedRwLockReadGuard<()>, StorageError> {
+        if self.0.closed.load(Ordering::Acquire) {
+            return Err(StorageError::Closed);
+        }
         let guard = self.0.admission.clone().read_owned().await;
         if self.0.closed.load(Ordering::Acquire) {
             Err(StorageError::Closed)
@@ -180,15 +212,20 @@ impl BlobDiskStore {
         let _drained = self.0.admission.write().await;
     }
 
-    pub(crate) async fn pending_tombstones(&self) -> Result<Vec<BlobTombstone>, StorageError> {
+    pub(crate) async fn pending_tombstones(
+        &self,
+        after: Option<BlobTombstone>,
+    ) -> Result<Vec<BlobTombstone>, StorageError> {
         let hooks = self.0.hooks.clone();
         let candidates = self
             .0
-            .db
-            .write_sqlite(move |tx| {
-                Ok(WriteOutcome::new(
-                    hooks.fetch_pending_blob_tombstones(tx, GC_BATCH_SIZE)?,
-                ))
+            .reads
+            .read(move |connection| {
+                Ok(hooks.fetch_pending_blob_tombstones(
+                    connection,
+                    after.as_ref(),
+                    GC_BATCH_SIZE,
+                )?)
             })
             .await?;
         if candidates.len() > GC_BATCH_SIZE {
@@ -219,11 +256,14 @@ impl BlobDiskStore {
             owner.disk.scan()
         })
         .await??;
+        let mut cursor = None;
         loop {
-            let candidates = self.pending_tombstones().await?;
+            let candidates = self.pending_tombstones(cursor.clone()).await?;
             if candidates.is_empty() {
                 break;
             }
+            let full = candidates.len() == GC_BATCH_SIZE;
+            let next_cursor = candidates.last().cloned();
             for candidate in candidates {
                 if !self.0.collect(candidate, false).await? {
                     return Err(StorageError::BlobUnverified(
@@ -231,6 +271,18 @@ impl BlobDiskStore {
                     ));
                 }
             }
+            if !full {
+                break;
+            }
+            if let (Some(prev), Some(next)) = (&cursor, &next_cursor)
+                && (next.deleted_at_ms, &next.record.blob_id)
+                    <= (prev.deleted_at_ms, &prev.record.blob_id)
+            {
+                return Err(StorageError::BlobUnverified(
+                    "startup tombstone pagination did not advance".into(),
+                ));
+            }
+            cursor = next_cursor;
         }
         let mut used = 0u64;
         loop {
@@ -280,7 +332,7 @@ impl BlobDiskStore {
 }
 
 impl Store {
-    fn slot(&self, id: &BlobId) -> &Arc<Mutex<HashSet<BlobId>>> {
+    fn slot(&self, id: &BlobId) -> &MutationSlot {
         &self.slots[self.hasher.hash_one(id) as usize % MUTATION_SLOTS]
     }
 
@@ -340,8 +392,9 @@ impl Store {
             + 'static,
     {
         let id = stage.info.blob_id.clone();
-        let mut slot = self.slot(&id).lock().await;
-        let admitted = if slot.contains(&id) {
+        let slot = self.slot(&id);
+        let _gate = slot.gate.write().await;
+        let admitted = if slot.is_quarantined(&id) {
             Err(StorageError::BlobUnverified(format!(
                 "unresolved prior mutation for {id}"
             )))
@@ -382,12 +435,12 @@ impl Store {
             Ok(Err(
                 error @ StorageError::Platform(PlatformError::PublishedDurabilityUnknown { .. }),
             )) => {
-                slot.insert(id);
+                slot.quarantine(id);
                 return Err(error.into());
             }
             Ok(Err(error)) => return Err(error.into()),
             Err(error) => {
-                slot.insert(id);
+                slot.quarantine(id);
                 return Err(StorageError::from(error).into());
             }
         };
@@ -412,14 +465,20 @@ impl Store {
                         Ok(BlobState::Tombstone(current)) if current.record == record => {
                             return Err(error);
                         }
+                        Err(StorageError::Closed) => return Err(error),
                         _ => {
-                            slot.insert(id);
+                            slot.quarantine(id);
                             return Err(error);
                         }
                     }
                 }
                 if let Err(cleanup) = self.unlink(record, true).await {
-                    slot.insert(id);
+                    tracing::warn!(
+                        blob_id = %id,
+                        %cleanup,
+                        "blob registration failed and rollback unlink also failed"
+                    );
+                    slot.quarantine(id);
                     return Err(cleanup.into());
                 }
                 Err(error)
@@ -429,8 +488,9 @@ impl Store {
 
     async fn collect(&self, candidate: BlobTombstone, account: bool) -> Result<bool, StorageError> {
         let id = candidate.record.blob_id.clone();
-        let mut slot = self.slot(&id).lock().await;
-        if slot.contains(&id) {
+        let slot = self.slot(&id);
+        let _gate = slot.gate.write().await;
+        if slot.is_quarantined(&id) {
             return Err(StorageError::BlobUnverified(format!(
                 "unresolved prior mutation for {id}"
             )));
@@ -451,8 +511,9 @@ impl Store {
                 match self.observe_after_writer(id.clone()).await {
                     Ok(BlobState::Absent) => Ok(true),
                     Ok(BlobState::Tombstone(current)) if current == candidate => Err(error),
+                    Err(StorageError::Overloaded | StorageError::Closed) => Err(error),
                     _ => {
-                        slot.insert(id);
+                        slot.quarantine(id);
                         Err(error)
                     }
                 }
@@ -483,18 +544,22 @@ async fn feed(
     limit: u64,
     expected: Option<u64>,
 ) -> Result<(), StorageError> {
-    let mut buffer = vec![0; CHUNK_BYTES];
+    let mut buffer = BytesMut::with_capacity(CHUNK_BYTES);
     let mut bytes = 0;
     loop {
+        if buffer.capacity() < CHUNK_BYTES {
+            buffer.reserve(CHUNK_BYTES);
+        }
         let count = tokio::select! {
-            count = reader.read(&mut buffer) => count?,
+            count = reader.read_buf(&mut buffer) => count?,
             () = send.closed() => return Err(StorageError::BlobAborted),
         };
         if count == 0 {
             break;
         }
         bytes = checked_blob_size(bytes, count as u64, limit, expected)?;
-        send.send(InputChunk::Data(Bytes::copy_from_slice(&buffer[..count])))
+        let chunk = buffer.split().freeze();
+        send.send(InputChunk::Data(chunk))
             .await
             .map_err(|_| StorageError::BlobAborted)?;
     }

@@ -1,9 +1,11 @@
 mod upload;
 
 use std::{
+    future::{Future, poll_fn},
     io,
     pin::Pin,
     task::{Context, Poll},
+    time::Duration,
 };
 
 use bytes::{Buf, Bytes};
@@ -13,7 +15,10 @@ use http::{
     header::{CONTENT_TYPE, ETAG},
 };
 use sha2::{Digest, Sha256};
-use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, ReadBuf};
+use tokio::{
+    io::{AsyncRead, AsyncWrite, AsyncWriteExt, ReadBuf},
+    time::Sleep,
+};
 
 use crate::{
     ClientError, CoopletClient,
@@ -32,8 +37,9 @@ pub struct DownloadedBlob {
     pub content_type: Option<String>,
 }
 
-/// A bounded HTTP reader carrying an external digest. The consumer verifies
-/// the content before publishing it. An error permanently fails the reader.
+/// A bounded HTTP reader carrying an external digest and per-chunk progress
+/// timeout. The consumer verifies the content before publishing it. An error
+/// permanently fails the reader.
 pub struct BlobDownload {
     pub expected_sha256: String,
     pub content_length: Option<u64>,
@@ -42,6 +48,8 @@ pub struct BlobDownload {
     pending: Bytes,
     seen: u64,
     max_bytes: u64,
+    chunk_timeout: Duration,
+    deadline: Option<Pin<Box<Sleep>>>,
     failed: bool,
 }
 
@@ -52,6 +60,7 @@ impl CoopletClient {
         expected_sha256: Option<&str>,
         max_bytes: u64,
     ) -> Result<BlobDownload, ClientError> {
+        let max_bytes = max_bytes.min(self.config.max_blob_bytes);
         if let Some(expected) = expected_sha256 {
             validate_sha256(expected)
                 .map_err(|_| ClientError::invalid("invalid expected SHA-256"))?;
@@ -106,6 +115,8 @@ impl CoopletClient {
             pending: Bytes::new(),
             seen: 0,
             max_bytes,
+            chunk_timeout: self.config.request_timeout,
+            deadline: None,
             failed: false,
         })
     }
@@ -123,14 +134,9 @@ impl CoopletClient {
             .open_blob_download(blob_id, expected_sha256, max_bytes)
             .await?;
         let mut digest = Sha256::new();
-        let mut buffer = vec![0; CHUNK_BYTES];
-        loop {
-            let read = download.read(&mut buffer).await.map_err(download_error)?;
-            if read == 0 {
-                break;
-            }
-            digest.update(&buffer[..read]);
-            writer.write_all(&buffer[..read]).await?;
+        while let Some(chunk) = download.next_chunk().await? {
+            digest.update(&chunk);
+            writer.write_all(&chunk).await?;
         }
         writer.flush().await?;
         let digest = format!("{:x}", digest.finalize());
@@ -172,28 +178,81 @@ pub(super) fn check_digest(expected: &str, actual: &str) -> Result<(), ClientErr
     }
 }
 
-fn download_error(error: io::Error) -> ClientError {
-    if error
-        .get_ref()
-        .is_some_and(|source| source.is::<ClientError>())
-    {
-        match error
-            .into_inner()
-            .and_then(|source| source.downcast::<ClientError>().ok())
-        {
-            Some(error) => *error,
-            None => ClientError::protocol("blob read failed"),
-        }
-    } else {
-        error.into()
-    }
-}
-
 impl BlobDownload {
-    fn fail(&mut self, error: ClientError) -> Poll<io::Result<()>> {
+    fn fail(&mut self, error: ClientError) -> Poll<Result<Option<Bytes>, ClientError>> {
         self.failed = true;
         self.chunks = None;
-        Poll::Ready(Err(io::Error::other(error)))
+        self.deadline = None;
+        self.pending = Bytes::new();
+        Poll::Ready(Err(error))
+    }
+
+    async fn next_chunk(&mut self) -> Result<Option<Bytes>, ClientError> {
+        poll_fn(|context| self.poll_next_chunk(context)).await
+    }
+
+    fn poll_next_chunk(
+        &mut self,
+        context: &mut Context<'_>,
+    ) -> Poll<Result<Option<Bytes>, ClientError>> {
+        if self.failed {
+            return Poll::Ready(Err(ClientError::protocol("blob reader failed earlier")));
+        }
+        if !self.pending.is_empty() {
+            return Poll::Ready(Ok(Some(std::mem::take(&mut self.pending))));
+        }
+        loop {
+            let Some(chunks) = &mut self.chunks else {
+                return Poll::Ready(Ok(None));
+            };
+            match chunks.as_mut().poll_next(context) {
+                Poll::Pending => {
+                    let timeout = self.chunk_timeout;
+                    let sleep = self
+                        .deadline
+                        .get_or_insert_with(|| Box::pin(tokio::time::sleep(timeout)));
+                    if sleep.as_mut().poll(context).is_ready() {
+                        return self.fail(ClientError::Timeout("blob download progress"));
+                    }
+                    return Poll::Pending;
+                }
+                Poll::Ready(None) => {
+                    self.chunks = None;
+                    self.deadline = None;
+                    if let Some(expected) = self.content_length
+                        && expected != self.seen
+                    {
+                        return self.fail(ClientError::BlobLengthMismatch {
+                            expected,
+                            actual: self.seen,
+                        });
+                    }
+                    return Poll::Ready(Ok(None));
+                }
+                Poll::Ready(Some(Err(error))) => return self.fail(error.into()),
+                Poll::Ready(Some(Ok(data))) => {
+                    if data.is_empty() {
+                        continue;
+                    }
+                    self.deadline = None;
+                    let length =
+                        match checked_blob_size(self.seen, data.len() as u64, self.max_bytes) {
+                            Ok(length) => length,
+                            Err(error) => return self.fail(error),
+                        };
+                    if let Some(expected) = self.content_length
+                        && length > expected
+                    {
+                        return self.fail(ClientError::BlobLengthMismatch {
+                            expected,
+                            actual: length,
+                        });
+                    }
+                    self.seen = length;
+                    return Poll::Ready(Ok(Some(data)));
+                }
+            }
+        }
     }
 }
 
@@ -210,49 +269,23 @@ impl AsyncRead for BlobDownload {
         if buffer.remaining() == 0 {
             return Poll::Ready(Ok(()));
         }
-        loop {
-            if !this.pending.is_empty() {
-                let count = buffer.remaining().min(this.pending.len());
-                buffer.put_slice(&this.pending[..count]);
-                this.pending.advance(count);
-                return Poll::Ready(Ok(()));
+        if !this.pending.is_empty() {
+            let count = buffer.remaining().min(this.pending.len());
+            buffer.put_slice(&this.pending[..count]);
+            this.pending.advance(count);
+            return Poll::Ready(Ok(()));
+        }
+        match this.poll_next_chunk(context) {
+            Poll::Pending => Poll::Pending,
+            Poll::Ready(Ok(None)) => Poll::Ready(Ok(())),
+            Poll::Ready(Ok(Some(mut data))) => {
+                let count = buffer.remaining().min(data.len());
+                buffer.put_slice(&data[..count]);
+                data.advance(count);
+                this.pending = data;
+                Poll::Ready(Ok(()))
             }
-            let Some(chunks) = &mut this.chunks else {
-                return Poll::Ready(Ok(()));
-            };
-            match chunks.as_mut().poll_next(context) {
-                Poll::Pending => return Poll::Pending,
-                Poll::Ready(None) => {
-                    this.chunks = None;
-                    if let Some(expected) = this.content_length
-                        && expected != this.seen
-                    {
-                        return this.fail(ClientError::BlobLengthMismatch {
-                            expected,
-                            actual: this.seen,
-                        });
-                    }
-                    return Poll::Ready(Ok(()));
-                }
-                Poll::Ready(Some(Err(error))) => return this.fail(error.into()),
-                Poll::Ready(Some(Ok(data))) => {
-                    let length =
-                        match checked_blob_size(this.seen, data.len() as u64, this.max_bytes) {
-                            Ok(length) => length,
-                            Err(error) => return this.fail(error),
-                        };
-                    if let Some(expected) = this.content_length
-                        && length > expected
-                    {
-                        return this.fail(ClientError::BlobLengthMismatch {
-                            expected,
-                            actual: length,
-                        });
-                    }
-                    this.seen = length;
-                    this.pending = data;
-                }
-            }
+            Poll::Ready(Err(error)) => Poll::Ready(Err(io::Error::other(error))),
         }
     }
 }
