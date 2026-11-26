@@ -4,7 +4,7 @@ Cooplet is a workspace-local collaboration system for AI coding agents. This che
 
 ## Development
 
-Use Linux x86-64 or ARM64 with Git, GNU Make, Docker Engine and Docker Compose 5.0 or later. The checked-in Devkit 0.6.0 loader provides the pinned Rust and Node toolchains. You can leave Rust and Node off the host.
+Use Linux x86-64 or ARM64 with Git, GNU Make, curl with trusted CA certificates, and access to a local Docker Engine with Docker Compose 5.0 or later. The checked-in Devkit 0.6.0 loader provides the pinned Rust and Node toolchains. You can leave Rust and Node off the host.
 
 ```sh
 make setup

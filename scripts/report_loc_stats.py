@@ -8,11 +8,11 @@ ROOT = Path(__file__).resolve().parents[1]
 LARGE_FILE = 1_000
 EXCLUDED_DIRS = {"tests", "test", "fixtures", "generated"}
 TEST_ATTRIBUTE = re.compile(r"\s*#\[cfg\(test\)\]\s*")
-MODULE = re.compile(r"(\s*)(?:pub(?:\([^)]*\))?\s+)?mod\s+\w+\s*\{")
+MODULE = re.compile(r"(\s*)(?:pub(?:\([^)]*\))?\s+)?mod\s+\w+\s*([{};])")
 
 
 def production_lines(path):
-    """Count nonblank physical lines, skipping rustfmt-style inline test modules."""
+    """Count nonblank lines, skipping rustfmt-style test module declarations and bodies."""
     test_attribute = False
     skipped_indent = None
     count = 0
@@ -28,7 +28,7 @@ def production_lines(path):
             module = MODULE.match(line)
             if module:
                 indent = module.group(1)
-                if not line.rstrip().endswith("}"):
+                if module.group(2) == "{" and not line.rstrip().endswith("}"):
                     skipped_indent = indent
                 test_attribute = False
                 continue
@@ -47,6 +47,9 @@ def source_files(component):
             continue
         parts = path.relative_to(component / "src").parts
         if EXCLUDED_DIRS.intersection(parts[:-1]):
+            continue
+        # Conventional files for out-of-line Rust test modules.
+        if path.name in {"test.rs", "tests.rs"} or path.name.endswith(("_test.rs", "_tests.rs")):
             continue
         if re.search(r"\.(test|spec|gen|generated)\.", path.name):
             continue

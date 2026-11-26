@@ -85,6 +85,17 @@ struct LockedPackage {
     source: Option<String>,
 }
 
+#[derive(Deserialize)]
+#[serde(untagged)]
+enum ConfigInclude {
+    Path(PathBuf),
+    Entry {
+        path: PathBuf,
+        #[serde(default)]
+        optional: bool,
+    },
+}
+
 fn workspace_root() -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR")).join("../..")
 }
@@ -124,10 +135,10 @@ fn read_toml<T: serde::de::DeserializeOwned>(path: &Path) -> Result<T, Box<dyn E
 #[test]
 fn gate_crate_dag() -> TestResult {
     let root = workspace_root().canonicalize()?;
+    reject_path_overrides(&root)?;
     let graph = metadata(&root)?;
     validate_dag(&graph, &root)?;
     validate_local_lock_packages(&graph, &read_toml(&root.join("Cargo.lock"))?)?;
-    reject_path_overrides(&root)?;
     Ok(())
 }
 
@@ -257,19 +268,52 @@ fn reject_path_overrides(root: &Path) -> TestResult {
     let manifest: Value = read_toml(&root.join("Cargo.toml"))?;
     reject_override_tables(&manifest, "Cargo.toml")?;
     for file in [".cargo/config", ".cargo/config.toml"] {
-        let path = root.join(file);
-        match path.symlink_metadata() {
-            Ok(_) => {
-                let config: Value = read_toml(&path)?;
-                reject_override_tables(&config, file)?;
-                if config.get("paths").is_some() {
-                    return Err(format!("{file}: Cargo path overrides are forbidden").into());
-                }
-            }
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-            Err(error) => return Err(error.into()),
+        reject_config_path_overrides(root, &root.join(file), true, &mut BTreeSet::new())?;
+    }
+    Ok(())
+}
+
+fn reject_config_path_overrides(
+    root: &Path,
+    path: &Path,
+    optional: bool,
+    active: &mut BTreeSet<PathBuf>,
+) -> TestResult {
+    let canonical = match path.canonicalize() {
+        Ok(path) => path,
+        Err(error) if optional && error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(error) => return Err(format!("cannot resolve {}: {error}", path.display()).into()),
+    };
+    let relative = canonical
+        .strip_prefix(root)
+        .map_err(|_| format!("Cargo config {} is outside the workspace", path.display()))?;
+    let file = relative.display().to_string();
+    if !active.insert(canonical.clone()) {
+        return Err(format!("{file}: cyclic Cargo config include").into());
+    }
+
+    let config: Value = read_toml(path)?;
+    reject_override_tables(&config, &file)?;
+    if config.get("paths").is_some() {
+        return Err(format!("{file}: Cargo path overrides are forbidden").into());
+    }
+    if let Some(includes) = config.get("include") {
+        let includes: Vec<ConfigInclude> = includes
+            .clone()
+            .try_into()
+            .map_err(|error| format!("{file}: invalid Cargo config include: {error}"))?;
+        let directory = path
+            .parent()
+            .ok_or_else(|| format!("{file}: Cargo config has no parent directory"))?;
+        for include in includes {
+            let (path, optional) = match include {
+                ConfigInclude::Path(path) => (path, false),
+                ConfigInclude::Entry { path, optional } => (path, optional),
+            };
+            reject_config_path_overrides(root, &directory.join(path), optional, active)?;
         }
     }
+    active.remove(&canonical);
     Ok(())
 }
 
@@ -507,6 +551,24 @@ fn rejects_unregistered_local_lock_packages_and_path_overrides() -> TestResult {
     assert_eq!(
         reject_override_tables(&patch, ".cargo/config.toml"),
         Err(".cargo/config.toml: path overrides under [patch] are forbidden".into())
+    );
+    Ok(())
+}
+
+#[test]
+fn rejects_path_overrides_from_included_cargo_configs() -> TestResult {
+    let fixtures = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("tests/fixtures/cargo-config")
+        .canonicalize()?;
+    let result = reject_config_path_overrides(
+        &fixtures,
+        &fixtures.join("entry.toml"),
+        false,
+        &mut BTreeSet::new(),
+    );
+    assert_eq!(
+        result.map_err(|error| error.to_string()),
+        Err("overrides.toml: Cargo path overrides are forbidden".into())
     );
     Ok(())
 }
