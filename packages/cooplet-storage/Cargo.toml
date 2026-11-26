@@ -7,10 +7,14 @@ license.workspace = true
 publish.workspace = true
 
 [dependencies]
+bytes = { workspace = true }
 cooplet-platform = { path = "../cooplet-platform" }
 cooplet-protocol = { path = "../cooplet-protocol" }
 rusqlite = { workspace = true }
+sha2 = { workspace = true }
+thiserror = { workspace = true }
 tokio = { workspace = true }
+tracing = { workspace = true }
 
 [lints]
 workspace = true

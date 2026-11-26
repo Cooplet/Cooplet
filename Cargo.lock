@@ -235,8 +235,20 @@ checksum = "1d07550c9036bf2ae0c684c4297d503f838287c83c53686d05370d0e139ae570"
 name = "cooplet-client"
 version = "0.1.0"
 dependencies = [
+ "bytes",
  "cooplet-protocol",
+ "futures-core",
+ "futures-util",
+ "http",
+ "percent-encoding",
  "reqwest",
+ "rustls",
+ "serde",
+ "serde_json",
+ "sha2",
+ "thiserror",
+ "tokio",
+ "url",
  "webpki-roots 0.26.11",
 ]
 
@@ -287,6 +299,13 @@ dependencies = [
 [[package]]
 name = "cooplet-platform"
 version = "0.1.0"
+dependencies = [
+ "getrandom 0.4.3",
+ "libc",
+ "serde",
+ "serde_json",
+ "thiserror",
+]
 
 [[package]]
 name = "cooplet-protocol"
@@ -296,6 +315,7 @@ dependencies = [
  "serde",
  "serde_json",
  "sha2",
+ "thiserror",
  "utoipa",
 ]
 
@@ -303,10 +323,14 @@ dependencies = [
 name = "cooplet-storage"
 version = "0.1.0"
 dependencies = [
+ "bytes",
  "cooplet-platform",
  "cooplet-protocol",
  "rusqlite",
+ "sha2",
+ "thiserror",
  "tokio",
+ "tracing",
 ]
 
 [[package]]
