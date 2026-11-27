@@ -768,3 +768,53 @@ async fn overlapping_background_runs_close_even_without_a_node_turn() -> TestRes
     ));
     Ok(())
 }
+
+#[tokio::test]
+async fn manual_compaction_releases_intake_on_either_side_of_busy_ack() -> TestResult {
+    use super::super::turn::COMPACTION_BUSY_ERROR;
+
+    for end_before_ack in [false, true] {
+        let (session, mut events, mut peer) = fixture()?;
+        let admission = AdmissionGuard::new(WAIT);
+        let end =
+            json!({"type":"compaction_end","reason":"manual","aborted":false,"willRetry":false});
+        let (outcome, proof) = tokio::join!(
+            session.submit("during-compaction".into(), "native maintenance", &admission),
+            async {
+                let (command, _) = peer.command().await?;
+                peer.frame(json!({"type":"compaction_start","reason":"manual"}))
+                    .await?;
+                if end_before_ack {
+                    peer.frame(end.clone()).await?;
+                }
+                peer.frame(json!({
+                    "type":"response","id":command["id"],"command":"prompt",
+                    "success":false,"error":COMPACTION_BUSY_ERROR
+                }))
+                .await
+            }
+        );
+        proof?;
+        assert!(matches!(outcome, SubmitOutcome::Busy));
+        if !end_before_ack {
+            assert!(matches!(
+                next(&mut events).await?.kind,
+                AdapterEventKind::StateChanged(ParticipantRuntimeState::Working)
+            ));
+            assert!(matches!(
+                session
+                    .submit("while-held".into(), "must not write", &admission)
+                    .await,
+                SubmitOutcome::Busy
+            ));
+            peer.frame(end).await?;
+        }
+        assert!(matches!(
+            next(&mut events).await?.kind,
+            AdapterEventKind::StateChanged(ParticipantRuntimeState::Idle)
+        ));
+        assert!(session.state().idle());
+        assert!(events.try_recv().is_err());
+    }
+    Ok(())
+}

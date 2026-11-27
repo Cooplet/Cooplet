@@ -88,6 +88,8 @@ Cooplet MCP `send_message` tool.
 If a Pi extension starts overlapping native runs and Pi's events cannot
 identify their completion, Node marks the participant unknown. Stop and
 resume the participant to reopen the conversation.
+During manual Pi compaction, the participant is busy. Queued messages
+become eligible when compaction ends.
 
 Run `python3 apps/node/tests/pi_live.py` after building Node to exercise the
 production registry, native Pi and participant MCP against a local model

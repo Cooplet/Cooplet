@@ -100,7 +100,7 @@ impl Session {
                 next_command: 0,
                 event_seq: 0,
                 turn: None,
-                native_activity: NativeActivity::Idle,
+                native_activity: NativeActivity::default(),
                 ready: false,
             }),
             input: AsyncMutex::new(Some(input)),

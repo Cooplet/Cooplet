@@ -272,7 +272,7 @@ def make_profile(area, pi, server, variant=""):
     (agent / "APPEND_SYSTEM.md").write_text(APPEND)
     extras = {
         "disabled": 'set -- --no-mcp "$@"',
-        "filtered": 'set -- --exclude-tools "mcp__cooplet__*" "$@"',
+        "filtered": 'set -- --exclude-tools mcp__cooplet__whoami "$@"',
     }
     wrapper = dirs["bin"] / "pi"
     if variant in ("unavailable", "missing-startup", "empty-instructions"):

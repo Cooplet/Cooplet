@@ -7,27 +7,46 @@ use crate::clients::{AdapterEventKind, ParticipantRuntimeState, SubmitOutcome, T
 use super::rpc::{Reply, State};
 
 pub(super) const NATIVE_BUSY_ERROR: &str = "Agent is already processing. Specify streamingBehavior ('steer' or 'followUp') to queue the message.";
+pub(super) const COMPACTION_BUSY_ERROR: &str = "Cannot submit a prompt while compaction is in progress. Wait for compaction to finish and retry.";
 
-pub(super) enum NativeActivity {
+#[derive(Default)]
+pub(super) struct NativeActivity {
+    agent: AgentActivity,
+    manual_compaction: bool,
+}
+
+#[derive(Default)]
+enum AgentActivity {
+    #[default]
     Idle,
     BusyBeforeStart,
-    Running { retry: bool },
+    Running {
+        retry: bool,
+    },
 }
 
 impl NativeActivity {
     pub(super) fn is_busy(&self) -> bool {
-        !matches!(self, Self::Idle)
+        self.manual_compaction || !matches!(self.agent, AgentActivity::Idle)
     }
 
     fn observe(&mut self, kind: &str, frame: &Value) -> bool {
         match kind {
             // A callback can delay an earlier run's settlement until another
             // run starts. Untagged events cannot establish ownership then.
-            "agent_start" if matches!(self, Self::Running { retry: false }) => return false,
-            "agent_start" => *self = Self::Running { retry: false },
-            "agent_settled" => *self = Self::Idle,
+            "agent_start" if matches!(self.agent, AgentActivity::Running { retry: false }) => {
+                return false;
+            }
+            "agent_start" => self.agent = AgentActivity::Running { retry: false },
+            "agent_settled" => self.agent = AgentActivity::Idle,
+            "compaction_start" if frame["reason"] == "manual" => {
+                self.manual_compaction = true;
+            }
+            "compaction_end" if frame["reason"] == "manual" => {
+                self.manual_compaction = false;
+            }
             "auto_retry_start" | "auto_retry_end" | "compaction_end" => {
-                if let Self::Running { retry } = self {
+                if let AgentActivity::Running { retry } = &mut self.agent {
                     *retry = kind == "auto_retry_start"
                         || (kind == "compaction_end" && frame["willRetry"] == true);
                 }
@@ -35,6 +54,21 @@ impl NativeActivity {
             _ => {}
         }
         true
+    }
+
+    fn acknowledge_busy(&mut self, error: &str, turn: &Turn) -> bool {
+        match error {
+            NATIVE_BUSY_ERROR => {
+                if !turn.saw_native_settle && matches!(self.agent, AgentActivity::Idle) {
+                    self.agent = AgentActivity::BusyBeforeStart;
+                }
+                true
+            }
+            // Pi also uses this error for branch navigation. Only manual
+            // compaction has an observable settlement to release our intake.
+            COMPACTION_BUSY_ERROR => self.manual_compaction || turn.saw_manual_compaction_end,
+            _ => false,
+        }
     }
 }
 
@@ -48,6 +82,7 @@ pub(super) struct Turn {
     run: NativeRun,
     saw_managed_user: bool,
     saw_native_settle: bool,
+    saw_manual_compaction_end: bool,
     assistant: Option<TurnResult>,
     finished: Option<TurnResult>,
 }
@@ -76,6 +111,7 @@ impl Turn {
             run: NativeRun::Waiting,
             saw_managed_user: false,
             saw_native_settle: false,
+            saw_manual_compaction_end: false,
             assistant: None,
             finished: None,
         }
@@ -95,6 +131,9 @@ impl Turn {
                 if self.run == NativeRun::Managed && frame["message"]["role"] == "assistant" =>
             {
                 self.assistant = Some(final_assistant(&frame["message"]));
+            }
+            "compaction_end" if frame["reason"] == "manual" => {
+                self.saw_manual_compaction_end = true;
             }
             "agent_settled" => {
                 self.saw_native_settle = true;
@@ -184,13 +223,13 @@ impl State {
         };
         if !reply.success
             && turn.run != NativeRun::Managed
-            && reply.error.as_deref() == Some(NATIVE_BUSY_ERROR)
+            && reply
+                .error
+                .as_deref()
+                .is_some_and(|error| self.native_activity.acknowledge_busy(error, turn))
         {
             // Releasing the Node slot on Busy requires an Idle event even if it
             // already arrived on the native stream while the ACK was pending.
-            if !turn.saw_native_settle && !self.native_activity.is_busy() {
-                self.native_activity = NativeActivity::BusyBeforeStart;
-            }
             self.turn = None;
             self.emit_native_state();
             return SubmitOutcome::Busy;
