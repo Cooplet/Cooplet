@@ -237,6 +237,78 @@ impl PrivateFs {
         verify_path(&path, &metadata)?;
         Ok(file)
     }
+
+    /// Open a regular file confined beneath `canonical_root` by stepping
+    /// component-by-component with `openat(..., O_NOFOLLOW | O_CLOEXEC)` and
+    /// opening the leaf with `O_NONBLOCK` so concurrent `RENAME_EXCHANGE`
+    /// symlink swaps cannot escape `canonical_root` and FIFOs cannot block.
+    ///
+    /// When `excluded_dir` is `Some((dev, ino))`, rejects any directory or leaf
+    /// whose `(dev, ino)` matches that excluded directory.
+    pub fn open_confined_regular_file(
+        canonical_root: &Path,
+        relative: &Path,
+        excluded_dir: Option<(u64, u64)>,
+    ) -> Result<File, PlatformError> {
+        let raw = relative.as_os_str().as_bytes();
+        if raw.ends_with(b"/") || raw.ends_with(b"/.") {
+            return Err(PlatformError::InvalidPath(relative.display().to_string()));
+        }
+        let mut names = Vec::new();
+        for part in relative.components() {
+            match part {
+                std::path::Component::Normal(name) => names.push(os_component(name)?),
+                _ => {
+                    return Err(PlatformError::InvalidPath(relative.display().to_string()));
+                }
+            }
+        }
+        let Some((leaf, parents)) = names.split_last() else {
+            return Err(PlatformError::InvalidPath(relative.display().to_string()));
+        };
+
+        let mut dir = Self::open_dir_nofollow(canonical_root)?;
+        check_not_excluded(&dir.metadata()?, excluded_dir)?;
+        let dir_flags = libc::O_RDONLY | libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC;
+        for parent in parents {
+            dir = openat_entry(&dir, parent, dir_flags, 0)?;
+            check_not_excluded(&dir.metadata()?, excluded_dir)?;
+        }
+
+        let file = openat_entry(&dir, leaf, libc::O_RDONLY | NOFOLLOW_FILE, 0)?;
+        let metadata = file.metadata()?;
+        check_not_excluded(&metadata, excluded_dir)?;
+        if !metadata.is_file() {
+            return Err(PlatformError::InvalidPath("expected a regular file".into()));
+        }
+        Ok(file)
+    }
+}
+
+fn check_not_excluded(
+    metadata: &Metadata,
+    excluded_dir: Option<(u64, u64)>,
+) -> Result<(), PlatformError> {
+    if excluded_dir == Some((metadata.dev(), metadata.ino())) {
+        return Err(PlatformError::PathExcluded);
+    }
+    Ok(())
+}
+
+fn os_component(name: &std::ffi::OsStr) -> Result<CString, PlatformError> {
+    let bytes = name.as_bytes();
+    if bytes.is_empty()
+        || bytes == b"."
+        || bytes == b".."
+        || bytes.contains(&b'/')
+        || bytes.contains(&b'\\')
+    {
+        return Err(PlatformError::InvalidPath(
+            Path::new(name).display().to_string(),
+        ));
+    }
+    CString::new(bytes)
+        .map_err(|_| PlatformError::InvalidPath(Path::new(name).display().to_string()))
 }
 
 fn canonical_private_directory(
@@ -690,6 +762,85 @@ mod tests {
         ));
         assert!(matches!(
             PrivateFs::remove_dir_at(&root_fd, ".."),
+            Err(PlatformError::InvalidPath(_))
+        ));
+        Ok(())
+    }
+
+    #[test]
+    fn open_confined_regular_file_blocks_symlinks_exclusions_and_fifos()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let scratch = Scratch::new()?;
+        let root = fs::canonicalize(&scratch.0)?;
+        let nested = root.join("a/b");
+        fs::create_dir_all(&nested)?;
+        let file_path = nested.join("data.txt");
+        fs::write(&file_path, b"confined-ok")?;
+
+        let mut file =
+            PrivateFs::open_confined_regular_file(&root, Path::new("a/b/data.txt"), None)?;
+        let mut buf = String::new();
+        file.read_to_string(&mut buf)?;
+        assert_eq!(buf, "confined-ok");
+
+        // Rejects directory leaf and non-normal components.
+        assert!(matches!(
+            PrivateFs::open_confined_regular_file(&root, Path::new("a/b"), None),
+            Err(PlatformError::InvalidPath(_))
+        ));
+        assert!(matches!(
+            PrivateFs::open_confined_regular_file(&root, Path::new("../data.txt"), None),
+            Err(PlatformError::InvalidPath(_))
+        ));
+        assert!(matches!(
+            PrivateFs::open_confined_regular_file(&root, Path::new(""), None),
+            Err(PlatformError::InvalidPath(_))
+        ));
+        assert!(matches!(
+            PrivateFs::open_confined_regular_file(&root, Path::new("a/b/data.txt/"), None),
+            Err(PlatformError::InvalidPath(_))
+        ));
+        assert!(matches!(
+            PrivateFs::open_confined_regular_file(&root, Path::new("a/b/data.txt/."), None),
+            Err(PlatformError::InvalidPath(_))
+        ));
+
+        // Rejects excluded intermediate directory and excluded root.
+        let excluded_meta = fs::symlink_metadata(root.join("a"))?;
+        let excluded = Some((excluded_meta.dev(), excluded_meta.ino()));
+        assert!(matches!(
+            PrivateFs::open_confined_regular_file(&root, Path::new("a/b/data.txt"), excluded),
+            Err(PlatformError::PathExcluded)
+        ));
+        let root_meta = fs::symlink_metadata(&root)?;
+        assert!(matches!(
+            PrivateFs::open_confined_regular_file(
+                &root,
+                Path::new("a/b/data.txt"),
+                Some((root_meta.dev(), root_meta.ino()))
+            ),
+            Err(PlatformError::PathExcluded)
+        ));
+
+        // Rejects symlink intermediate directory and symlink leaf without following.
+        let outside = Scratch::new()?;
+        fs::write(outside.0.join("secret.txt"), b"secret")?;
+        symlink(&outside.0, root.join("escape_dir"))?;
+        symlink(outside.0.join("secret.txt"), root.join("escape_file"))?;
+        assert!(
+            PrivateFs::open_confined_regular_file(&root, Path::new("escape_dir/secret.txt"), None)
+                .is_err()
+        );
+        assert!(
+            PrivateFs::open_confined_regular_file(&root, Path::new("escape_file"), None).is_err()
+        );
+
+        // Rejects FIFO without blocking.
+        let fifo = root.join("pipe");
+        let status = std::process::Command::new("mkfifo").arg(&fifo).status()?;
+        assert!(status.success());
+        assert!(matches!(
+            PrivateFs::open_confined_regular_file(&root, Path::new("pipe"), None),
             Err(PlatformError::InvalidPath(_))
         ));
         Ok(())

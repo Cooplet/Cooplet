@@ -19,6 +19,8 @@ pub enum PlatformError {
     LockBusy,
     #[error("the path no longer refers to the opened object")]
     PathReplaced,
+    #[error("path enters an excluded directory")]
+    PathExcluded,
     #[error("insecure file permissions at {path}: {detail}")]
     InsecurePermissions { path: PathBuf, detail: String },
     #[error("file exceeds the limit of {limit_bytes} bytes")]

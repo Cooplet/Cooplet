@@ -6,7 +6,7 @@ use std::{
     fs::{self, Permissions},
     io,
     os::unix::fs::{MetadataExt, PermissionsExt},
-    path::PathBuf,
+    path::{Path, PathBuf},
     pin::Pin,
     sync::{
         Arc, Mutex,
@@ -14,7 +14,7 @@ use std::{
         mpsc,
     },
     task::{Context, Poll},
-    time::Duration,
+    time::{Duration, SystemTime},
 };
 
 use cooplet_platform::PrivateFs;
@@ -261,6 +261,12 @@ async fn stores_sealed_contents_only_after_valid_eof_and_checks_bounds() -> Test
         "weekly report.md"
     );
     assert_eq!(safe_disk_name("-a..b.tar.gz"), "_a._b.tar.gz");
+    assert_eq!(safe_disk_name("report\u{202E}gpj.exe"), "report_gpj.exe");
+    assert_eq!(safe_disk_name("\u{202E}\u{2066}\u{2069}"), "file.bin");
+    assert_eq!(
+        safe_disk_name("line\u{2028}para\u{2029}.txt"),
+        "line_para_.txt"
+    );
     let name = safe_disk_name(&format!("{}.txt", "🙂".repeat(150)));
     assert!(name.ends_with(".txt"));
     assert!(name.chars().count() <= 120 && name.len() <= 255);
@@ -1123,7 +1129,17 @@ async fn checked_open_validates_under_the_sidecar_before_migrations_and_recovery
             Ok(())
         }
     };
-    let rejected = StorageEngine::open_existing_managed_checked(
+    let sidecar = config.db_path.with_extension("lock");
+    let diagnostic =
+        StorageEngine::check_existing(config.clone(), &migrations, move |connection| {
+            assert!(connection.is_readonly("main")?);
+            assert_eq!(FileLock::probe_owner_state(&sidecar)?, LockProbe::Idle);
+            let _reader = FileLock::acquire_existing_shared(&sidecar)?;
+            fingerprint(connection).map_err(Into::into)
+        })
+        .await?;
+    assert_eq!(diagnostic, "current");
+    let rejected = StorageEngine::open_managed_checked(
         config.clone(),
         &migrations,
         registry.clone(),
@@ -1164,6 +1180,110 @@ async fn checked_open_validates_under_the_sidecar_before_migrations_and_recovery
 }
 
 #[tokio::test]
+async fn checked_open_rejects_clean_wal_databases_without_creating_sidecars() -> TestResult {
+    let scratch = Scratch::new()?;
+    let config = StorageConfig::new(scratch.0.join("node?#%.sqlite3"));
+    let engine = StorageEngine::open(config.clone(), SCHEMA).await?;
+    engine.shutdown().await?;
+    let wal = config.db_path.with_extension("sqlite3-wal");
+    let shm = config.db_path.with_extension("sqlite3-shm");
+    assert!(!wal.try_exists()?);
+    assert!(!shm.try_exists()?);
+
+    // A clean shutdown may leave a zero-length WAL when WAL persistence is enabled.
+    for empty_wal in [false, true] {
+        if empty_wal {
+            fs::File::create_new(&wal)?;
+            fs::set_permissions(&wal, Permissions::from_mode(0o600))?;
+        }
+        let before = snapshot_database_files(&config.db_path, true)?;
+        let path = config.db_path.clone();
+        let observed = snapshot_database_files(&path, true)?;
+        let rejected = StorageEngine::open_existing_managed_checked(
+            config.clone(),
+            SCHEMA,
+            Arc::new(Registry::default()),
+            None,
+            move |connection| {
+                let version = connection
+                    .pragma_query_value(None, "user_version", |row| row.get::<_, i32>(0))?;
+                assert_eq!(version, 1);
+                assert_eq!(snapshot_database_files(&path, true)?, observed);
+                Err(StorageError::InvalidConfig("reject clean database"))
+            },
+        )
+        .await;
+        assert!(matches!(
+            rejected,
+            Err(StorageError::InvalidConfig("reject clean database"))
+        ));
+        assert_eq!(snapshot_database_files(&config.db_path, true)?, before);
+    }
+
+    // Plain `StorageEngine::open` (without `existing_check`) must also use
+    // non-mutating startup preflight: rejecting a clean WAL DB creates no
+    // `-wal`/`-shm` sidecars, and a symlink `-wal` is rejected before open.
+    let _ = fs::remove_file(&wal);
+    let before = snapshot_database_files(&config.db_path, true)?;
+    let mut small = config.clone();
+    small.max_page_count = 1;
+    assert!(matches!(
+        StorageEngine::open(small, SCHEMA).await,
+        Err(StorageError::PageLimit { requested: 1, .. })
+    ));
+    assert_eq!(snapshot_database_files(&config.db_path, true)?, before);
+
+    let fake_wal = scratch.0.join("foreign.wal");
+    fs::write(&fake_wal, b"not-a-wal")?;
+    std::os::unix::fs::symlink(&fake_wal, &wal)?;
+    assert!(matches!(
+        StorageEngine::open(config.clone(), SCHEMA).await,
+        Err(StorageError::IncompatibleDatabase(_))
+    ));
+    fs::remove_file(&wal)?;
+
+    // `check_existing` reports DatabaseMissing even when no sidecar lock exists.
+    let absent = StorageConfig::new(scratch.0.join("absent.sqlite3"));
+    assert!(matches!(
+        StorageEngine::check_existing(absent, SCHEMA, |_| Ok(())).await,
+        Err(StorageError::DatabaseMissing)
+    ));
+    Ok(())
+}
+
+#[derive(Debug, Eq, PartialEq)]
+struct SqliteFileSnapshot {
+    bytes: Vec<u8>,
+    mode: u32,
+    modified: SystemTime,
+    changed: Option<(i64, i64)>,
+}
+
+fn snapshot_database_files(
+    database: &Path,
+    include_wal_ctime: bool,
+) -> io::Result<Vec<Option<SqliteFileSnapshot>>> {
+    ["sqlite3", "sqlite3-wal", "sqlite3-shm"]
+        .into_iter()
+        .map(|suffix| {
+            let path = database.with_extension(suffix);
+            let metadata = match fs::metadata(&path) {
+                Ok(metadata) => metadata,
+                Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
+                Err(error) => return Err(error),
+            };
+            Ok(Some(SqliteFileSnapshot {
+                bytes: fs::read(path)?,
+                mode: metadata.mode(),
+                modified: metadata.modified()?,
+                changed: (suffix != "sqlite3-wal" || include_wal_ctime)
+                    .then(|| (metadata.ctime(), metadata.ctime_nsec())),
+            }))
+        })
+        .collect()
+}
+
+#[tokio::test]
 async fn checked_open_reads_identity_committed_in_the_wal() -> TestResult {
     let scratch = Scratch::new()?;
     let (config, _) = configs(&scratch);
@@ -1178,28 +1298,61 @@ async fn checked_open_reads_identity_committed_in_the_wal() -> TestResult {
         })
         .await?;
     // Copy a quiescent database before shutdown checkpoints its committed WAL.
-    let copy = scratch.0.join("copy.sqlite3");
-    fs::copy(&config.db_path, &copy)?;
-    assert!(
-        fs::copy(
-            config.db_path.with_extension("sqlite3-wal"),
-            copy.with_extension("sqlite3-wal")
-        )? > 0
-    );
-    engine.shutdown().await?;
-    let engine = StorageEngine::open_existing_managed_checked(
-        StorageConfig::new(copy),
-        SCHEMA,
-        Arc::new(Registry::default()),
-        None,
-        |c| {
-            let fingerprint: String =
-                c.query_row("SELECT fingerprint FROM identity", [], |r| r.get(0))?;
-            assert_eq!(fingerprint, "in-wal");
+    for include_shm in [false, true] {
+        let copy = scratch.0.join(format!("copy-{include_shm}.sqlite3"));
+        fs::copy(&config.db_path, &copy)?;
+        assert!(
+            fs::copy(
+                config.db_path.with_extension("sqlite3-wal"),
+                copy.with_extension("sqlite3-wal")
+            )? > 0
+        );
+        if include_shm {
+            fs::copy(
+                config.db_path.with_extension("sqlite3-shm"),
+                copy.with_extension("sqlite3-shm"),
+            )?;
+        }
+        // The bundled Unix VFS can fchown an existing WAL when running as root.
+        let include_wal_ctime = cooplet_platform::current_euid() != 0;
+        let before = snapshot_database_files(&copy, include_wal_ctime)?;
+        let path = copy.clone();
+        let observed = snapshot_database_files(&path, include_wal_ctime)?;
+        let check_wal_identity = |connection: &Connection| -> Result<(), StorageError> {
+            assert!(connection.is_readonly("main")?);
+            let identity: String =
+                connection.query_row("SELECT fingerprint FROM identity", [], |row| row.get(0))?;
+            assert_eq!(identity, "in-wal");
             Ok(())
-        },
-    )
-    .await?;
+        };
+        let rejected = StorageEngine::open_existing_managed_checked(
+            StorageConfig::new(&copy),
+            SCHEMA,
+            Arc::new(Registry::default()),
+            None,
+            move |connection| {
+                check_wal_identity(connection)?;
+                assert_eq!(snapshot_database_files(&path, include_wal_ctime)?, observed);
+                Err(StorageError::InvalidConfig("reject crash WAL database"))
+            },
+        )
+        .await;
+        assert!(matches!(
+            rejected,
+            Err(StorageError::InvalidConfig("reject crash WAL database"))
+        ));
+        assert_eq!(snapshot_database_files(&copy, include_wal_ctime)?, before);
+
+        let reopened = StorageEngine::open_existing_managed_checked(
+            StorageConfig::new(copy),
+            SCHEMA,
+            Arc::new(Registry::default()),
+            None,
+            check_wal_identity,
+        )
+        .await?;
+        reopened.shutdown().await?;
+    }
     engine.shutdown().await?;
     Ok(())
 }

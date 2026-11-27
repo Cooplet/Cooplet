@@ -22,6 +22,33 @@ const POLL_INTERVAL: Duration = Duration::from_millis(20);
 const KILL_CONFIRM_TIMEOUT: Duration = Duration::from_secs(1);
 const SPAWN_CLEANUP_GRACE: Duration = Duration::from_millis(100);
 
+/// Return a verified boot identifier on Linux, when the kernel exposes one.
+pub fn current_linux_boot_id() -> Option<String> {
+    #[cfg(target_os = "linux")]
+    return sys::boot_id().ok();
+    #[cfg(not(target_os = "linux"))]
+    None
+}
+
+/// Result of waiting on one or more Linux `pidfd`s alongside a wakeup pipe.
+#[cfg(target_os = "linux")]
+#[derive(Debug, Default, PartialEq, Eq)]
+pub struct PidfdPoll {
+    pub woken: bool,
+    pub wake_closed: bool,
+    pub exited: Vec<usize>,
+}
+
+/// Block until either `wake` becomes readable/closed or at least one `pidfd`
+/// reports process exit (`POLLIN | POLLHUP`), without reaping any child.
+#[cfg(target_os = "linux")]
+pub fn poll_pidfds(
+    pidfds: &[&std::os::fd::OwnedFd],
+    wake: &io::PipeReader,
+) -> io::Result<PidfdPoll> {
+    sys::poll_pidfds(pidfds, wake)
+}
+
 /// Fingerprint of the group leader. Persist this only for a managed launch.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -33,7 +60,7 @@ pub struct ProcessIdentity {
 
 impl ProcessIdentity {
     pub fn capture(pid: u32, pgid: u32) -> Result<Self, PlatformError> {
-        let pid_os = group_leader(pid, pgid)?;
+        let pid_os = child_group_leader(pid, pgid)?;
         let (snapshot, token) = sys::capture(pid_os)?;
         if snapshot.pgid != pid_os || snapshot.uid != current_euid() {
             return Err(PlatformError::ProcessNotOwned);
@@ -46,10 +73,10 @@ impl ProcessIdentity {
     }
 
     pub fn probe(&self) -> Result<ProcessProbe, PlatformError> {
-        let pid = self.validated_pid()?;
+        let pid = self.validated_structural_pid()?;
         match sys::capture(pid) {
             Ok((snapshot, token)) => {
-                if !self.matches_for_probe(&snapshot, &token) {
+                if is_self_pid_or_pgid(pid) || !self.matches_for_probe(&snapshot, &token) {
                     Ok(ProcessProbe::IdentityMismatch)
                 } else if snapshot.exited {
                     Ok(ProcessProbe::Exited)
@@ -64,8 +91,8 @@ impl ProcessIdentity {
         }
     }
 
-    fn validated_pid(&self) -> Result<libc::pid_t, PlatformError> {
-        let pid = group_leader(self.pid, self.pgid)?;
+    fn validated_structural_pid(&self) -> Result<libc::pid_t, PlatformError> {
+        let pid = structural_group_leader(self.pid, self.pgid)?;
         sys::validate_token(&self.start_token)?;
         Ok(pid)
     }
@@ -89,18 +116,30 @@ fn own_pgid() -> libc::pid_t {
     unsafe { libc::getpgrp() }
 }
 
-fn group_leader(pid: u32, pgid: u32) -> Result<libc::pid_t, PlatformError> {
+fn is_self_pid_or_pgid(pid: libc::pid_t) -> bool {
+    u32::try_from(pid).ok() == Some(std::process::id()) || pid == own_pgid()
+}
+
+fn structural_group_leader(pid: u32, pgid: u32) -> Result<libc::pid_t, PlatformError> {
     if pid == pgid
         && pid > 1
-        && pid != std::process::id()
         && let Ok(pid) = libc::pid_t::try_from(pid)
-        && pid != own_pgid()
     {
         return Ok(pid);
     }
     Err(PlatformError::InvalidProcessIdentity(
-        "expected a positive child group leader PID distinct from this process".into(),
+        "expected a positive process group leader PID".into(),
     ))
+}
+
+fn child_group_leader(pid: u32, pgid: u32) -> Result<libc::pid_t, PlatformError> {
+    let pid = structural_group_leader(pid, pgid)?;
+    if is_self_pid_or_pgid(pid) {
+        return Err(PlatformError::InvalidProcessIdentity(
+            "expected a positive child group leader PID distinct from this process".into(),
+        ));
+    }
+    Ok(pid)
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -147,10 +186,16 @@ impl PendingCleanup {
     pub fn terminate_and_reap(&mut self, grace: Duration) -> Result<Termination, PlatformError> {
         self.0.terminate(grace)
     }
+
+    /// Reap an exited leader after the caller confirms manual group cleanup.
+    /// Sends no signals. Returns false while the leader is still running.
+    pub fn reap_after_manual_cleanup(&mut self) -> Result<bool, PlatformError> {
+        Ok(self.0.reap_leader(TerminateOutcome::AlreadyGone)?.is_some())
+    }
 }
 
-/// Exclusive owner of a child started in its own process group. The caller
-/// must keep the handle and use `terminate_and_reap` to release the group.
+/// Exclusive owner of a child started in its own process group. Use
+/// `terminate_and_reap` for ordinary group cleanup.
 /// Host code must leave child reaping to this owner.
 #[derive(Debug)]
 #[must_use]
@@ -173,7 +218,7 @@ impl ProcessHandle {
             .spawn()
             .map_err(SpawnError::Spawn)?;
         let pid = child.id();
-        let pid_os = match group_leader(pid, pid) {
+        let pid_os = match child_group_leader(pid, pid) {
             Ok(pid_os) => pid_os,
             Err(source) => {
                 let _ = child.kill();
@@ -244,13 +289,22 @@ impl ProcessHandle {
         self.group.terminate(grace)
     }
 
+    /// Reap an exited leader after the caller confirms manual group cleanup.
+    /// Sends no signals. Returns false while the leader is still running.
+    pub fn reap_after_manual_cleanup(&mut self) -> Result<bool, PlatformError> {
+        Ok(self
+            .group
+            .reap_leader(TerminateOutcome::AlreadyGone)?
+            .is_some())
+    }
+
     /// Clean up a persisted managed launch via a stable OS address. Callers
     /// must withhold resume while the outcome remains unverified.
     pub fn terminate_detached(
         identity: &ProcessIdentity,
         grace: Duration,
     ) -> Result<TerminateOutcome, PlatformError> {
-        let pid = identity.validated_pid()?;
+        let pid = identity.validated_structural_pid()?;
         sys::terminate_detached(identity, pid, grace)
     }
 }
@@ -309,15 +363,26 @@ impl OwnedGroup {
         if outcome == TerminateOutcome::CleanupUnverified || !leader_exited {
             return Ok(unverified());
         }
-        let Ok(Some(status)) = self.child.try_wait() else {
-            return Ok(unverified());
+        Ok(self
+            .reap_leader(outcome)
+            .ok()
+            .flatten()
+            .unwrap_or_else(unverified))
+    }
+
+    fn reap_leader(&mut self, outcome: TerminateOutcome) -> io::Result<Option<Termination>> {
+        if let Some(done) = self.done {
+            return Ok(Some(done));
+        }
+        let Some(status) = self.child.try_wait()? else {
+            return Ok(None);
         };
         let done = Termination {
             outcome,
             leader_status: Some(status),
         };
         self.done = Some(done);
-        Ok(done)
+        Ok(Some(done))
     }
 }
 
@@ -506,6 +571,34 @@ mod tests {
         assert!(outcome.leader_status.is_some());
         assert!(handle.observe_exit()?);
         assert_eq!(handle.terminate_and_reap(Duration::ZERO)?, outcome);
+        Ok(())
+    }
+
+    #[test]
+    fn manual_cleanup_reaps_only_an_exited_leader() -> TestResult {
+        let mut command = Command::new("sh");
+        command
+            .stdin(Stdio::piped())
+            .args(["-c", "read -r line; exit 23"]);
+        let mut handle = ProcessHandle::spawn_isolated_group(&mut command)?;
+        let input = handle.take_stdin().ok_or("missing stdin")?;
+        assert!(!handle.reap_after_manual_cleanup()?);
+        assert_eq!(handle.identity().probe()?, ProcessProbe::Running);
+
+        drop(input);
+        wait_for_leader(&handle)?;
+        assert!(handle.reap_after_manual_cleanup()?);
+        assert!(handle.reap_after_manual_cleanup()?);
+        let result = handle.terminate_and_reap(Duration::ZERO)?;
+        assert_eq!(result.outcome, TerminateOutcome::AlreadyGone);
+        assert_eq!(
+            result.leader_status.and_then(|status| status.code()),
+            Some(23)
+        );
+        assert!(matches!(
+            handle.identity().probe()?,
+            ProcessProbe::Missing | ProcessProbe::IdentityMismatch
+        ));
         Ok(())
     }
 
@@ -801,6 +894,33 @@ mod tests {
             ProcessHandle::terminate_detached(&identity, Duration::ZERO)?,
             TerminateOutcome::AlreadyGone
         );
+
+        // Post-reboot PID reuse by the current process itself must classify as
+        // AlreadyGone on a boot_id change, and fail closed without self-signaling
+        // when the boot_id matches.
+        let self_pid = std::process::id();
+        let boot = sys::boot_id()?;
+        let self_last_boot = ProcessIdentity {
+            pid: self_pid,
+            pgid: self_pid,
+            start_token: "linux:00000000-0000-0000-0000-000000000000:42".into(),
+        };
+        assert_eq!(
+            ProcessHandle::terminate_detached(&self_last_boot, Duration::ZERO)?,
+            TerminateOutcome::AlreadyGone
+        );
+        assert_eq!(self_last_boot.probe()?, ProcessProbe::IdentityMismatch);
+
+        let self_same_boot = ProcessIdentity {
+            pid: self_pid,
+            pgid: self_pid,
+            start_token: format!("linux:{boot}:42"),
+        };
+        assert_eq!(
+            ProcessHandle::terminate_detached(&self_same_boot, Duration::ZERO)?,
+            TerminateOutcome::CleanupUnverified
+        );
+        assert_eq!(self_same_boot.probe()?, ProcessProbe::IdentityMismatch);
         Ok(())
     }
 }

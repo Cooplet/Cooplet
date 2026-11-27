@@ -1,9 +1,9 @@
 use std::{collections::BTreeMap, fs, io, path::PathBuf, time::Duration};
 
-use cooplet_protocol::{BlobId, EventEnvelope};
+use cooplet_protocol::BlobId;
 use rusqlite::{Connection, Transaction};
 
-use crate::{StorageConfig, StorageError, pragma::wal_path};
+use crate::{EventNotice, StorageConfig, StorageError, pragma::wal_path};
 
 pub const GC_BATCH_SIZE: usize = 200;
 const RESTART_TIMEOUT: Duration = Duration::from_millis(50);
@@ -30,7 +30,7 @@ pub enum BlobState {
 
 #[derive(Debug, Default)]
 pub struct GcBatchOutcome {
-    pub events: Vec<EventEnvelope>,
+    pub events: Vec<EventNotice>,
     pub has_more: bool,
 }
 

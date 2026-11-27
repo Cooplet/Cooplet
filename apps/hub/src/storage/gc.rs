@@ -7,10 +7,8 @@ use std::{
     },
 };
 
-use cooplet_protocol::{
-    AggregateType, AttachmentRef, BlobId, EventEnvelope, EventKind, NodeId, ThreadId,
-};
-use cooplet_storage::{BlobRecord, BlobState, BlobTombstone, GcBatchOutcome, GcHooks};
+use cooplet_protocol::{AggregateType, AttachmentRef, BlobId, EventKind, NodeId, ThreadId};
+use cooplet_storage::{BlobRecord, BlobState, BlobTombstone, EventNotice, GcBatchOutcome, GcHooks};
 use rusqlite::{
     Connection, ErrorCode as SqliteErrorCode, OptionalExtension, Row, Transaction, params,
 };
@@ -244,11 +242,7 @@ struct ExpiredBlob {
     scope: BlobScope,
 }
 
-fn prune_blobs(
-    tx: &Transaction<'_>,
-    now: i64,
-    limit: usize,
-) -> rusqlite::Result<Vec<EventEnvelope>> {
+fn prune_blobs(tx: &Transaction<'_>, now: i64, limit: usize) -> rusqlite::Result<Vec<EventNotice>> {
     let mut statement = tx.prepare_cached(
         "SELECT blob_id, original_name, mime_type, size_bytes, sha256, owner_actor_id,
                 scope_node_id, scope_thread_id, attached_at_ms

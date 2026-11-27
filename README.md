@@ -31,7 +31,7 @@ Restore the complete backup into clean locations while the service is stopped. U
 
 | Path | Role |
 | --- | --- |
-| `apps/node` | Agent coordination and CLI (`cooplet`) |
+| [`apps/node`](apps/node/README.md) | Agent coordination and CLI (`cooplet`) |
 | [`apps/hub`](apps/hub/README.md) | Multi-node coordination (`cooplet-hub`) |
 | `apps/telegram` | Telegram integration (`cooplet-telegram`) |
 | `apps/history` | Event archive and export (`cooplet-history`) |

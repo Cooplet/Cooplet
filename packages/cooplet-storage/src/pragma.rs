@@ -1,21 +1,31 @@
 use std::{
     fs::{self, Metadata, OpenOptions, Permissions},
     io,
-    os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt},
+    os::unix::{
+        ffi::OsStrExt,
+        fs::{MetadataExt, OpenOptionsExt, PermissionsExt},
+    },
     path::{Path, PathBuf},
 };
 
 use cooplet_platform::{FileLock, PlatformError, PrivateFs, current_euid};
-use rusqlite::{Connection, OpenFlags};
+use rusqlite::{Connection, OpenFlags, config::DbConfig};
 
 use crate::{Migration, StorageConfig, StorageError, SynchronousMode, migrate};
 
 const PAGE_SIZE: u32 = 4096;
 const MAX_SQLITE_PAGES: u32 = 4_294_967_294;
 const STATEMENT_CACHE_CAPACITY: usize = 128;
+const READ_ONLY_FLAGS: OpenFlags = OpenFlags::SQLITE_OPEN_READ_ONLY
+    .union(OpenFlags::SQLITE_OPEN_NO_MUTEX)
+    .union(OpenFlags::SQLITE_OPEN_NOFOLLOW);
 
-pub(crate) type ExistingDatabaseCheck =
-    Box<dyn FnOnce(&Connection) -> Result<(), StorageError> + Send>;
+type Check = Box<dyn FnOnce(&Connection) -> Result<(), StorageError> + Send>;
+
+pub(crate) struct ExistingDatabaseCheck {
+    pub(crate) require_database: bool,
+    pub(crate) validate: Check,
+}
 
 pub(crate) fn validate_config(config: &StorageConfig) -> Result<(), StorageError> {
     if config.read_pool_size == 0
@@ -46,56 +56,19 @@ pub(crate) fn open_writer(
 ) -> Result<(Connection, FileLock), StorageError> {
     validate_config(config)?;
     let target = migrate::target_version(migrations)?;
-    let input = &config.db_path;
-    let parent = input
-        .parent()
-        .filter(|parent| !parent.as_os_str().is_empty())
-        .unwrap_or(Path::new("."));
-    let file = input
-        .file_name()
-        .filter(|name| {
-            name.as_encoded_bytes().ends_with(b".sqlite3") && name.len() > b".sqlite3".len()
-        })
-        .ok_or(StorageError::InvalidConfig(
-            "database must have a .sqlite3 basename",
-        ))?;
-    let existing_only = existing_check.is_some();
-    let parent = if existing_only {
-        match PrivateFs::validate_private_dir(parent) {
-            Err(PlatformError::Io(error)) if error.kind() == io::ErrorKind::NotFound => {
-                return Err(StorageError::DatabaseMissing);
-            }
-            result => result?,
-        }
-    } else {
-        PrivateFs::ensure_private_dir(parent)?
-    };
-    let path = parent.join(file);
+    let existing_only = existing_check
+        .as_ref()
+        .is_some_and(|check| check.require_database);
+    let path = database_path(&config.db_path, existing_only)?;
     if existing_only {
         // Avoid creating an orphan sidecar lock when the database is missing or empty.
-        match database_metadata(&path)?.map(|meta| meta.len()) {
-            None => return Err(StorageError::DatabaseMissing),
-            Some(0) => {
-                return Err(StorageError::IncompatibleDatabase(
-                    "expected a non-empty existing database".into(),
-                ));
-            }
-            Some(_) => {}
-        }
+        require_existing(database_metadata(&path)?.as_ref())?;
     }
     let lock = FileLock::acquire_exclusive(&path.with_extension("lock"))?;
     let metadata = database_metadata(&path)?;
     let size = metadata.as_ref().map(Metadata::len);
     if existing_only {
-        match size {
-            None => return Err(StorageError::DatabaseMissing),
-            Some(0) => {
-                return Err(StorageError::IncompatibleDatabase(
-                    "expected a non-empty existing database".into(),
-                ));
-            }
-            Some(_) => {}
-        }
+        require_existing(metadata.as_ref())?;
     }
 
     let fresh = size.unwrap_or(0) == 0;
@@ -113,23 +86,15 @@ pub(crate) fn open_writer(
         }
         0
     } else {
-        let preflight = open_readonly(&path, config)?;
-        verify_header(&preflight)?;
-        let from: i64 = pragma(&preflight, "user_version")?;
-        if !(0..=i64::from(target)).contains(&from) {
-            return Err(StorageError::IncompatibleDatabase(format!(
-                "user_version {from} exceeds supported range 0..={target}"
-            )));
-        }
-        check_page_limit(pragma(&preflight, "page_count")?, config.max_page_count)?;
-        migrate::schema_hygiene(&preflight)?;
+        let preflight = open_startup_preflight(&path, config, &lock)?;
+        let from = validate_preflight(&preflight, config, target)?;
         if let Some(check) = existing_check {
-            check(&preflight)?;
+            (check.validate)(&preflight)?;
         }
         if let Some(root) = blob_root {
             crate::blob_store::check_before_database_open(root, &path, false)?;
         }
-        from as u32
+        from
     };
 
     lock.verify_path()?;
@@ -190,6 +155,73 @@ pub(crate) fn open_writer(
     Ok((connection, lock))
 }
 
+pub(crate) fn check_existing<T>(
+    config: &StorageConfig,
+    target: u32,
+    check: impl FnOnce(&Connection) -> Result<T, StorageError>,
+) -> Result<T, StorageError> {
+    let path = database_path(&config.db_path, true)?;
+    require_existing(database_metadata(&path)?.as_ref())?;
+    let lock = FileLock::acquire_existing_shared(&path.with_extension("lock"))?;
+    require_existing(database_metadata(&path)?.as_ref())?;
+    let connection = open_startup_preflight(&path, config, &lock)?;
+    validate_preflight(&connection, config, target)?;
+    check(&connection)
+}
+
+fn database_path(input: &Path, existing_only: bool) -> Result<PathBuf, StorageError> {
+    let parent = input
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+        .unwrap_or(Path::new("."));
+    let file = input
+        .file_name()
+        .filter(|name| {
+            name.as_encoded_bytes().ends_with(b".sqlite3") && name.len() > b".sqlite3".len()
+        })
+        .ok_or(StorageError::InvalidConfig(
+            "database must have a .sqlite3 basename",
+        ))?;
+    let parent = if existing_only {
+        match PrivateFs::validate_private_dir(parent) {
+            Err(PlatformError::Io(error)) if error.kind() == io::ErrorKind::NotFound => {
+                return Err(StorageError::DatabaseMissing);
+            }
+            result => result?,
+        }
+    } else {
+        PrivateFs::ensure_private_dir(parent)?
+    };
+    Ok(parent.join(file))
+}
+
+fn require_existing(metadata: Option<&Metadata>) -> Result<(), StorageError> {
+    match metadata.map(Metadata::len) {
+        None => Err(StorageError::DatabaseMissing),
+        Some(0) => Err(StorageError::IncompatibleDatabase(
+            "expected a non-empty existing database".into(),
+        )),
+        Some(_) => Ok(()),
+    }
+}
+
+fn validate_preflight(
+    preflight: &Connection,
+    config: &StorageConfig,
+    target: u32,
+) -> Result<u32, StorageError> {
+    verify_header(preflight)?;
+    let from: i64 = pragma(preflight, "user_version")?;
+    if !(0..=i64::from(target)).contains(&from) {
+        return Err(StorageError::IncompatibleDatabase(format!(
+            "user_version {from} exceeds supported range 0..={target}"
+        )));
+    }
+    check_page_limit(pragma(preflight, "page_count")?, config.max_page_count)?;
+    migrate::schema_hygiene(preflight)?;
+    Ok(from as u32)
+}
+
 fn database_metadata(path: &Path) -> Result<Option<Metadata>, StorageError> {
     match fs::symlink_metadata(path) {
         Ok(metadata)
@@ -216,15 +248,66 @@ pub(crate) fn open_readonly(
     path: &Path,
     config: &StorageConfig,
 ) -> Result<Connection, StorageError> {
-    let connection = Connection::open_with_flags(
-        path,
-        OpenFlags::SQLITE_OPEN_READ_ONLY
-            | OpenFlags::SQLITE_OPEN_NO_MUTEX
-            | OpenFlags::SQLITE_OPEN_NOFOLLOW,
-    )?;
-    connection.pragma_update(None, "query_only", true)?;
-    common_pragmas(&connection, config)?;
+    let connection = Connection::open_with_flags(path, READ_ONLY_FLAGS)?;
+    configure_readonly(&connection, config)?;
     Ok(connection)
+}
+
+fn open_startup_preflight(
+    path: &Path,
+    config: &StorageConfig,
+    lock: &FileLock,
+) -> Result<Connection, StorageError> {
+    lock.verify_path()?;
+    let has_wal = match fs::symlink_metadata(wal_path(path)) {
+        Ok(metadata) if metadata.is_file() => metadata.len() != 0,
+        Ok(_) => {
+            return Err(StorageError::IncompatibleDatabase(
+                "expected a regular WAL file".into(),
+            ));
+        }
+        Err(error) if error.kind() == io::ErrorKind::NotFound => false,
+        Err(error) => return Err(error.into()),
+    };
+    let connection = if has_wal {
+        // The sidecar excludes writers while this read runs. The exclusive
+        // pager mode builds each reader's WAL index in memory before the first read.
+        let connection = Connection::open_with_flags_and_vfs(path, READ_ONLY_FLAGS, "unix-none")?;
+        connection.set_db_config(DbConfig::SQLITE_DBCONFIG_NO_CKPT_ON_CLOSE, true)?;
+        connection.pragma_update(None, "locking_mode", "EXCLUSIVE")?;
+        connection
+    } else {
+        // SQLite's regular WAL reader can create a WAL and a shared-memory
+        // file even when both are absent. The sidecar keeps this file stable.
+        Connection::open_with_flags(
+            immutable_uri(path),
+            READ_ONLY_FLAGS | OpenFlags::SQLITE_OPEN_URI,
+        )?
+    };
+    configure_readonly(&connection, config)?;
+    Ok(connection)
+}
+
+fn immutable_uri(path: &Path) -> String {
+    const HEX: &[u8; 16] = b"0123456789ABCDEF";
+    let mut uri = String::from("file:");
+    // Paths can contain arbitrary Unix bytes and SQLite URI delimiters.
+    for &byte in path.as_os_str().as_bytes() {
+        if byte.is_ascii_alphanumeric() || matches!(byte, b'/' | b'.' | b'_' | b'-' | b'~') {
+            uri.push(char::from(byte));
+        } else {
+            uri.push('%');
+            uri.push(char::from(HEX[usize::from(byte >> 4)]));
+            uri.push(char::from(HEX[usize::from(byte & 15)]));
+        }
+    }
+    uri.push_str("?mode=ro&immutable=1");
+    uri
+}
+
+fn configure_readonly(connection: &Connection, config: &StorageConfig) -> Result<(), StorageError> {
+    connection.pragma_update(None, "query_only", true)?;
+    common_pragmas(connection, config)
 }
 
 fn common_pragmas(connection: &Connection, config: &StorageConfig) -> Result<(), StorageError> {

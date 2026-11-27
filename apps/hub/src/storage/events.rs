@@ -4,6 +4,7 @@ use cooplet_protocol::{
     AggregateType, AnswerPayload, AttachmentRef, DeliveryState, EventEnvelope, EventId, EventKind,
     HubId, MessageId, NodeId, ParticipantId, SourceKind, ThreadId,
 };
+use cooplet_storage::EventNotice;
 use rusqlite::{Transaction, params};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
@@ -99,7 +100,7 @@ pub(crate) fn append(
     tx: &Transaction<'_>,
     hub_id: &HubId,
     new: NewEvent<'_>,
-) -> rusqlite::Result<EventEnvelope> {
+) -> rusqlite::Result<EventNotice> {
     let event = record(tx, hub_id, new)?;
     advance_head(tx, event.seq)?;
     Ok(event)
@@ -110,7 +111,7 @@ pub(crate) fn record(
     tx: &Transaction<'_>,
     hub_id: &HubId,
     new: NewEvent<'_>,
-) -> rusqlite::Result<EventEnvelope> {
+) -> rusqlite::Result<EventNotice> {
     if matches!(&new.audience, EventAudience::Nodes { node_ids } if node_ids.is_empty()) {
         return Err(encode_error(std::io::Error::other(
             "empty event node audience",
@@ -163,7 +164,10 @@ pub(crate) fn record(
     {
         return Err(encode_error(FrameTooLarge));
     }
-    Ok(event)
+    Ok(EventNotice {
+        seq: event.seq,
+        kind: event.kind,
+    })
 }
 
 pub(crate) fn advance_head(tx: &Transaction<'_>, seq: u64) -> rusqlite::Result<()> {

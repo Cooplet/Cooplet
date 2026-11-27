@@ -9,11 +9,10 @@ use std::{
     time::Duration,
 };
 
-use cooplet_protocol::{
-    AggregateType, EventEnvelope, EventId, EventKind, NodeId, SourceId, SourceKind,
-};
+use cooplet_protocol::EventKind;
 use cooplet_storage::{
-    Migration, StorageConfig, StorageEngine, StorageError, WriteError, WriteFailure, WriteOutcome,
+    EventNotice, Migration, StorageConfig, StorageEngine, StorageError, WriteError, WriteFailure,
+    WriteOutcome,
 };
 use rusqlite::Connection;
 use tokio::sync::oneshot;
@@ -268,20 +267,11 @@ async fn cancelled_reader_holds_permit_and_leaves_no_snapshot() -> TestResult {
     Ok(())
 }
 
-fn event(seq: u64) -> Result<EventEnvelope, cooplet_protocol::IdError> {
-    let node = NodeId::from_parts(0, [0; 10])?;
-    Ok(EventEnvelope {
+fn event(seq: u64) -> EventNotice {
+    EventNotice {
         seq,
-        event_id: EventId::from_parts(seq, [0; 10])?,
-        source_kind: SourceKind::Node,
-        source_id: SourceId::Node(node.clone()),
         kind: EventKind::NodeStatus,
-        aggregate_type: AggregateType::Node,
-        aggregate_id: node.to_string(),
-        actor_id: None,
-        created_at_ms: 0,
-        payload: Default::default(),
-    })
+    }
 }
 
 #[tokio::test]
@@ -305,7 +295,7 @@ async fn accepted_write_survives_cancellation_and_broadcast_waits_for_commit() -
             .await
     });
     started.await?;
-    let committed = event(1)?;
+    let committed = event(1);
     let mut admitted = Box::pin(engine.db().write_sqlite(move |tx| {
         tx.execute("INSERT INTO rows VALUES(1, NULL)", [])?;
         tx.execute("INSERT INTO outbox VALUES(1)", [])?;
@@ -328,10 +318,11 @@ async fn accepted_write_survives_cancellation_and_broadcast_waits_for_commit() -
     release.send(())?;
     work.await??;
     assert_eq!(
-        tokio::time::timeout(Duration::from_secs(1), events.recv())
-            .await??
-            .seq,
-        1
+        tokio::time::timeout(Duration::from_secs(1), events.recv()).await??,
+        EventNotice {
+            seq: 1,
+            kind: EventKind::NodeStatus,
+        }
     );
     let rows = engine
         .reads()
@@ -353,7 +344,7 @@ async fn accepted_write_survives_cancellation_and_broadcast_waits_for_commit() -
         })
         .await;
     assert!(matches!(rejected, Err(WriteFailure::App("rollback"))));
-    let invalid = event(2)?;
+    let invalid = event(2);
     let fail = engine
         .db()
         .write_sqlite(move |tx| {
@@ -402,7 +393,7 @@ async fn sqlite_full_inside_composed_write_rolls_back_and_stays_usable() -> Test
     config.max_page_count = 24;
     let engine = StorageEngine::open(config, &[BASE]).await?;
     let mut events = engine.db().subscribe();
-    let wrong = event(1)?;
+    let wrong = event(1);
     let result = engine
         .db()
         .write::<_, &'static str, _>(move |tx| {

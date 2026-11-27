@@ -28,9 +28,27 @@ impl FileLock {
     pub fn acquire_exclusive(path: &Path) -> Result<Self, PlatformError> {
         let path = sidecar_path(path)?;
         let file = open_or_create_sidecar(&path)?;
+        Self::lock(path, file, File::try_lock)
+    }
+
+    /// Hold a shared guard for an existing sidecar without creating it.
+    pub fn acquire_existing_shared(path: &Path) -> Result<Self, PlatformError> {
+        let path = sidecar_path(path)?;
+        let file = OpenOptions::new()
+            .read(true)
+            .custom_flags(NOFOLLOW_FILE)
+            .open(&path)?;
+        Self::lock(path, file, File::try_lock_shared)
+    }
+
+    fn lock(
+        path: PathBuf,
+        file: File,
+        try_lock: fn(&File) -> Result<(), TryLockError>,
+    ) -> Result<Self, PlatformError> {
         verified_lock_metadata(&file, &path)?;
         for attempt in 0..5 {
-            match file.try_lock() {
+            match try_lock(&file) {
                 Ok(()) => {
                     let lock = Self { file, path };
                     lock.verify_path()?;
@@ -103,14 +121,17 @@ fn open_or_create_sidecar(path: &Path) -> Result<File, PlatformError> {
             file.set_permissions(Permissions::from_mode(0o600))?;
             Ok(file)
         }
-        Err(error) if error.kind() == io::ErrorKind::AlreadyExists => Ok(OpenOptions::new()
-            .read(true)
-            .write(true)
-            .truncate(false)
-            .custom_flags(NOFOLLOW_FILE)
-            .open(path)?),
+        Err(error) if error.kind() == io::ErrorKind::AlreadyExists => Ok(open_sidecar(path)?),
         Err(error) => Err(error.into()),
     }
+}
+
+fn open_sidecar(path: &Path) -> io::Result<File> {
+    OpenOptions::new()
+        .read(true)
+        .write(true)
+        .custom_flags(NOFOLLOW_FILE)
+        .open(path)
 }
 
 fn verified_lock_metadata(file: &File, path: &Path) -> Result<Metadata, PlatformError> {
@@ -139,6 +160,10 @@ mod tests {
         let scratch = Scratch::new()?;
         let path = scratch.0.join("node.lock");
         assert_eq!(FileLock::probe_owner_state(&path)?, LockProbe::Idle);
+        assert!(matches!(
+            FileLock::acquire_existing_shared(&path),
+            Err(PlatformError::Io(error)) if error.kind() == io::ErrorKind::NotFound
+        ));
         assert!(!path.exists());
 
         let lock = FileLock::acquire_exclusive(&path)?;
@@ -149,7 +174,7 @@ mod tests {
         assert!(!lock.protects_path(&alias)?);
         assert!(!lock.protects_path(&scratch.0.join("absent.lock"))?);
         assert!(matches!(
-            FileLock::acquire_exclusive(&path),
+            FileLock::acquire_existing_shared(&path),
             Err(PlatformError::LockBusy)
         ));
         assert_eq!(
@@ -173,6 +198,15 @@ mod tests {
         );
         drop(replacement);
         assert_eq!(FileLock::probe_owner_state(&path)?, LockProbe::Idle);
+        let reader = FileLock::acquire_existing_shared(&path)?;
+        let other_reader = FileLock::acquire_existing_shared(&path)?;
+        assert_eq!(FileLock::probe_owner_state(&path)?, LockProbe::Idle);
+        assert!(matches!(
+            FileLock::acquire_exclusive(&path),
+            Err(PlatformError::LockBusy)
+        ));
+        drop((reader, other_reader));
+        let _writer = FileLock::acquire_exclusive(&path)?;
         Ok(())
     }
 
