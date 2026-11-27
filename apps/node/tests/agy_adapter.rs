@@ -140,8 +140,15 @@ impl Drop for Tree {
     }
 }
 
-async fn eventually<T>(mut check: impl FnMut() -> TestResult<Option<T>>) -> TestResult<T> {
-    tokio::time::timeout(WAIT, async {
+async fn eventually<T>(check: impl FnMut() -> TestResult<Option<T>>) -> TestResult<T> {
+    eventually_before(WAIT, check).await
+}
+
+async fn eventually_before<T>(
+    wait: Duration,
+    mut check: impl FnMut() -> TestResult<Option<T>>,
+) -> TestResult<T> {
+    tokio::time::timeout(wait, async {
         loop {
             if let Some(value) = check()? {
                 return Ok(value);
@@ -948,6 +955,50 @@ async fn post_ack_fault_waits_for_submit_exit_before_emitting_unknown() -> TestR
     Ok(())
 }
 
+#[tokio::test]
+async fn explicit_stop_closes_stdin_without_waiting_for_a_ready_submit_ack() -> TestResult {
+    let tree = Tree::new()?;
+    tree.mode("cancel")?;
+    let adapter = AgyAdapter::new(tree.config());
+    let owner = Arc::new(Spawner::new(tree.0.clone()));
+    let mut session = adapter
+        .create_or_resume(open_request(&tree, owner.clone(), SessionOpenMode::Create)?)
+        .await?;
+    let handle = session.handle.clone();
+    let submit = adapter.submit_turn(&handle, human("keep ACK queued")?);
+    tokio::pin!(submit);
+    let in_progress = tokio::select! {
+        biased;
+        _ = &mut submit => false,
+        _ = std::future::ready(()) => true,
+    };
+    assert!(in_progress);
+    assert!(matches!(
+        event(&mut session, 1).await?,
+        AdapterEventKind::StateChanged(ParticipantRuntimeState::Working)
+    ));
+
+    assert!(matches!(
+        adapter
+            .cancel_or_stop(&handle, StopMode::StopSession)
+            .await?,
+        StopOutcome::Stopped
+    ));
+    tree.wait_for(|frame| frame["stdin_eof"] == true, 1).await?;
+    assert!(tree.frames("session/close")?.is_empty());
+    assert!(matches!(
+        session.events.try_recv(),
+        Err(tokio::sync::mpsc::error::TryRecvError::Empty)
+    ));
+    assert!(matches!(submit.await, SubmitOutcome::Accepted { .. }));
+    assert!(
+        tokio::time::timeout(WAIT, session.events.recv())
+            .await?
+            .is_none()
+    );
+    Ok(())
+}
+
 struct Server {
     client: CoopletClient,
     shutdown: watch::Sender<bool>,
@@ -1340,18 +1391,30 @@ async fn live_signed_in_agy_creates_cancels_and_reopens_with_fresh_mcp() -> Test
         .await?;
     live_whoami(&tree, &server, &id, &trace, "initial").await?;
 
-    let cancelled = server
-        .message(
-            &id,
-            "Run the local command sleep 30 immediately. Take no other action.",
-            "live-cancel-target",
-        )
-        .await?;
-    assert_eq!(cancelled["delivery_state"], "delivered");
+    let cancel_prompt = "Run this exact local command once in the foreground in the current workspace using the shell tool: printf started > cancel-started; sleep 30; printf finished > cancel-finished. Wait for the command before responding.";
+    let delivery = server
+        .message(&id, cancel_prompt, "live-cancel-target")
+        .await
+        .map_err(|error| {
+            std::io::Error::other(format!("Live cancel target was not delivered ({error})"))
+        })?;
+    assert_eq!(delivery["delivery_state"], "delivered");
+    let started = tree.workspace().join("cancel-started");
+    eventually_before(Duration::from_secs(90), || {
+        Ok(started.try_exists()?.then_some(()))
+    })
+    .await
+    .map_err(|error| {
+        std::io::Error::other(format!("Live foreground command did not start ({error})"))
+    })?;
     server.state(&id, "working", Some("busy")).await?;
-    server
+    let cancel = server
         .lifecycle(&id, "stop", "live-cancel", json!({"cancel_turn_only":true}))
-        .await?;
+        .await
+        .map_err(|error| {
+            std::io::Error::other(format!("Live CancelTurn did not succeed ({error})"))
+        })?;
+    assert_eq!(cancel["stop_outcome"], "turn_cancelled");
     server.state(&id, "idle", Some("ready")).await?;
     live_whoami(&tree, &server, &id, &trace, "after-cancel").await?;
     server
@@ -1367,6 +1430,7 @@ async fn live_signed_in_agy_creates_cancels_and_reopens_with_fresh_mcp() -> Test
         .await?;
     live_whoami(&tree, &server, &id, &trace, "reopened").await?;
     assert!(mcp_whoami_calls(&trace.join(format!("{id}.g2.json")))? >= 1);
+    assert!(!tree.workspace().join("cancel-finished").try_exists()?);
     server.shutdown().await?;
     Ok(())
 }

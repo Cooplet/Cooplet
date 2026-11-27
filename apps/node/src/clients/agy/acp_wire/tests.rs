@@ -112,3 +112,40 @@ fn writer_distinguishes_prewrite_rejection_from_partial_frame() {
     );
     assert!(output.is_empty());
 }
+
+#[test]
+fn fenced_payload_write_never_terminates_the_frame() {
+    struct FencingWriter<'a> {
+        closed: &'a AtomicBool,
+        output: Vec<u8>,
+    }
+
+    impl Write for FencingWriter<'_> {
+        fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+            self.output.extend(bytes);
+            self.closed.store(true, Ordering::Release);
+            Ok(bytes.len())
+        }
+
+        fn flush(&mut self) -> io::Result<()> {
+            Ok(())
+        }
+    }
+
+    let closed = AtomicBool::new(false);
+    let mut writer = FencingWriter {
+        closed: &closed,
+        output: Vec::new(),
+    };
+    assert_eq!(
+        write_frame(
+            &mut writer,
+            b"{\"fixture\":true}\n",
+            None,
+            &closed,
+            &OnceLock::new()
+        ),
+        Err(WriteFailure::Unknown)
+    );
+    assert_eq!(writer.output, b"{\"fixture\":true");
+}

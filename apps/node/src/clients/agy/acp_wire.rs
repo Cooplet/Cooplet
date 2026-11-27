@@ -281,7 +281,14 @@ fn write_frame(
         } else if closed.load(Ordering::Acquire) || abandoned() {
             return Err(WriteFailure::Unknown);
         }
-        match writer.write(remaining) {
+        // Fence again before the JSON closing byte and its LF. A blocked
+        // payload write that finishes after fencing leaves incomplete JSON.
+        let chunk = if remaining.len() > 2 {
+            &remaining[..remaining.len() - 2]
+        } else {
+            remaining
+        };
+        match writer.write(chunk) {
             Ok(0) => break,
             Ok(count) => remaining = &remaining[count..],
             Err(error) if error.kind() == io::ErrorKind::Interrupted => continue,

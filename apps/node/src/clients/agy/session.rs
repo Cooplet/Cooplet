@@ -62,8 +62,16 @@ impl Session {
             while let Ok(request) = requests.try_recv() {
                 request.transport_closed();
             }
+            // An explicit stop owns transport teardown. Faults instead
+            // leave both descriptors open until Node can observe the ACK.
+            let faulted_wire = if fault.is_none() {
+                drop(wire);
+                None
+            } else {
+                Some(wire)
+            };
             actor.await_submit_exit().await;
-            drop(wire);
+            drop(faulted_wire);
             actor.finish(fault).await;
         });
         (
