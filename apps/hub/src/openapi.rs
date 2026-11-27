@@ -10,6 +10,7 @@ use utoipa::{
         header::Header,
         path::{Operation, ParameterBuilder, ParameterIn},
         response::Response,
+        schema::{AllOfBuilder, AnyOfBuilder},
         security::{Http, HttpAuthScheme, SecurityScheme},
     },
 };
@@ -83,13 +84,26 @@ struct HttpConventions;
 
 impl Modify for HttpConventions {
     fn modify(&self, document: &mut utoipa::openapi::OpenApi) {
-        document
-            .components
-            .get_or_insert_with(Components::new)
-            .add_security_scheme(
-                "hub_bearer",
-                SecurityScheme::Http(Http::new(HttpAuthScheme::Bearer)),
-            );
+        let components = document.components.get_or_insert_with(Components::new);
+        components.add_security_scheme(
+            "hub_bearer",
+            SecurityScheme::Http(Http::new(HttpAuthScheme::Bearer)),
+        );
+        // Either selector may be supplied alone, and a request may specify both.
+        if let Some(schema) = components.schemas.get_mut("CreateAgentRequest") {
+            let mut selector = AnyOfBuilder::new();
+            for name in ["client_kind", "template_id"] {
+                selector = selector.item(
+                    ObjectBuilder::new()
+                        .property(name, ObjectBuilder::new().schema_type(Type::String))
+                        .required(name),
+                );
+            }
+            *schema = AllOfBuilder::new()
+                .item(schema.clone())
+                .item(selector)
+                .into();
+        }
 
         for (path, item) in &mut document.paths.paths {
             let public = matches!(path.as_str(), "/v1/info" | "/v1/openapi.json");

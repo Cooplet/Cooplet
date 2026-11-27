@@ -77,7 +77,8 @@ pub(crate) struct CreateAgentRequest {
     pub(super) template_id: Option<String>,
     pub(super) name: Option<String>,
     pub(super) workspace_dir: Option<String>,
-    pub(super) overrides: Option<Value>,
+    #[schema(value_type = Option<Object>)]
+    pub(super) overrides: Option<serde_json::Map<String, Value>>,
 }
 
 #[derive(Deserialize, ToSchema)]
@@ -102,16 +103,13 @@ pub(crate) struct RunWorkflowRequest {
     pub(super) target_node_id: NodeId,
     pub(super) workflow_name: String,
     pub(super) workspace_dir: String,
-    #[serde(default = "empty_object")]
-    pub(super) params: Value,
+    #[serde(default)]
+    #[schema(value_type = Object)]
+    pub(super) params: serde_json::Map<String, Value>,
 }
 
 #[derive(Deserialize, ToSchema)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct CancelWorkflowRequest {
     pub(super) target_node_id: NodeId,
-}
-
-fn empty_object() -> Value {
-    Value::Object(serde_json::Map::new())
 }

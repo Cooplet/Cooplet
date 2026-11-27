@@ -145,21 +145,19 @@ pub(crate) async fn list_nodes(
     parse_optional_cursor::<NodeId>(query.after.as_deref())?;
 
     read_snapshot(state, move |tx| {
-        let mut statement = tx.prepare(
+        let node_filter = if allowed.is_some() {
+            "AND node_id IN (SELECT value FROM json_each(?2))"
+        } else {
+            ""
+        };
+        let mut statement = tx.prepare_cached(&format!(
             "SELECT node_id, display_name, status, generation, session_epoch,
                     capabilities_json, last_seen_at_ms, enrolled_at_ms, revoked_at_ms
-               FROM nodes
-              WHERE node_id > ?1
-                AND (?2 IS NULL OR node_id = ?2)
-                AND (?3 IS NULL OR node_id IN (SELECT value FROM json_each(?3)))
-              ORDER BY node_id LIMIT ?4",
-        )?;
-        let mut rows = statement.query(params![
-            query.after.unwrap_or_default(),
-            query.node_id.as_ref().map(NodeId::as_str),
-            allowed,
-            limit + 1,
-        ])?;
+               FROM nodes WHERE node_id > ?1 {node_filter}
+              ORDER BY node_id LIMIT ?3"
+        ))?;
+        let mut rows =
+            statement.query(params![query.after.unwrap_or_default(), allowed, limit + 1])?;
         collect_page(&mut rows, limit, |row| {
             let node_id: NodeId = parse_text(row, 0)?;
             let cursor = node_id.to_string();
@@ -200,23 +198,27 @@ pub(crate) async fn list_participants(
     };
 
     read_snapshot(state, move |tx| {
-        let mut statement = tx.prepare(
+        // A scoped page visits the selected nodes in key order, then seeks directly
+        // to the first eligible participant within each node.
+        let source = if allowed.is_some() {
+            "FROM nodes n CROSS JOIN node_participants p ON p.node_id = n.node_id
+             WHERE n.node_id IN (SELECT value FROM json_each(?3)) AND n.node_id >= ?1
+               AND p.participant_id > CASE WHEN n.node_id = ?1 THEN ?2 ELSE '' END
+               AND n.revoked_at_ms IS NULL AND n.status != 'revoked'
+             ORDER BY n.node_id, p.participant_id"
+        } else {
+            "FROM node_participants p JOIN nodes n USING (node_id)
+             WHERE (p.node_id, p.participant_id) > (?1, ?2)
+               AND n.revoked_at_ms IS NULL AND n.status != 'revoked'
+             ORDER BY p.node_id, p.participant_id"
+        };
+        let mut statement = tx.prepare_cached(&format!(
             "SELECT p.node_id, p.participant_id, p.kind, p.name, p.client_kind, p.workspace_dir,
                     p.state, p.capabilities_json, p.synced_epoch, p.updated_at_ms
-               FROM node_participants p JOIN nodes n USING (node_id)
-              WHERE (p.node_id, p.participant_id) > (?1, ?2)
-                AND (?3 IS NULL OR p.node_id = ?3)
-                AND (?4 IS NULL OR p.node_id IN (SELECT value FROM json_each(?4)))
-                AND n.revoked_at_ms IS NULL AND n.status != 'revoked'
-              ORDER BY p.node_id, p.participant_id LIMIT ?5",
-        )?;
-        let mut rows = statement.query(params![
-            after_node,
-            after_participant,
-            query.node_id.as_ref().map(NodeId::as_str),
-            allowed,
-            limit + 1,
-        ])?;
+             {source} LIMIT ?4"
+        ))?;
+        let mut rows =
+            statement.query(params![after_node, after_participant, allowed, limit + 1])?;
         collect_page(&mut rows, limit, |row| {
             let state: ParticipantState = parse_text(row, 6)?;
             let node_id: NodeId = parse_text(row, 0)?;
@@ -246,11 +248,14 @@ fn catalog_allowed_nodes(
     node_id: Option<&NodeId>,
 ) -> Result<Option<String>, HubError> {
     caller.require_scope(ServiceScope::Read)?;
-    if node_id.is_some_and(|id| !caller.allows_node(id)) {
-        return Err(HubError::new(
-            ErrorCode::Forbidden,
-            "Node is outside the allowed scope",
-        ));
+    if let Some(id) = node_id {
+        if !caller.allows_node(id) {
+            return Err(HubError::new(
+                ErrorCode::Forbidden,
+                "Node is outside the allowed scope",
+            ));
+        }
+        return Ok(Some(serde_json::to_string(&[id])?));
     }
     caller
         .allowed_nodes()

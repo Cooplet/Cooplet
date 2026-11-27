@@ -110,41 +110,76 @@
         "type": "object"
       },
       "CreateAgentRequest": {
-        "additionalProperties": false,
-        "properties": {
-          "client_kind": {
-            "type": [
-              "string",
-              "null"
-            ]
+        "allOf": [
+          {
+            "additionalProperties": false,
+            "properties": {
+              "client_kind": {
+                "type": [
+                  "string",
+                  "null"
+                ]
+              },
+              "name": {
+                "type": [
+                  "string",
+                  "null"
+                ]
+              },
+              "overrides": {
+                "type": [
+                  "object",
+                  "null"
+                ]
+              },
+              "target_node_id": {
+                "$ref": "#/components/schemas/NodeId"
+              },
+              "template_id": {
+                "type": [
+                  "string",
+                  "null"
+                ]
+              },
+              "workspace_dir": {
+                "type": [
+                  "string",
+                  "null"
+                ]
+              }
+            },
+            "required": [
+              "target_node_id"
+            ],
+            "type": "object"
           },
-          "name": {
-            "type": [
-              "string",
-              "null"
-            ]
-          },
-          "overrides": {},
-          "target_node_id": {
-            "$ref": "#/components/schemas/NodeId"
-          },
-          "template_id": {
-            "type": [
-              "string",
-              "null"
-            ]
-          },
-          "workspace_dir": {
-            "type": [
-              "string",
-              "null"
+          {
+            "anyOf": [
+              {
+                "properties": {
+                  "client_kind": {
+                    "type": "string"
+                  }
+                },
+                "required": [
+                  "client_kind"
+                ],
+                "type": "object"
+              },
+              {
+                "properties": {
+                  "template_id": {
+                    "type": "string"
+                  }
+                },
+                "required": [
+                  "template_id"
+                ],
+                "type": "object"
+              }
             ]
           }
-        },
-        "required": [
-          "target_node_id"
-        ],
-        "type": "object"
+        ]
       },
       "CreatePrincipalRequest": {
         "additionalProperties": false,
@@ -1210,7 +1245,9 @@
       "RunWorkflowRequest": {
         "additionalProperties": false,
         "properties": {
-          "params": {},
+          "params": {
+            "type": "object"
+          },
           "target_node_id": {
             "$ref": "#/components/schemas/NodeId"
           },

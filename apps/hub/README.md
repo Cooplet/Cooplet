@@ -29,6 +29,14 @@ The CLI prints the idempotency key to stderr before making the request. If the i
 
 If you lose the redemption response, use the recorded `token_id` to call `POST /v1/enrollment-tokens/{token_id}/revoke`. Revoke the reserved node with `POST /v1/nodes/{node_id}/revoke` if the first call reports `already_consumed: true` or the enrollment record is gone (`404`). For a definitive check, call both endpoints in that order. Use an admin bearer, the Hub pin and a distinct idempotency key for each call. A `404` from the node revocation means the reserved node ID has no current registration. Generate a new enrollment token for the next attempt.
 
+## Grant service access
+
+Use a full human administrator bearer to create a service with `POST /v1/principals`, then issue its token with `POST /v1/principals/{id}/tokens`. Set `with_participant: true` if the service sends messages. Give the token a future `expires_at_ms` in Unix milliseconds. Save the returned secret on issuance.
+
+Specify `scopes` and `allowed_nodes` on both requests. The Hub intersects the two grants. The `read` scope permits reads, `collaborate` adds messaging, and `manage` adds control commands. Administrative routes require a full human administrator bearer.
+
+Use an array of node IDs to limit access. An empty array grants access to zero nodes. The explicit value `null` allows all nodes at that level. A service with effective all-node `read` access can read the global archive, including other callers’ unattached blobs.
+
 ## Stop and back up
 
 Send `SIGINT` or `SIGTERM` and wait for Hub to exit successfully. Once stopped, back up `hub.sqlite3`, its `-wal` file if present, `hub.master.key`, and the entire `blobs/` directory together. Include the blob directory's `database.owner` file. Keep the matching durable admin credential in secure storage.

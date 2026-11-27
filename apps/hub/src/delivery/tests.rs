@@ -969,6 +969,81 @@ fn answer_for(node: &NodeId, recipient: &ParticipantId, question: &MessageId) ->
 }
 
 #[tokio::test]
+async fn hub_participant_addresses_are_qualified_by_destination() -> TestResult {
+    let f = Fixture::new(Arc::new(OfflineBridge)).await?;
+    let participant = f.admin.participant_id().ok_or("missing Hub participant")?;
+    assert!(f.admin.is_hub_recipient(None, participant));
+    assert!(
+        !f.admin
+            .is_hub_recipient(Some(&NodeId::generate()?), participant)
+    );
+    assert!(!f.admin.is_hub_recipient(None, &ParticipantId::generate()?));
+    f.close().await?;
+    Ok(())
+}
+
+#[tokio::test]
+async fn concurrent_answer_keys_report_one_winner() -> TestResult {
+    let bridge = FakeBridge::new();
+    let f = Fixture::new(bridge.clone()).await?;
+    let node = NodeId::generate()?;
+    let asker = ParticipantId::generate()?;
+    f.node(&node, &asker, "agent").await?;
+    let recipient = f.admin.participant_id().ok_or("missing Hub participant")?;
+    let question = f.inbound_question(&node, &asker, None, recipient).await?;
+    let answer = answer_for(&node, &asker, &question);
+
+    // Keep both callers past RO preflight before either acceptance can commit.
+    let (entered, writing) = oneshot::channel();
+    let (release, blocked) = std::sync::mpsc::channel();
+    let db = f.state.db.clone();
+    let writer = tokio::spawn(async move {
+        db.write_sqlite(move |_tx| {
+            let _ = entered.send(());
+            let _ = blocked.recv_timeout(Duration::from_secs(10));
+            Ok(WriteOutcome::new(()))
+        })
+        .await
+    });
+    writing.await?;
+    let race = |key, body| {
+        let state = f.state.clone();
+        let caller = f.admin.clone();
+        tokio::spawn(async move { send_message(&state, &caller, key, body).await })
+    };
+    let first = race("first-answer-key", serde_json::from_value(answer.clone())?);
+    let second = race("second-answer-key", serde_json::from_value(answer)?);
+    tokio::time::timeout(Duration::from_secs(3), async {
+        while bridge.shared.reserves.load(Ordering::SeqCst) < 2 {
+            bridge.shared.reserved.notified().await;
+        }
+    })
+    .await?;
+    release.send(())?;
+    writer.await??;
+    let (winner, conflict) = match (first.await?, second.await?) {
+        (Ok(winner), Err(conflict)) | (Err(conflict), Ok(winner)) => (winner, conflict),
+        _ => return Err("expected one answer and one conflict".into()),
+    };
+    assert_eq!(winner.0, StatusCode::CREATED);
+    assert_eq!(conflict.problem().code, ErrorCode::QuestionAlreadyAnswered);
+    assert_eq!(conflict.problem().status, 409);
+    assert_eq!(
+        conflict.problem().extensions["existing_answer_id"],
+        winner.1.message_id.as_str()
+    );
+    assert_eq!(bridge.shared.submits.load(Ordering::SeqCst), 1);
+    let counts: (u64,u64,u64) = f.state.reads.read(|db| Ok(db.query_row(
+        "SELECT (SELECT COUNT(*) FROM operations), (SELECT COUNT(*) FROM hub_messages WHERE answer_json IS NOT NULL),
+                (SELECT COUNT(*) FROM events WHERE kind = 'question.answered')",
+        [], |row| Ok((row.get(0)?,row.get(1)?,row.get(2)?))
+    )?)).await?;
+    assert_eq!(counts, (1, 1, 1));
+    f.close().await?;
+    Ok(())
+}
+
+#[tokio::test]
 async fn production_offline_bridge_accepts_answer_on_real_http() -> TestResult {
     let f = Fixture::new(Arc::new(OfflineBridge)).await?;
     let node = NodeId::generate()?;

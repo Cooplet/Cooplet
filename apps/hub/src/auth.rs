@@ -65,6 +65,14 @@ impl AuthenticatedCaller {
         }
     }
 
+    pub(crate) fn is_hub_recipient(
+        &self,
+        node: Option<&NodeId>,
+        participant: &ParticipantId,
+    ) -> bool {
+        node.is_none() && self.participant_id() == Some(participant)
+    }
+
     pub(crate) fn node_id(&self) -> Option<&NodeId> {
         match &self.identity {
             Identity::Node { id, .. } => Some(id),

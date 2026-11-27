@@ -415,3 +415,39 @@ fn event_filter_requires_valid_nonempty_csv_and_deduplicates_labels() -> TestRes
     );
     Ok(())
 }
+
+#[tokio::test]
+async fn quiet_stream_reconciles_a_durable_commit_without_a_wake() -> TestResult {
+    let fixture = Fixture::new().await?;
+    // Isolate the stream from broadcasts while using the real writer and reader.
+    let (_silent, wake) = watch::channel((0, 0));
+    let mut body = super::stream::response(
+        Reader::new(&fixture.state, &fixture.admin, HashSet::new()),
+        0,
+        None,
+        wake,
+        fixture.state.revocations.subscribe(),
+        fixture.state.shutdown.clone(),
+    )
+    .await?
+    .into_body()
+    .into_data_stream();
+    fixture
+        .publish(vec![(
+            EventAudience::GlobalArchiveOnly,
+            json!({"status": "offline"}),
+        )])
+        .await?;
+    tokio::time::pause();
+    tokio::time::advance(Duration::from_secs(31)).await;
+    tokio::time::resume();
+    let frame = next_frame(&mut body).await?;
+    let event = if matches!(frame, Some(EventStreamFrame::Ping {})) {
+        next_frame(&mut body).await?
+    } else {
+        frame
+    };
+    assert!(matches!(event, Some(EventStreamFrame::Event { event }) if event.seq == 1));
+    drop(body);
+    fixture.close().await
+}

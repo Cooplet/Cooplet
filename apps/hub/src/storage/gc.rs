@@ -56,7 +56,7 @@ impl GcHooks for HubGcHooks {
                     events = prune_blobs(tx, now_ms, limit.saturating_sub(1) / 2)?;
                     events.len()
                 }
-                _ => prune_events(tx, now_ms, limit.saturating_sub(1))?,
+                _ => prune_events(tx, now_ms, limit.saturating_sub(1), EVENT_CAP)?,
             };
             if changed > 0 {
                 return Ok(GcBatchOutcome {
@@ -264,22 +264,17 @@ fn prune_blobs(
     Ok(events)
 }
 
-fn prune_events(tx: &Transaction<'_>, now: i64, limit: usize) -> rusqlite::Result<usize> {
+fn prune_events(tx: &Transaction<'_>, now: i64, limit: usize, cap: u64) -> rusqlite::Result<usize> {
     let (floor, head): (u64, u64) = tx.query_row(
         "SELECT events_pruned_through_seq, events_head_seq FROM hub_meta WHERE id = 1",
         [],
         |row| Ok((row.get(0)?, row.get(1)?)),
     )?;
-    // The sequence span is a cheap upper bound on the count. When the bound
-    // exceeds the cap, find the actual oldest excess row without relying on dense IDs.
-    let count_boundary: u64 = if head.saturating_sub(floor) > EVENT_CAP {
-        tx.query_row(
-            "SELECT seq FROM events ORDER BY seq DESC LIMIT 1 OFFSET ?1",
-            [EVENT_CAP],
-            |row| row.get(0),
-        )
-        .optional()?
-        .unwrap_or(0)
+    // The span bounds the count even with sequence gaps. Only when the cap
+    // could be exceeded, count the compact index instead of walking event payloads.
+    let mut excess = if head.saturating_sub(floor) > cap {
+        let count: u64 = tx.query_row("SELECT COUNT(*) FROM events", [], |row| row.get(0))?;
+        count.saturating_sub(cap)
     } else {
         0
     };
@@ -292,9 +287,10 @@ fn prune_events(tx: &Transaction<'_>, now: i64, limit: usize) -> rusqlite::Resul
     while let Some(row) = rows.next()? {
         let seq: u64 = row.get(0)?;
         let created_at_ms: i64 = row.get(1)?;
-        if seq > count_boundary && created_at_ms > cutoff {
+        if excess == 0 && created_at_ms > cutoff {
             break;
         }
+        excess = excess.saturating_sub(1);
         through = seq;
     }
     drop(rows);
@@ -310,4 +306,32 @@ fn prune_events(tx: &Transaction<'_>, now: i64, limit: usize) -> rusqlite::Resul
         [through],
     )?;
     Ok(removed)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn event_cap_prunes_only_excess_rows_even_with_sequence_gaps() -> rusqlite::Result<()> {
+        let mut db = Connection::open_in_memory()?;
+        db.execute_batch(include_str!("v1.sql"))?;
+        let tx = db.transaction()?;
+        tx.execute_batch(
+            "INSERT INTO hub_meta VALUES (1, 'hub', 'Hub', 'key', 0, 100, 1, 1);
+             INSERT INTO events(seq,event_id,kind,aggregate_type,aggregate_id,payload_json,created_at_ms)
+             SELECT value, value, 'node.status', 'node', 'node', '{}', 1
+               FROM json_each('[1,4,7,15,100]');"
+        )?;
+        assert_eq!(prune_events(&tx, 1, 1, 3)?, 1);
+        assert_eq!(prune_events(&tx, 1, 20, 3)?, 1);
+        assert_eq!(prune_events(&tx, 1, 20, 3)?, 0);
+        assert_eq!(
+            tx.query_row("SELECT events_pruned_through_seq FROM hub_meta", [], |r| {
+                r.get::<_, u64>(0)
+            })?,
+            4
+        );
+        Ok(())
+    }
 }

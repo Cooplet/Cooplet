@@ -79,13 +79,6 @@ pub(crate) async fn create_agent(
             "Specify a client kind or an agent template.",
         ));
     }
-    if request
-        .overrides
-        .as_ref()
-        .is_some_and(|value| !value.is_object())
-    {
-        return Err(HubError::invalid("Agent overrides must be a JSON object."));
-    }
     control(
         state,
         caller,
@@ -96,7 +89,7 @@ pub(crate) async fn create_agent(
             template_id: request.template_id,
             name: request.name,
             workspace_dir: request.workspace_dir,
-            overrides: request.overrides,
+            overrides: request.overrides.map(serde_json::Value::Object),
         },
     )
     .await
@@ -159,7 +152,7 @@ pub(crate) async fn run_workflow(
         BridgeCommand::RunWorkflow {
             workflow_name: request.workflow_name,
             workspace_dir: request.workspace_dir,
-            params: request.params,
+            params: serde_json::Value::Object(request.params),
         },
     )
     .await

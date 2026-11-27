@@ -142,10 +142,17 @@ impl EventStream {
             let expiry = self.expiry_wait()?;
             if self.revocations.has_changed().ok()? || now >= self.recheck_at {
                 self.revocations.borrow_and_update();
-                tokio::select! {
-                    biased;
-                    _ = self.shutdown.changed() => return None,
-                    result = auth::reverify_caller(&self.reader.reads, &self.reader.caller) => result.ok()?,
+                if self.pending.is_empty() && self.pending_resync.is_none() {
+                    // An uncertain commit can leave a durable event without a wake.
+                    // This snapshot also reverifies the caller in the same read transaction.
+                    self.scan().await?;
+                } else {
+                    tokio::select! {
+                        biased;
+                        _ = self.shutdown.changed() => return None,
+                        result = auth::reverify_caller(&self.reader.reads, &self.reader.caller) => result.ok()?,
+                    }
+                    self.needs_scan = true;
                 }
                 self.recheck_at = Instant::now() + AUTH_INTERVAL;
                 // Check for a second revocation that could have committed during the read.
@@ -168,24 +175,7 @@ impl EventStream {
                 return Some(EventStreamFrame::Event { event });
             }
             if self.needs_scan {
-                // Coalesce existing wakeups. A notification sent during this snapshot stays
-                // pending for another pass if the snapshot could not see its commit.
-                self.wake.borrow_and_update();
-                let next = tokio::select! {
-                    biased;
-                    _ = self.shutdown.changed() => return None,
-                    next = self.reader.snapshot(Cursor::Resume(self.cursor), self.budget) => next.ok()?,
-                };
-                match next {
-                    Snapshot::Page(page) => {
-                        self.pending = page.items.into();
-                        self.cursor = page.next_seq;
-                        self.needs_scan = page.has_more;
-                    }
-                    Snapshot::CursorLost(watermarks) => {
-                        self.pending_resync = Some(watermarks);
-                    }
-                }
+                self.scan().await?;
                 continue;
             }
 
@@ -204,6 +194,28 @@ impl EventStream {
                 () = tokio::time::sleep_until(deadline) => {},
             }
         }
+    }
+
+    async fn scan(&mut self) -> Option<()> {
+        // Coalesce existing wakeups. A notification sent during this snapshot stays
+        // pending for another pass if the snapshot could not see its commit.
+        self.wake.borrow_and_update();
+        let next = tokio::select! {
+            biased;
+            _ = self.shutdown.changed() => return None,
+            next = self.reader.snapshot(Cursor::Resume(self.cursor), self.budget) => next.ok()?,
+        };
+        match next {
+            Snapshot::Page(page) => {
+                self.pending = page.items.into();
+                self.cursor = page.next_seq;
+                self.needs_scan = page.has_more;
+            }
+            Snapshot::CursorLost(watermarks) => {
+                self.pending_resync = Some(watermarks);
+            }
+        }
+        Some(())
     }
 
     /// Finite credentials can expire before the next idle recheck. The cap keeps

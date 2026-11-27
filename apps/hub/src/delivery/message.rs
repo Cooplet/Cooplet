@@ -145,7 +145,10 @@ fn answer_target(
             HubError::invalid("The referenced message does not contain a question.")
         })?;
 
-    let addressed_to_caller = caller.participant_id() == Some(&parent.view.target_participant_id);
+    let addressed_to_caller = caller.is_hub_recipient(
+        parent.view.target_node_id.as_ref(),
+        &parent.view.target_participant_id,
+    );
     if !addressed_to_caller && !caller.is_admin() && !caller.is_service() {
         let target_is_agent = match &parent.view.target_node_id {
             Some(node_id) => {
