@@ -42,6 +42,8 @@ pub(super) struct State {
     next_command: u64,
     event_seq: u64,
     pub(super) turn: Option<Turn>,
+    pub(super) native_busy: bool,
+    ready: bool,
 }
 
 struct Pending {
@@ -68,6 +70,7 @@ pub(super) struct Reply {
 #[derive(Clone, Copy, Debug)]
 pub(super) enum CommandError {
     Expired,
+    Busy,
     BeforeWrite,
     AfterWrite,
 }
@@ -97,6 +100,8 @@ impl Session {
                 next_command: 0,
                 event_seq: 0,
                 turn: None,
+                native_busy: false,
+                ready: false,
             }),
             input: AsyncMutex::new(Some(input)),
             shutdown: shutdown.clone(),
@@ -116,6 +121,12 @@ impl Session {
 
     pub(super) fn state(&self) -> MutexGuard<'_, State> {
         self.shared.state()
+    }
+
+    pub(super) fn mark_ready(&self) -> bool {
+        let mut state = self.state();
+        state.ready = state.idle();
+        state.ready
     }
 
     pub(super) async fn close(&self) {
@@ -160,7 +171,7 @@ impl Session {
             let Ok(id) = state.new_id() else {
                 return SubmitOutcome::Unavailable("Pi exhausted its RPC request IDs".into());
             };
-            state.turn = Some(Turn::new(id.clone(), operation_key));
+            state.turn = Some(Turn::new(id.clone(), operation_key, message));
             Reservation { session: self, id }
         };
 
@@ -186,6 +197,7 @@ impl Session {
                 SubmitOutcome::Unknown("Pi did not correlate the prompt acknowledgment".into())
             }),
             Err(CommandError::Expired) => SubmitOutcome::Expired,
+            Err(CommandError::Busy) => SubmitOutcome::Busy,
             Err(CommandError::BeforeWrite) => {
                 SubmitOutcome::Unavailable("Pi RPC failed before writing the prompt".into())
             }
@@ -379,6 +391,9 @@ impl Transfer<'_> {
                 if admission.is_some_and(AdmissionGuard::is_expired) {
                     return Err(CommandError::Expired);
                 }
+                if state.native_busy && state.turn.as_ref().is_some_and(|turn| turn.id == self.id) {
+                    return Err(CommandError::Busy);
+                }
                 let result = pipe.try_write(bytes);
                 if matches!(result, Ok(count) if count != 0)
                     && let Some(turn) = state.turn.as_mut().filter(|turn| turn.id == self.id)
@@ -444,7 +459,9 @@ impl State {
     }
 
     pub(super) fn emit(&mut self, kind: AdapterEventKind) {
-        if let Some(events) = &self.events {
+        if self.ready
+            && let Some(events) = &self.events
+        {
             self.event_seq += 1;
             if events
                 .try_send(AdapterEvent {

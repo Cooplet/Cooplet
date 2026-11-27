@@ -9,21 +9,19 @@ const requiredTools = [
 ].map((name) => `mcp__cooplet__${name}`);
 
 export default function participant(pi) {
-  const credential = process.env.COOPLET_PARTICIPANT_CRED_FILE;
-  const executable = process.env.COOPLET_PARTICIPANT_MCP_BIN;
-  delete process.env.COOPLET_PARTICIPANT_CRED_FILE;
-  delete process.env.COOPLET_PARTICIPANT_MCP_BIN;
-
-  let instructions;
+  // Pi can start package-manager children before this extension loads.
+  // Keep participant credentials in the private startup file instead of the environment.
+  let startup;
   try {
-    instructions = readFileSync(new URL("./instructions.txt", import.meta.url), "utf8");
+    startup = JSON.parse(readFileSync(new URL("./startup.json", import.meta.url), "utf8"));
   } catch {
+    throw new Error("Cooplet participant startup configuration is unavailable");
+  }
+  const { credential, executable, instructions } = startup ?? {};
+  if (typeof instructions !== "string" || !instructions.trim()) {
     throw new Error("Frozen Cooplet instructions are unavailable");
   }
-  if (!instructions.trim()) {
-    throw new Error("Frozen Cooplet instructions are empty");
-  }
-  if (!credential || !executable) {
+  if (typeof credential !== "string" || !credential || typeof executable !== "string" || !executable) {
     throw new Error("Cooplet participant configuration is unavailable");
   }
 

@@ -15,6 +15,7 @@ use std::{
 use cooplet_platform::PrivateFs;
 use cooplet_protocol::ErrorCode;
 use futures_util::future::BoxFuture;
+use serde::Serialize;
 use serde_json::Value;
 use tokio::{
     io::{AsyncReadExt as _, sink},
@@ -39,6 +40,9 @@ use self::{
 
 const KIND: &str = "pi";
 const EXTENSION_FILENAME: &str = "participant.ts";
+const STARTUP_FILENAME: &str = "startup.json";
+const CREDENTIAL_ENV: &str = "COOPLET_PARTICIPANT_CRED_FILE";
+const MCP_BINARY_ENV: &str = "COOPLET_PARTICIPANT_MCP_BIN";
 const BUILTIN_MCP: &str = "builtin:mcp";
 const REQUIRED_TOOLS: &[&str] = &[
     "mcp__cooplet__whoami",
@@ -49,6 +53,13 @@ const REQUIRED_TOOLS: &[&str] = &[
 ];
 
 pub struct PiAdapter;
+
+#[derive(Serialize)]
+struct Startup<'a> {
+    executable: &'a Path,
+    credential: &'a Path,
+    instructions: &'a str,
+}
 
 impl ClientAdapter for PiAdapter {
     fn kind(&self) -> &'static str {
@@ -183,20 +194,20 @@ async fn open(
     let binary =
         executable().ok_or_else(|| unavailable("The Pi executable was not found on PATH"))?;
     let cooplet = env::current_exe()
-        .ok()
-        .filter(|path| path.to_str().is_some())
-        .ok_or_else(|| unavailable("Could not resolve the Cooplet executable for Pi MCP"))?;
+        .map_err(|_| unavailable("Could not resolve the Cooplet executable for Pi MCP"))?;
     let runtime = PrivateFs::validate_private_dir(&request.runtime_dir)
         .map_err(|_| unavailable("Could not open the private Pi generation directory"))?;
     let extension = runtime.join(EXTENSION_FILENAME);
     let extension_path = extension
         .to_str()
         .ok_or_else(|| unavailable("The Pi extension path is not valid UTF-8"))?;
-    let credential = request
-        .cred_file_path
-        .to_str()
-        .ok_or_else(|| unavailable("The Pi credential path is not valid UTF-8"))?;
-    PrivateFs::write_private_file_atomic(&runtime, "instructions.txt", instructions.as_bytes())
+    let startup = serde_json::to_vec(&Startup {
+        executable: &cooplet,
+        credential: &request.cred_file_path,
+        instructions,
+    })
+    .map_err(|_| unavailable("Could not encode the private Pi startup configuration"))?;
+    PrivateFs::write_private_file_atomic(&runtime, STARTUP_FILENAME, &startup)
         .and_then(|()| {
             PrivateFs::write_private_file_atomic(
                 &runtime,
@@ -218,8 +229,8 @@ async fn open(
         .args(["--extension", extension_path])
         .current_dir(&file.workspace)
         .env("PI_CODING_AGENT_DIR", &file.agent_dir)
-        .env("COOPLET_PARTICIPANT_CRED_FILE", credential)
-        .env("COOPLET_PARTICIPANT_MCP_BIN", cooplet)
+        .env_remove(CREDENTIAL_ENV)
+        .env_remove(MCP_BINARY_ENV)
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
@@ -251,8 +262,8 @@ async fn open(
     }
     let native_key = file.verify(&state.data)?;
     verify_mcp(&session, extension_path).await?;
-    if !session.state().idle() {
-        return Err(unavailable("Pi RPC closed during startup"));
+    if !session.mark_ready() {
+        return Err(unavailable("Pi RPC did not remain idle through startup"));
     }
     let adapter_binding = serde_json::to_value(Binding {
         session_file: file.path,
@@ -483,8 +494,8 @@ async fn probe(binary: &Path, flag: &str) -> Option<String> {
         let mut process = tokio::process::Command::new(binary)
             .arg(flag)
             .env("PI_OFFLINE", "1")
-            .env_remove("COOPLET_PARTICIPANT_CRED_FILE")
-            .env_remove("COOPLET_PARTICIPANT_MCP_BIN")
+            .env_remove(CREDENTIAL_ENV)
+            .env_remove(MCP_BINARY_ENV)
             .stdin(Stdio::null())
             .stdout(Stdio::piped())
             .stderr(Stdio::null())

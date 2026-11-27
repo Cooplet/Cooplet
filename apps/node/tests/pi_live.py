@@ -139,7 +139,7 @@ class Node:
         self.state = area / "state"
         self.workspace = area / "workspace"
         self.keys = itertools.count(1)
-        self.before_turn = {}
+        self.minimum_idle_event = {}
         self.announcement = None
 
     def command(self, *args):
@@ -209,7 +209,8 @@ class Node:
             "delivery_mode": "queue_until_idle" if deferred else "direct_now",
         }, 202 if deferred else 201)
         assert response["delivery_state"] == ("queued" if deferred else "delivered"), response
-        self.before_turn[response["message_id"]] = previous
+        # The deferred case in this fixture is submitted while another turn is Working.
+        self.minimum_idle_event[response["message_id"]] = previous + (3 if deferred else 2)
         return response
 
     def runtime(self, participant):
@@ -223,10 +224,10 @@ class Node:
     def finished(self, participant, receipt, stop_reason="stop"):
         message_id = receipt["message_id"]
         _, _, path = self.binding(participant)
-        previous = self.before_turn.pop(message_id)
+        minimum = self.minimum_idle_event.pop(message_id)
         def settled():
             state, sequence = self.runtime(participant)
-            if state != "idle" or sequence <= previous:
+            if state != "idle" or sequence < minimum:
                 return False
             current = False
             for entry in history(path):
@@ -272,16 +273,49 @@ def make_profile(area, pi, server, variant=""):
     extras = {
         "disabled": 'set -- --no-mcp "$@"',
         "filtered": 'set -- --exclude-tools "mcp__cooplet__*" "$@"',
-        "unavailable": 'export COOPLET_PARTICIPANT_MCP_BIN=/nonexistent/cooplet-fixture',
     }
     wrapper = dirs["bin"] / "pi"
-    wrapper.write_text("#!/bin/sh\n" + extras.get(variant, "") + '\nexec "$PI_FIXTURE_BINARY" "$@"\n')
+    if variant in ("unavailable", "missing-startup", "empty-instructions"):
+        wrapper.write_text(f"""#!{sys.executable}
+import json
+import os
+import sys
+from pathlib import Path
+
+args = sys.argv[1:]
+if "--extension" in args:
+    startup = Path(args[args.index("--extension") + 1]).with_name("startup.json")
+    assert startup.stat().st_mode & 0o777 == 0o600
+    if {variant!r} == "missing-startup":
+        startup.unlink()
+    else:
+        data = json.loads(startup.read_text())
+        if {variant!r} == "unavailable":
+            data["executable"] = "/nonexistent/cooplet-fixture"
+        else:
+            data["instructions"] = ""
+        startup.write_text(json.dumps(data))
+os.execv(os.environ["PI_FIXTURE_BINARY"], [os.environ["PI_FIXTURE_BINARY"], *args])
+""")
+    else:
+        wrapper.write_text("""#!/bin/sh
+if [ "$1" = "--mode" ]; then
+    /bin/sh -c '
+      if [ "${COOPLET_PARTICIPANT_CRED_FILE+x}" ] || [ "${COOPLET_PARTICIPANT_MCP_BIN+x}" ]; then
+        printf "present\n"
+      else
+        printf "absent\n"
+      fi
+    ' > "$PI_FIXTURE_EARLY_ENV"
+fi
+""" + extras.get(variant, "") + '\nexec "$PI_FIXTURE_BINARY" "$@"\n')
     wrapper.chmod(0o755)
     env = {
         "PATH": str(dirs["bin"]) + os.pathsep + os.environ["PATH"],
         "HOME": str(dirs["home"]),
         "PI_CODING_AGENT_DIR": str(agent),
         "PI_FIXTURE_BINARY": str(pi),
+        "PI_FIXTURE_EARLY_ENV": str(area / "early-env"),
         "PI_OFFLINE": "1",
         "PI_TELEMETRY": "0",
         "LANG": "C.UTF-8",
@@ -363,6 +397,7 @@ def run_positive(binary, pi, area, server):
         first = node.create("plain", overrides={"model": "loopback/fixture", "effort": "off"})["participant_id"]
         second = node.create("templated", template_id="large")["participant_id"]
         assert not server.requests, "Startup diagnostics ran a model turn"
+        assert (area / "early-env").read_text() == "absent\n"
         for participant in (first, second):
             assert node.api(f"/v1/participants/{participant}/attach-plan")["mode"] == "unsupported"
         native_id, store, path = node.binding(first)
@@ -390,13 +425,15 @@ def run_positive(binary, pi, area, server):
         node.finished(first, sent)
 
         held = "Hold for cancellation."
-        assert node.message(first, held)["delivery_state"] == "delivered"
+        held_receipt = node.message(first, held)
         assert server.holding.wait(5)
+        wait_until(lambda: node.runtime(first)[0] == "working")
         queued = "Deferred after cancellation. λ\u2028🦀"
         receipt = node.message(first, queued, deferred=True)
         assert not any(queued in content for content, _ in server.requests)
         assert node.stop(first, cancel_turn_only=True)["stop_outcome"] == "turn_cancelled"
         server.release.set()
+        node.finished(first, held_receipt, "aborted")
         wait_until(lambda: any(queued in content for content, _ in server.requests))
         node.finished(first, receipt)
         assert_prompt(server, queued, receipt)
@@ -472,7 +509,8 @@ def run_positive(binary, pi, area, server):
 
 
 def run_negative(binary, pi, area, server):
-    for variant in ("disabled", "filtered", "unavailable", "overridden", "shadowed-command"):
+    for variant in ("disabled", "filtered", "unavailable", "overridden", "shadowed-command",
+                    "missing-startup", "empty-instructions"):
         profile = area / variant
         agent, env = make_profile(profile, pi, server, variant)
         if variant == "overridden":

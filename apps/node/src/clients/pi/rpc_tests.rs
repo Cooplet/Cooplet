@@ -51,6 +51,19 @@ impl Peer {
         self.frame(json!({"type":"agent_start"})).await
     }
 
+    async fn user(&mut self, message: &Value) -> TestResult {
+        self.frame(json!({
+            "type":"message_start",
+            "message":{"role":"user","content":[{"type":"text","text":message}]}
+        }))
+        .await
+    }
+
+    async fn begin(&mut self, command: &Value) -> TestResult {
+        self.start().await?;
+        self.user(&command["message"]).await
+    }
+
     async fn assistant(&mut self, stop_reason: &str, body: &str) -> TestResult {
         self.frame(json!({
             "type":"message_end",
@@ -81,6 +94,7 @@ fn fixture() -> TestResult<(Session, mpsc::Receiver<AdapterEvent>, Peer)> {
     let (output, rx) = pipe_pair()?;
     let (errors, drain) = pipe_pair()?;
     let (session, events) = Session::with_pipes(tx, rx, drain);
+    assert!(session.mark_ready());
     Ok((
         session,
         events,
@@ -161,6 +175,29 @@ fn direct(kind: AuthorKind, body: String, attachment: bool) -> TestResult<Inboun
     })
 }
 
+fn large_direct() -> TestResult<InboundMessage> {
+    // This shape fits the Node's message limit but exceeds 1 MiB as a Pi prompt
+    // once the attachment paths have been expanded and the body JSON-escaped.
+    let mut message = direct(AuthorKind::Human, "\0".repeat(174_400), false)?;
+    let parent = format!(
+        "/fixture/{}/{}/state/objects/de",
+        "z".repeat(150),
+        "y".repeat(150)
+    );
+    for index in 0..8 {
+        let blob_id = BlobId::generate()?;
+        let name = format!("fixture-{index}.txt");
+        let local_path = Some(format!("{parent}/{blob_id}/{name}"));
+        message.attachments.push(ResolvedAttachment {
+            blob_id,
+            name,
+            local_path,
+            local_path_bytes: None,
+        });
+    }
+    Ok(message)
+}
+
 fn thread(authors: &[AuthorKind]) -> TestResult<TurnInput> {
     let mut posts = Vec::new();
     for (index, kind) in authors.iter().enumerate() {
@@ -209,7 +246,7 @@ async fn adapter_sends_canonical_direct_and_thread_input_over_lf_framing() -> Te
         TurnInput::direct(direct(AuthorKind::Service, FORGED.into(), false)?),
         thread(&[AuthorKind::Human])?,
         thread(&[AuthorKind::Agent, AuthorKind::Human])?,
-        TurnInput::direct(direct(AuthorKind::Human, "\0".repeat(230_000), false)?),
+        TurnInput::direct(large_direct()?),
     ];
 
     let mut previous_id = Value::Null;
@@ -248,12 +285,8 @@ async fn adapter_sends_canonical_direct_and_thread_input_over_lf_framing() -> Te
                 assert!(wire_length > 1024 * 1024);
                 // Exercise independent stderr draining and a large native stdout record.
                 peer.errors.write_all(&vec![b'x'; 256 * 1024]).await?;
-                peer.frame(
-                    json!({"type":"message_end", "message":{"role":"user", "content":message}}),
-                )
-                .await?;
             }
-            peer.start().await?;
+            peer.begin(&command).await?;
             peer.assistant("stop", "current answer").await?;
             peer.settle(false).await?;
             peer.ack(&command, "started").await
@@ -289,7 +322,7 @@ async fn retry_errors_and_cancel_use_the_current_turn_and_native_settlement() ->
         wrong["id"] = json!("unrelated-request");
         peer.ack(&wrong, "handled").await?;
         peer.ack(&command, "started").await?;
-        peer.start().await?;
+        peer.begin(&command).await?;
         peer.assistant("error", "partial from first run").await?;
         peer.frame(json!({"type":"agent_end","willRetry":true}))
             .await?;
@@ -323,7 +356,7 @@ async fn retry_errors_and_cancel_use_the_current_turn_and_native_settlement() ->
                 let (command, _) = peer.command().await?;
                 peer.ack(&command, "started").await?;
                 if let Some(stop) = finish {
-                    peer.start().await?;
+                    peer.begin(&command).await?;
                     peer.assistant(stop, "partial failure").await?;
                 }
                 peer.settle(false).await
@@ -346,7 +379,7 @@ async fn retry_errors_and_cancel_use_the_current_turn_and_native_settlement() ->
         async {
             let (command, _) = peer.command().await?;
             peer.ack(&command, "started").await?;
-            peer.start().await
+            peer.begin(&command).await
         }
     );
     proof?;
@@ -359,7 +392,7 @@ async fn retry_errors_and_cancel_use_the_current_turn_and_native_settlement() ->
         tokio::time::sleep(Duration::from_millis(25)).await;
         assert_eq!(events.len(), 1);
         peer.assistant("aborted", "partial").await?;
-        peer.settle(true).await
+        peer.frame(json!({"type":"agent_settled"})).await
     });
     proof?;
     assert!(matches!(cancel, StopOutcome::TurnCancelled));
@@ -386,9 +419,9 @@ async fn more_than_five_thousand_turns_release_all_per_turn_state() -> TestResul
                 let (command, _) = peer.command().await?;
                 assert_eq!(command["id"], (n + 1).to_string());
                 peer.ack(&command, "started").await?;
-                peer.start().await?;
+                peer.begin(&command).await?;
                 peer.assistant("stop", "").await?;
-                peer.settle(false).await
+                peer.frame(json!({"type":"agent_settled"})).await
             }
         );
         proof?;
@@ -529,6 +562,123 @@ async fn handled_or_queued_is_unknown_and_cannot_be_replayed() -> TestResult {
             SubmitOutcome::Unavailable(_)
         ));
         assert!(timeout(WAIT, events.recv()).await?.is_none());
+    }
+    Ok(())
+}
+
+#[tokio::test]
+async fn unrelated_run_in_preflight_does_not_finish_the_node_turn() -> TestResult {
+    let (session, mut events, mut peer) = fixture()?;
+    let admission = AdmissionGuard::new(WAIT);
+    let (outcome, proof) = tokio::join!(
+        session.submit("managed".into(), "managed input", &admission),
+        async {
+            let (command, _) = peer.command().await?;
+            peer.start().await?;
+            peer.user(&json!("an extension's native input")).await?;
+            peer.assistant("stop", "external answer").await?;
+            peer.settle(false).await?;
+            peer.ack(&command, "started").await?;
+            Ok::<_, Box<dyn Error + Send + Sync>>(command)
+        }
+    );
+    let command = proof?;
+    assert!(matches!(outcome, SubmitOutcome::Accepted { .. }));
+    assert_eq!(
+        session.state().runtime_state(),
+        ParticipantRuntimeState::Working
+    );
+    assert_eq!(
+        events.len(),
+        1,
+        "external settlement cannot produce a completion or Idle"
+    );
+
+    peer.begin(&command).await?;
+    peer.assistant("stop", "managed answer").await?;
+    peer.settle(false).await?;
+    completed(
+        &mut events,
+        1,
+        "managed",
+        TurnFinishStatus::Completed,
+        "managed answer",
+    )
+    .await?;
+    Ok(())
+}
+
+#[tokio::test]
+async fn native_busy_releases_intake_when_external_work_settles_on_either_side_of_ack() -> TestResult
+{
+    use super::super::turn::NATIVE_BUSY_ERROR;
+
+    for settle_before_ack in [false, true] {
+        let (session, mut events, mut peer) = fixture()?;
+        let admission = AdmissionGuard::new(WAIT);
+        let (outcome, proof) = tokio::join!(
+            session.submit("declined".into(), "not started", &admission),
+            async {
+                let (command, _) = peer.command().await?;
+                if settle_before_ack {
+                    peer.start().await?;
+                    peer.user(&json!("an extension's native input")).await?;
+                    peer.assistant("stop", "external answer").await?;
+                    peer.settle(false).await?;
+                }
+                peer.frame(json!({
+                    "type":"response", "id":command["id"], "command":"prompt",
+                    "success":false, "error":NATIVE_BUSY_ERROR
+                }))
+                .await
+            }
+        );
+        proof?;
+        assert!(matches!(outcome, SubmitOutcome::Busy));
+        if !settle_before_ack {
+            assert!(matches!(
+                next(&mut events).await?.kind,
+                AdapterEventKind::StateChanged(ParticipantRuntimeState::Working)
+            ));
+            assert!(matches!(
+                session
+                    .submit("still-busy".into(), "discard", &admission)
+                    .await,
+                SubmitOutcome::Busy
+            ));
+            peer.start().await?;
+            peer.user(&json!("an extension's native input")).await?;
+            peer.assistant("stop", "external answer").await?;
+            peer.settle(false).await?;
+        }
+        let idle = next(&mut events).await?;
+        assert!(matches!(
+            idle.kind,
+            AdapterEventKind::StateChanged(ParticipantRuntimeState::Idle)
+        ));
+        assert!(session.state().idle());
+        assert!(events.try_recv().is_err());
+
+        let (outcome, proof) = tokio::join!(
+            session.submit("after-external".into(), "managed input", &admission),
+            async {
+                let (command, _) = peer.command().await?;
+                peer.ack(&command, "started").await?;
+                peer.begin(&command).await?;
+                peer.assistant("stop", "managed answer").await?;
+                peer.settle(false).await
+            }
+        );
+        proof?;
+        assert!(matches!(outcome, SubmitOutcome::Accepted { .. }));
+        completed(
+            &mut events,
+            idle.event_seq + 1,
+            "after-external",
+            TurnFinishStatus::Completed,
+            "managed answer",
+        )
+        .await?;
     }
     Ok(())
 }
