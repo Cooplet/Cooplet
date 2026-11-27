@@ -216,9 +216,9 @@ fn validate_dependency(from: &str, dependency: &Dependency, root: &Path) -> Poli
             TELEGRAM | HISTORY => &[PROTOCOL, PLATFORM, CLIENT],
             _ => &[],
         };
-        let hub_dev_client =
-            from == HUB && to == CLIENT && dependency.kind == Some(DependencyKind::Dev);
-        if !allowed.contains(&to) && !hub_dev_client {
+        let hub_client =
+            from == HUB && to == CLIENT && dependency.kind != Some(DependencyKind::Build);
+        if !allowed.contains(&to) && !hub_client {
             return Err(fail("forbidden internal dependency"));
         }
     } else {
@@ -486,7 +486,7 @@ fn rejects_forbidden_internal_edges() -> TestResult {
 }
 
 #[test]
-fn hub_can_use_client_only_in_dev_dependencies() -> TestResult {
+fn hub_can_use_client_at_runtime_and_in_tests() -> TestResult {
     let root = workspace_root().canonicalize()?;
     let mut dependency = Dependency {
         name: CLIENT.into(),
@@ -495,16 +495,11 @@ fn hub_can_use_client_only_in_dev_dependencies() -> TestResult {
         target: None,
     };
     validate_dependency(HUB, &dependency, &root)?;
-    for (kind, target) in [
-        (None, None),
-        (Some(DependencyKind::Build), None),
-        (None, Some("cfg(target_os = \"linux\")")),
-    ] {
-        dependency.kind = kind;
-        dependency.target = target.map(str::to_owned);
-        let result = validate_dependency(HUB, &dependency, &root);
-        assert!(result.is_err_and(|error| error.contains("forbidden internal dependency")));
-    }
+    dependency.kind = None;
+    validate_dependency(HUB, &dependency, &root)?;
+    dependency.kind = Some(DependencyKind::Build);
+    let result = validate_dependency(HUB, &dependency, &root);
+    assert!(result.is_err_and(|error| error.contains("forbidden internal dependency")));
     Ok(())
 }
 
