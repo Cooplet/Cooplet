@@ -39,6 +39,10 @@ CREATE TABLE auth_tokens (
     CHECK (is_admin = 0 OR token_kind = 'bearer_api')
 );
 CREATE INDEX idx_auth_tokens_principal ON auth_tokens(principal_id);
+CREATE INDEX idx_auth_tokens_principal_page ON auth_tokens(principal_id, token_id)
+    WHERE token_kind != 'enrollment_token';
+CREATE INDEX idx_auth_tokens_enrollment_page ON auth_tokens(token_id)
+    WHERE token_kind = 'enrollment_token';
 CREATE INDEX idx_auth_tokens_gc ON auth_tokens(expires_at_ms);
 CREATE INDEX idx_auth_tokens_revoked ON auth_tokens(revoked_at_ms) WHERE revoked_at_ms IS NOT NULL;
 CREATE INDEX idx_auth_tokens_consumed ON auth_tokens(consumed_at_ms) WHERE consumed_at_ms IS NOT NULL;

@@ -19,6 +19,18 @@ use super::model::{
 
 const MAX_CATALOG_BYTES: usize = 4 * 1024 * 1024;
 const DEFAULT_PAGE_LIMIT: usize = 100;
+const PRINCIPAL_TOKENS: &str =
+    "SELECT token_id, principal_id, token_kind, is_admin, label, scopes_json,
+            allowed_nodes_json, expires_at_ms, revoked_at_ms, created_at_ms
+     FROM auth_tokens
+     WHERE principal_id = ?1 AND token_id > ?2 AND token_kind != 'enrollment_token'
+     ORDER BY token_id LIMIT ?3";
+const ENROLLMENT_TOKENS: &str =
+    "SELECT token_id, principal_id, label, expires_at_ms, consumed_at_ms,
+            revoked_at_ms, created_at_ms
+     FROM auth_tokens
+     WHERE token_kind = 'enrollment_token' AND token_id > ?1
+     ORDER BY token_id LIMIT ?2";
 
 pub(crate) async fn list_principals(
     state: &AppState,
@@ -70,13 +82,7 @@ pub(crate) async fn list_tokens(
         if !exists {
             return Ok(None);
         }
-        let mut statement = tx.prepare(
-            "SELECT token_id, principal_id, token_kind, is_admin, label, scopes_json,
-                    allowed_nodes_json, expires_at_ms, revoked_at_ms, created_at_ms
-               FROM auth_tokens
-              WHERE principal_id = ?1 AND token_id > ?2 AND token_kind != 'enrollment_token'
-              ORDER BY token_id LIMIT ?3",
-        )?;
+        let mut statement = tx.prepare(PRINCIPAL_TOKENS)?;
         let mut rows = statement.query(params![
             principal_id,
             query.after.unwrap_or_default(),
@@ -103,13 +109,7 @@ pub(crate) async fn list_enrollment(
     parse_optional_cursor::<TokenId>(query.after.as_deref())?;
 
     read_snapshot(state, move |tx| {
-        let mut statement = tx.prepare(
-            "SELECT token_id, principal_id, label, expires_at_ms, consumed_at_ms,
-                    revoked_at_ms, created_at_ms
-               FROM auth_tokens
-              WHERE token_kind = 'enrollment_token' AND token_id > ?1
-              ORDER BY token_id LIMIT ?2",
-        )?;
+        let mut statement = tx.prepare(ENROLLMENT_TOKENS)?;
         let mut rows = statement.query(params![query.after.unwrap_or_default(), limit + 1])?;
         collect_page(&mut rows, limit, |row| {
             let token_id: TokenId = parse_text(row, 0)?;
@@ -427,7 +427,7 @@ fn conversion_error(index: usize, error: impl Error + Send + Sync + 'static) -> 
 mod tests {
     use std::error::Error;
 
-    use super::{MAX_CATALOG_BYTES, collect_page};
+    use super::{ENROLLMENT_TOKENS, MAX_CATALOG_BYTES, PRINCIPAL_TOKENS, collect_page};
     use rusqlite::{Connection, params};
     use serde::Serialize;
 
@@ -435,6 +435,33 @@ mod tests {
     struct RowValue {
         id: String,
         text: String,
+    }
+
+    #[test]
+    fn token_catalogs_seek_by_cursor_in_display_order() -> rusqlite::Result<()> {
+        let connection = Connection::open_in_memory()?;
+        connection.execute_batch(include_str!("../storage/v1.sql"))?;
+        for (query, bindings, index) in [
+            (
+                PRINCIPAL_TOKENS,
+                params!["principal", "cursor", 6],
+                "idx_auth_tokens_principal_page (principal_id=? AND token_id>?)",
+            ),
+            (
+                ENROLLMENT_TOKENS,
+                params!["cursor", 6],
+                "idx_auth_tokens_enrollment_page (token_id>?)",
+            ),
+        ] {
+            let mut statement = connection.prepare(&format!("EXPLAIN QUERY PLAN {query}"))?;
+            let plan = statement
+                .query_map(bindings, |row| row.get::<_, String>(3))?
+                .collect::<rusqlite::Result<Vec<_>>>()?
+                .join("\n");
+            assert!(plan.contains(index), "{plan}");
+            assert!(!plan.contains("USE TEMP B-TREE"), "{plan}");
+        }
+        Ok(())
     }
 
     #[test]
