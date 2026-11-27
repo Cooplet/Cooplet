@@ -39,8 +39,7 @@ const HEADER_READ_TIMEOUT: Duration = Duration::from_secs(10);
 const WRITE_IDLE_TIMEOUT: Duration = Duration::from_secs(30);
 const DRAIN_TIMEOUT: Duration = Duration::from_secs(5);
 const FORCE_CLOSE_TIMEOUT: Duration = Duration::from_secs(1);
-const BACKGROUND_DRAIN_TIMEOUT: Duration = Duration::from_secs(5);
-const BRIDGE_DRAIN_TIMEOUT: Duration = Duration::from_secs(5);
+const WORKER_DRAIN_TIMEOUT: Duration = Duration::from_secs(5);
 const MAX_ADMIN_TOKEN_BYTES: u64 = 1024;
 const MAX_ENROLLMENT_TTL_MS: i64 = 86_400_000;
 
@@ -417,24 +416,54 @@ async fn serve(
             result
         }
     };
-    if time::timeout(BRIDGE_DRAIN_TIMEOUT, bridge.drain())
-        .await
-        .is_err()
-    {
-        tracing::warn!("Bridge drain timed out during Hub shutdown");
-    }
-    if time::timeout(BACKGROUND_DRAIN_TIMEOUT, background.drain())
-        .await
-        .is_err()
-    {
-        tracing::warn!("Background write drain timed out during Hub shutdown");
-    }
-    served
+    let drained = drain_workers(bridge.drain(), background.drain(), WORKER_DRAIN_TIMEOUT).await;
+    served.and(drained)
+}
+
+async fn drain_workers(
+    sessions: impl Future<Output = ()>,
+    writes: impl Future<Output = ()>,
+    timeout: Duration,
+) -> io::Result<()> {
+    time::timeout(timeout, async {
+        tokio::join!(sessions, writes);
+    })
+    .await
+    .map_err(|_| {
+        io::Error::new(
+            io::ErrorKind::TimedOut,
+            "Hub workers did not finish before shutdown",
+        )
+    })
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn shutdown_reports_unfinished_sessions_and_background_writes() -> CliResult<()> {
+        use std::future::{pending, ready};
+
+        let background = crate::BackgroundWrites::new(1);
+        let (release, hold) = oneshot::channel::<()>();
+        let writer = background.spawn(hold)?;
+        background.close();
+        let incomplete = drain_workers(ready(()), background.drain(), Duration::ZERO).await;
+        assert_eq!(
+            incomplete.err().map(|e| e.kind()),
+            Some(io::ErrorKind::TimedOut)
+        );
+        let _ = release.send(());
+        writer.await??;
+        let incomplete = drain_workers(pending(), background.drain(), Duration::ZERO).await;
+        assert_eq!(
+            incomplete.err().map(|e| e.kind()),
+            Some(io::ErrorKind::TimedOut)
+        );
+        drain_workers(ready(()), background.drain(), WORKER_DRAIN_TIMEOUT).await?;
+        Ok(())
+    }
 
     #[test]
     fn validates_public_origin_against_listener() -> CliResult<()> {

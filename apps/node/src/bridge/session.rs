@@ -22,7 +22,7 @@ use http::{
 use tokio::{
     io::{AsyncRead, AsyncWrite},
     net::TcpStream,
-    sync::{Semaphore, mpsc, watch},
+    sync::{OwnedSemaphorePermit, Semaphore, mpsc, watch},
 };
 use tokio_rustls::TlsConnector;
 use tokio_tungstenite::{
@@ -200,6 +200,7 @@ impl Attempt<'_> {
             .send_replace(Some(ReverseHandle::new(epoch, outbox.clone())));
 
         let notices = self.state.db.subscribe();
+        let uncertain_commit = self.state.db.subscribe_uncertain_commits();
         let max_commands = (hello.max_inflight_commands as usize).min(MAX_COMMANDS);
         let max_threads = (hello.max_inflight_threads as usize).min(MAX_THREAD_DELIVERIES);
         let (cursor, participants) = match self
@@ -214,8 +215,16 @@ impl Attempt<'_> {
         let reads = self.state.reads.clone();
         let local_id = self.state.info.node_id.clone();
         self.bridge.spawn_worker(async move {
-            if let Err(error) =
-                events::pump(reads, local_id, notices, cursor, participants, event_tx).await
+            if let Err(error) = events::pump(
+                reads,
+                local_id,
+                notices,
+                uncertain_commit,
+                cursor,
+                participants,
+                event_tx,
+            )
+            .await
             {
                 tracing::warn!(code = %error.code(), "Could not forward Node events");
             }
@@ -472,20 +481,19 @@ impl Attempt<'_> {
         {
             return None;
         }
-        let slot = (online.work.threads.len() < online.work.max_threads
-            && !online.work.threads.contains_key(&key))
-        .then(|| self.limits.threads.clone().try_acquire_owned().ok())
-        .flatten();
-        let Some(slot) = slot else {
-            return Some(ThreadAckPayload {
-                delivery_id: request.delivery_id,
-                thread_id: request.thread_id,
-                member_id: request.member_id,
-                delivery_generation: request.delivery_generation,
-                acked_seq: request.to_seq,
-                outcome: ThreadDeliveryOutcome::Busy,
-                detail: Some("thread_delivery_in_flight".into()),
-            });
+        let slot = match online.work.thread_slot(&key, &self.limits.threads) {
+            Ok(slot) => slot,
+            Err(outcome) => {
+                return Some(ThreadAckPayload {
+                    delivery_id: request.delivery_id,
+                    thread_id: request.thread_id,
+                    member_id: request.member_id,
+                    delivery_generation: request.delivery_generation,
+                    acked_seq: request.to_seq,
+                    outcome,
+                    detail: Some("thread_delivery_in_flight".into()),
+                });
+            }
         };
         online.work.threads.insert(
             key,
@@ -581,6 +589,22 @@ struct ThreadWork {
 }
 
 impl InFlight {
+    fn thread_slot(
+        &self,
+        key: &(ThreadId, ParticipantId),
+        slots: &Arc<Semaphore>,
+    ) -> Result<OwnedSemaphorePermit, ThreadDeliveryOutcome> {
+        // These slots can outlive their bridge epoch. Their release does not
+        // emit a participant Idle event, so the Hub must retry on backoff.
+        if self.threads.len() >= self.max_threads || self.threads.contains_key(key) {
+            return Err(ThreadDeliveryOutcome::Unavailable);
+        }
+        slots
+            .clone()
+            .try_acquire_owned()
+            .map_err(|_| ThreadDeliveryOutcome::Unavailable)
+    }
+
     fn new(max_commands: usize, max_threads: usize) -> Self {
         Self {
             max_commands,
@@ -977,6 +1001,34 @@ mod tests {
         fn now(&self) -> MonoInstant {
             MonoInstant::from_millis(self.0.load(Ordering::Relaxed))
         }
+    }
+
+    #[test]
+    fn thread_worker_contention_allows_retry_without_a_participant_idle_event()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let slots = Arc::new(Semaphore::new(1));
+        let mut work = InFlight::new(1, 1);
+        let key = (ThreadId::generate()?, ParticipantId::generate()?);
+        let old_epoch_slot = slots.clone().try_acquire_owned()?;
+        assert!(matches!(
+            work.thread_slot(&key, &slots),
+            Err(ThreadDeliveryOutcome::Unavailable)
+        ));
+        drop(old_epoch_slot);
+        work.threads.insert(
+            key.clone(),
+            ThreadWork {
+                delivery: OperationId::generate()?,
+                admission: AdmissionGuard::new(Duration::from_secs(5)),
+            },
+        );
+        assert!(matches!(
+            work.thread_slot(&key, &slots),
+            Err(ThreadDeliveryOutcome::Unavailable)
+        ));
+        work.threads.remove(&key);
+        assert!(work.thread_slot(&key, &slots).is_ok());
+        Ok(())
     }
 
     #[test]

@@ -1,4 +1,4 @@
-use std::{collections::BTreeSet, error::Error, io, str::FromStr, sync::Arc};
+use std::{error::Error, io, str::FromStr, sync::Arc};
 
 use cooplet_protocol::NodeId;
 use cooplet_storage::ReadPool;
@@ -115,24 +115,6 @@ where
         read(tx, &caller, now)
     })
     .await
-}
-
-pub(crate) fn dialog_node_ids(
-    sender_node: Option<NodeId>,
-    target_node: Option<NodeId>,
-    parent_sender_node: Option<NodeId>,
-    parent_target_node: Option<NodeId>,
-) -> Vec<NodeId> {
-    let nodes: BTreeSet<NodeId> = [
-        sender_node,
-        target_node,
-        parent_sender_node,
-        parent_target_node,
-    ]
-    .into_iter()
-    .flatten()
-    .collect();
-    nodes.into_iter().collect()
 }
 
 pub(crate) fn nodes_audience(nodes: &[NodeId]) -> EventAudience {

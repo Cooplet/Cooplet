@@ -181,6 +181,10 @@ target/debug/cooplet --state-dir ./alpha thread resume "$THREAD" \
   --member-key "$BETA_MEMBER" --after-seq "$AFTER_SEQ"
 ```
 
+When a thread cursor expires, the CLI prints `floor_seq` and `head_seq` on
+stderr. Read again from `floor_seq` to fetch the retained posts. A pin conflict
+reports `current_version`. Read the pin before retrying with that version.
+
 ## Managed Codex
 
 Install and sign in to the Codex CLI, then run `cooplet node doctor` to check

@@ -9,15 +9,13 @@ use super::{
         EventAudience, NewEvent, advance_head, encode_error, message_delivery_updated_data,
         node_disconnected_data, record,
     },
-    sql::{dialog_node_ids, nodes_audience, parse_col, parse_opt_col},
+    sql::{nodes_audience, parse_col, parse_json, parse_opt_col},
 };
 
 const RESTARTED: &str = "hub restarted before delivery confirmation";
 pub(super) const RECOVERABLE_MESSAGES: &str =
-    "SELECT msg.message_id, msg.sender_node_id, msg.target_node_id,
-            parent.sender_node_id, parent.target_node_id
-     FROM hub_messages msg LEFT JOIN hub_messages parent ON parent.message_id = msg.in_reply_to
-     WHERE msg.delivery_state IN ('accepted','dispatched')";
+    "SELECT message_id, target_node_id, required_node_ids_json FROM hub_messages
+     WHERE delivery_state IN ('accepted','dispatched')";
 
 pub(super) async fn recover(engine: &StorageEngine, hub_id: &HubId) -> Result<(), StorageError> {
     let hub_id = hub_id.clone();
@@ -114,13 +112,8 @@ fn recover_messages(
     let mut rows = statement.query([])?;
     while let Some(row) = rows.next()? {
         let message_id: MessageId = parse_col(row, 0)?;
-        let target: Option<NodeId> = parse_opt_col(row, 2)?;
-        let nodes = dialog_node_ids(
-            parse_opt_col(row, 1)?,
-            target.clone(),
-            parse_opt_col(row, 3)?,
-            parse_opt_col(row, 4)?,
-        );
+        let target: Option<NodeId> = parse_opt_col(row, 1)?;
+        let nodes: Vec<NodeId> = parse_json(row, 2)?;
         events.push(record(
             tx,
             hub_id,

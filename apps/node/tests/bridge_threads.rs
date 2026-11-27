@@ -23,6 +23,7 @@ use cooplet_protocol::{
     ApprovalWait, ApprovalWaitKind, AttachmentRef, AuthorKind, ErrorCode, EventKind, MessageId,
     NodeId, ParticipantId,
 };
+use cooplet_storage::WriteOutcome;
 use serde_json::{Value, json};
 use tokio::time::{sleep, timeout};
 
@@ -38,6 +39,7 @@ const FILE_NAME: &str = "Coordinator notes.txt";
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn enrolled_nodes_share_a_thread_and_reply_over_the_same_bridge() -> TestResult {
     let mut hub = BridgeHub::start().await?;
+    let blob_requests = hub.observe_blob_requests().await?;
     let a_mock = MockAdapter::default();
     let b_mock = MockAdapter::default();
     let mut a = TestNode::start(a_mock.clone()).await?;
@@ -99,13 +101,12 @@ async fn enrolled_nodes_share_a_thread_and_reply_over_the_same_bridge() -> TestR
 
     // Declared after the initial roster. The Hub must project this participant
     // and its working state before it can be selected for delivery.
-    let coordinator = b
-        .create(
-            "create-coordinator",
-            json!({"client_kind":"mock","name":"coordinator"}),
-        )
-        .await?;
-    let b_session = session(&b_mock, &coordinator)?;
+    let coordinator = resume_colliding_coordinator(&b, &a_agent).await?;
+    assert_eq!(coordinator, a_agent);
+    assert_ne!(b_enrollment.node_id, a_enrollment.node_id);
+    let b_session = b_mock
+        .session(&coordinator, 2)
+        .ok_or("missing resumed coordinator")?;
     b_session
         .emit(AdapterEventKind::StateChanged(
             ParticipantRuntimeState::Working,
@@ -174,6 +175,7 @@ async fn enrolled_nodes_share_a_thread_and_reply_over_the_same_bridge() -> TestR
     let attachment: AttachmentRef = serde_json::from_value(upload)?;
     assert_eq!(attachment.name, FILE_NAME);
     assert_eq!(attachment.size_bytes, FILE_BYTES.len() as u64);
+    assert_eq!(blob_requests.snapshot(), ["POST /v1/blobs"]);
     let operator_post = json!({"body":"Coordination note", "mentions":["coordinator"]});
     let human_post = json!({"body":"@coordinator review the decision"});
     let service_post = json!({"body":"@coordinator the checks passed"});
@@ -236,20 +238,27 @@ async fn enrolled_nodes_share_a_thread_and_reply_over_the_same_bridge() -> TestR
     for kind in [AuthorKind::Human, AuthorKind::Agent, AuthorKind::Service] {
         assert!(batch.posts.iter().any(|post| post.author.kind == kind));
     }
-    let path = batch
+    let cached_attachment = batch
         .posts
         .iter()
         .flat_map(|post| &post.attachments)
         .next()
-        .ok_or("missing relayed attachment")?;
-    assert!(path.local_path.is_none());
+        .ok_or("missing relayed attachment")?
+        .clone();
+    assert!(cached_attachment.local_path.is_none());
     let local = PathBuf::from(OsString::from_vec(
-        path.local_path_bytes
+        cached_attachment
+            .local_path_bytes
             .clone()
             .ok_or("non-UTF-8 path was lost")?,
     ));
     assert_eq!(local.file_name(), Some(OsStr::new(FILE_NAME)));
-    assert_eq!(fs::read(local)?, FILE_BYTES);
+    assert_eq!(fs::read(&local)?, FILE_BYTES);
+    let cold_requests = [
+        "POST /v1/blobs".to_owned(),
+        format!("GET /v1/blobs/{}", attachment.blob_id),
+    ];
+    assert_eq!(blob_requests.snapshot(), cold_requests);
     assert!(
         turn.request
             .input
@@ -283,6 +292,67 @@ async fn enrolled_nodes_share_a_thread_and_reply_over_the_same_bridge() -> TestR
             .is_err()
     );
 
+    // Keep the cached file live but bring its expiry forward so a second use
+    // must extend retention even on a fast clock.
+    let before_reuse = cooplet_node::now_ms()?;
+    let local_id = cached_attachment.blob_id.clone();
+    let source_id = attachment.blob_id.clone();
+    b.db.write_sqlite(move |tx| {
+        assert_eq!(
+            tx.execute(
+                "UPDATE blobs SET expires_at_ms = ?3
+             WHERE blob_id = ?1 AND source_hub_blob_id = ?2 AND deleted_at_ms IS NULL",
+                rusqlite::params![local_id.as_str(), source_id.as_str(), before_reuse + 60_000],
+            )?,
+            1
+        );
+        Ok(WriteOutcome::new(()))
+    })
+    .await?;
+    finish_live_turn(&hub.admin, &b_enrollment.node_id, &b_session).await?;
+    let (failed, reused) = mcp_call(
+        a_session.credential.clone(),
+        "thread_post",
+        json!({"thread_id":thread, "body":"@coordinator check the same file", "operation_key":"reuse-file",
+               "attachments":[attachment]}),
+    ).await?;
+    assert!(!failed, "MCP attachment reuse failed: {reused}");
+    let warm = required_submit(&b_mock, "repeated attachment to B").await?;
+    let TurnInput::Thread(batch) = &warm.request.input else {
+        return Err("expected a thread turn on cache reuse".into());
+    };
+    let repeated_id = field(&reused, "post_id")?;
+    let repeated = batch
+        .posts
+        .iter()
+        .find(|post| post.post_id.as_str() == repeated_id)
+        .ok_or("missing repeated post")?;
+    assert_eq!(
+        repeated.attachments.as_slice(),
+        std::slice::from_ref(&cached_attachment)
+    );
+    assert_eq!(fs::read(&local)?, FILE_BYTES);
+    assert_eq!(blob_requests.snapshot(), cold_requests);
+    let local_id = cached_attachment.blob_id;
+    let expiry = b
+        .reads
+        .read(move |db| {
+            Ok(db.query_row(
+                "SELECT expires_at_ms FROM blobs WHERE blob_id=?1 AND deleted_at_ms IS NULL",
+                [local_id.as_str()],
+                |row| row.get::<_, i64>(0),
+            )?)
+        })
+        .await?;
+    assert!(expiry >= before_reuse + 7 * 24 * 60 * 60 * 1000);
+    warm.finish(SubmitOutcome::Accepted {
+        native_turn_id: None,
+    })?;
+    member_when(&hub.admin, &thread, &b_member, |row| {
+        row["confirmed_seq"] == reused["seq"]
+    })
+    .await?;
+
     let (outgoing, early_reply) = exercise_direct_reply(
         &hub, &a_session, &a_mock, &a_member, &b_session, &b_mock, &b_member,
     )
@@ -307,6 +377,43 @@ async fn enrolled_nodes_share_a_thread_and_reply_over_the_same_bridge() -> TestR
     a.stop().await?;
     b.stop().await?;
     Ok(())
+}
+
+async fn resume_colliding_coordinator(
+    node: &TestNode,
+    id: &ParticipantId,
+) -> TestResult<ParticipantId> {
+    // Independent Node stores can assign the same participant ID. Seed just
+    // the stopped native conversation, then let the public resume path issue
+    // its real credential, start the adapter and declare it over the live WS.
+    let saved = id.clone();
+    let workspace = node
+        .workspace_dir
+        .to_str()
+        .ok_or("invalid workspace path")?
+        .to_owned();
+    let now = cooplet_node::now_ms()?;
+    node.db
+        .write_sqlite(move |tx| {
+            tx.execute(
+                "INSERT INTO participants
+             (participant_id,kind,name,client_kind,store_namespace,native_session_id,workspace_dir,
+              process_ownership,state,generation,created_at_ms,updated_at_ms,stopped_at_ms)
+             VALUES (?1,'agent','coordinator','mock',?2,'coordinator-session',?2,
+                     'attached','stopped',1,?3,?3,?3)",
+                rusqlite::params![saved.as_str(), workspace, now],
+            )?;
+            Ok(WriteOutcome::new(()))
+        })
+        .await?;
+    let resumed = post(
+        &node.client,
+        &format!("/v1/agents/{id}/resume"),
+        &json!({}),
+        "resume-coordinator",
+    )
+    .await?;
+    Ok(field(&resumed, "participant_id")?.parse()?)
 }
 
 async fn post(client: &CoopletClient, path: &str, body: &Value, key: &str) -> TestResult<Value> {

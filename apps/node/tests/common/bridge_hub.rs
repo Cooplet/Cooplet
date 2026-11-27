@@ -5,7 +5,7 @@ use std::{
     os::unix::fs::{DirBuilderExt, OpenOptionsExt},
     path::{Path, PathBuf},
     process::{Child, Command, Stdio},
-    sync::OnceLock,
+    sync::{Arc, Mutex, OnceLock},
     time::Duration,
 };
 
@@ -13,7 +13,13 @@ use cooplet_client::{BearerToken, ClientConfig, CoopletClient, Destination};
 use cooplet_protocol::{HubId, InfoResponse, NodeId};
 use serde::Deserialize;
 use serde_json::{Value, json};
-use tokio::{sync::oneshot, time::timeout};
+use tokio::{
+    io::{AsyncBufReadExt, AsyncWriteExt, BufReader as AsyncBufReader, copy_bidirectional},
+    net::{TcpListener, TcpStream},
+    sync::oneshot,
+    task::JoinSet,
+    time::timeout,
+};
 
 use crate::test_node::TestResult;
 
@@ -122,6 +128,32 @@ impl BridgeHub {
         json!({"hub_url":self.origin,"hub_id":self.id,"token":enrollment.token})
     }
 
+    /// Count blob requests at the real Hub's HTTP boundary, including cache misses.
+    pub async fn observe_blob_requests(&mut self) -> TestResult<BlobRequests> {
+        let upstream: SocketAddr = self.origin.trim_start_matches("http://").parse()?;
+        let listener = TcpListener::bind(("127.0.0.1", 0)).await?;
+        self.origin = format!("http://{}", listener.local_addr()?);
+        let requests = Arc::new(Mutex::new(Vec::new()));
+        let observed = requests.clone();
+        let mut tasks = JoinSet::new();
+        tasks.spawn(async move {
+            let mut connections = JoinSet::new();
+            loop {
+                tokio::select! {
+                    accepted = listener.accept() => {
+                        let Ok((peer, _)) = accepted else { break };
+                        connections.spawn(observe_connection(peer, upstream, observed.clone()));
+                    }
+                    _ = connections.join_next(), if !connections.is_empty() => {}
+                }
+            }
+        });
+        Ok(BlobRequests {
+            requests,
+            _tasks: tasks,
+        })
+    }
+
     pub async fn stop(&mut self) -> TestResult {
         let status = Command::new("sh")
             .args([
@@ -144,6 +176,70 @@ impl BridgeHub {
         .await??;
         Ok(())
     }
+}
+
+pub struct BlobRequests {
+    requests: Arc<Mutex<Vec<String>>>,
+    _tasks: JoinSet<()>,
+}
+
+impl BlobRequests {
+    pub fn snapshot(&self) -> Vec<String> {
+        self.requests
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone()
+    }
+}
+
+async fn observe_connection(
+    peer: TcpStream,
+    upstream: SocketAddr,
+    observed: Arc<Mutex<Vec<String>>>,
+) -> io::Result<()> {
+    peer.set_nodelay(true)?;
+    let mut peer = AsyncBufReader::new(peer);
+    let mut line = String::new();
+    if peer.read_line(&mut line).await? == 0 {
+        return Ok(());
+    }
+    let mut fields = line.split_ascii_whitespace();
+    let method = fields.next().unwrap_or_default();
+    let path = fields.next().unwrap_or_default();
+    if path == "/v1/blobs" || path.starts_with("/v1/blobs/") {
+        observed
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .push(format!("{method} {path}"));
+    }
+    let websocket = path == "/v1/bridge/connect";
+    let mut hub = TcpStream::connect(upstream).await?;
+    hub.set_nodelay(true)?;
+    hub.write_all(line.as_bytes()).await?;
+    loop {
+        line.clear();
+        if peer.read_line(&mut line).await? == 0 {
+            return Ok(());
+        }
+        if line == "\r\n" {
+            break;
+        }
+        if websocket
+            || !line
+                .split_once(':')
+                .is_some_and(|(name, _)| name.eq_ignore_ascii_case("connection"))
+        {
+            hub.write_all(line.as_bytes()).await?;
+        }
+    }
+    // Keep each HTTP request observable without parsing streamed bodies. The
+    // upgraded connection continues to carry every frame of the same bridge.
+    if !websocket {
+        hub.write_all(b"Connection: close\r\n").await?;
+    }
+    hub.write_all(b"\r\n").await?;
+    copy_bidirectional(&mut peer, &mut hub).await?;
+    Ok(())
 }
 
 pub struct Scratch(pub PathBuf);

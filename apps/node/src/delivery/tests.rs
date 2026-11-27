@@ -169,6 +169,52 @@ fn question(expires_at_ms: Option<i64>) -> QuestionPayload {
 }
 
 #[tokio::test]
+async fn replayed_hub_receipt_resolves_an_outgoing_projection_once() -> TestResult {
+    use cooplet_protocol::{DirectMessageReceipt, EventKind, NodeId, OperationId};
+
+    let fixture = Fixture::start().await?;
+    let mut notices = fixture.open.engine.db().subscribe();
+    let sender = fixture.open.operator.participant_id.clone();
+    let recipient = format!("{}/{}", NodeId::generate()?, ParticipantId::generate()?);
+    let hub_message = MessageId::generate()?;
+    let operation = OperationId::generate()?;
+    let apply = |delivery_state| {
+        fixture.service.project_outbound(
+            sender.clone(),
+            recipient.clone(),
+            message(&recipient, "Confirmed answer"),
+            DirectMessageReceipt {
+                operation_id: operation.clone(),
+                message_id: hub_message.clone(),
+                in_reply_to: None,
+                delivery_state,
+            },
+        )
+    };
+    let local = apply(DeliveryState::Unknown)
+        .await?
+        .message_id
+        .ok_or("missing local message")?;
+    assert_eq!(notices.try_recv()?.kind, EventKind::MessageCreated);
+    fixture.clock.store(NOW + 1, Ordering::SeqCst);
+    let resolved = apply(DeliveryState::Delivered).await?;
+    assert_eq!(resolved.message_id.as_ref(), Some(&local));
+    assert_eq!(notices.try_recv()?.kind, EventKind::MessageDeliveryUpdated);
+    fixture.clock.store(NOW + 2, Ordering::SeqCst);
+    for state in [DeliveryState::Delivered, DeliveryState::Unknown] {
+        assert_eq!(apply(state).await?.delivery_state, DeliveryState::Delivered);
+    }
+    assert!(matches!(
+        notices.try_recv(),
+        Err(tokio::sync::broadcast::error::TryRecvError::Empty)
+    ));
+    let view = fixture.service.show(&fixture.operator()?, local).await?;
+    assert_eq!(view.delivery_state, DeliveryState::Delivered);
+    assert_eq!(view.delivered_at_ms, Some(NOW + 1));
+    fixture.stop().await
+}
+
+#[tokio::test]
 async fn question_accepts_one_answer_and_replays_it_after_expiry() -> TestResult {
     let fixture = Fixture::start().await?;
     let agent = fixture.stopped_agent().await?;

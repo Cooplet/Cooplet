@@ -368,28 +368,28 @@ async fn ready_agent(
     epoch: u64,
     state: ParticipantState,
 ) -> TestResult<ParticipantId> {
-    let participant_id = ParticipantId::generate()?;
-    send_roster(
-        client,
-        epoch,
-        vec![ParticipantWire {
-            participant_id: participant_id.clone(),
-            kind: ParticipantKind::Agent,
-            name: "coordinator".into(),
-            client_kind: Some("mock".into()),
-            workspace_dir: None,
-            state,
-            capabilities: json!({}),
-            wait_kind: None,
-            approval_id: None,
-            action_hint: None,
-            summary: None,
-            can_respond_remotely: None,
-        }],
-    )
-    .await?;
+    let participant = agent("coordinator", state)?;
+    let id = participant.participant_id.clone();
+    send_roster(client, epoch, vec![participant]).await?;
     expect_ready(client).await?;
-    Ok(participant_id)
+    Ok(id)
+}
+
+fn agent(name: &str, state: ParticipantState) -> TestResult<ParticipantWire> {
+    Ok(ParticipantWire {
+        participant_id: ParticipantId::generate()?,
+        kind: ParticipantKind::Agent,
+        name: name.into(),
+        client_kind: Some("mock".into()),
+        workspace_dir: None,
+        state,
+        capabilities: json!({}),
+        wait_kind: None,
+        approval_id: None,
+        action_hint: None,
+        summary: None,
+        can_respond_remotely: None,
+    })
 }
 
 async fn expect_ready(client: &mut Client) -> TestResult {
@@ -594,12 +594,17 @@ async fn disconnect_catalog_update_waits_for_full_actor_inbox() -> TestResult {
 #[tokio::test]
 async fn thread_ack_deadlines_pause_only_the_matching_ranges_on_a_live_socket() -> TestResult {
     let (hub, mut client, epoch) = Fixture::open().await?;
-    let participant = ready_agent(&mut client, epoch, ParticipantState::Idle).await?;
+    let first = agent("text-worker", ParticipantState::Idle)?;
+    let second = agent("file-worker", ParticipantState::Idle)?;
+    let text_worker = first.participant_id.clone();
+    let file_worker = second.participant_id.clone();
+    send_roster(&mut client, epoch, vec![first, second]).await?;
+    expect_ready(&mut client).await?;
     let caller = hub.admin().await?;
     let short = hub
         .board(
             &caller,
-            &participant,
+            &text_worker,
             "short-ack",
             DeliveryMode::QueueUntilIdle,
         )
@@ -607,7 +612,7 @@ async fn thread_ack_deadlines_pause_only_the_matching_ranges_on_a_live_socket() 
     let long = hub
         .board(
             &caller,
-            &participant,
+            &file_worker,
             "long-ack",
             DeliveryMode::QueueUntilIdle,
         )
@@ -647,18 +652,18 @@ async fn thread_ack_deadlines_pause_only_the_matching_ranges_on_a_live_socket() 
     }
     hub.heartbeat(&mut client, 39_999, false).await?;
     assert_eq!(
-        hub.member(&caller, &short, &participant).await?.state,
+        hub.member(&caller, &short, &text_worker).await?.state,
         ThreadMemberState::Active
     );
     hub.heartbeat(&mut client, 40_000, false).await?;
     let paused = hub
-        .wait_member(&caller, &short, &participant, |member| {
+        .wait_member(&caller, &short, &text_worker, |member| {
             member.state == ThreadMemberState::PausedUnknown
         })
         .await?;
     assert_pending_range(&paused, &short_wire)?;
     assert_eq!(
-        hub.member(&caller, &long, &participant).await?.state,
+        hub.member(&caller, &long, &file_worker).await?.state,
         ThreadMemberState::Active
     );
     for now in [45_000, 60_000] {
@@ -666,12 +671,12 @@ async fn thread_ack_deadlines_pause_only_the_matching_ranges_on_a_live_socket() 
     }
     hub.heartbeat(&mut client, 64_999, false).await?;
     assert_eq!(
-        hub.member(&caller, &long, &participant).await?.state,
+        hub.member(&caller, &long, &file_worker).await?.state,
         ThreadMemberState::Active
     );
     hub.heartbeat(&mut client, 65_000, false).await?;
     let paused = hub
-        .wait_member(&caller, &long, &participant, |member| {
+        .wait_member(&caller, &long, &file_worker, |member| {
             member.state == ThreadMemberState::PausedUnknown
         })
         .await?;

@@ -10,7 +10,7 @@ use rusqlite::{OptionalExtension, params};
 use super::{
     DeliveryService, MessageView, SendMessageRequest, SendMessageResponse,
     model::{invalid, message_missing},
-    queries::{HubProjection, sql_error, store_message},
+    queries::{HubProjection, sql_error, store_message, update_delivery},
 };
 use crate::{
     auth::Principal,
@@ -134,7 +134,7 @@ impl DeliveryService {
             .map_err(Into::into)
     }
 
-    async fn project_outbound(
+    pub(super) async fn project_outbound(
         &self,
         sender: ParticipantId,
         recipient: String,
@@ -164,20 +164,35 @@ impl DeliveryService {
                     .flatten();
                 let prior = tx
                     .query_row(
-                        "SELECT message_id FROM messages
+                        "SELECT message_id, delivery_state, sender_id = ?2 AND operation_id IS NULL FROM messages
                  WHERE hub_message_id = ?1 AND (sender_id = ?2 OR recipient_id = ?2)",
                         params![receipt.message_id.as_str(), sender.as_str()],
-                        |row| row.get::<_, String>(0)?.parse().map_err(sql_error),
+                        |row| Ok((
+                            MessageId::parse(&row.get::<_, String>(0)?).map_err(sql_error)?,
+                            row.get::<_, String>(1)?.parse::<DeliveryState>().map_err(sql_error)?,
+                            row.get::<_, bool>(2)?,
+                        )),
                     )
                     .optional()?;
                 let local_id = match prior {
-                    Some(id) => {
-                        return Ok(WriteOutcome::new(SendMessageResponse {
+                    Some((id, saved_state, outgoing)) => {
+                        let mut delivery_state = receipt.delivery_state;
+                        let mut events = Vec::new();
+                        // A loopback delivery with a local operation follows its native outcome.
+                        // Only the sender's outbound projection is advanced by a Hub receipt.
+                        if outgoing {
+                            if saved_state != DeliveryState::Unknown {
+                                delivery_state = saved_state;
+                            } else if delivery_state != DeliveryState::Unknown {
+                                events.push(update_delivery(tx, now, id.as_str(), delivery_state, None)?);
+                            }
+                        }
+                        return Ok(WriteOutcome::with_events(SendMessageResponse {
                             operation_id: receipt.operation_id.clone(),
                             message_id: Some(id),
                             in_reply_to: parent,
-                            delivery_state: receipt.delivery_state,
-                        }));
+                            delivery_state,
+                        }, events));
                     }
                     None => MessageId::generate().map_err(NodeError::from)?,
                 };

@@ -390,17 +390,17 @@ async fn restart_preserves_terminal_facts_and_atomically_recovers_interrupted_de
         )?;
         tx.execute(
             "INSERT INTO hub_messages (message_id, sender_actor_id, target_participant_id, sender_node_id,
-                                       target_node_id, body, delivery_mode, delivery_state, created_at_ms, expires_at_ms)
-             VALUES ('msg_00000000000000000000000001', 'sender', 'target', ?1, ?2, 'parent', 'direct_now', 'delivered', 0, 9999999999999),
-                    ('msg_00000000000000000000000003', 'sender', 'target', NULL, ?2, 'queued', 'queue_until_idle', 'queued', 0, 9999999999999)",
+                                       target_node_id, body, delivery_mode, delivery_state, created_at_ms, expires_at_ms, required_node_ids_json)
+             VALUES ('msg_00000000000000000000000001', 'sender', 'target', ?1, ?2, 'parent', 'direct_now', 'delivered', 0, 9999999999999, json_array(?1, ?2)),
+                    ('msg_00000000000000000000000003', 'sender', 'target', NULL, ?2, 'queued', 'queue_until_idle', 'queued', 0, 9999999999999, json_array(?2))",
             params![node_a_for_write.as_str(), node_b_for_write.as_str()],
         )?;
         tx.execute(
             "INSERT INTO hub_messages (message_id, sender_actor_id, target_participant_id, target_node_id,
-                                       in_reply_to, body, answer_json, delivery_mode, delivery_state, created_at_ms, expires_at_ms)
+                                       in_reply_to, body, answer_json, delivery_mode, delivery_state, created_at_ms, expires_at_ms, required_node_ids_json)
              VALUES ('msg_00000000000000000000000002', 'sender', 'target', ?1,
-                     'msg_00000000000000000000000001', 'answer', '{}', 'direct_now', 'dispatched', 0, 9999999999999)",
-            [node_a_for_write.as_str()],
+                     NULL, 'answer', '{}', 'direct_now', 'dispatched', 0, 9999999999999, json_array(?1, ?2))",
+            params![node_a_for_write.as_str(), node_b_for_write.as_str()],
         )?;
         Ok(WriteOutcome::new(()))
     }).await?;
@@ -617,15 +617,15 @@ async fn gc_preserves_single_answer_after_receipt_expiry_and_bounds_reply_detach
                                      created_at_ms, updated_at_ms, expires_at_ms)
              VALUES ('receipt', 'actor', 'key', 'answer_question', 'hash', 'succeeded', 0, 0, 10);
              INSERT INTO hub_messages (message_id, sender_actor_id, target_participant_id, target_node_id,
-                                       body, delivery_mode, delivery_state, created_at_ms, expires_at_ms)
-             SELECT 'question', 'sender', 'target', node_id, '', 'direct_now', 'delivered', 0, 100 FROM nodes;
+                                       body, delivery_mode, delivery_state, created_at_ms, expires_at_ms, required_node_ids_json)
+             SELECT 'question', 'sender', 'target', node_id, '', 'direct_now', 'delivered', 0, 100, json_array(node_id) FROM nodes;
              INSERT INTO hub_messages (message_id, sender_actor_id, target_participant_id, in_reply_to,
-                                       body, answer_json, operation_id, delivery_mode, delivery_state, created_at_ms, expires_at_ms)
-             VALUES ('answer', 'sender', 'target', 'question', '', '{}', 'receipt', 'direct_now', 'delivered', 0, 100);
+                                       body, answer_json, operation_id, delivery_mode, delivery_state, created_at_ms, expires_at_ms, required_node_ids_json)
+             SELECT 'answer', 'sender', 'target', 'question', '', '{}', 'receipt', 'direct_now', 'delivered', 0, 100, json_array(node_id) FROM nodes;
              WITH RECURSIVE numbers(i) AS (VALUES (1) UNION ALL SELECT i + 1 FROM numbers WHERE i < 250)
              INSERT INTO hub_messages (message_id, sender_actor_id, target_participant_id, target_node_id,
-                                       in_reply_to, body, delivery_mode, delivery_state, created_at_ms, expires_at_ms)
-             SELECT 'reply_' || i, 'sender', 'target', node_id, 'question', '', 'direct_now', 'delivered', 0, 1000
+                                       in_reply_to, body, delivery_mode, delivery_state, created_at_ms, expires_at_ms, required_node_ids_json)
+             SELECT 'reply_' || i, 'sender', 'target', node_id, 'question', '', 'direct_now', 'delivered', 0, 1000, json_array(node_id)
              FROM numbers CROSS JOIN nodes;",
         )?;
         Ok(WriteOutcome::new(()))
@@ -636,8 +636,8 @@ async fn gc_preserves_single_answer_after_receipt_expiry_and_bounds_reply_detach
         assert!(answer_receipt.is_none());
         let duplicate = tx.execute(
             "INSERT INTO hub_messages (message_id, sender_actor_id, target_participant_id, in_reply_to,
-                                       body, answer_json, delivery_mode, delivery_state, created_at_ms, expires_at_ms)
-             VALUES ('duplicate', 'sender', 'target', 'question', '', '{}', 'direct_now', 'delivered', 0, 100)",
+                                       body, answer_json, delivery_mode, delivery_state, created_at_ms, expires_at_ms, required_node_ids_json)
+             SELECT 'duplicate', 'sender', 'target', 'question', '', '{}', 'direct_now', 'delivered', 0, 100, json_array(node_id) FROM nodes",
             [],
         );
         assert!(matches!(duplicate, Err(error) if error.sqlite_error_code() == Some(rusqlite::ErrorCode::ConstraintViolation)));
@@ -798,6 +798,9 @@ fn gc_filters_use_the_retention_and_recovery_indexes() -> TestResult {
         "{blobs}"
     );
     assert!(!blobs.contains("USE TEMP B-TREE"), "{blobs}");
+    let posts = explain(&tx, gc::EXPIRED_POST_PREFIX, params!["thread", 5, 199])?;
+    assert!(posts.contains("idx_thread_posts_expiry_seq"), "{posts}");
+    assert!(!posts.contains("USE TEMP B-TREE"), "{posts}");
     let messages = explain(&tx, recovery::RECOVERABLE_MESSAGES, [])?;
     assert!(
         messages.contains("USING INDEX idx_hub_messages_recovery"),

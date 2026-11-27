@@ -284,7 +284,7 @@ fn store_post(
             op_id.as_str(), post.created_at_ms, expiry],
     )?;
     if expiry > ctx.now {
-        defer_direct_wakes(ctx, id, post, &mentions)?;
+        record_wakes(ctx, id, post, &mentions)?;
     }
     ctx.tx.execute(
         "UPDATE threads SET head_seq=?1, updated_at_ms=?2 WHERE thread_id=?3",
@@ -293,23 +293,26 @@ fn store_post(
     Ok(())
 }
 
-fn defer_direct_wakes(
+fn record_wakes(
     ctx: &Mutation<'_>,
     id: &ThreadId,
     post: &ThreadPostWire,
     mentions: &str,
 ) -> rusqlite::Result<()> {
-    // An armed explicit recovery also owns new matching wakes while the Node
-    // is offline or a prefix is in flight. Keep their horizon with the post.
+    // Record queue eligibility with the post, including while the Node is offline.
+    // A direct member only retains wakes during an explicit recovery.
     ctx.tx.execute(
-        "UPDATE thread_members AS m SET resume_through_seq=?2
-         WHERE m.thread_id=?1 AND m.state='active' AND m.delivery_mode='direct_now'
-           AND m.resume_through_seq<?2 AND m.node_id IS NOT NULL
+        "UPDATE thread_members AS m SET
+           last_wake_seq=CASE WHEN m.delivery_mode='queue_until_idle' THEN ?2 ELSE last_wake_seq END,
+           resume_through_seq=CASE WHEN m.resume_through_seq IS NOT NULL THEN ?2 END
+         WHERE m.thread_id=?1 AND m.state='active' AND m.node_id IS NOT NULL
+           AND (m.delivery_mode='queue_until_idle' OR m.resume_through_seq IS NOT NULL)
            AND m.role!='observer' AND m.wake_policy!='muted' AND m.member_key!=?3
-           AND (m.wake_policy='all' OR EXISTS(
-               SELECT 1 FROM json_each(?4) WHERE value IN ('all',m.member_key)
-           ))",
-        params![id.as_str(), post.seq, post.author_actor_id, mentions],
+           AND (m.wake_policy='all' OR ?5 OR m.member_key IN (SELECT value FROM json_each(?4)))",
+        params![
+            id.as_str(), post.seq, post.author_actor_id, mentions,
+            post.mentions.iter().any(|mention| mention == "all")
+        ],
     )?;
     Ok(())
 }
@@ -450,15 +453,19 @@ pub(crate) async fn wait(
                 if let Some(policy) = body.wake_policy.map(ThreadWakePolicy::from) {
                     member.wake_policy = policy;
                 }
+                let head_seq = board.head_seq;
+                let relevant = last_relevant_seq(ctx.tx, &id, body.since_seq, head_seq, &member)?;
                 ctx.tx.execute(
                     "UPDATE thread_members SET confirmed_seq=MAX(confirmed_seq,?1),wake_policy=?2,
+                     last_wake_seq=CASE WHEN delivery_mode='queue_until_idle' THEN ?5 ELSE 0 END,
                      resume_through_seq=CASE WHEN resume_through_seq<=?1 THEN NULL ELSE resume_through_seq END
                      WHERE thread_id=?3 AND member_key=?4",
                     params![
                         body.since_seq,
                         member.wake_policy.as_str(),
                         id.as_str(),
-                        member.member_key
+                        member.member_key,
+                        relevant.unwrap_or(0)
                     ],
                 )?;
                 if body.wake_policy.is_some() {
@@ -470,10 +477,7 @@ pub(crate) async fn wait(
                         &members::event_data(&id, &updated),
                     )?;
                 }
-                let head_seq = board.head_seq;
-                let Some(through) =
-                    last_relevant_seq(ctx.tx, &id, body.since_seq, head_seq, &member)?
-                else {
+                let Some(through) = relevant else {
                     return Ok(ThreadWaitResponse::Waiting { head_seq });
                 };
                 let mut out = ThreadWaitResponse::Ready {

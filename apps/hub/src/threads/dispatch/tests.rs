@@ -56,8 +56,8 @@ fn queue_coalesces_once_idle_and_cannot_accept_an_old_generation_ack() -> TestRe
          VALUES(?1,'Dispatch',?2,'open',5,1,5)", params![thread.as_str(), owner.as_str()],
     )?;
     tx.execute(
-        "INSERT INTO thread_members(thread_id,member_key,participant_id,node_id,handle,role,wake_policy,joined_at_ms)
-         VALUES(?1,?2,?3,?4,'worker','member','mentions_only',1)",
+        "INSERT INTO thread_members(thread_id,member_key,participant_id,node_id,handle,role,wake_policy,last_wake_seq,joined_at_ms)
+         VALUES(?1,?2,?3,?4,'worker','member','mentions_only',4,1)",
         params![thread.as_str(), key, participant.as_str(), node.as_str()],
     )?;
     let worker_mention = serde_json::to_string(&[&key])?;
@@ -144,6 +144,65 @@ const TEST_EPOCH: u64 = 5;
 const TEST_NOW: i64 = 1_800_000_000_000;
 const STEP_TIMEOUT: Duration = Duration::from_secs(2);
 
+#[tokio::test]
+async fn queue_wake_is_recomputed_after_a_policy_change_or_resume() -> TestResult {
+    use cooplet_protocol::{ThreadWaitPolicy, ThreadWaitRequest, ThreadWaitResponse};
+
+    let mut fixture = Fixture::new(true).await?;
+    let thread = fixture.board(DeliveryMode::QueueUntilIdle).await?;
+    fixture
+        .post(&thread, "ordinary-update", "An ordinary update")
+        .await?;
+    fixture.set_worker(ParticipantState::Idle).await?;
+    fixture.settle().await?;
+
+    let node = fixture.node.clone();
+    let worker = fixture.worker.clone();
+    let actor = storage::sql::read_tx(&fixture.state.reads, move |db| {
+        auth::attest_node_participant(db, &node, &worker, Some((1, TEST_EPOCH)))
+    })
+    .await?;
+    let caught_up = threads::wait(
+        &fixture.state,
+        &actor,
+        thread.clone(),
+        ThreadWaitRequest {
+            since_seq: 0,
+            wake_policy: Some(ThreadWaitPolicy::All),
+        },
+    )
+    .await?;
+    assert!(matches!(
+        caught_up,
+        ThreadWaitResponse::Ready { head_seq: 1, .. }
+    ));
+    let first = fixture.attempt().await?;
+    assert_eq!((first.payload.from_seq, first.payload.to_seq), (1, 1));
+    first.complete(ThreadDeliveryOutcome::Unknown)?;
+    fixture.settle().await?;
+
+    fixture
+        .post(&thread, "paused-update", "Another update")
+        .await?;
+    fixture.settle().await?;
+    threads::resume(
+        &fixture.state,
+        &fixture.admin,
+        thread,
+        "resume-queued-member",
+        ThreadMemberResumeRequest {
+            member_key: Some(fixture.member_key()),
+            after_seq: 1,
+        },
+    )
+    .await?;
+    let resumed = fixture.attempt().await?;
+    assert_eq!((resumed.payload.from_seq, resumed.payload.to_seq), (2, 2));
+    resumed.complete(ThreadDeliveryOutcome::Delivered)?;
+    fixture.settle().await?;
+    fixture.close().await
+}
+
 struct AttemptOnWire {
     payload: ThreadDeliverPayload,
     reply: oneshot::Sender<ThreadAckPayload>,
@@ -188,19 +247,32 @@ impl BridgeRegistry for ControlledBridge {
     fn reserve_thread<'a>(
         &'a self,
         _: &'a NodeId,
+        direct_epoch: Option<u64>,
     ) -> BoxFuture<'a, Result<Box<dyn ThreadPermit>, ReserveError>> {
         Box::pin(async move {
-            if !self.online.load(Ordering::Acquire) {
+            if !self.online.load(Ordering::Acquire)
+                || direct_epoch.is_some_and(|epoch| epoch != TEST_EPOCH)
+            {
                 return Err(ReserveError::Offline);
             }
-            if let Ok(slot) = self.free_slot.clone().try_acquire_owned() {
-                return Ok(Box::new(ControlledPermit {
-                    slot,
-                    sent: self.sent.clone(),
-                }) as Box<dyn ThreadPermit>);
-            }
-            let _ = self.saturated.send(());
-            Err(ReserveError::RateLimited)
+            let slot = match self.free_slot.clone().try_acquire_owned() {
+                Ok(slot) => slot,
+                Err(_) => {
+                    let _ = self.saturated.send(());
+                    if direct_epoch.is_none() {
+                        return Err(ReserveError::RateLimited);
+                    }
+                    self.free_slot
+                        .clone()
+                        .acquire_owned()
+                        .await
+                        .map_err(|_| ReserveError::Offline)?
+                }
+            };
+            Ok(Box::new(ControlledPermit {
+                slot,
+                sent: self.sent.clone(),
+            }) as Box<dyn ThreadPermit>)
         })
     }
 
@@ -333,7 +405,7 @@ impl Fixture {
         let created = threads::create(
             &self.state,
             &self.admin,
-            "create-test-thread",
+            EventId::generate()?.as_str(),
             ThreadCreateRequest {
                 title: "Review regression".into(),
                 topic: None,
@@ -353,6 +425,35 @@ impl Fixture {
 
     fn member_key(&self) -> String {
         format!("{}/{}", self.node, self.worker)
+    }
+
+    async fn add_peer(&self, board: &ThreadId, mode: DeliveryMode) -> TestResult<ParticipantId> {
+        let peer = ParticipantId::generate()?;
+        let node = self.node.clone();
+        let participant = peer.clone();
+        self.state.db.write_sqlite(move |tx| {
+            tx.execute(
+                "INSERT INTO node_participants(node_id,participant_id,kind,name,state,synced_epoch,updated_at_ms)
+                 VALUES(?1,?2,'agent','Peer','idle',?3,1)",
+                params![node.as_str(), participant.as_str(), TEST_EPOCH],
+            )?;
+            Ok(WriteOutcome::new(()))
+        }).await?;
+        threads::join(
+            &self.state,
+            &self.admin,
+            board.clone(),
+            "join-peer",
+            ThreadMemberJoinRequest {
+                member_key: format!("{}/{}", self.node, peer),
+                handle: Some("peer".into()),
+                role: None,
+                wake_policy: None,
+                delivery_mode: Some(mode),
+            },
+        )
+        .await?;
+        Ok(peer)
     }
 
     async fn resume_through(&self, thread: &ThreadId) -> TestResult<Option<u64>> {
@@ -489,6 +590,104 @@ impl Fixture {
         drop(scratch);
         Ok(())
     }
+}
+
+#[tokio::test]
+async fn direct_fanout_waits_for_bridge_capacity_but_attempts_each_recipient_once() -> TestResult {
+    let mut fixture = Fixture::new(true).await?;
+    let board = fixture.board(DeliveryMode::DirectNow).await?;
+    let peer = fixture.add_peer(&board, DeliveryMode::DirectNow).await?;
+    let occupied = fixture.bridge.free_slot.clone().try_acquire_owned()?;
+    fixture.post(&board, "fanout-direct", "@all review").await?;
+    fixture.blocked_scan().await?;
+    drop(occupied);
+
+    let first = fixture.attempt().await?;
+    let first_member = first.payload.member_id.clone();
+    first.complete(ThreadDeliveryOutcome::Busy)?;
+    let second = fixture.attempt().await?;
+    assert_ne!(first_member, second.payload.member_id);
+    assert!([first_member, second.payload.member_id.clone()].contains(&peer));
+    second.complete(ThreadDeliveryOutcome::Delivered)?;
+    fixture.settle().await?;
+    fixture.set_worker(ParticipantState::Idle).await?;
+    fixture.settle().await?;
+    fixture.close().await
+}
+
+#[tokio::test]
+async fn new_posts_do_not_restart_a_saturated_idle_sweep_at_the_first_member() -> TestResult {
+    let mut fixture = Fixture::new(true).await?;
+    let board = fixture.board(DeliveryMode::QueueUntilIdle).await?;
+    let peer = fixture
+        .add_peer(&board, DeliveryMode::QueueUntilIdle)
+        .await?;
+    fixture.set_worker(ParticipantState::Idle).await?;
+    fixture.settle().await?;
+    fixture.post(&board, "fanout-idle", "@all review").await?;
+    let first = fixture.attempt().await?;
+    fixture.blocked_scan().await?;
+    let first_member = first.payload.member_id.clone();
+    let next_post = if first_member == peer {
+        "@peer"
+    } else {
+        "@worker"
+    };
+    fixture.post(&board, "wake-first-again", next_post).await?;
+    fixture.blocked_scan().await?;
+    first.complete(ThreadDeliveryOutcome::Delivered)?;
+
+    let second = fixture.attempt().await?;
+    assert_ne!(first_member, second.payload.member_id);
+    second.complete(ThreadDeliveryOutcome::Delivered)?;
+    let follow_up = fixture.attempt().await?;
+    assert_eq!(follow_up.payload.member_id, first_member);
+    assert_eq!(
+        (follow_up.payload.from_seq, follow_up.payload.to_seq),
+        (2, 2)
+    );
+    follow_up.complete(ThreadDeliveryOutcome::Delivered)?;
+    fixture.settle().await?;
+    fixture.close().await
+}
+
+#[tokio::test]
+async fn an_idle_participant_gets_one_pending_turn_across_boards() -> TestResult {
+    let mut fixture = Fixture::new(true).await?;
+    let one = fixture.board(DeliveryMode::QueueUntilIdle).await?;
+    let two = fixture.board(DeliveryMode::QueueUntilIdle).await?;
+    fixture.set_worker(ParticipantState::Idle).await?;
+    fixture.post(&one, "one-board", "@worker review").await?;
+    let first = fixture.attempt().await?;
+    fixture
+        .post(&two, "two-boards", "@worker follow up")
+        .await?;
+    // Exercise staging even if another bridge slot were available now.
+    let node = fixture.node.clone();
+    let overlap = fixture
+        .state
+        .db
+        .write(move |tx| {
+            let job = stage(
+                tx,
+                &node,
+                (TEST_EPOCH, TEST_NOW),
+                &Mode::Idle,
+                None,
+                &HashMap::new(),
+                OperationId::generate().map_err(HubError::from)?,
+            )?;
+            Ok::<_, WriteError<HubError>>(WriteOutcome::new(job))
+        })
+        .await
+        .map_err(HubError::from)?;
+    assert!(overlap.is_none());
+    first.complete(ThreadDeliveryOutcome::Delivered)?;
+    let next = fixture.attempt().await?;
+    assert_eq!(next.payload.thread_id, two);
+    next.complete(ThreadDeliveryOutcome::Delivered)?;
+    fixture.settle().await?;
+    fixture.close().await
 }
 
 #[tokio::test]

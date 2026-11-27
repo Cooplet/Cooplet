@@ -108,6 +108,7 @@ CREATE TABLE hub_messages (
     sender_node_id        TEXT    REFERENCES nodes(node_id) ON DELETE SET NULL,
     target_node_id        TEXT    REFERENCES nodes(node_id) ON DELETE SET NULL,
     target_participant_id TEXT    NOT NULL,
+    required_node_ids_json TEXT   NOT NULL,
     in_reply_to           TEXT    REFERENCES hub_messages(message_id) ON DELETE SET NULL,
     body                  TEXT    NOT NULL,
     attachments_json      TEXT    NOT NULL DEFAULT '[]',
@@ -165,6 +166,8 @@ CREATE TABLE thread_members (
                         CHECK (state IN ('active','paused_unknown','left')),
     delivery_generation INTEGER NOT NULL DEFAULT 0 CHECK (delivery_generation >= 0),
     confirmed_seq       INTEGER NOT NULL DEFAULT 0,
+    -- Latest post that can wake this queued member; eligibility also requires a live cursor.
+    last_wake_seq       INTEGER NOT NULL DEFAULT 0 CHECK (last_wake_seq >= 0),
     -- The head at explicit resume, extended by relevant direct wakes deferred into recovery.
     resume_through_seq  INTEGER,
     pending_delivery_id TEXT,

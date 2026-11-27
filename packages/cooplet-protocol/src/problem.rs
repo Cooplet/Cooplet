@@ -2,7 +2,7 @@ use std::collections::BTreeMap;
 
 use serde_json::Value;
 
-use crate::RequestId;
+use crate::{MessageId, OperationId, RequestId, ThreadId};
 
 pub const PROBLEM_JSON_MEDIA_TYPE: &str = "application/problem+json";
 
@@ -103,6 +103,35 @@ impl ProblemDetails {
             retryable: code.default_retryable(),
             extensions: BTreeMap::new(),
         }
+    }
+
+    /// Typed identifiers and cursors that a client can show when recovering from an error.
+    pub fn recovery_fields(&self) -> impl Iterator<Item = (&'static str, &Value)> {
+        [
+            "operation_id",
+            "message_id",
+            "existing_answer_id",
+            "thread_id",
+            "floor_seq",
+            "head_seq",
+            "current_version",
+        ]
+        .into_iter()
+        .filter_map(|key| {
+            let value = self.extensions.get(key)?;
+            let valid = match key {
+                "operation_id" => value
+                    .as_str()
+                    .is_some_and(|id| OperationId::parse(id).is_ok()),
+                "message_id" | "existing_answer_id" => value
+                    .as_str()
+                    .is_some_and(|id| MessageId::parse(id).is_ok()),
+                "thread_id" => value.as_str().is_some_and(|id| ThreadId::parse(id).is_ok()),
+                "current_version" => value.is_null() || value.is_u64(),
+                _ => value.is_u64(),
+            };
+            valid.then_some((key, value))
+        })
     }
 
     pub fn with_instance(mut self, instance: impl Into<String>) -> Self {

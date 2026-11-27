@@ -179,8 +179,9 @@ impl Fixture {
             let now = now_ms();
             tx.execute(
                 "INSERT INTO hub_messages (message_id, sender_actor_id, sender_node_id, target_node_id, target_participant_id,
-                                           body, question_json, delivery_mode, delivery_state, created_at_ms, expires_at_ms)
-                 VALUES (?1, ?2, ?3, ?4, ?5, '', ?6, 'direct_now', 'delivered', ?7, ?8)",
+                                           body, question_json, delivery_mode, delivery_state, created_at_ms, expires_at_ms, required_node_ids_json)
+                 VALUES (?1, ?2, ?3, ?4, ?5, '', ?6, 'direct_now', 'delivered', ?7, ?8,
+                         CASE WHEN ?4 IS NULL OR ?4=?3 THEN json_array(?3) ELSE json_array(?3,?4) END)",
                 rusqlite::params![id.as_str(), sender.as_str(), from.as_str(), to.as_ref().map(NodeId::as_str), recipient.as_str(),
                     r#"{"mode":"text","prompt":"Proceed?"}"#, now, now + 600_000],
             )?;
@@ -929,6 +930,23 @@ async fn recovering_an_unacknowledged_acceptance_never_starts_bridge_delivery() 
 }
 
 #[tokio::test]
+async fn thread_creation_checks_node_scope_before_loading_inline_members() -> TestResult {
+    let f = Fixture::new(FakeBridge::new()).await?;
+    let (_, scoped) = f.scoped_admin_token(&NodeId::generate()?).await?;
+    let member = format!("{}/{}", NodeId::generate()?, ParticipantId::generate()?);
+    let request = serde_json::from_value(json!({
+        "title": "Board",
+        "members": [{"member_key": member}],
+    }))?;
+    result_code(
+        crate::threads::create(&f.state, &scoped, "create-scoped-board", request).await,
+        ErrorCode::Forbidden,
+    )?;
+    f.close().await?;
+    Ok(())
+}
+
+#[tokio::test]
 async fn cross_node_answer_remains_local_after_unknown_and_rechecks_saved_scope() -> TestResult {
     let bridge = FakeBridge::new();
     bridge.set(CommandOutcome::Unknown, None)?;
@@ -984,6 +1002,41 @@ async fn cross_node_answer_remains_local_after_unknown_and_rechecks_saved_scope(
     assert_eq!(replay.delivery_state, DeliveryState::Unknown);
     assert_eq!(restart_bridge.shared.reserves.load(Ordering::SeqCst), 0);
     assert_eq!(restart_bridge.shared.submits.load(Ordering::SeqCst), 0);
+
+    // The target reconnects after restart. GC can detach a parent while later
+    // replies continue the dialogue.
+    let reconnected = from.clone();
+    f.state
+        .db
+        .write_sqlite(move |tx| {
+            tx.execute(
+                "UPDATE nodes SET status='online' WHERE node_id=?1",
+                [reconnected.as_str()],
+            )?;
+            tx.execute(
+                "DELETE FROM hub_messages WHERE message_id=?1",
+                [question.as_str()],
+            )?;
+            Ok(WriteOutcome::new(()))
+        })
+        .await?;
+    let mut follow_up = direct(&from, &sender)?;
+    follow_up.in_reply_to = Some(response.message_id);
+    let (_, follow_up) = send_message(&f.state, &f.admin, "follow-up", follow_up).await?;
+    let stored: Vec<NodeId> = f
+        .state
+        .reads
+        .read(move |db| {
+            Ok(db.query_row(
+                "SELECT required_node_ids_json FROM hub_messages WHERE message_id=?1",
+                [follow_up.message_id.as_str()],
+                |row| crate::storage::sql::parse_json(row, 0),
+            )?)
+        })
+        .await?;
+    let mut expected = vec![from, to];
+    expected.sort_unstable();
+    assert_eq!(stored, expected);
     f.close().await?;
     Ok(())
 }
@@ -1884,8 +1937,8 @@ async fn attachment_cap_valid_attach_question_expiry_and_human_member_acl() -> T
             tx.execute(
                 "INSERT INTO hub_messages (message_id, sender_actor_id, sender_node_id,
                     target_node_id, target_participant_id, body, question_json,
-                    delivery_mode, delivery_state, created_at_ms, expires_at_ms)
-                 VALUES (?1, ?2, ?3, NULL, ?4, '', ?5, 'direct_now', 'delivered', ?6, ?7)",
+                    delivery_mode, delivery_state, created_at_ms, expires_at_ms, required_node_ids_json)
+                 VALUES (?1, ?2, ?3, NULL, ?4, '', ?5, 'direct_now', 'delivered', ?6, ?7, json_array(?3))",
                 rusqlite::params![
                     q_id.as_str(),
                     a_id.as_str(),

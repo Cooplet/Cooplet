@@ -15,7 +15,7 @@ use crate::{
     storage::{
         events::{self, NewEvent, message_delivery_updated_data, question_answered_data},
         sql::{
-            dialog_node_ids, nodes_audience, parse_col, parse_json, parse_opt_col, parse_opt_json,
+            nodes_audience, parse_col, parse_json, parse_opt_col, parse_opt_json,
             read_verified_tx_with_clock,
         },
     },
@@ -221,17 +221,12 @@ fn message_target(
     notify: Option<NodeId>,
     expires_at_ms: i64,
 ) -> Target {
-    let mut required_nodes = dialog_node_ids(
-        caller.source_node_id().cloned(),
-        request.target_node_id.clone(),
-        parent.and_then(|p| p.view.sender_node_id.clone()),
-        parent.and_then(|p| p.view.target_node_id.clone()),
-    );
-    if let Some(parent) = parent {
-        required_nodes.extend(parent.node_ids.iter().cloned());
-        required_nodes.sort_unstable();
-        required_nodes.dedup();
-    }
+    // Each reply inherits the dialogue audience even after its ancestors expire.
+    let mut required_nodes = parent.map(|p| p.node_ids.clone()).unwrap_or_default();
+    required_nodes.extend(caller.source_node_id().cloned());
+    required_nodes.extend(request.target_node_id.clone());
+    required_nodes.sort_unstable();
+    required_nodes.dedup();
     let attachment_node = request
         .target_node_id
         .clone()
@@ -420,27 +415,18 @@ fn load(db: &Connection, id: &MessageId, now: i64) -> Result<MessageRecord, HubE
                 m.target_participant_id, m.in_reply_to, m.body, m.attachments_json,
                 m.question_json, m.answer_json, m.delivery_mode, m.delivery_state,
                 m.delivery_detail, m.operation_id, m.created_at_ms, m.delivered_at_ms,
-                m.expires_at_ms, parent.sender_node_id, parent.target_node_id
+                m.expires_at_ms, m.required_node_ids_json
          FROM hub_messages m
-         LEFT JOIN hub_messages parent ON parent.message_id = m.in_reply_to
          WHERE m.message_id = ?1 AND m.expires_at_ms > ?2",
     )?;
     statement
         .query_row(params![id.as_str(), now], |row| {
-            let sender_node_id = parse_opt_col::<NodeId>(row, 2)?;
-            let target_node_id = parse_opt_col::<NodeId>(row, 3)?;
-            let node_ids = dialog_node_ids(
-                sender_node_id.clone(),
-                target_node_id.clone(),
-                parse_opt_col::<NodeId>(row, 17)?,
-                parse_opt_col::<NodeId>(row, 18)?,
-            );
             Ok(MessageRecord {
                 view: HubMessageView {
                     message_id: parse_col(row, 0)?,
                     sender_actor_id: parse_col(row, 1)?,
-                    sender_node_id,
-                    target_node_id,
+                    sender_node_id: parse_opt_col(row, 2)?,
+                    target_node_id: parse_opt_col(row, 3)?,
                     target_participant_id: parse_col(row, 4)?,
                     in_reply_to: parse_opt_col(row, 5)?,
                     body: row.get(6)?,
@@ -454,7 +440,7 @@ fn load(db: &Connection, id: &MessageId, now: i64) -> Result<MessageRecord, HubE
                     created_at_ms: row.get(14)?,
                     delivered_at_ms: row.get(15)?,
                 },
-                node_ids,
+                node_ids: parse_json(row, 17)?,
                 expires_at_ms: row.get(16)?,
             })
         })
@@ -513,8 +499,8 @@ pub(super) fn insert(
         "INSERT INTO hub_messages (
              message_id, sender_actor_id, sender_node_id, target_node_id, target_participant_id, in_reply_to,
              body, attachments_json, question_json, answer_json, delivery_mode, delivery_state,
-             operation_id, created_at_ms, delivered_at_ms, expires_at_ms
-         ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16)",
+             operation_id, created_at_ms, delivered_at_ms, expires_at_ms, required_node_ids_json
+         ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17)",
     )?
     .execute(params![
         id.as_str(),
@@ -535,6 +521,7 @@ pub(super) fn insert(
         now,
         (state == DeliveryState::Delivered).then_some(now),
         target.message_expires_at_ms,
+        serde_json::to_string(&target.required_nodes)?,
     ])?;
 
     let audience = nodes_audience(&target.required_nodes);

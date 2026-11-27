@@ -8,7 +8,7 @@ use std::{
 use cooplet_platform::FileLock;
 use cooplet_protocol::EventKind;
 use rusqlite::{Connection, Transaction, TransactionBehavior};
-use tokio::sync::{broadcast, mpsc, oneshot};
+use tokio::sync::{broadcast, mpsc, oneshot, watch};
 
 use crate::{
     CheckpointReport, Migration, ReadPool, StorageConfig, StorageError, WriteError, WriteFailure,
@@ -62,6 +62,7 @@ struct WriterHandle {
 pub struct DbActor {
     inbox: Arc<Mutex<Option<mpsc::Sender<Job>>>>,
     events: broadcast::Sender<EventNotice>,
+    uncertain_commit: watch::Sender<()>,
 }
 
 impl DbActor {
@@ -142,12 +143,18 @@ impl DbActor {
         let actor = Self {
             inbox: Arc::new(Mutex::new(Some(sender))),
             events,
+            uncertain_commit: watch::channel(()).0,
         };
         Ok((actor, reads, thread))
     }
 
     pub fn subscribe(&self) -> broadcast::Receiver<EventNotice> {
         self.events.subscribe()
+    }
+
+    /// Recheck the durable event head when a commit with events could not be confirmed.
+    pub fn subscribe_uncertain_commits(&self) -> watch::Receiver<()> {
+        self.uncertain_commit.subscribe()
     }
 
     /// Once accepted, the writer owns the operation through commit or rollback.
@@ -184,6 +191,7 @@ impl DbActor {
     {
         let (reply, result) = oneshot::channel();
         let events = self.events.clone();
+        let uncertain_commit = self.uncertain_commit.clone();
         let job = Job::Write(Box::new(move |conn, lock| {
             let result = (|| {
                 lock.verify_path().map_err(StorageError::from)?;
@@ -203,6 +211,10 @@ impl DbActor {
                     }
                 };
                 if let Err(error) = tx.commit() {
+                    if !committed.is_empty() {
+                        // Subscribers reconcile from SQLite. Never announce these rows as committed.
+                        uncertain_commit.send_replace(());
+                    }
                     if !conn.is_autocommit() {
                         let _ = conn.execute_batch("ROLLBACK");
                         if !conn.is_autocommit() {

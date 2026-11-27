@@ -10,10 +10,9 @@ use cooplet_client::{
     BlobUploadOutcome, BlobUploadSpec, ClientError, CoopletClient, UploadVerification, api_path,
 };
 use cooplet_protocol::{
-    AnswerPayload, AttachmentRef, DeliveryMode, ErrorCode, MessageId, NodeId, OperationId,
-    ParticipantId, ParticipantKind, PrincipalKind, ProblemDetails, QuestionPayload, RunId,
-    ServicePrincipalId, ThreadId, UserId, WhoamiResponse, validate_attachment_name,
-    validate_idempotency_key,
+    AnswerPayload, AttachmentRef, DeliveryMode, ErrorCode, MessageId, NodeId, ParticipantId,
+    ParticipantKind, PrincipalKind, ProblemDetails, QuestionPayload, RunId, ServicePrincipalId,
+    UserId, WhoamiResponse, validate_attachment_name, validate_idempotency_key,
 };
 use cooplet_storage::DEFAULT_MAX_BLOB_BYTES;
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
@@ -54,41 +53,11 @@ impl ToolError {
         let mut error = Self::new(problem.code, problem.code.title());
         error.status = Some(problem.status);
         error.retryable = problem.retryable;
-        // Return typed correlation IDs. Arbitrary strings from an HTTP error
-        // can contain local paths or credentials.
-        for field in ["message_id", "existing_answer_id"] {
-            if let Some(value) = problem.extensions.get(field).and_then(Value::as_str)
-                && MessageId::parse(value).is_ok()
-            {
-                error
-                    .extensions
-                    .insert(field, Value::String(value.to_owned()));
-            }
-        }
-        if let Some(value) = problem
-            .extensions
-            .get("operation_id")
-            .and_then(Value::as_str)
-            && OperationId::parse(value).is_ok()
-        {
-            error
-                .extensions
-                .insert("operation_id", Value::String(value.to_owned()));
-        }
-        if let Some(value) = problem.extensions.get("thread_id").and_then(Value::as_str)
-            && ThreadId::parse(value).is_ok()
-        {
-            error
-                .extensions
-                .insert("thread_id", Value::String(value.to_owned()));
-        }
-        for field in ["floor_seq", "head_seq", "current_version"] {
-            if let Some(value) = problem.extensions.get(field)
-                && (value.is_u64() || (field == "current_version" && value.is_null()))
-            {
-                error.extensions.insert(field, value.clone());
-            }
-        }
+        error.extensions.extend(
+            problem
+                .recovery_fields()
+                .map(|(key, value)| (key, value.clone())),
+        );
         if let Some(reason) = problem.extensions.get("reason").and_then(Value::as_str)
             && reason.len() <= 64
             && reason.contains('_')

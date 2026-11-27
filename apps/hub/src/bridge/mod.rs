@@ -58,6 +58,8 @@ pub(crate) trait BridgeRegistry: Send + Sync {
     fn reserve_thread<'a>(
         &'a self,
         _node_id: &'a NodeId,
+        // A direct post waits for capacity only in the session that observed it.
+        _direct_epoch: Option<u64>,
     ) -> BoxFuture<'a, Result<Box<dyn ThreadPermit>, ReserveError>> {
         Box::pin(std::future::ready(Err(ReserveError::Offline)))
     }

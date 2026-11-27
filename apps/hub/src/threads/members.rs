@@ -26,10 +26,15 @@ pub(super) struct MemberAddress {
 }
 
 impl MemberAddress {
-    fn resolve(db: &Connection, key: &str) -> Result<Self, HubError> {
+    fn resolve(db: &Connection, caller: &AuthenticatedCaller, key: &str) -> Result<Self, HubError> {
         if let Some((node_id, participant_id)) = key.split_once('/') {
             let node_id = NodeId::parse(node_id)?;
             let participant = ParticipantId::parse(participant_id)?;
+            if caller.source_node_id().is_none() && !caller.allows_node(&node_id) {
+                return Err(store::forbidden(
+                    "This credential cannot add the requested node.",
+                ));
+            }
             let name = db
                 .query_row(
                     "SELECT p.name FROM node_participants p JOIN nodes n USING(node_id)
@@ -197,18 +202,7 @@ pub(super) fn add(
     head: u64,
     body: ThreadMemberJoinRequest,
 ) -> Result<MemberView, HubError> {
-    let address = MemberAddress::resolve(ctx.tx, &body.member_key)?;
-    // A scoped Hub token must be able to read the resulting historical membership.
-    if ctx.caller.source_node_id().is_none()
-        && address
-            .node_id
-            .as_ref()
-            .is_some_and(|node_id| !ctx.caller.allows_node(node_id))
-    {
-        return Err(store::forbidden(
-            "This credential cannot add the requested node.",
-        ));
-    }
+    let address = MemberAddress::resolve(ctx.tx, ctx.caller, &body.member_key)?;
     let existing = member(ctx.tx, id, &body.member_key)?;
     if existing
         .as_ref()
@@ -227,7 +221,7 @@ pub(super) fn add(
         let disputed = existing.pending.is_some();
         ctx.tx.execute(
             "UPDATE thread_members SET node_id=?1, role=?2, wake_policy=?3, delivery_mode=?4, state=?5,
-             confirmed_seq=?6, resume_through_seq=NULL, joined_at_ms=?7, left_at_ms=NULL
+             confirmed_seq=?6, last_wake_seq=0, resume_through_seq=NULL, joined_at_ms=?7, left_at_ms=NULL
              WHERE thread_id=?8 AND member_key=?9",
             params![address.node_id.as_ref().map(NodeId::as_str), role.as_str(), wake.as_str(), mode.as_str(),
                 if disputed { "paused_unknown" } else { "active" },
@@ -393,20 +387,20 @@ pub(crate) async fn resume(
         let generation = existing.delivery_generation.checked_add(1)
             .filter(|seq| i64::try_from(*seq).is_ok())
             .ok_or_else(|| HubError::internal("Thread delivery generation overflow."))?;
-        let resume_through = if existing.delivery_mode == DeliveryMode::DirectNow
-            && existing.node_id.is_some()
-            && existing.role != ThreadRole::Observer
-            && posts::last_relevant_seq(ctx.tx, &id, body.after_seq, board.head_seq, &existing)?.is_some()
-        {
-            Some(board.head_seq)
+        let relevant = if existing.node_id.is_some() && existing.role != ThreadRole::Observer {
+            posts::last_relevant_seq(ctx.tx, &id, body.after_seq, board.head_seq, &existing)?
         } else {
             None
         };
+        let (last_wake, resume_through) = match existing.delivery_mode {
+            DeliveryMode::QueueUntilIdle => (relevant.unwrap_or(0), None),
+            DeliveryMode::DirectNow => (0, relevant.map(|_| board.head_seq)),
+        };
         ctx.tx.execute(
             "UPDATE thread_members SET state='active',delivery_generation=?1,confirmed_seq=?2,
-             pending_delivery_id=NULL,pending_from_seq=NULL,pending_to_seq=NULL,resume_through_seq=?3
+             pending_delivery_id=NULL,pending_from_seq=NULL,pending_to_seq=NULL,resume_through_seq=?3,last_wake_seq=?6
              WHERE thread_id=?4 AND member_key=?5",
-            params![generation, body.after_seq, resume_through, id.as_str(), key],
+            params![generation, body.after_seq, resume_through, id.as_str(), key, last_wake],
         )?;
         let saved = member(ctx.tx, &id, key)?.ok_or_else(store::not_found)?;
         ctx.event(&id, EventKind::ThreadMemberUpdated, &event_data(&id, &saved))?;

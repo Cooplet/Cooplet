@@ -103,7 +103,7 @@ pub(super) async fn wake_thread(state: &AppState, thread_id: ThreadId, direct_se
     let id = thread_id.clone();
     let nodes = read_tx(&state.reads, move |db| {
         let mut stmt = db.prepare_cached(
-            "SELECT m.node_id, m.delivery_mode, MAX(m.resume_through_seq IS NOT NULL)
+            "SELECT m.node_id, m.delivery_mode, MAX(m.resume_through_seq IS NOT NULL), n.session_epoch
              FROM thread_members m JOIN nodes n USING(node_id)
              WHERE m.thread_id=?1 AND m.state='active' AND m.node_id IS NOT NULL
                AND m.role!='observer' AND m.wake_policy!='muted' AND n.status='online'
@@ -116,6 +116,7 @@ pub(super) async fn wake_thread(state: &AppState, thread_id: ThreadId, direct_se
                     parse_col::<NodeId>(row, 0)?,
                     parse_col::<DeliveryMode>(row, 1)?,
                     row.get::<_, bool>(2)?,
+                    row.get::<_, u64>(3)?,
                 ))
             })?
             .collect::<rusqlite::Result<Vec<_>>>()?)
@@ -123,7 +124,7 @@ pub(super) async fn wake_thread(state: &AppState, thread_id: ThreadId, direct_se
     .await;
     match nodes {
         Ok(nodes) => {
-            for (node_id, mode, has_resume) in nodes {
+            for (node_id, mode, has_resume, epoch) in nodes {
                 if mode == DeliveryMode::QueueUntilIdle || has_resume {
                     signal(state, &node_id, WakeTrigger::Work);
                 }
@@ -131,7 +132,7 @@ pub(super) async fn wake_thread(state: &AppState, thread_id: ThreadId, direct_se
                     let state_copy = state.clone();
                     let thread_id = thread_id.clone();
                     let _ = state.background.spawn(async move {
-                        drive_direct(state_copy, node_id, thread_id, seq).await;
+                        drive_direct(state_copy, node_id, thread_id, seq, epoch).await;
                     });
                 }
             }
@@ -151,7 +152,11 @@ struct Candidate {
 #[derive(Clone)]
 enum Mode {
     Idle,
-    Direct { thread_id: ThreadId, post_seq: u64 },
+    Direct {
+        thread_id: ThreadId,
+        post_seq: u64,
+        epoch: u64,
+    },
 }
 
 impl Mode {
@@ -207,10 +212,14 @@ impl Sweep {
         staged_revision: u64,
     ) -> Attempt {
         let mut shutdown = state.shutdown.clone();
+        let direct_epoch = match &mode {
+            Mode::Direct { epoch, .. } => Some(*epoch),
+            Mode::Idle => None,
+        };
         let reserved = tokio::select! {
             biased;
             _ = shutdown.changed() => return Attempt::Offline,
-            reserved = state.bridge.reserve_thread(node_id) => reserved,
+            reserved = state.bridge.reserve_thread(node_id, direct_epoch) => reserved,
         };
         let permit = match reserved {
             Ok(permit) => permit,
@@ -293,11 +302,18 @@ impl Sweep {
     }
 }
 
-async fn drive_direct(state: AppState, node_id: NodeId, thread_id: ThreadId, post_seq: u64) {
+async fn drive_direct(
+    state: AppState,
+    node_id: NodeId,
+    thread_id: ThreadId,
+    post_seq: u64,
+    epoch: u64,
+) {
     let mut sweep = Sweep::new();
     let mode = Mode::Direct {
         thread_id,
         post_seq,
+        epoch,
     };
     while let Attempt::Started = sweep.start(&state, &node_id, mode.clone(), 0).await {}
     while sweep.next().await.is_some() {}
@@ -336,7 +352,10 @@ async fn drive_queue(state: AppState, node_id: NodeId, mut wake: watch::Receiver
         if scan {
             match sweep.start(&state, &node_id, Mode::Idle, observed).await {
                 Attempt::Started => continue,
-                Attempt::NoCandidate | Attempt::Offline | Attempt::Saturated => scan = false,
+                Attempt::NoCandidate | Attempt::Offline => scan = false,
+                // A full bridge pauses this sweep mid-keyset. A new wake adds
+                // a follow-up pass and must not restart at the earliest member.
+                Attempt::Saturated => {}
                 Attempt::Retry => {
                     scan = false;
                     retry = true;
@@ -416,7 +435,7 @@ fn stage(
         Mode::Direct { thread_id, .. } => Some(thread_id.as_str()),
     };
     let mut candidates = tx.prepare_cached(
-        "SELECT m.participant_id,m.thread_id,m.member_key,m.resume_through_seq
+        "SELECT m.participant_id,m.thread_id,m.member_key,m.resume_through_seq,m.last_wake_seq
          FROM thread_members m JOIN nodes n USING(node_id)
          JOIN node_participants p ON p.node_id=m.node_id AND p.participant_id=m.participant_id
          JOIN threads t USING(thread_id)
@@ -426,7 +445,12 @@ fn stage(
            AND p.synced_epoch=?2 AND p.kind='agent'
            AND ((?3='direct_now' AND m.delivery_mode='direct_now')
                 OR (?3='queue_until_idle' AND p.state='idle'
-                    AND (m.delivery_mode='queue_until_idle' OR m.resume_through_seq IS NOT NULL)))
+                    AND m.participant_id NOT IN (
+                        SELECT participant_id FROM thread_members WHERE node_id=?1
+                          AND state='active' AND role!='observer' AND wake_policy!='muted'
+                          AND pending_delivery_id IS NOT NULL)
+                    AND (m.last_wake_seq>m.confirmed_seq AND m.delivery_mode='queue_until_idle'
+                         OR m.resume_through_seq IS NOT NULL)))
            AND (?4 IS NULL OR m.thread_id=?4) AND (m.participant_id,m.thread_id)>(?5,?6)
          ORDER BY m.participant_id,m.thread_id",
     )?;
@@ -448,6 +472,7 @@ fn stage(
         }
         let key: String = row.get(2)?;
         let resume_through: Option<u64> = row.get(3)?;
+        let last_wake: u64 = row.get(4)?;
         let member =
             members::member(tx, &candidate.thread_id, &key)?.ok_or_else(store::not_found)?;
         let board = store::board(tx, &candidate.thread_id, now)?;
@@ -470,10 +495,7 @@ fn stage(
             Mode::Idle if member.delivery_mode == DeliveryMode::DirectNow => {
                 recovery_ready.then_some(board.head_seq)
             }
-            Mode::Idle => {
-                posts::last_relevant_seq(tx, &candidate.thread_id, floor, board.head_seq, &member)?
-                    .map(|_| board.head_seq)
-            }
+            Mode::Idle => (last_wake > floor).then_some(board.head_seq),
             Mode::Direct { post_seq, .. }
                 if !recovery_ready && *post_seq > floor && *post_seq <= board.head_seq =>
             {

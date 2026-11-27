@@ -28,6 +28,12 @@ pub(super) const PENDING_BLOB_TOMBSTONES: &str =
     "SELECT blob_id, disk_rel_path, size_bytes, deleted_at_ms FROM blobs
      WHERE deleted_at_ms IS NOT NULL AND (deleted_at_ms, blob_id) > (?1, ?2)
      ORDER BY deleted_at_ms, blob_id LIMIT ?3";
+// Post expiry is monotone within a board. This index order picks the same
+// oldest prefix without sorting the entire expired range for each GC batch.
+pub(super) const EXPIRED_POST_PREFIX: &str = "SELECT MAX(seq) FROM (
+    SELECT seq FROM thread_posts WHERE thread_id=?1 AND expires_at_ms<=?2
+    ORDER BY expires_at_ms,seq LIMIT ?3
+)";
 pub(super) const DELETE_EXPIRED_TOKENS: &str = "DELETE FROM auth_tokens WHERE token_id IN (
          SELECT token_id FROM auth_tokens
          WHERE expires_at_ms <= ?1 OR revoked_at_ms <= ?1 OR consumed_at_ms <= ?1
@@ -249,10 +255,9 @@ fn prune_thread_posts(tx: &Transaction<'_>, now: i64, limit: usize) -> rusqlite:
         .optional()?;
     let Some(id) = candidate else { return Ok(0) };
     let through: Option<u64> = tx.query_row(
-        "SELECT MAX(seq) FROM (
-             SELECT seq FROM thread_posts WHERE thread_id=?1 AND expires_at_ms<=?2 ORDER BY seq LIMIT ?3
-         )",
-        params![id.as_str(), now, limit], |row| row.get(0),
+        EXPIRED_POST_PREFIX,
+        params![id.as_str(), now, limit],
+        |row| row.get(0),
     )?;
     let Some(through) = through else { return Ok(0) };
     let removed = tx.execute(

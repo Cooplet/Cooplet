@@ -7,7 +7,7 @@ use cooplet_protocol::{
 use cooplet_storage::{EventNotice, ReadPool, StorageError};
 use rusqlite::{Connection, ToSql};
 use serde::Deserialize;
-use tokio::sync::{broadcast, mpsc};
+use tokio::sync::{broadcast, mpsc, watch};
 
 use crate::{error::Result, http::events::events_query_sql, storage::read_event};
 
@@ -36,6 +36,7 @@ pub(super) async fn pump(
     reads: ReadPool,
     local_id: NodeId,
     mut notices: broadcast::Receiver<EventNotice>,
+    mut uncertain_commit: watch::Receiver<()>,
     mut cursor: u64,
     participants: HashSet<ParticipantId>,
     outbox: mpsc::Sender<Batch>,
@@ -93,6 +94,12 @@ pub(super) async fn pump(
         loop {
             tokio::select! {
                 () = outbox.closed() => return Ok(()),
+                change = uncertain_commit.changed() => {
+                    if change.is_err() {
+                        return Ok(());
+                    }
+                    break;
+                }
                 notice = notices.recv() => match notice {
                     Ok(notice) if notice.seq <= cursor => {},
                     Ok(_) | Err(broadcast::error::RecvError::Lagged(_)) => break,
@@ -307,6 +314,82 @@ mod tests {
     use serde_json::json;
 
     use super::*;
+
+    #[tokio::test]
+    async fn uncertain_commit_wakes_the_pump_for_the_last_durable_event()
+    -> std::result::Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        use crate::config::{NodeConfig, OpenNode};
+        use cooplet_protocol::RunId;
+        use cooplet_storage::WriteOutcome;
+        use std::{path::PathBuf, time::Duration};
+
+        struct Scratch(PathBuf);
+        impl Drop for Scratch {
+            fn drop(&mut self) {
+                let _ = std::fs::remove_dir_all(&self.0);
+            }
+        }
+        let dir = Scratch(cooplet_platform::PrivateFs::ensure_private_dir(
+            &std::env::temp_dir().join(format!("cooplet-pump-{}", EventId::generate()?)),
+        )?);
+        let open = OpenNode::start(NodeConfig::new(dir.0.join("node"), dir.0.clone())).await?;
+        let db = open.engine.db();
+        let cursor = open
+            .engine
+            .reads()
+            .read(|conn| Ok(super::super::roster::head(conn)?))
+            .await?;
+        let (outbox, mut batches) = mpsc::channel(1);
+        let mut ordinary = db.subscribe();
+        let pump = tokio::spawn(pump(
+            open.engine.reads().clone(),
+            open.info.node_id,
+            db.subscribe(),
+            db.subscribe_uncertain_commits(),
+            cursor,
+            HashSet::new(),
+            outbox,
+        ));
+        let wait = Duration::from_secs(5);
+        let initial = tokio::time::timeout(wait, batches.recv())
+            .await?
+            .ok_or("missing initial cut")?;
+        assert_eq!(initial.through, cursor);
+        let run = RunId::generate()?;
+        let event_run = run.clone();
+        let now = crate::now_ms()?;
+        let write = db
+            .write_sqlite(move |tx| {
+                let notice = crate::storage::append_event(
+                    tx,
+                    now,
+                    EventKind::WorkflowRunStarted,
+                    AggregateType::WorkflowRun,
+                    event_run.as_str(),
+                    None,
+                    json!({ "run_id": event_run, "workflow_name": "report" }),
+                )?;
+                // The row is durable, but DbActor's subsequent COMMIT reports an error.
+                tx.execute_batch("COMMIT")?;
+                Ok(WriteOutcome::with_events((), vec![notice]))
+            })
+            .await;
+        assert!(matches!(write, Err(StorageError::CommitFailed(_))));
+        let batch = tokio::time::timeout(wait, batches.recv())
+            .await?
+            .ok_or("missing durable event")?;
+        assert_eq!(batch.through, cursor + 1);
+        assert!(matches!(batch.events.as_slice(),
+            [NodeEventPayload::WorkflowRunStarted { run_id, .. }] if run_id == &run));
+        assert!(matches!(
+            ordinary.try_recv(),
+            Err(broadcast::error::TryRecvError::Empty)
+        ));
+        drop(batches);
+        tokio::time::timeout(wait, pump).await???;
+        open.engine.shutdown().await?;
+        Ok(())
+    }
 
     #[test]
     fn first_failed_open_is_declared_without_losing_event_history()

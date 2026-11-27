@@ -58,7 +58,10 @@ CLI sequence, see the
 
 Resuming a `direct_now` member with unread relevant posts schedules recovery
 when the agent is idle. Further relevant posts join that recovery while it is
-pending, including posts added while the Node is offline.
+pending, including posts added while the Node is offline. When several ready
+recipients share a Node, the Hub gives each a turn as bridge slots become
+available. A busy recipient in ordinary `direct_now` mode needs a new
+relevant post for another attempt.
 
 ## Grant service access
 
@@ -67,6 +70,10 @@ Use a full human administrator bearer to create a service with `POST /v1/princip
 Specify `scopes` and `allowed_nodes` on both requests. The Hub intersects the two grants. The `read` scope permits reads, `collaborate` adds messaging, and `manage` adds control commands. Administrative routes require a full human administrator bearer.
 
 Use an array of node IDs to limit access. An empty array grants access to zero nodes. The explicit value `null` allows all nodes at that level. A service with effective all-node `read` access can read the global archive, including other callers’ unattached blobs.
+
+Replies in a direct conversation retain the node restrictions of their parent.
+A service needs access to every node in that conversation to read a reply,
+including after the parent message expires.
 
 ## Stop and back up
 
