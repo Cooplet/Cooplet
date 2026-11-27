@@ -163,7 +163,46 @@ pub enum SessionOpenMode {
     },
 }
 
+/// Filesystem preparation may outlive a cancelled adapter future. The opener waits
+/// for it before cleaning the generation and rolls back a new reservation only
+/// after the process owner and database confirm that the open failed.
+#[derive(Clone, Default)]
+pub struct OpenPreparation {
+    rollback: Arc<tokio::sync::Mutex<Option<OpenRollback>>>,
+}
+
+pub type OpenRollback = Box<dyn FnOnce() -> std::io::Result<()> + Send>;
+
+impl OpenPreparation {
+    pub async fn run<T: Send + 'static>(
+        &self,
+        job: impl FnOnce(&mut Option<OpenRollback>) -> Result<T> + Send + 'static,
+    ) -> Result<T> {
+        let mut rollback = self.rollback.clone().lock_owned().await;
+        tokio::task::spawn_blocking(move || job(&mut rollback))
+            .await
+            .map_err(NodeError::internal)?
+    }
+
+    async fn wait(&self) {
+        drop(self.rollback.lock().await);
+    }
+
+    async fn undo(&self) {
+        if let Some(cleanup) = self.rollback.lock().await.take() {
+            match tokio::task::spawn_blocking(cleanup).await {
+                Ok(Ok(())) => {}
+                Ok(Err(error)) => {
+                    tracing::warn!(%error, "Could not release a native session reservation")
+                }
+                Err(error) => tracing::warn!(%error, "Native session rollback task failed"),
+            }
+        }
+    }
+}
+
 pub struct SessionOpenRequest {
+    pub preparation: OpenPreparation,
     pub participant_id: ParticipantId,
     pub generation: u64,
     pub mode: SessionOpenMode,

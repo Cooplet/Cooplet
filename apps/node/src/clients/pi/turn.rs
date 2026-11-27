@@ -21,8 +21,10 @@ enum AgentActivity {
     Idle,
     BusyBeforeStart,
     Running {
+        ended: bool,
         retry: bool,
     },
+    CheckingContinuation,
 }
 
 impl NativeActivity {
@@ -32,12 +34,41 @@ impl NativeActivity {
 
     fn observe(&mut self, kind: &str, frame: &Value) -> bool {
         match kind {
-            // A callback can delay an earlier run's settlement until another
-            // run starts. Untagged events cannot establish ownership then.
-            "agent_start" if matches!(self.agent, AgentActivity::Running { retry: false }) => {
+            // A fresh prompt always projects its input before an assistant starts.
+            // A low-level continuation can instead start directly with an assistant.
+            "agent_start" => {
+                self.agent = match self.agent {
+                    AgentActivity::Running {
+                        ended: true,
+                        retry: false,
+                    } => AgentActivity::CheckingContinuation,
+                    AgentActivity::Running { retry: false, .. }
+                    | AgentActivity::CheckingContinuation => return false,
+                    _ => AgentActivity::Running {
+                        ended: false,
+                        retry: false,
+                    },
+                };
+            }
+            "message_start" if matches!(self.agent, AgentActivity::CheckingContinuation) => {
+                if frame["message"]["role"] != "assistant" {
+                    return false;
+                }
+                self.agent = AgentActivity::Running {
+                    ended: false,
+                    retry: false,
+                };
+            }
+            "agent_end" | "agent_settled"
+                if matches!(self.agent, AgentActivity::CheckingContinuation) =>
+            {
                 return false;
             }
-            "agent_start" => self.agent = AgentActivity::Running { retry: false },
+            "agent_end" => {
+                if let AgentActivity::Running { ended, .. } = &mut self.agent {
+                    *ended = true;
+                }
+            }
             "agent_settled" => self.agent = AgentActivity::Idle,
             "compaction_start" if frame["reason"] == "manual" => {
                 self.manual_compaction = true;
@@ -46,7 +77,7 @@ impl NativeActivity {
                 self.manual_compaction = false;
             }
             "auto_retry_start" | "auto_retry_end" | "compaction_end" => {
-                if let AgentActivity::Running { retry } = &mut self.agent {
+                if let AgentActivity::Running { retry, .. } = &mut self.agent {
                     *retry = kind == "auto_retry_start"
                         || (kind == "compaction_end" && frame["willRetry"] == true);
                 }
@@ -76,6 +107,7 @@ pub(super) struct Turn {
     pub(super) id: String,
     pub(super) wrote: bool,
     pub(super) accepted: bool,
+    pub(super) awaiting_state_check: bool,
     pub(super) cancel: Option<oneshot::Sender<TurnFinishStatus>>,
     operation_key: String,
     input: [u8; 32],
@@ -94,7 +126,7 @@ enum NativeRun {
     Managed,
 }
 
-struct TurnResult {
+pub(super) struct TurnResult {
     status: TurnFinishStatus,
     text: String,
 }
@@ -105,6 +137,7 @@ impl Turn {
             id,
             wrote: false,
             accepted: false,
+            awaiting_state_check: false,
             cancel: None,
             operation_key,
             input: Sha256::digest(message.as_bytes()).into(),
@@ -119,8 +152,13 @@ impl Turn {
 
     /// Returns false when the native stream no longer identifies the managed run.
     fn observe(&mut self, kind: &str, frame: &Value) -> bool {
-        if !self.wrote || self.finished.is_some() {
+        if !self.wrote {
             return true;
+        }
+        if self.finished.is_some() {
+            // Several native runs crossed one ACK. An idle snapshot cannot
+            // establish which of their results belongs to this operation.
+            return kind != "agent_start";
         }
         match kind {
             "agent_start" => return self.begin(),
@@ -150,6 +188,7 @@ impl Turn {
     }
 
     fn begin(&mut self) -> bool {
+        self.awaiting_state_check = false;
         self.run = match self.run {
             NativeRun::Waiting if self.accepted => NativeRun::Managed,
             NativeRun::Waiting => NativeRun::Unclaimed { conflicting: false },
@@ -217,9 +256,16 @@ impl State {
         }
     }
 
-    pub(super) fn accept_turn(&mut self, id: &str, reply: &Reply) -> SubmitOutcome {
+    pub(super) fn accept_turn(
+        &mut self,
+        id: &str,
+        reply: &Reply,
+    ) -> (SubmitOutcome, Option<TurnResult>) {
         let Some(turn) = self.turn.as_mut().filter(|turn| turn.id == id) else {
-            return SubmitOutcome::Unknown("Pi disconnected during intake".into());
+            return (
+                SubmitOutcome::Unknown("Pi disconnected during intake".into()),
+                None,
+            );
         };
         if !reply.success
             && turn.run != NativeRun::Managed
@@ -232,19 +278,66 @@ impl State {
             // already arrived on the native stream while the ACK was pending.
             self.turn = None;
             self.emit_native_state();
-            return SubmitOutcome::Busy;
+            return (SubmitOutcome::Busy, None);
         }
         if !reply.success || reply.data["disposition"] != "started" {
             self.close();
-            return SubmitOutcome::Unknown("Pi did not confirm that the turn started".into());
+            return (
+                SubmitOutcome::Unknown("Pi did not confirm that the turn started".into()),
+                None,
+            );
+        }
+        // A native input hook may run the exact same text in a separate prompt.
+        // Even an exact echo does not prove that a pre-ACK result belongs to us.
+        if turn.run == NativeRun::Managed && turn.finished.is_none() {
+            self.close_ambiguous_stream();
+            return (
+                SubmitOutcome::Accepted {
+                    native_turn_id: None,
+                },
+                None,
+            );
+        }
+        let early = turn.finished.take();
+        if early.is_some() {
+            turn.awaiting_state_check = true;
+            turn.run = NativeRun::Waiting;
+            turn.saw_managed_user = false;
+            turn.assistant = None;
         }
         turn.accepted = true;
         self.emit(AdapterEventKind::StateChanged(
             ParticipantRuntimeState::Working,
         ));
-        self.emit_finished();
-        SubmitOutcome::Accepted {
-            native_turn_id: None,
+        (
+            SubmitOutcome::Accepted {
+                native_turn_id: None,
+            },
+            early,
+        )
+    }
+
+    pub(super) fn reconcile_early(
+        &mut self,
+        id: &str,
+        result: TurnResult,
+        streaming: Option<bool>,
+    ) {
+        let Some(turn) = self.turn.as_mut().filter(|turn| turn.id == id) else {
+            // The actual managed run has already completed while get_state was in flight.
+            return;
+        };
+        turn.awaiting_state_check = false;
+        match streaming {
+            Some(false)
+                if turn.run == NativeRun::Waiting
+                    && matches!(self.native_activity.agent, AgentActivity::Idle) =>
+            {
+                turn.finished = Some(result);
+                self.emit_finished();
+            }
+            Some(_) => {} // Keep collecting the managed run after its ACK.
+            None => self.close(),
         }
     }
 

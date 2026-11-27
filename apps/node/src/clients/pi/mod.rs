@@ -6,7 +6,6 @@ mod turn;
 
 use std::{
     env, io,
-    os::unix::fs::PermissionsExt as _,
     path::{Path, PathBuf},
     process::{Command, Stdio},
     time::Duration,
@@ -188,45 +187,48 @@ async fn open(
     validate_options(&request.effective_options)?;
     let instructions = request
         .instructions
-        .as_deref()
         .filter(|value| !value.trim().is_empty())
         .ok_or_else(|| unavailable("Frozen Cooplet instructions are unavailable"))?;
-    let binary =
-        executable().ok_or_else(|| unavailable("The Pi executable was not found on PATH"))?;
-    let cooplet = env::current_exe()
-        .map_err(|_| unavailable("Could not resolve the Cooplet executable for Pi MCP"))?;
-    let runtime = PrivateFs::validate_private_dir(&request.runtime_dir)
-        .map_err(|_| unavailable("Could not open the private Pi generation directory"))?;
-    let extension = runtime.join(EXTENSION_FILENAME);
-    let extension_path = extension
-        .to_str()
-        .ok_or_else(|| unavailable("The Pi extension path is not valid UTF-8"))?;
-    let startup = serde_json::to_vec(&Startup {
-        executable: &cooplet,
-        credential: &request.cred_file_path,
-        instructions,
-    })
-    .map_err(|_| unavailable("Could not encode the private Pi startup configuration"))?;
-    PrivateFs::write_private_file_atomic(&runtime, STARTUP_FILENAME, &startup)
-        .and_then(|()| {
-            PrivateFs::write_private_file_atomic(
-                &runtime,
-                EXTENSION_FILENAME,
-                include_bytes!("participant.ts"),
-            )
+    let participant = request.participant_id.clone();
+    let (binary, file, runtime, extension) = request
+        .preparation
+        .run(move |rollback| {
+            let binary = executable()
+                .ok_or_else(|| unavailable("The Pi executable was not found on PATH"))?;
+            let cooplet = env::current_exe()
+                .map_err(|_| unavailable("Could not resolve the Cooplet executable for Pi MCP"))?;
+            let runtime = PrivateFs::validate_private_dir(&request.runtime_dir)
+                .map_err(|_| unavailable("Could not open the private Pi generation directory"))?;
+            let extension = runtime
+                .join(EXTENSION_FILENAME)
+                .into_os_string()
+                .into_string()
+                .map_err(|_| unavailable("The Pi extension path is not valid UTF-8"))?;
+            let startup = serde_json::to_vec(&Startup {
+                executable: &cooplet,
+                credential: &request.cred_file_path,
+                instructions: &instructions,
+            })
+            .map_err(|_| unavailable("Could not encode the private Pi startup configuration"))?;
+            PrivateFs::write_private_file_atomic(&runtime, STARTUP_FILENAME, &startup)
+                .and_then(|()| {
+                    PrivateFs::write_private_file_atomic(
+                        &runtime,
+                        EXTENSION_FILENAME,
+                        include_bytes!("participant.ts"),
+                    )
+                })
+                .map_err(|_| unavailable("Could not prepare the private Pi extension files"))?;
+            let file =
+                SessionFile::prepare(&request.workspace_dir, &participant, request.mode, rollback)?;
+            Ok((binary, file, runtime, extension))
         })
-        .map_err(|_| unavailable("Could not prepare the private Pi extension files"))?;
-
-    let file = SessionFile::prepare(
-        &request.workspace_dir,
-        &request.participant_id,
-        request.mode,
-    )?;
+        .await?;
     let mut command = Command::new(binary);
     command
         .args(["--mode", "rpc", "--session"])
         .arg(&file.path)
-        .args(["--extension", extension_path])
+        .args(["--extension", &extension])
         .current_dir(&file.workspace)
         .env("PI_CODING_AGENT_DIR", &file.agent_dir)
         .env_remove(CREDENTIAL_ENV)
@@ -260,8 +262,13 @@ async fn open(
     {
         return Err(unavailable("Pi did not open an idle session"));
     }
-    let native_key = file.verify(&state.data)?;
-    verify_mcp(&session, extension_path).await?;
+    let (file, native_key) = tokio::task::spawn_blocking(move || {
+        let key = file.verify(&state.data)?;
+        Ok::<_, NodeError>((file, key))
+    })
+    .await
+    .map_err(NodeError::internal)??;
+    verify_mcp(&session, &extension).await?;
     if !session.mark_ready() {
         return Err(unavailable("Pi RPC did not remain idle through startup"));
     }
@@ -434,18 +441,14 @@ fn executable() -> Option<PathBuf> {
     let cwd = env::current_dir().ok()?;
     env::split_paths(&path)
         .map(|directory| cwd.join(directory).join(KIND))
-        .find(|candidate| {
-            candidate
-                .metadata()
-                .is_ok_and(|meta| meta.is_file() && meta.permissions().mode() & 0o111 != 0)
-        })
+        .find(|candidate| cooplet_platform::is_executable_file(candidate))
 }
 
 async fn discover() -> DiscoveryReport {
     let mut report = DiscoveryReport {
         client_kind: KIND.into(),
         available: false,
-        binary_path: executable(),
+        binary_path: tokio::task::spawn_blocking(executable).await.ok().flatten(),
         version: None,
         capabilities: AdapterCapabilities::default(),
         detail: Some("The Pi executable was not found on PATH".into()),

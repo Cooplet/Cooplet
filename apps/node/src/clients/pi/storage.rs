@@ -1,6 +1,7 @@
 use std::{
-    env, fs,
+    env, fs, io,
     io::{BufRead as _, BufReader, Read as _},
+    os::unix::fs::MetadataExt as _,
     path::{Path, PathBuf},
 };
 
@@ -10,7 +11,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 use crate::{
-    clients::{NativeSessionKey, SessionOpenMode},
+    clients::{NativeSessionKey, OpenRollback, SessionOpenMode},
     error::Result,
 };
 
@@ -44,6 +45,7 @@ impl SessionFile {
         workspace: &Path,
         participant: &ParticipantId,
         mode: SessionOpenMode,
+        rollback: &mut Option<OpenRollback>,
     ) -> Result<Self> {
         let workspace = canonical_directory(workspace)
             .ok_or_else(|| unavailable("Could not resolve the Pi workspace"))?;
@@ -70,13 +72,24 @@ impl SessionFile {
             SessionOpenMode::Create => {
                 let directory = PrivateFs::open_dir_nofollow(&store)
                     .map_err(|_| unavailable("Could not open the private Pi session store"))?;
-                PrivateFs::create_private_file_at(&directory, &filename)
-                    .and_then(|file| {
-                        file.sync_all()?;
-                        directory.sync_all()?;
-                        Ok(())
-                    })
+                let file = PrivateFs::create_private_file_at(&directory, &filename)
                     .map_err(|_| unavailable("Could not reserve a new Pi session file"))?;
+                let reserved_path = path.clone();
+                let synced = file.sync_all().and_then(|()| directory.sync_all());
+                *rollback = Some(Box::new(move || {
+                    let expected = file.metadata()?;
+                    let actual = match fs::symlink_metadata(&reserved_path) {
+                        Ok(actual) => actual,
+                        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(()),
+                        Err(error) => return Err(error),
+                    };
+                    if (actual.dev(), actual.ino()) != (expected.dev(), expected.ino()) {
+                        return Err(io::Error::other("The reserved native session file changed"));
+                    }
+                    PrivateFs::unlink_file_at(&directory, &filename).map_err(io::Error::other)?;
+                    directory.sync_all()
+                }));
+                synced.map_err(|_| unavailable("Could not sync the Pi session reservation"))?;
                 None
             }
             SessionOpenMode::Resume {

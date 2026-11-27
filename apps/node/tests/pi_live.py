@@ -214,7 +214,7 @@ class Node:
         return response
 
     def runtime(self, participant):
-        with contextlib.closing(sqlite3.connect(f"file:{self.state / 'node.sqlite3'}?mode=ro", uri=True)) as db:
+        with contextlib.closing(sqlite3.connect((self.state / "node.sqlite3").resolve().as_uri() + "?mode=ro", uri=True)) as db:
             state, binding = db.execute(
                 "SELECT state,adapter_binding_json FROM participants WHERE participant_id=?",
                 (participant,),
@@ -240,7 +240,7 @@ class Node:
         wait_until(settled)
 
     def binding(self, participant):
-        with contextlib.closing(sqlite3.connect(f"file:{self.state / 'node.sqlite3'}?mode=ro", uri=True)) as db:
+        with contextlib.closing(sqlite3.connect((self.state / "node.sqlite3").resolve().as_uri() + "?mode=ro", uri=True)) as db:
             namespace, identity, binding = db.execute(
                 "SELECT store_namespace,native_session_id,adapter_binding_json FROM participants WHERE participant_id=?",
                 (participant,),
@@ -531,6 +531,7 @@ def run_negative(binary, pi, area, server):
         with node.running():
             assert node.create(variant, expected=503)["code"] == "overloaded"
         assert len(server.requests) == before, variant
+        assert not list((agent / "cooplet-sessions").glob("*.jsonl")), variant
         print(f"Startup rejected {variant} MCP without a model turn")
 
 

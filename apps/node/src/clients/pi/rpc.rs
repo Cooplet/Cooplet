@@ -19,7 +19,7 @@ use crate::clients::{
     TurnFinishStatus,
 };
 
-use super::turn::{NativeActivity, Turn};
+use super::turn::{NativeActivity, Turn, TurnResult};
 
 const COMMAND_TIMEOUT: Duration = Duration::from_secs(15);
 const MAX_RECORD_BYTES: usize = 16 * 1024 * 1024;
@@ -140,17 +140,8 @@ impl Session {
         message: Option<&str>,
         collect_notifications: bool,
     ) -> Result<Reply, CommandError> {
-        let input = self.shared.input.lock().await;
-        let id = self.state().new_id()?;
         self.shared
-            .command(
-                input.as_ref(),
-                id,
-                kind,
-                message,
-                None,
-                collect_notifications,
-            )
+            .request(kind, message, collect_notifications)
             .await
     }
 
@@ -225,6 +216,9 @@ impl Session {
             else {
                 return StopOutcome::AlreadyGone;
             };
+            if turn.awaiting_state_check {
+                return StopOutcome::Unknown("Pi is verifying which turn is active".into());
+            }
             let (send, receive) = oneshot::channel();
             turn.cancel = Some(send);
             (id, receive)
@@ -255,6 +249,35 @@ impl Shared {
         self.state
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+
+    async fn request(
+        &self,
+        kind: &'static str,
+        message: Option<&str>,
+        collect_notifications: bool,
+    ) -> Result<Reply, CommandError> {
+        let input = self.input.lock().await;
+        let id = self.state().new_id()?;
+        self.command(
+            input.as_ref(),
+            id,
+            kind,
+            message,
+            None,
+            collect_notifications,
+        )
+        .await
+    }
+
+    async fn check_early_result(&self, turn_id: String, result: TurnResult) {
+        let streaming = self
+            .request("get_state", None, false)
+            .await
+            .ok()
+            .filter(|r| r.success)
+            .and_then(|r| r.data["isStreaming"].as_bool());
+        self.state().reconcile_early(&turn_id, result, streaming);
     }
 
     async fn command(
@@ -477,7 +500,8 @@ impl State {
         }
     }
 
-    fn handle(&mut self, mut frame: Value) {
+    fn handle(&mut self, mut frame: Value) -> Option<(String, TurnResult)> {
+        let mut early = None;
         let kind = frame["type"].as_str().unwrap_or_default();
         match kind {
             "response" => {
@@ -492,7 +516,9 @@ impl State {
                     {
                         reply.notifications = pending.notifications.unwrap_or_default();
                         if self.turn.as_ref().is_some_and(|turn| turn.id == pending.id) {
-                            reply.outcome = Some(self.accept_turn(&pending.id, &reply));
+                            let (outcome, result) = self.accept_turn(&pending.id, &reply);
+                            reply.outcome = Some(outcome);
+                            early = result.map(|result| (pending.id, result));
                         }
                         let _ = pending.reply.send(reply);
                     } else {
@@ -527,6 +553,7 @@ impl State {
             }
             _ => self.handle_turn_event(kind, &frame),
         }
+        early
     }
 }
 
@@ -549,7 +576,12 @@ async fn read_output(shared: Arc<Shared>, output: Receiver) {
         if !frame["type"].is_string() {
             break;
         }
-        shared.state().handle(frame);
+        if let Some((id, result)) = shared.state().handle(frame) {
+            // Intake is already acknowledged. Resolve only the ambiguous completion
+            // through a native read barrier, without blocking ACK delivery or stdout.
+            let check = Arc::clone(&shared);
+            tokio::spawn(async move { check.check_early_result(id, result).await });
+        }
         buffer.clear();
         // Avoid retaining the high-water mark of a large echo for the whole generation.
         if buffer.capacity() > 128 * 1024 {

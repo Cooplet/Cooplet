@@ -289,7 +289,14 @@ async fn adapter_sends_canonical_direct_and_thread_input_over_lf_framing() -> Te
             peer.begin(&command).await?;
             peer.assistant("stop", "current answer").await?;
             peer.settle(false).await?;
-            peer.ack(&command, "started").await
+            peer.ack(&command, "started").await?;
+            let (probe, _) = peer.command().await?;
+            assert_eq!(probe["type"], "get_state");
+            peer.frame(
+                json!({"type":"response","command":"get_state","id":probe["id"],
+                "success":true,"data":{"isStreaming":false}}),
+            )
+            .await
         };
         let (outcome, native) = timeout(WAIT, async { tokio::join!(submit, native) }).await?;
         native?;
@@ -410,6 +417,37 @@ async fn retry_errors_and_cancel_use_the_current_turn_and_native_settlement() ->
     )
     .await?;
     Ok(())
+}
+
+#[tokio::test]
+async fn assistant_continuation_finishes_on_the_last_native_run() -> TestResult {
+    let (session, mut events, mut peer) = fixture()?;
+    let admission = AdmissionGuard::new(WAIT);
+    let (outcome, proof) = tokio::join!(
+        session.submit("continued".into(), "prompt", &admission),
+        async {
+            let (command, _) = peer.command().await?;
+            peer.ack(&command, "started").await?;
+            peer.begin(&command).await?;
+            peer.assistant("stop", "intermediate").await?;
+            peer.frame(json!({"type":"agent_end"})).await?;
+            peer.start().await?;
+            peer.frame(json!({"type":"message_start","message":{"role":"assistant"}}))
+                .await?;
+            peer.assistant("stop", "final answer").await?;
+            peer.settle(false).await
+        }
+    );
+    proof?;
+    assert!(matches!(outcome, SubmitOutcome::Accepted { .. }));
+    completed(
+        &mut events,
+        1,
+        "continued",
+        TurnFinishStatus::Completed,
+        "final answer",
+    )
+    .await
 }
 
 #[tokio::test]
@@ -580,10 +618,17 @@ async fn unrelated_run_in_preflight_does_not_finish_the_node_turn() -> TestResul
         async {
             let (command, _) = peer.command().await?;
             peer.start().await?;
-            peer.user(&json!("an extension's native input")).await?;
+            peer.user(&command["message"]).await?;
             peer.assistant("stop", "external answer").await?;
             peer.settle(false).await?;
             peer.ack(&command, "started").await?;
+            let (probe, _) = peer.command().await?;
+            assert_eq!(probe["type"], "get_state");
+            peer.frame(
+                json!({"type":"response","command":"get_state","id":probe["id"],
+                "success":true,"data":{"isStreaming":true}}),
+            )
+            .await?;
             Ok::<_, Box<dyn Error + Send + Sync>>(command)
         }
     );

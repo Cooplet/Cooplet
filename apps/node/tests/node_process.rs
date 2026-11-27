@@ -184,11 +184,23 @@ async fn foreground_cli_restarts_with_same_identity_and_replays_stop_without_sto
         .0
         .join(std::ffi::OsStr::from_bytes(b"client-binaries-\xff"));
     fs::create_dir(&client_path)?;
+    let first_bin = directory.0.join("first-bin");
+    fs::create_dir(&first_bin)?;
+    let shadow = first_bin.join("pi");
+    fs::write(&shadow, "#!/bin/sh\nexit 1\n")?;
+    // For the owning non-root user, execute permission for others does not apply.
+    let mode = if cooplet_platform::current_euid() == 0 {
+        0o644
+    } else {
+        0o645
+    };
+    fs::set_permissions(&shadow, fs::Permissions::from_mode(mode))?;
+    let path = std::env::join_paths([&first_bin, &client_path])?;
     let diagnose = || -> TestResult<Value> {
         let output = Command::new(COOPLET)
             .args(["node", "doctor", "--state-dir"])
             .arg(&state)
-            .env("PATH", &client_path)
+            .env("PATH", &path)
             .output()?;
         assert!(
             output.status.success(),

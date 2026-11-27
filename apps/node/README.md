@@ -85,6 +85,8 @@ A delivered receipt confirms Pi intake. Pi saves the assistant turn in its
 native history. To send a reply through Cooplet, the participant calls the
 Cooplet MCP `send_message` tool.
 
+A Pi extension can request another model response before the current turn
+settles. Cooplet waits for settlement and uses the final assistant response.
 If a Pi extension starts overlapping native runs and Pi's events cannot
 identify their completion, Node marks the participant unknown. Stop and
 resume the participant to reopen the conversation.
