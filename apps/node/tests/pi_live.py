@@ -58,7 +58,7 @@ class Provider(http.server.BaseHTTPRequestHandler):
         content = text(messages[user]["content"])
         results = [m for m in messages[user + 1:] if m["role"] == "tool"]
         self.server.requests.append((content, request))
-        if "Hold for cancellation." in content:
+        if "Hold for cancellation." in content or "Hold for native follow-up." in content:
             self.server.holding.set()
             self.server.release.wait(10)
         if "Return a provider error." in content:
@@ -374,6 +374,18 @@ def run_positive(binary, pi, area, server):
       });
     }
     """)
+    (extensions / "native-follow-up.ts").write_text("""export default function(pi) {
+      let pending = false;
+      pi.on("input", (event) => {
+        if (event.source === "rpc" && event.text.includes("Hold for native follow-up.")) pending = true;
+      });
+      pi.on("message_end", (event) => {
+        if (pending && event.message.role === "assistant") {
+          pending = false;
+          pi.sendUserMessage("Continue inside this native run.", { deliverAs: "followUp" });
+        }
+      });
+    }""")
     (area / "empty-path").mkdir()
     template = node.workspace / ".cooplet/agents/large"
     template.mkdir(parents=True)
@@ -423,6 +435,19 @@ def run_positive(binary, pi, area, server):
         ))
         assert public["sender_id"] == first and public["in_reply_to"] == sent["message_id"]
         node.finished(first, sent)
+
+        before = len(server.requests)
+        node.message(first, "Hold for native follow-up.")
+        assert server.holding.wait(5)
+        waiting = node.message(first, "Queued behind the native follow-up.", deferred=True)
+        server.release.set()
+        node.finished(first, waiting)
+        sequence = [content for content, _ in server.requests[before:]]
+        assert len(sequence) == 3 and "Hold for native follow-up." in sequence[0]
+        assert sequence[1] == "Continue inside this native run."
+        assert "Queued behind the native follow-up." in sequence[2]
+        server.holding.clear()
+        server.release.clear()
 
         held = "Hold for cancellation."
         held_receipt = node.message(first, held)

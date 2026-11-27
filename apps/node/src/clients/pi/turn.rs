@@ -112,7 +112,7 @@ pub(super) struct Turn {
     operation_key: String,
     input: [u8; 32],
     run: NativeRun,
-    saw_managed_user: bool,
+    verify_continuation_input: bool,
     saw_native_settle: bool,
     saw_manual_compaction_end: bool,
     assistant: Option<TurnResult>,
@@ -142,7 +142,7 @@ impl Turn {
             operation_key,
             input: Sha256::digest(message.as_bytes()).into(),
             run: NativeRun::Waiting,
-            saw_managed_user: false,
+            verify_continuation_input: false,
             saw_native_settle: false,
             saw_manual_compaction_end: false,
             assistant: None,
@@ -165,9 +165,16 @@ impl Turn {
             "message_start" if frame["message"]["role"] == "user" => {
                 return self.observe_user(&frame["message"]["content"]);
             }
+            "message_start"
+                if self.run == NativeRun::Managed && frame["message"]["role"] == "assistant" =>
+            {
+                self.verify_continuation_input = false;
+                self.assistant = None;
+            }
             "message_end"
                 if self.run == NativeRun::Managed && frame["message"]["role"] == "assistant" =>
             {
+                self.verify_continuation_input = false;
                 self.assistant = Some(final_assistant(&frame["message"]));
             }
             "compaction_end" if frame["reason"] == "manual" => {
@@ -188,6 +195,7 @@ impl Turn {
     }
 
     fn begin(&mut self) -> bool {
+        self.verify_continuation_input = self.run == NativeRun::Managed;
         if self.run == NativeRun::Waiting && self.accepted {
             self.awaiting_state_check = false;
         }
@@ -205,19 +213,19 @@ impl Turn {
     }
 
     fn observe_user(&mut self, content: &Value) -> bool {
-        // A started ACK followed by an unambiguous new run identifies that
-        // run even if a trusted Pi input hook transformed the user text.
-        if self.run == NativeRun::Managed && !self.saw_managed_user {
-            self.saw_managed_user = true;
+        self.assistant = None;
+        // Once a low-level run is identified, Pi can consume queued follow-ups
+        // within it. Only a new low-level start reopens the ownership question.
+        if self.run == NativeRun::Managed && !self.verify_continuation_input {
             return true;
         }
         let matches = user_input_digest(content) == Some(self.input);
+        self.verify_continuation_input = false;
         match self.run {
             NativeRun::Managed => matches,
             NativeRun::Unclaimed { conflicting: true } if matches => false,
             _ => {
                 self.run = if matches {
-                    self.saw_managed_user = true;
                     NativeRun::Managed
                 } else {
                     NativeRun::Unclaimed { conflicting: true }
@@ -321,7 +329,7 @@ impl State {
         let result = turn.finished.take()?;
         if turn.awaiting_state_check {
             turn.run = NativeRun::Waiting;
-            turn.saw_managed_user = false;
+            turn.verify_continuation_input = false;
             turn.assistant = None;
             return Some((turn.id.clone(), result));
         }

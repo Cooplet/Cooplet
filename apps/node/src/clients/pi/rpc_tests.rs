@@ -457,6 +457,37 @@ async fn assistant_continuation_finishes_on_the_last_native_run() -> TestResult 
 }
 
 #[tokio::test]
+async fn native_follow_up_uses_only_the_final_response_in_the_same_run() -> TestResult {
+    let (session, mut events, mut peer) = fixture()?;
+    for (index, final_reply) in [Some("final answer"), None].into_iter().enumerate() {
+        let operation = format!("follow-up-{index}");
+        let admission = AdmissionGuard::new(WAIT);
+        let (outcome, proof) = tokio::join!(
+            session.submit(operation.clone(), "original input", &admission),
+            async {
+                let (command, _) = peer.command().await?;
+                peer.ack(&command, "started").await?;
+                peer.begin(&command).await?;
+                peer.assistant("stop", "intermediate answer").await?;
+                peer.user(&json!("native follow-up input")).await?;
+                if let Some(reply) = final_reply {
+                    peer.assistant("stop", reply).await?;
+                }
+                peer.settle(false).await
+            }
+        );
+        proof?;
+        assert!(matches!(outcome, SubmitOutcome::Accepted { .. }));
+        let (status, text) = match final_reply {
+            Some(reply) => (TurnFinishStatus::Completed, reply),
+            None => (TurnFinishStatus::Failed, ""),
+        };
+        completed(&mut events, index as u64 * 3 + 1, &operation, status, text).await?;
+    }
+    Ok(())
+}
+
+#[tokio::test]
 async fn more_than_five_thousand_turns_release_all_per_turn_state() -> TestResult {
     let (session, mut events, mut peer) = fixture()?;
     for n in 0..5_001 {
