@@ -5,6 +5,7 @@ use std::{
     os::unix::{ffi::OsStrExt, process::CommandExt},
     path::{Path, PathBuf},
     process::Command,
+    sync::Arc,
     time::Duration,
 };
 
@@ -25,7 +26,7 @@ use tokio::signal::unix::{SignalKind, signal};
 use cooplet_node::{
     auth::{Credential, read_master},
     clients::{
-        AdapterConfig, AdapterRegistry, ParticipantPage, ParticipantView, TuiAttachPlan,
+        AdapterConfig, AdapterRegistry, ParticipantPage, ParticipantView, PiAdapter, TuiAttachPlan,
         list_templates,
     },
     config::{NodeConfig, check_offline_state, default_state_dir, operator_path},
@@ -218,8 +219,10 @@ async fn run_local_node(command: NodeCommand, dir: &Path) -> CliResult {
     }
 }
 
-fn adapter_registry() -> AdapterRegistry {
-    AdapterRegistry::default()
+fn adapter_registry() -> CliResult<AdapterRegistry> {
+    let mut registry = AdapterRegistry::default();
+    registry.register(Arc::new(PiAdapter))?;
+    Ok(registry)
 }
 
 async fn run_daemon(
@@ -237,7 +240,7 @@ async fn run_daemon(
     let mut config = NodeConfig::new(dir.to_owned(), workspace_dir);
     config.port = port;
     config.display_name = display_name;
-    let node = Node::open(config, adapter_registry()).await?;
+    let node = Node::open(config, adapter_registry()?).await?;
     let credential_path = operator_path(dir).canonicalize()?;
     let credential = Credential::read(&credential_path)?;
     let path_text = credential_path.to_str();
@@ -289,7 +292,7 @@ async fn doctor(dir: &Path, workspace_dir: Option<&Path>) -> CliResult {
     } else {
         check_offline_state(&dir).await?
     };
-    let registry = adapter_registry();
+    let registry = adapter_registry()?;
     let reports = registry
         .discover_all(&AdapterConfig {
             state_dir: dir.clone(),

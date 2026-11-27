@@ -1,6 +1,7 @@
 //! Native client contract. The Node selects a registered adapter by its opaque kind.
 
 mod binding;
+mod pi;
 mod registry;
 mod runtime;
 mod templates;
@@ -8,6 +9,7 @@ mod turn_input;
 
 pub use binding::*;
 pub use cooplet_protocol::{ApprovalAction, ApprovalDecision, ApprovalWait, ApprovalWaitKind};
+pub use pi::PiAdapter;
 pub use registry::AdapterRegistry;
 pub use runtime::*;
 pub use templates::{

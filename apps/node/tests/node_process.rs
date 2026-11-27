@@ -2,6 +2,7 @@ use std::{
     error::Error,
     fs, io,
     io::{BufRead, BufReader, Write},
+    os::unix::fs::PermissionsExt as _,
     path::{Path, PathBuf},
     process::{Child, ChildStdout, Command, Stdio},
     time::Duration,
@@ -179,13 +180,52 @@ async fn foreground_cli_restarts_with_same_identity_and_replays_stop_without_sto
         serde_json::from_slice::<Value>(&command(&state, &["node", "status"])?.stdout)?["status"],
         "ok"
     );
-    let diagnosis: Value = serde_json::from_slice(&command(&state, &["node", "doctor"])?.stdout)?;
+    let client_path = directory.0.join("client-binaries");
+    fs::create_dir(&client_path)?;
+    let diagnose = || -> TestResult<Value> {
+        let output = Command::new(COOPLET)
+            .args(["node", "doctor", "--state-dir"])
+            .arg(&state)
+            .env("PATH", &client_path)
+            .output()?;
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        Ok(serde_json::from_slice(&output.stdout)?)
+    };
+    let pi_report = |diagnosis: &Value| {
+        diagnosis["adapters"]
+            .as_array()
+            .and_then(|reports| reports.iter().find(|report| report["client_kind"] == "pi"))
+            .cloned()
+            .unwrap_or(Value::Null)
+    };
+    let diagnosis = diagnose()?;
     assert_eq!(diagnosis["running"], true);
-    assert_eq!(diagnosis["adapters"], json!([]));
+    assert_eq!(pi_report(&diagnosis)["available"], false);
     assert_eq!(
         diagnosis["workspace_dir"],
         json!(std::env::current_dir()?.canonicalize()?)
     );
+    let pi = client_path.join("pi");
+    fs::write(
+        &pi,
+        r#"#!/bin/sh
+case "$1" in
+  --help) printf '%s\n' '  --mode <mode> text, json, or rpc' '  --session <path>' '  --extension <path>' '  --model <id>' '  --thinking <level>' ;;
+  --version) printf '%s\n' '9.0.0' ;;
+  *) exit 1 ;;
+esac
+"#,
+    )?;
+    fs::set_permissions(&pi, fs::Permissions::from_mode(0o755))?;
+    let installed = pi_report(&diagnose()?);
+    assert_eq!(installed["available"], true);
+    assert_eq!(installed["version"], "9.0.0");
+    assert_eq!(installed["capabilities"]["supports_resume"], true);
+    assert_eq!(installed["capabilities"]["supports_tui_attach"], false);
     use std::os::unix::ffi::OsStrExt;
     let workspace = directory
         .0
