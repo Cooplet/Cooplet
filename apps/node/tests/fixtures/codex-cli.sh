@@ -1,6 +1,8 @@
 #!/bin/sh
 set -eu
 
+[ "${0##*/}" = codex ]
+
 if [ "$#" -eq 1 ] && [ "$1" = --help ]; then
     if [ "${COOPLET_FIXTURE_MODE:-}" != no-remote ]; then
         printf '    --remote <ADDR>\n'
@@ -25,6 +27,7 @@ case "$1" in
         fi
         ;;
     generate-json-schema)
+        [ "${COOPLET_FIXTURE_MODE:-}" != no-schema ]
         [ "$2" = --out ]
         mkdir -p "$3/v2"
         printf '%s\n' '{"definitions":{"TurnToolOutput":{"properties":{"namespace":{},"name":{},"output":{},"retain":{}}}},"properties":{"toolOutput":{},"outputSchema":{}}}' > "$3/v2/TurnStartParams.json"

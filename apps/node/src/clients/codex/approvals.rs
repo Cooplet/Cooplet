@@ -67,6 +67,15 @@ impl Approvals {
                 "Codex is waiting for additional permissions",
                 requested_permissions(&params["permissions"]).map(Reply::Permissions),
             ),
+            "mcpServer/elicitation/request"
+                if params["_meta"]["codex_approval_kind"] == "mcp_tool_call" =>
+            {
+                (
+                    ApprovalWaitKind::Permission,
+                    "Codex is waiting for MCP tool approval",
+                    None,
+                )
+            }
             "item/tool/requestUserInput" | "mcpServer/elicitation/request" => (
                 ApprovalWaitKind::Question,
                 "Codex is waiting for an answer",

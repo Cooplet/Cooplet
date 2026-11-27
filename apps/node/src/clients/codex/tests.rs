@@ -84,7 +84,7 @@ async fn live(
         let request = peer.recv().await?;
         peer.ack(
             &request,
-            json!({"thread": {"id": NATIVE_THREAD, "status":{"type":"idle"}}}),
+            json!({"thread": {"id": NATIVE_THREAD, "cwd": "/workspace", "status":{"type":"idle"}}}),
         )
         .await
     });
@@ -347,7 +347,7 @@ async fn accounts_invalidate_route_and_native_rejections_are_classified_after_on
             .ok_or_else(|| io::Error::other("missing live fixture"))?
             .session;
         timeout(LIMIT, async {
-            while session.snapshot().route_revision == 0 {
+            while session.snapshot().route_revision == Some(0) {
                 sleep(Duration::from_millis(1)).await;
             }
         })
@@ -375,6 +375,83 @@ async fn accounts_invalidate_route_and_native_rejections_are_classified_after_on
                 | ("unknown", SubmitOutcome::Unknown(_))
         ));
     }
+    Ok(())
+}
+
+#[tokio::test]
+async fn thread_settings_only_revoke_named_output_for_a_changed_own_route() -> Test {
+    for (thread, provider, cwd, named) in [
+        ("other", "custom", "/other", true),
+        (NATIVE_THREAD, "openai", "/workspace", true),
+        (NATIVE_THREAD, "custom", "/workspace", false),
+        (NATIVE_THREAD, "openai", "/other", false),
+    ] {
+        let (mut peer, handle, mut events) = live(Some(0), true).await?;
+        let adapter = CodexAdapter::new(None);
+        peer.send(json!({"method":"thread/settings/updated","params":{
+            "threadId":thread, "threadSettings":{"modelProvider":provider, "cwd":cwd}
+        }}))
+        .await?;
+        // Observe a later notification on the same stream before admitting the turn.
+        peer.state(json!({"type":"active","activeFlags":[]}))
+            .await?;
+        peer.state(json!({"type":"idle"})).await?;
+        assert!(matches!(
+            next(&mut events).await?.kind,
+            AdapterEventKind::StateChanged(State::Working)
+        ));
+        assert!(matches!(
+            next(&mut events).await?.kind,
+            AdapterEventKind::StateChanged(State::Idle)
+        ));
+        let (outcome, result) = tokio::join!(
+            adapter.submit_turn(&handle, submission(input(Some(AuthorKind::Agent))?, None)),
+            async {
+                let rpc = peer.recv().await?;
+                assert_eq!(rpc["params"]["toolOutput"].is_object(), named);
+                assert_eq!(rpc["params"]["input"][0]["type"] == "text", !named);
+                peer.ack(&rpc, json!({"turn":{"id":"routed"}})).await
+            }
+        );
+        result?;
+        assert!(matches!(outcome, SubmitOutcome::Accepted { .. }));
+    }
+    Ok(())
+}
+
+#[tokio::test]
+async fn saturated_transport_declines_interrupt_before_writing() -> Test {
+    let (mut peer, handle, mut events) = live(None, true).await?;
+    peer.begin("active").await?;
+    assert!(matches!(
+        next(&mut events).await?.kind,
+        AdapterEventKind::StateChanged(State::Working)
+    ));
+    let session = &handle
+        .downcast_ref::<Live>()
+        .ok_or_else(|| io::Error::other("missing live fixture"))?
+        .session;
+    let mut pending = Vec::new();
+    for _ in 0..transport::MAX_PENDING {
+        let mut rpc = Box::pin(session.rpc(
+            "thread/read",
+            json!({"threadId":NATIVE_THREAD, "includeTurns":false}),
+        ));
+        tokio::select! {
+            _ = &mut rpc => return Err(io::Error::other("unexpected read reply").into()),
+            received = peer.recv() => assert_eq!(received?["method"], "thread/read"),
+        }
+        pending.push(rpc);
+    }
+    let outcome = CodexAdapter::new(None)
+        .cancel_or_stop(&handle, cancel_turn())
+        .await?;
+    assert!(matches!(outcome, StopOutcome::Unavailable(_)));
+    assert!(
+        timeout(Duration::from_millis(25), peer.0.next())
+            .await
+            .is_err()
+    );
     Ok(())
 }
 
@@ -496,6 +573,29 @@ async fn written_turn_without_ack_is_unknown_and_transport_closes() -> Test {
             .await,
         SubmitOutcome::Unavailable(_)
     ));
+    Ok(())
+}
+
+#[tokio::test]
+async fn mcp_elicitation_distinguishes_tool_permission_from_an_ordinary_question() -> Test {
+    for (meta, expected) in [
+        (
+            json!({"codex_approval_kind":"mcp_tool_call"}),
+            ApprovalWaitKind::Permission,
+        ),
+        (Value::Null, ApprovalWaitKind::Question),
+    ] {
+        let (mut peer, _handle, mut events) = live(None, true).await?;
+        peer.callback(
+            json!(1),
+            "mcpServer/elicitation/request",
+            json!({"mode":"form", "_meta":meta}),
+        )
+        .await?;
+        assert!(matches!(next(&mut events).await?.kind,
+            AdapterEventKind::StateChanged(State::AwaitingApproval(wait))
+            if wait.kind == expected && !wait.can_respond_remotely && wait.action_hint.is_some()));
+    }
     Ok(())
 }
 

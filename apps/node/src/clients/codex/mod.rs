@@ -376,6 +376,9 @@ impl ClientAdapter for CodexAdapter {
                 return Ok(StopOutcome::Stopped);
             };
             let snapshot = live.session.snapshot();
+            if let State::Unknown { reason } = snapshot.state {
+                return Ok(StopOutcome::Unknown(reason));
+            }
             let Some(turn) = snapshot.active_turn else {
                 return Ok(match snapshot.state {
                     State::Idle | State::Stopped => StopOutcome::AlreadyGone,
@@ -402,9 +405,8 @@ impl ClientAdapter for CodexAdapter {
                     Err(Failure::Expired | Failure::Rejected(Rejection::NoIntake)) => {
                         StopOutcome::Unavailable("Codex could not accept the interrupt".into())
                     }
-                    Err(Failure::NotSent(reason) | Failure::Uncertain(reason)) => {
-                        StopOutcome::Unknown(reason.into())
-                    }
+                    Err(Failure::NotSent(reason)) => StopOutcome::Unavailable(reason.into()),
+                    Err(Failure::Uncertain(reason)) => StopOutcome::Unknown(reason.into()),
                     _ => StopOutcome::Unknown("Codex did not acknowledge the interrupt".into()),
                 },
             )

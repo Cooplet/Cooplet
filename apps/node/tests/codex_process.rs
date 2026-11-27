@@ -190,6 +190,9 @@ async fn stop_agent(client: &CoopletClient, id: &str, key: &str) -> Test {
 #[tokio::test]
 async fn cli_runs_codex_with_mcp_and_resumes_the_same_thread_in_a_new_group() -> Test {
     let fixture = Fixture::new()?;
+    // A multicall executable dispatches on its invocation name.
+    fs::rename(fixture.root.join("codex"), fixture.root.join("dispatcher"))?;
+    std::os::unix::fs::symlink("dispatcher", fixture.root.join("codex"))?;
     let (daemon, client) = fixture.start("ok").await?;
     let doctor = fixture.cli("ok", &["node", "doctor"])?;
     assert_eq!(doctor["adapters"][0]["available"], true);
@@ -226,6 +229,7 @@ async fn cli_runs_codex_with_mcp_and_resumes_the_same_thread_in_a_new_group() ->
     participant_state(&client, id, "idle").await?;
     let attach: Value = client.get_json(&path, &[]).await?;
     assert_eq!(attach["mode"], "exec");
+    assert_eq!(attach["program"], json!(fixture.root.join("codex")));
     assert_eq!(attach["args"][0], "--remote");
     assert_eq!(attach["args"][2], "resume");
     assert_eq!(attach["args"][3], THREAD);
@@ -360,6 +364,12 @@ async fn invalid_codex_peer_home_mcp_and_paths_fail_closed() -> Test {
 async fn doctor_rejects_missing_flags_and_bounds_a_hung_probe() -> Test {
     let fixture = Fixture::new()?;
     let (_daemon, _client) = fixture.start("ok").await?;
+    let no_schema = fixture.cli("no-schema", &["node", "doctor"])?;
+    assert_eq!(no_schema["adapters"][0]["available"], true);
+    assert_eq!(
+        no_schema["adapters"][0]["capabilities"]["supports_structured_output"],
+        false
+    );
     for (mode, detail) in [
         ("no-remote", "--remote"),
         ("probe-timeout", "stdio initialize"),

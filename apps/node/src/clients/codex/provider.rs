@@ -29,7 +29,7 @@ pub(super) async fn named_output_revision(
         // Startup routing discovery can emit account/updated while the first
         // account/read is pending. Confirm once more on the new observation.
         for _ in 0..2 {
-            let revision = session.snapshot().route_revision;
+            let revision = session.snapshot().route_revision?;
             let (account, config, requirements, providers) = tokio::try_join!(
                 session.rpc("account/read", json!({"refreshToken": false})),
                 session.rpc("config/read", json!({"cwd": cwd, "includeLayers": false})),
@@ -37,7 +37,7 @@ pub(super) async fn named_output_revision(
                 session.rpc("modelProvider/list", json!({})),
             )
             .ok()?;
-            if revision == session.snapshot().route_revision {
+            if Some(revision) == session.snapshot().route_revision {
                 return compatible(&account, &config, &requirements, &providers)
                     .then_some(revision);
             }

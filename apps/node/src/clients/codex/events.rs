@@ -24,7 +24,8 @@ pub(super) struct Snapshot {
     pub(super) state: State,
     pub(super) active_turn: Option<String>,
     pub(super) rollout_path: Option<PathBuf>,
-    pub(super) route_revision: u64,
+    // None when the live thread no longer matches the route checked at open.
+    pub(super) route_revision: Option<u64>,
 }
 
 impl Default for Snapshot {
@@ -33,7 +34,7 @@ impl Default for Snapshot {
             state: State::Starting,
             active_turn: None,
             rollout_path: None,
-            route_revision: 0,
+            route_revision: Some(0),
         }
     }
 }
@@ -42,6 +43,7 @@ pub(super) struct Observations {
     pub(super) thread_id: Option<String>,
     pub(super) approvals: Approvals,
     pub(super) snapshot: Snapshot,
+    opened_cwd: Option<String>,
     native_state: State,
     accepts_direct_input: bool,
     turns: BTreeMap<String, Turn>,
@@ -117,6 +119,7 @@ impl Observations {
             events,
             snapshots,
             snapshot: Snapshot::default(),
+            opened_cwd: None,
             native_state: State::Starting,
             accepts_direct_input: true,
             thread_id: None,
@@ -133,6 +136,7 @@ impl Observations {
         let thread = &result["thread"];
         let id = native_id(&thread["id"])?;
         self.thread_id = Some(id.to_owned());
+        self.opened_cwd = thread["cwd"].as_str().map(str::to_owned);
         self.snapshot.rollout_path = rollout_path(thread);
         self.accepts_direct_input = thread["canAcceptDirectInput"] != false;
         self.native_state = thread_state(thread, &self.hint);
@@ -160,7 +164,8 @@ impl Observations {
                 | "config/changed"
                 | "modelProvider/updated"
         ) {
-            self.snapshot.route_revision += 1;
+            self.snapshot.route_revision =
+                self.snapshot.route_revision.and_then(|n| n.checked_add(1));
             self.sync_snapshot();
             return Ok(());
         }
@@ -171,6 +176,16 @@ impl Observations {
             return Ok(());
         }
         match method {
+            "thread/settings/updated" => {
+                let settings = &params["threadSettings"];
+                if settings["modelProvider"] != "openai"
+                    || settings["cwd"].as_str() != self.opened_cwd.as_deref()
+                {
+                    self.snapshot.route_revision = None;
+                    self.sync_snapshot();
+                }
+                Ok(())
+            }
             "thread/closed" => {
                 self.native_state = State::Unavailable {
                     reason: "Codex closed the native thread".into(),

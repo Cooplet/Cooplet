@@ -17,7 +17,7 @@ use serde_json::{Value, json};
 use tokio::{
     net::UnixStream,
     sync::{mpsc, oneshot, watch},
-    time::{Instant, interval, sleep, timeout},
+    time::{Instant, sleep, sleep_until, timeout},
 };
 use tokio_tungstenite::{
     WebSocketStream, client_async_with_config,
@@ -36,7 +36,7 @@ const CONNECT_TIMEOUT: Duration = Duration::from_secs(3);
 const WRITE_TIMEOUT: Duration = Duration::from_secs(2);
 const RPC_TIMEOUT: Duration = Duration::from_secs(5);
 const TURN_ACK_TIMEOUT: Duration = Duration::from_secs(12);
-const MAX_PENDING: usize = 16;
+pub(super) const MAX_PENDING: usize = 16;
 const MAX_MESSAGE_BYTES: usize = 4 * 1024 * 1024;
 
 const QUEUED: u8 = 0;
@@ -304,16 +304,21 @@ async fn drive(
     let mut next_id = 1;
     let mut staged = None;
     let mut flush = None;
-    let mut check_cancelled = interval(Duration::from_millis(100));
     let reason = loop {
         tokio::select! {
             biased;
             _ = stop.changed() => break "codex_transport_stopped",
-            _ = check_cancelled.tick() => {
-                if flush.is_some_and(|deadline| Instant::now() >= deadline) {
-                    break "codex_write_timeout";
+            _ = async { if let Some(deadline) = flush { sleep_until(deadline).await } }, if flush.is_some() => {
+                break "codex_write_timeout";
+            }
+            _ = poll_fn(|cx| {
+                if pending.values_mut().any(|entry: &mut Pending| entry.result.poll_closed(cx).is_ready()) {
+                    Poll::Ready(())
+                } else {
+                    Poll::Pending
                 }
-                if pending.values().any(|entry: &Pending| entry.exchange == Exchange::Turn && entry.result.is_closed()) {
+            }), if !pending.is_empty() => {
+                if pending.values().any(|entry| entry.exchange == Exchange::Turn && entry.result.is_closed()) {
                     break "codex_turn_acknowledgement_lost";
                 }
                 pending.retain(|_, entry| !entry.result.is_closed());
@@ -506,7 +511,7 @@ fn prepare(operation: &Operation, observed: &Observations, id: u64) -> Result<Pr
             }
             let mut params = json!({"threadId": observed.thread_id});
             if let Some((name, revision)) = tool
-                && *revision == observed.snapshot.route_revision
+                && Some(*revision) == observed.snapshot.route_revision
             {
                 params["input"] = json!([]);
                 params["toolOutput"] = json!({"namespace": "cooplet", "name": name, "output": rendered, "retain": false});

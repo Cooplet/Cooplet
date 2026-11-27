@@ -16,7 +16,7 @@ use tokio::{
 };
 
 use super::{CAPABILITIES, KIND};
-use crate::clients::DiscoveryReport;
+use crate::clients::{AdapterCapabilities, DiscoveryReport};
 
 const PROBE_TIMEOUT: Duration = Duration::from_secs(3);
 const HELP_TIMEOUT: Duration = Duration::from_secs(2);
@@ -24,7 +24,8 @@ const MAX_PROBE_BYTES: u64 = 128 * 1024;
 
 pub(super) fn executable(override_path: Option<&Path>) -> Option<PathBuf> {
     fn checked(path: &Path) -> Option<PathBuf> {
-        let absolute = path.canonicalize().ok()?;
+        // A multicall shim selects Codex by its invocation name.
+        let absolute = std::path::absolute(path).ok()?;
         let file = absolute.metadata().ok()?;
         (file.is_file() && can_execute(&absolute).ok() == Some(true)).then_some(absolute)
     }
@@ -45,89 +46,94 @@ pub(super) fn initialize_params() -> Value {
 
 pub(super) async fn discover(override_path: Option<&Path>) -> DiscoveryReport {
     let Some(binary) = executable(override_path) else {
-        return report(
+        return unavailable(
             None,
-            None,
-            Some(if override_path.is_some() {
+            if override_path.is_some() {
                 "COOPLET_CODEX_BIN does not point to an executable file"
             } else {
                 "Codex was not found on PATH"
-            }),
+            },
         );
     };
     if binary.to_str().is_none() {
-        return report(None, None, Some("The Codex executable path is not UTF-8"));
+        return unavailable(None, "The Codex executable path is not UTF-8");
     }
 
-    let result = async {
-        let app_help = help(&binary, &["app-server", "--help"]).await?;
-        let cli_help = help(&binary, &["--help"]).await?;
-        if !has_flag(&app_help, "--listen") || !has_flag(&cli_help, "--remote") {
-            return Err("Codex lacks the required --listen or --remote flag");
-        }
+    match discover_binary(binary.clone()).await {
+        Ok((version, supports_structured_output)) => DiscoveryReport {
+            client_kind: KIND.into(),
+            available: true,
+            binary_path: Some(binary),
+            version,
+            capabilities: AdapterCapabilities {
+                supports_structured_output,
+                ..CAPABILITIES
+            },
+            detail: None,
+        },
+        Err(detail) => unavailable(Some(binary), detail),
+    }
+}
 
+async fn discover_binary(binary: PathBuf) -> Result<(Option<String>, bool), &'static str> {
+    let app_help = help(&binary, &["app-server", "--help"]).await?;
+    let cli_help = help(&binary, &["--help"]).await?;
+    if !has_flag(&app_help, "--listen") || !has_flag(&cli_help, "--remote") {
+        return Err("Codex lacks the required --listen or --remote flag");
+    }
+
+    // Keep the disposable home alive through both bounded probes if discovery is cancelled.
+    tokio::spawn(async move {
         let home = ProbeHome::new().map_err(|_| "Could not prepare an isolated Codex probe")?;
         let params = initialize_params();
+        let schema = home.0.join("schema");
         let mut cmd = Command::new(&binary);
         cmd.args(["app-server", "--stdio"])
             .env("CODEX_HOME", &home.0)
             .current_dir(&home.0)
             .stdin(Stdio::piped());
-        run_probe(
-            cmd,
-            PROBE_TIMEOUT,
-            false,
-            Some(home),
-            |mut input, output| async move {
-                let input = input
-                    .as_mut()
-                    .ok_or_else(|| io::Error::other("missing probe stdin"))?;
-                let packet = json!({"id": 1, "method": "initialize", "params": params});
-                input.write_all(packet.to_string().as_bytes()).await?;
-                input.write_all(b"\n").await?;
-                let mut line = Vec::new();
-                BufReader::new(output.take(MAX_PROBE_BYTES))
-                    .read_until(b'\n', &mut line)
-                    .await?;
-                let message: Value = serde_json::from_slice(&line)?;
-                if message["id"] != 1
-                    || !message["result"]["codexHome"]
-                        .as_str()
-                        .is_some_and(|home| !home.is_empty())
-                {
-                    return Err(io::Error::other("invalid initialize response"));
-                }
-                Ok(message["result"]["userAgent"]
+        let initialize = run_probe(cmd, PROBE_TIMEOUT, false, |mut input, output| async move {
+            let input = input
+                .as_mut()
+                .ok_or_else(|| io::Error::other("missing probe stdin"))?;
+            let packet = json!({"id": 1, "method": "initialize", "params": params});
+            input.write_all(packet.to_string().as_bytes()).await?;
+            input.write_all(b"\n").await?;
+            let mut line = Vec::new();
+            BufReader::new(output.take(MAX_PROBE_BYTES))
+                .read_until(b'\n', &mut line)
+                .await?;
+            let message: Value = serde_json::from_slice(&line)?;
+            if message["id"] != 1
+                || !message["result"]["codexHome"]
                     .as_str()
-                    .and_then(safe_version))
-            },
-        )
-        .await
-        .ok_or("Codex did not complete the stdio initialize probe")
-    }
-    .await;
-    match result {
-        Ok(version) => report(Some(binary), version, None),
-        Err(detail) => report(Some(binary), None, Some(detail)),
-    }
+                    .is_some_and(|home| !home.is_empty())
+            {
+                return Err(io::Error::other("invalid initialize response"));
+            }
+            Ok(message["result"]["userAgent"]
+                .as_str()
+                .and_then(safe_version))
+        });
+        let (version, features) =
+            tokio::join!(initialize, wire_features(&binary, &schema, &home.0));
+        Ok((
+            version.ok_or("Codex did not complete the stdio initialize probe")?,
+            features.output_schema,
+        ))
+    })
+    .await
+    .map_err(|_| "Codex discovery could not complete")?
 }
 
-fn report(
-    binary_path: Option<PathBuf>,
-    version: Option<String>,
-    detail: Option<&str>,
-) -> DiscoveryReport {
+fn unavailable(binary_path: Option<PathBuf>, detail: &str) -> DiscoveryReport {
     DiscoveryReport {
         client_kind: KIND.into(),
-        available: detail.is_none(),
+        available: false,
         binary_path,
-        version,
-        capabilities: if detail.is_none() {
-            CAPABILITIES
-        } else {
-            Default::default()
-        },
-        detail: detail.map(str::to_owned),
+        version: None,
+        capabilities: AdapterCapabilities::default(),
+        detail: Some(detail.to_owned()),
     }
 }
 
@@ -149,7 +155,7 @@ fn has_flag(help: &str, flag: &str) -> bool {
 async fn help(binary: &Path, args: &[&str]) -> Result<String, &'static str> {
     let mut command = Command::new(binary);
     command.args(args);
-    run_probe(command, HELP_TIMEOUT, true, None, |_, output| async move {
+    run_probe(command, HELP_TIMEOUT, true, |_, output| async move {
         let mut help = String::new();
         output
             .take(MAX_PROBE_BYTES)
@@ -173,7 +179,7 @@ pub(super) async fn wire_features(binary: &Path, directory: &Path, home: &Path) 
         .args(["app-server", "generate-json-schema", "--out"])
         .arg(directory)
         .env("CODEX_HOME", home);
-    let generated = run_probe(command, PROBE_TIMEOUT, true, None, |_, output| async move {
+    let generated = run_probe(command, PROBE_TIMEOUT, true, |_, output| async move {
         // Wait for command completion and bound output even if the CLI is broken.
         let bytes =
             tokio::io::copy(&mut output.take(MAX_PROBE_BYTES), &mut tokio::io::sink()).await?;
@@ -219,7 +225,6 @@ async fn run_probe<T, F, Fut>(
     mut command: Command,
     deadline: Duration,
     require_success: bool,
-    probe_home: Option<ProbeHome>,
     read: F,
 ) -> Option<T>
 where
@@ -230,7 +235,6 @@ where
     command.stdout(Stdio::piped()).stderr(Stdio::null());
     // This task retains the process group if the caller abandons the probe.
     tokio::spawn(async move {
-        let _probe_home = probe_home;
         let mut handle = tokio::task::spawn_blocking(move || {
             match ProcessHandle::spawn_isolated_group(&mut command) {
                 Ok(handle) => Some(handle),

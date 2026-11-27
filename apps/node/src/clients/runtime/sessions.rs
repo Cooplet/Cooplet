@@ -461,7 +461,7 @@ impl SubmitSlot {
                 admission.expire();
                 if started.load(Ordering::Relaxed) {
                     match acknowledged.as_mut().now_or_never() {
-                        Some(Ok(accepted @ SubmitOutcome::Accepted { .. })) => accepted,
+                        Some(Ok(outcome)) => outcome,
                         _ => SubmitOutcome::Unknown("session closed during submit".into()),
                     }
                 } else {
@@ -1159,6 +1159,40 @@ mod tests {
         assert_eq!(terminal.structured, Some(json!({"id":"acknowledged"})));
         assert_eq!(live.state(), ParticipantState::Unknown);
         assert!(live.try_submit("later").is_err());
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn ready_no_intake_survives_event_stream_loss() -> SessionTestResult {
+        use std::time::Duration;
+
+        let (ack, receiver) = tokio::sync::oneshot::channel();
+        let live = live_session_with(StubAck::new(Some(receiver)))?;
+        let mut slot = live
+            .try_submit("rejected")
+            .map_err(|err| format!("{err:?}"))?;
+        let submit = slot.submit(super::SubmitTurnRequest {
+            operation_key: "rejected".into(),
+            message_id: None,
+            input: test_turn_input()?,
+            output_schema: None,
+            steer: false,
+            admission: cooplet_platform::AdmissionGuard::new(Duration::from_secs(10)),
+        });
+        tokio::pin!(submit);
+        assert!(
+            submit
+                .as_mut()
+                .poll(&mut std::task::Context::from_waker(std::task::Waker::noop()))
+                .is_pending()
+        );
+        ack.send(super::SubmitOutcome::Unavailable(
+            "native server is draining".into(),
+        ))
+        .map_err(|_| "stub acknowledgement receiver closed")?;
+        live.disconnect();
+        assert!(matches!(submit.await, super::SubmitOutcome::Unavailable(_)));
+        assert_eq!(live.state(), ParticipantState::Unknown);
         Ok(())
     }
 

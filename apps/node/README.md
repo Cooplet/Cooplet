@@ -90,7 +90,8 @@ Install and sign in to the Codex CLI, then run `cooplet node doctor` to check
 discovery. The Node finds `codex` on `PATH`. Set `COOPLET_CODEX_BIN` to select
 a specific executable for both `node doctor` and `node run`. Discovery checks
 app-server initialization in an isolated temporary Codex home and checks the
-required CLI flags. The reported version is diagnostic.
+required CLI flags. The reported structured-output capability comes from the
+installed CLI's schema. The reported version is diagnostic.
 
 Create a participant with `POST /v1/agents` and `"client_kind": "codex"` or a
 template using that client. A template can set `model`, `effort`, `approval`
@@ -115,8 +116,8 @@ message has been taken in by Codex. If a TUI user submits at the same time,
 Codex may handle both inputs in the same turn and produce one result.
 
 After the first saved turn, use `cooplet node attach NAME` to open that
-conversation interactively. Use the TUI to answer questions or resolve
-approvals that are available only there. For supported permission requests,
+conversation interactively. Use the TUI to answer questions and approve MCP
+tool prompts. For permission requests that support a remote response,
 `cooplet node approve NAME` and `cooplet node deny NAME` can send a response.
 An exact response uses `--approval-id ID --operation-key KEY`. Codex can report
 that a request was resolved without identifying which client answered, so
