@@ -26,7 +26,10 @@ use std::{
     path::{Path, PathBuf},
     process::{ChildStderr, ChildStdin, ChildStdout, Command},
     str::FromStr,
-    sync::Arc,
+    sync::{
+        Arc,
+        atomic::{AtomicBool, Ordering},
+    },
 };
 
 use cooplet_platform::{AdmissionGuard, ProcessIdentity};
@@ -173,6 +176,7 @@ pub enum SessionOpenMode {
 #[derive(Clone, Default)]
 pub struct OpenPreparation {
     rollback: Arc<tokio::sync::Mutex<Option<OpenRollback>>>,
+    before_managed_launch: Arc<AtomicBool>,
 }
 
 pub type OpenRollback = Box<dyn FnOnce() -> std::io::Result<()> + Send>;
@@ -186,6 +190,29 @@ impl OpenPreparation {
         tokio::task::spawn_blocking(move || job(&mut rollback))
             .await
             .map_err(NodeError::internal)?
+    }
+
+    /// The adapter awaits this preparation directly, before it can request a
+    /// managed launch or cause any other native effect in this open attempt.
+    pub(crate) async fn run_before_managed_launch<T: Send + 'static>(
+        &self,
+        job: impl FnOnce(&mut Option<OpenRollback>) -> Result<T> + Send + 'static,
+    ) -> Result<T> {
+        struct Waiting<'a>(&'a AtomicBool);
+
+        impl Drop for Waiting<'_> {
+            fn drop(&mut self) {
+                self.0.store(false, Ordering::Release);
+            }
+        }
+
+        self.before_managed_launch.store(true, Ordering::Release);
+        let _waiting = Waiting(&self.before_managed_launch);
+        self.run(job).await
+    }
+
+    fn awaiting_managed_preparation(&self) -> bool {
+        self.before_managed_launch.load(Ordering::Acquire)
     }
 
     async fn wait(&self) {

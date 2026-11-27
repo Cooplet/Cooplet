@@ -31,7 +31,7 @@ use super::{
     approvals::abandon_inflight_approval,
     bad_data, busy, invalid, lock, not_found,
     participants::{ParticipantRow, load_participant, runtime_dir},
-    processes::OpeningSpawner,
+    processes::{LaunchOutcome, OpeningSpawner},
     sessions::{LiveSession, run_events},
     state::{ApprovalSource, enter_awaiting_approval, participant_event},
     stop::{StopUpdate, finish_stop},
@@ -89,6 +89,11 @@ pub(super) type WriteResult<T> = std::result::Result<WriteOutcome<T>, WriteError
 pub(super) enum Reservation<T> {
     Replay(Value),
     New(T),
+}
+
+struct NativeOpenTimeout {
+    admission_closed: bool,
+    awaiting_managed_preparation: bool,
 }
 
 impl AgentService {
@@ -556,23 +561,46 @@ impl AgentService {
                 if admission.is_some_and(AdmissionGuard::is_expired) {
                     return Err(admission_expired());
                 }
-                tokio::time::timeout(OPEN_REQUEST_TIMEOUT, plan.adapter.create_or_resume(request))
+                let mut opening = plan.adapter.create_or_resume(request);
+                // Keep the adapter future alive until we sample what it was
+                // awaiting. Its preparation worker may have completed without
+                // returning control to the adapter before the timed-out poll.
+                let outcome = tokio::time::timeout(OPEN_REQUEST_TIMEOUT, opening.as_mut())
                     .await
-                    .map_err(|_| unknown("native_open_timed_out"))?
-                    // Adapter-controlled diagnostics can contain credentials.
-                    .map_err(|error| {
-                        NodeError::new(
-                            error.code(),
-                            "The adapter could not open its native session",
-                        )
-                        .with_extension("reason", "native_open_failed")
-                    })
+                    .map_err(|_| NativeOpenTimeout {
+                        admission_closed: admission.is_some_and(AdmissionGuard::is_expired),
+                        awaiting_managed_preparation: preparation.awaiting_managed_preparation(),
+                    });
+                Ok(outcome)
             })
             .await;
         // A detached spawn may still be publishing its process identity.
         // Rollback needs ownership settled before it checks for the child.
-        let launch_expired = spawner.seal().await;
-        if launch_expired && result.is_err() {
+        let launch = spawner.seal().await;
+        let result = match result {
+            Ok(Ok(result)) => result.map_err(|error| {
+                // Adapter-controlled diagnostics can contain credentials.
+                NodeError::new(
+                    error.code(),
+                    "The adapter could not open its native session",
+                )
+                .with_extension("reason", "native_open_failed")
+            }),
+            Ok(Err(NativeOpenTimeout {
+                admission_closed,
+                awaiting_managed_preparation,
+            })) => {
+                if admission_closed
+                    && (launch == LaunchOutcome::AdmissionExpired
+                        || (launch == LaunchOutcome::Unused && awaiting_managed_preparation))
+                {
+                    return Err(admission_expired());
+                }
+                return Err(unknown("native_open_timed_out"));
+            }
+            Err(error) => Err(error),
+        };
+        if launch == LaunchOutcome::AdmissionExpired && result.is_err() {
             return Err(admission_expired());
         }
         let opened = result?;

@@ -366,6 +366,34 @@ impl Fixture {
         }).await?)
     }
 
+    async fn arm_direct_recovery(&mut self, thread: &ThreadId) -> TestResult<i64> {
+        let disputed = self
+            .post(thread, "expiry-recovery-first", "@worker first")
+            .await?;
+        self.attempt()
+            .await?
+            .complete(ThreadDeliveryOutcome::Unknown)?;
+        self.settle().await?;
+
+        let expiry = disputed.created_at_ms + threads::RETENTION_MS;
+        self.wall.store(expiry - 1, Ordering::Relaxed);
+        let resumed = threads::resume(
+            &self.state,
+            &self.admin,
+            thread.clone(),
+            "expiry-recovery-resume",
+            ThreadMemberResumeRequest {
+                member_key: Some(self.member_key()),
+                after_seq: 0,
+            },
+        )
+        .await?;
+        assert_eq!(resumed.delivery_generation, 1);
+        assert_eq!(self.resume_through(thread).await?, Some(1));
+        self.settle().await?;
+        Ok(expiry)
+    }
+
     async fn post(
         &self,
         thread: &ThreadId,
@@ -501,7 +529,7 @@ async fn offline_direct_resume_delivers_once_after_idle_and_preserves_normal_dir
 -> TestResult {
     let mut fixture = Fixture::new(false).await?;
     let board = fixture.board(DeliveryMode::DirectNow).await?;
-    fixture
+    let first = fixture
         .post(&board, "resume-regression-first", "@worker please review")
         .await?;
     fixture
@@ -520,6 +548,8 @@ async fn offline_direct_resume_delivers_once_after_idle_and_preserves_normal_dir
         Ok(WriteOutcome::new(()))
     }).await?;
 
+    let expiry = first.created_at_ms + threads::RETENTION_MS;
+    fixture.wall.store(expiry - 1, Ordering::Relaxed);
     let resumed = threads::resume(
         &fixture.state,
         &fixture.admin,
@@ -535,8 +565,6 @@ async fn offline_direct_resume_delivers_once_after_idle_and_preserves_normal_dir
     assert!(resumed.pending.is_none());
     fixture.settle().await?;
 
-    fixture.reconnect_working().await?;
-    fixture.settle().await?;
     fixture
         .post(
             &board,
@@ -545,11 +573,18 @@ async fn offline_direct_resume_delivers_once_after_idle_and_preserves_normal_dir
         )
         .await?;
     fixture.settle().await?;
+    assert_eq!(fixture.resume_through(&board).await?, Some(3));
+    fixture.wall.store(expiry + 1, Ordering::Relaxed);
+    fixture.reconnect_working().await?;
+    fixture.settle().await?;
     fixture.set_worker(ParticipantState::Idle).await?;
     let recovery = fixture.attempt().await?;
     assert_eq!(recovery.payload.delivery_generation, 1);
     assert_eq!(recovery.payload.delivery_mode, DeliveryMode::DirectNow);
     assert_eq!((recovery.payload.from_seq, recovery.payload.to_seq), (1, 3));
+    assert!(recovery.payload.truncated_earlier);
+    assert_eq!(recovery.payload.posts.len(), 1);
+    assert_eq!(recovery.payload.posts[0].seq, 3);
     recovery.complete(ThreadDeliveryOutcome::Delivered)?;
     fixture.settle().await?;
 
@@ -572,30 +607,7 @@ async fn offline_direct_resume_delivers_once_after_idle_and_preserves_normal_dir
 async fn deferred_direct_wake_survives_expiry_of_the_original_recovery_range() -> TestResult {
     let mut fixture = Fixture::new(true).await?;
     let thread = fixture.board(DeliveryMode::DirectNow).await?;
-    let first = fixture
-        .post(&thread, "expiry-recovery-first", "@worker first")
-        .await?;
-    fixture
-        .attempt()
-        .await?
-        .complete(ThreadDeliveryOutcome::Unknown)?;
-    fixture.settle().await?;
-
-    let expiry = first.created_at_ms + threads::RETENTION_MS;
-    fixture.wall.store(expiry - 1, Ordering::Relaxed);
-    let resumed = threads::resume(
-        &fixture.state,
-        &fixture.admin,
-        thread.clone(),
-        "expiry-recovery-resume",
-        ThreadMemberResumeRequest {
-            member_key: Some(fixture.member_key()),
-            after_seq: 0,
-        },
-    )
-    .await?;
-    assert_eq!(resumed.delivery_generation, 1);
-    assert_eq!(fixture.resume_through(&thread).await?, Some(1));
+    let expiry = fixture.arm_direct_recovery(&thread).await?;
 
     fixture
         .post(&thread, "expiry-recovery-context", "More context")
@@ -636,4 +648,57 @@ async fn deferred_direct_wake_survives_expiry_of_the_original_recovery_range() -
     fixture.settle().await?;
     assert_eq!(fixture.resume_through(&thread).await?, None);
     fixture.close().await
+}
+
+#[tokio::test]
+async fn ack_for_a_recovery_prefix_preserves_a_newer_direct_wake() -> TestResult {
+    use ThreadDeliveryOutcome as Outcome;
+
+    for (outcome, expected_from, expected_posts) in [
+        (Outcome::Busy, 1, &[2_u64][..]),
+        (Outcome::Delivered, 2, &[2][..]),
+        (Outcome::Rejected, 1, &[1, 2][..]),
+    ] {
+        let mut fixture = Fixture::new(true).await?;
+        let thread = fixture.board(DeliveryMode::DirectNow).await?;
+        let expiry = fixture.arm_direct_recovery(&thread).await?;
+
+        fixture.set_worker(ParticipantState::Idle).await?;
+        let prefix = fixture.attempt().await?;
+        assert_eq!((prefix.payload.from_seq, prefix.payload.to_seq), (1, 1));
+        fixture.set_worker(ParticipantState::Working).await?;
+        fixture
+            .post(&thread, "pending-recovery-tail", "@worker new request")
+            .await?;
+        assert_eq!(fixture.resume_through(&thread).await?, Some(2));
+        prefix.complete(outcome)?;
+        fixture.settle().await?;
+        assert_eq!(fixture.resume_through(&thread).await?, Some(2));
+
+        if outcome == Outcome::Busy {
+            fixture.wall.store(expiry + 1, Ordering::Relaxed);
+        }
+        fixture.set_worker(ParticipantState::Idle).await?;
+        let tail = fixture.attempt().await?;
+        assert_eq!(
+            (tail.payload.from_seq, tail.payload.to_seq),
+            (expected_from, 2)
+        );
+        assert_eq!(tail.payload.delivery_generation, 1);
+        assert_eq!(tail.payload.truncated_earlier, outcome == Outcome::Busy);
+        assert_eq!(
+            tail.payload
+                .posts
+                .iter()
+                .map(|post| post.seq)
+                .collect::<Vec<_>>()
+                .as_slice(),
+            expected_posts
+        );
+        tail.complete(Outcome::Delivered)?;
+        fixture.settle().await?;
+        assert_eq!(fixture.resume_through(&thread).await?, None);
+        fixture.close().await?;
+    }
+    Ok(())
 }

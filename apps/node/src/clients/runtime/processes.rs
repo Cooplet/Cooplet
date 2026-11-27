@@ -49,7 +49,13 @@ pub(super) struct OpeningSpawner {
 
 enum OpeningState {
     Available,
-    Sealed,
+    Sealed(LaunchOutcome),
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(super) enum LaunchOutcome {
+    Unused,
+    Attempted,
     AdmissionExpired,
 }
 
@@ -67,14 +73,16 @@ impl OpeningSpawner {
         }
     }
 
-    /// Wait for the current launch attempt and prevent another. The result
-    /// records expiry proven by the worker at the process creation boundary.
-    pub(super) async fn seal(&self) -> bool {
+    /// Wait for the current launch attempt and prevent another.
+    pub(super) async fn seal(&self) -> LaunchOutcome {
         let mut state = self.state.lock().await;
-        if matches!(*state, OpeningState::Available) {
-            *state = OpeningState::Sealed;
+        match *state {
+            OpeningState::Sealed(outcome) => outcome,
+            OpeningState::Available => {
+                *state = OpeningState::Sealed(LaunchOutcome::Unused);
+                LaunchOutcome::Unused
+            }
         }
-        matches!(*state, OpeningState::AdmissionExpired)
     }
 }
 
@@ -88,14 +96,14 @@ impl ManagedProcessSpawner for OpeningSpawner {
             if !matches!(*state, OpeningState::Available) {
                 return Err(SpawnManagedError::AlreadySpawned);
             }
-            *state = OpeningState::Sealed;
+            *state = OpeningState::Sealed(LaunchOutcome::Attempted);
             let service = self.service.clone();
             let key = self.key.clone();
             let admission = self.admission.clone();
             tokio::spawn(async move {
                 let result = spawn_owned(service, key, command, admission).await;
                 if matches!(&result, Err(SpawnManagedError::AdmissionExpired)) {
-                    *state = OpeningState::AdmissionExpired;
+                    *state = OpeningState::Sealed(LaunchOutcome::AdmissionExpired);
                 }
                 result
             })

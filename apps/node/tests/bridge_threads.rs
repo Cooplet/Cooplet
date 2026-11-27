@@ -490,8 +490,12 @@ async fn failed_open_does_not_interrupt_an_inflight_command(
     tokio::time::sleep_until(late_ack).await;
     assert!(!existing.is_finished());
     acknowledgement
-        .send(SubmitOutcome::Accepted { native_turn_id: None })
-        .map_err(|_| io::Error::other("the admitted command no longer accepted its acknowledgement"))?;
+        .send(SubmitOutcome::Accepted {
+            native_turn_id: None,
+        })
+        .map_err(|_| {
+            io::Error::other("the admitted command no longer accepted its acknowledgement")
+        })?;
     assert_eq!(existing.await??["delivery_state"], "delivered");
     Ok(())
 }

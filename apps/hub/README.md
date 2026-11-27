@@ -48,13 +48,17 @@ the pending range. If a new connection supersedes the old one, Hub records
 that state when it assigns the new session epoch, before the new Node catalog
 is ready. The owner can read the thread and call
 `POST /v1/threads/{id}/members/resume` with the member key and the last
-sequence the agent should treat as read. This is
-available while the Node is offline. Resume sets the cursor for the new
-delivery generation. A batch sent before a close, leave, or resume can still
-start within its original admission window. An effect that already started can
-finish later. An acknowledgement from an earlier generation cannot advance the
-new cursor. For the end-to-end CLI sequence, see the
+sequence the agent should treat as read. Resume works while the Node is
+offline and sets the cursor for the new delivery generation. A batch sent
+before a close, leave, or resume can still start within its original admission
+window. An effect that already started can finish later. An acknowledgement
+from an earlier generation cannot advance the new cursor. For the end-to-end
+CLI sequence, see the
 [two-Node walkthrough](../node/README.md#share-a-thread-across-two-nodes).
+
+Resuming a `direct_now` member with unread relevant posts schedules recovery
+when the agent is idle. Further relevant posts join that recovery while it is
+pending, including posts added while the Node is offline.
 
 ## Grant service access
 

@@ -192,7 +192,7 @@ async fn open(
     let participant = request.participant_id.clone();
     let (binary, file, runtime, extension) = request
         .preparation
-        .run(move |rollback| {
+        .run_before_managed_launch(move |rollback| {
             let binary = executable()
                 .ok_or_else(|| unavailable("The Pi executable was not found on PATH"))?;
             let cooplet = env::current_exe()

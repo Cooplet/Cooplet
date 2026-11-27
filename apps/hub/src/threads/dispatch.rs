@@ -686,20 +686,21 @@ fn finish(
 ) -> rusqlite::Result<WriteOutcome<bool>> {
     let delivered = outcome == ThreadDeliveryOutcome::Delivered;
     let unknown = outcome == ThreadDeliveryOutcome::Unknown;
-    let rejected = outcome == ThreadDeliveryOutcome::Rejected;
+    let retire_covered = delivered || outcome == ThreadDeliveryOutcome::Rejected;
     let changed = tx.execute(
         "UPDATE thread_members SET state=CASE WHEN ?1 THEN 'paused_unknown' ELSE state END,
            confirmed_seq=CASE WHEN ?2 THEN MAX(confirmed_seq,?3) ELSE confirmed_seq END,
            pending_delivery_id=CASE WHEN ?1 THEN pending_delivery_id ELSE NULL END,
            pending_from_seq=CASE WHEN ?1 THEN pending_from_seq ELSE NULL END,
            pending_to_seq=CASE WHEN ?1 THEN pending_to_seq ELSE NULL END,
-           resume_through_seq=CASE WHEN ?1 OR ?2 OR ?10 THEN NULL ELSE resume_through_seq END
+           resume_through_seq=CASE WHEN ?1 OR (?10 AND resume_through_seq<=?3) THEN NULL
+                                   ELSE resume_through_seq END
          WHERE thread_id=?4 AND member_key=?5 AND node_id=?6 AND state='active' AND delivery_generation=?7
            AND pending_delivery_id=?8 AND pending_to_seq=?3
            AND EXISTS(SELECT 1 FROM nodes WHERE node_id=?6 AND session_epoch=?9)",
         params![unknown, delivered, delivery.to_seq, delivery.candidate.thread_id.as_str(),
             delivery.member_key, delivery.node_id.as_str(), delivery.generation,
-            delivery.delivery_id.as_str(), delivery.epoch, rejected],
+            delivery.delivery_id.as_str(), delivery.epoch, retire_covered],
     )?;
     let mut notices = Vec::new();
     if changed != 0 {
