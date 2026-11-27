@@ -2,9 +2,11 @@ use std::{error::Error, fs, path::PathBuf, sync::Arc, time::Duration};
 
 use axum::body::to_bytes;
 use bytes::Bytes;
-use cooplet_client::{IDEMPOTENCY_KEY, X_COOPLET_FILENAME, X_COOPLET_SHA256};
+use cooplet_client::{
+    IDEMPOTENCY_KEY, X_COOPLET_FILENAME, X_COOPLET_PARTICIPANT, X_COOPLET_SHA256,
+};
 use cooplet_platform::PrivateFs;
-use cooplet_protocol::EventId;
+use cooplet_protocol::{EventId, ParticipantId, ThreadId};
 use cooplet_storage::{StorageEngine, WriteOutcome};
 use futures_util::stream;
 use http::{HeaderMap, StatusCode};
@@ -113,7 +115,7 @@ impl Fixture {
         self.state
             .db
             .write::<_, HubError, _>(move |tx| {
-                attach_to_node(tx, &admin, &node, &[attachment], now)?;
+                attach_to_node(tx, &admin, &node, None, &[attachment], now)?;
                 Ok(WriteOutcome::new(()))
             })
             .await?;
@@ -405,7 +407,14 @@ async fn enrolled_node_can_attach_own_blob_only_to_its_own_node() -> TestResult 
         .state
         .db
         .write::<_, HubError, _>(move |tx| {
-            attach_to_node(tx, &caller, &foreign_node, &[foreign_attachment], now_ms())?;
+            attach_to_node(
+                tx,
+                &caller,
+                &foreign_node,
+                None,
+                &[foreign_attachment],
+                now_ms(),
+            )?;
             Ok(WriteOutcome::new(()))
         })
         .await;
@@ -422,7 +431,7 @@ async fn enrolled_node_can_attach_own_blob_only_to_its_own_node() -> TestResult 
         .state
         .db
         .write::<_, HubError, _>(move |tx| {
-            attach_to_node(tx, &caller, &target_node, &[own_attachment], now_ms())?;
+            attach_to_node(tx, &caller, &target_node, None, &[own_attachment], now_ms())?;
             Ok(WriteOutcome::new(()))
         })
         .await?;
@@ -432,6 +441,167 @@ async fn enrolled_node_can_attach_own_blob_only_to_its_own_node() -> TestResult 
         .reads
         .read(move |conn| Ok(lookup_blob(conn, &attachment.blob_id)?.map(|row| row.scope)))
         .await?;
-    assert_eq!(scope, Some(crate::storage::events::BlobScope::Node(own_id)));
+    assert_eq!(
+        scope,
+        Some(crate::storage::events::BlobScope::Node(own_id, None))
+    );
+    fixture.close().await
+}
+
+#[tokio::test]
+async fn attributed_upload_uses_a_pair_scope_and_replays_for_its_owner() -> TestResult {
+    let fixture = Fixture::new(LIMIT).await?;
+    let (a, sender_machine) = fixture.node().await?;
+    let (b, target_machine) = fixture.node().await?;
+    let (_, outsider_machine) = fixture.node().await?;
+    let participant = ParticipantId::generate()?;
+    let insert = (a.clone(), b.clone(), participant.clone());
+    fixture.state.db.write_sqlite(move |tx| {
+        for node in [&insert.0, &insert.1] {
+            tx.execute(
+                "INSERT INTO node_participants (node_id, participant_id, kind, name, state, synced_epoch, updated_at_ms)
+                 VALUES (?1, ?2, 'agent', 'sender', 'idle', 0, ?3)",
+                params![node.as_str(), insert.2.as_str(), now_ms()],
+            )?;
+        }
+        Ok(WriteOutcome::new(()))
+    }).await?;
+    let mut headers = upload_headers(Some("attributed-upload"));
+    headers.insert(
+        X_COOPLET_PARTICIPANT,
+        HeaderValue::from_str(participant.as_str())?,
+    );
+    assert!(
+        upload(
+            &fixture.state,
+            &fixture.admin,
+            &headers,
+            Body::from("nodefile")
+        )
+        .await
+        .is_err_and(|error| error.problem().code == ErrorCode::Forbidden)
+    );
+    let (_, attachment) = upload(
+        &fixture.state,
+        &sender_machine,
+        &headers,
+        Body::from("nodefile"),
+    )
+    .await?;
+    let pair = (
+        a.clone(),
+        b.clone(),
+        participant.clone(),
+        attachment.clone(),
+        fixture.admin.clone(),
+    );
+    fixture
+        .state
+        .db
+        .write::<_, HubError, _>(move |tx| {
+            let caller = auth::attest_node_participant(tx, &pair.0, &pair.2, None)?;
+            let other = auth::attest_node_participant(tx, &pair.1, &pair.2, None)?;
+            let attachments = std::slice::from_ref(&pair.3);
+            attach_to_node(tx, &caller, &pair.1, Some(&pair.0), attachments, now_ms())?;
+            attach_to_node(tx, &pair.4, &pair.0, Some(&pair.1), attachments, now_ms())?;
+            assert!(
+                preflight_node_attachments(
+                    tx,
+                    &other,
+                    &pair.0,
+                    Some(&pair.1),
+                    attachments,
+                    now_ms()
+                )
+                .is_err_and(|error| error.problem().code == ErrorCode::Forbidden)
+            );
+            Ok(WriteOutcome::new(()))
+        })
+        .await?;
+    for caller in [&sender_machine, &target_machine] {
+        let response = download(&fixture.state, caller, attachment.blob_id.clone()).await?;
+        assert_eq!(
+            to_bytes(response.into_body(), 8).await?.as_ref(),
+            b"nodefile"
+        );
+    }
+    assert!(
+        download(
+            &fixture.state,
+            &outsider_machine,
+            attachment.blob_id.clone()
+        )
+        .await
+        .is_err_and(|error| error.problem().code == ErrorCode::Forbidden)
+    );
+    assert_eq!(
+        upload(
+            &fixture.state,
+            &sender_machine,
+            &headers,
+            Body::from("nodefile")
+        )
+        .await?,
+        (StatusCode::OK, attachment)
+    );
+    assert_eq!(fixture.state.blobs.used_bytes(), LIMIT);
+    fixture.close().await
+}
+
+#[tokio::test]
+async fn thread_machine_grant_only_covers_live_posts_in_the_pending_suffix() -> TestResult {
+    let fixture = Fixture::new(LIMIT).await?;
+    let (node, _) = fixture.node().await?;
+    let thread = ThreadId::generate()?;
+    let recent = BlobId::generate()?;
+    let expired = BlobId::generate()?;
+    let truncated = BlobId::generate()?;
+    let delivery = OperationId::generate()?;
+    let owner = fixture.admin.actor_id().to_owned();
+    let participant = ParticipantId::generate()?;
+    let seed = (
+        node.clone(),
+        thread.clone(),
+        recent.clone(),
+        expired.clone(),
+        truncated.clone(),
+    );
+    fixture.state.db.write_sqlite(move |tx| {
+        let (node, thread, recent, expired, truncated) = &seed;
+        tx.execute("UPDATE nodes SET status = 'online' WHERE node_id = ?1", [node.as_str()])?;
+        tx.execute(
+            "INSERT INTO threads(thread_id, title, created_by_actor_id, status, head_seq, created_at_ms, updated_at_ms)
+             VALUES (?1, 'Grant', ?2, 'open', 22, 0, 0)",
+            params![thread.as_str(), owner],
+        )?;
+        tx.execute(
+            "INSERT INTO thread_members(thread_id, member_key, participant_id, node_id, handle,
+                 role, wake_policy, pending_delivery_id, pending_from_seq, pending_to_seq, joined_at_ms)
+             VALUES (?1, ?2, ?3, ?4, 'target', 'member', 'mentions_only', ?5, 1, 22, 0)",
+            params![thread.as_str(), format!("{node}/{participant}"), participant.as_str(),
+                node.as_str(), delivery.as_str()],
+        )?;
+        let mut post = tx.prepare(
+            "INSERT INTO thread_posts(thread_id, seq, post_id, author_actor_id, author_kind, author_handle,
+                 body, attachments_json, created_at_ms, expires_at_ms)
+             VALUES (?1, ?2, ?3, ?4, 'human', 'author', '', ?5, 0, ?6)",
+        )?;
+        for seq in 1..=22 {
+            let attachments = match seq {
+                1 => format!(r#"[{{"blob_id":"{truncated}"}}]"#),
+                21 => format!(r#"[{{"blob_id":"{expired}"}}]"#),
+                22 => format!(r#"[{{"blob_id":"{recent}"}}]"#),
+                _ => "[]".into(),
+            };
+            let expires = if seq <= 21 { 101 } else { 102 };
+            post.execute(params![thread.as_str(), seq, format!("post-{seq}"), owner, attachments, expires])?;
+        }
+        assert!(thread_delivery_contains_blob(tx, thread, node, recent, 101)?);
+        assert!(!thread_delivery_contains_blob(tx, thread, node, expired, 101)?);
+        assert!(!thread_delivery_contains_blob(tx, thread, node, truncated, 100)?);
+        tx.execute("UPDATE thread_members SET state = 'paused_unknown' WHERE thread_id = ?1", [thread.as_str()])?;
+        assert!(!thread_delivery_contains_blob(tx, thread, node, recent, 101)?);
+        Ok(WriteOutcome::new(()))
+    }).await?;
     fixture.close().await
 }

@@ -47,7 +47,7 @@ fn empty_roster() -> Value {
 }
 
 #[test]
-fn all_seven_bridge_payloads_are_strict() -> TestResult {
+fn all_ten_bridge_payloads_are_strict() -> TestResult {
     strict_round_trip::<HelloAckPayload>(json!({
         "hub_id":"hub_00000000000000000000000000","node_id":"node_00000000000000000000000000",
         "max_inflight_commands":8,"max_inflight_threads":16,"pending_op_ids":[]
@@ -58,13 +58,27 @@ fn all_seven_bridge_payloads_are_strict() -> TestResult {
     }))?;
     strict_round_trip::<CommandResPayload>(json!({"op_id":OP,"outcome":"unknown"}))?;
     strict_round_trip::<ThreadDeliverPayload>(json!({
-        "delivery_id":OP,"thread_id":THREAD,"member_id":PART,"from_seq":6,"to_seq":10,
-        "posts":[],"delivery_mode":"queue_until_idle","admission_budget_ms":100
+        "delivery_generation":1,"delivery_id":OP,"thread_id":THREAD,"member_id":PART,
+        "from_seq":6,"to_seq":10,"truncated_earlier":true,
+        "posts":[{"seq":10,"post_id":"msg_00000000000000000000000000","author_actor_id":"operator",
+            "author_kind":"human","author_handle":"operator","body":"hi","created_at_ms":0}],
+        "delivery_mode":"queue_until_idle","admission_budget_ms":100
     }))?;
     strict_round_trip::<ThreadAckPayload>(json!({
-        "delivery_id":OP,"thread_id":THREAD,"member_id":PART,"acked_seq":10,"outcome":"delivered"
+        "delivery_generation":1,"delivery_id":OP,"thread_id":THREAD,"member_id":PART,
+        "acked_seq":10,"outcome":"delivered"
     }))?;
     strict_round_trip::<RosterSyncPayload>(empty_roster())?;
+    strict_round_trip::<RosterReadyPayload>(json!({}))?;
+    strict_round_trip::<NodeRequestPayload>(json!({
+        "request_id":OP,"caller":{"type":"participant","participant_id":PART},
+        "operation":{"type":"thread_get","thread_id":THREAD}
+    }))?;
+    strict_round_trip::<NodeResponsePayload>(json!({
+        "request_id":OP,"outcome":{"type":"result","result":{
+            "type":"thread_wait","body":{"status":"waiting","head_seq":7}
+        }}
+    }))?;
     strict_round_trip::<NodeEventPayload>(json!({
         "type":"participant_state_changed","participant_id":PART,"state":"awaiting_approval",
         "approval_id":"a1","action_hint":"review","summary":"Read file","wait_kind":"permission",
@@ -122,15 +136,20 @@ fn roster_and_hello_require_complete_accounting() -> TestResult {
 #[test]
 fn roster_chunks_measure_real_bytes_with_the_envelope() -> TestResult {
     let mut roster: RosterSyncPayload = serde_json::from_value(empty_roster())?;
-    let bytes_without_text = {
+    for index in 0..80 {
         roster.workflows.push(WorkflowSummary {
-            workflow_name: "wf".into(),
+            workflow_name: format!("workflow-{index}"),
             title: None,
             description: Some(String::new()),
         });
-        BridgeFrame::encode(16, &roster)?.to_json()?.len()
-    };
-    roster.workflows[0].description = Some("a".repeat(MAX_WS_FRAME_BYTES - bytes_without_text));
+    }
+    let empty_bytes = BridgeFrame::encode(16, &roster)?.to_json()?.len();
+    let fill_bytes = MAX_WS_FRAME_BYTES - empty_bytes;
+    let count = roster.workflows.len();
+    for (index, workflow) in roster.workflows.iter_mut().enumerate() {
+        let remainder = usize::from(index < fill_bytes % count);
+        workflow.description = Some("a".repeat(fill_bytes / count + remainder));
+    }
     let at_limit = BridgeFrame::encode(16, &roster)?.to_json()?;
     assert_eq!(at_limit.len(), 262_144);
     BridgeFrame::from_json(&at_limit)?;
@@ -324,7 +343,8 @@ fn reconnect_wire_preserves_receipt_and_injection_fence_after_lost_ack() -> Test
             "chunk_index":0,"is_final":true,"participants":[],"templates":[],"workflows":[],
             "unresolved_thread_fences":[{
                 "thread_id":"thr_00000000000000000000000000",
-                "participant_id":"part_00000000000000000000000000","highest_dispatched_seq":10
+                "participant_id":"part_00000000000000000000000000","delivery_generation":2,
+                "highest_dispatched_seq":10
             }],
             "resolved_op_receipts":[{
                 "op_id":"op_00000000000000000000000000","outcome":"succeeded",
@@ -352,6 +372,7 @@ fn reconnect_wire_preserves_receipt_and_injection_fence_after_lost_ack() -> Test
         .ok_or("missing unresolved fence")?;
     assert_eq!(fence.thread_id.as_str(), THREAD);
     assert_eq!(fence.participant_id.as_str(), PART);
+    assert_eq!(fence.delivery_generation, 2);
     assert_eq!(fence.highest_dispatched_seq, 10);
     Ok(())
 }
@@ -550,6 +571,7 @@ fn bridge_and_event_nested_validation_and_object_defaults() -> TestResult {
     assert!(BridgeFrame::encode_json(1, &bad_approval).is_err());
 
     let bad_thread: ThreadDeliverPayload = serde_json::from_value(json!({
+        "delivery_generation": 0,
         "delivery_id": OP,
         "thread_id": THREAD,
         "member_id": PART,
@@ -776,6 +798,7 @@ fn author_kind_and_strict_display_handle_actor_validation() -> TestResult {
 
     // ThreadPostWire carries author_kind and strictly validates author_actor_id & author_handle.
     let valid_thread = json!({
+        "delivery_generation": 0,
         "delivery_id": OP,
         "thread_id": THREAD,
         "member_id": PART,

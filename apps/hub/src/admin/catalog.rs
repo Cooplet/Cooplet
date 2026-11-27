@@ -10,6 +10,7 @@ use serde::Serialize;
 use crate::{
     AppState,
     auth::AuthenticatedCaller,
+    bridge::{ApprovalView, RosterCatalog},
     credentials::enrollment_node_id,
     error::HubError,
     storage::sql::{
@@ -46,24 +47,24 @@ const ENROLLMENT_TOKENS: &str =
      ORDER BY token_id LIMIT ?2";
 const LIST_NODES_UNSCOPED: &str = "
     SELECT node_id, display_name, status, generation, session_epoch,
-           capabilities_json, last_seen_at_ms, enrolled_at_ms, revoked_at_ms
+           capabilities_json, last_seen_at_ms, enrolled_at_ms, revoked_at_ms, roster_catalog_json
       FROM nodes WHERE node_id > ?1
      ORDER BY node_id LIMIT ?2";
 const LIST_NODES_SCOPED: &str = "
     SELECT node_id, display_name, status, generation, session_epoch,
-           capabilities_json, last_seen_at_ms, enrolled_at_ms, revoked_at_ms
+           capabilities_json, last_seen_at_ms, enrolled_at_ms, revoked_at_ms, roster_catalog_json
       FROM nodes WHERE node_id > ?1 AND node_id IN (SELECT value FROM json_each(?2))
      ORDER BY node_id LIMIT ?3";
 const LIST_PARTICIPANTS_UNSCOPED: &str = "
     SELECT p.node_id, p.participant_id, p.kind, p.name, p.client_kind, p.workspace_dir,
-           p.state, p.capabilities_json, p.synced_epoch, p.updated_at_ms
+           p.state, p.capabilities_json, p.synced_epoch, p.updated_at_ms, p.approval_json
       FROM node_participants p JOIN nodes n USING (node_id)
      WHERE (p.node_id, p.participant_id) > (?1, ?2)
        AND n.revoked_at_ms IS NULL AND n.status != 'revoked'
      ORDER BY p.node_id, p.participant_id LIMIT ?3";
 const LIST_PARTICIPANTS_SCOPED: &str = "
     SELECT p.node_id, p.participant_id, p.kind, p.name, p.client_kind, p.workspace_dir,
-           p.state, p.capabilities_json, p.synced_epoch, p.updated_at_ms
+           p.state, p.capabilities_json, p.synced_epoch, p.updated_at_ms, p.approval_json
       FROM nodes n CROSS JOIN node_participants p ON p.node_id = n.node_id
      WHERE n.node_id IN (SELECT value FROM json_each(?3)) AND n.node_id >= ?1
        AND p.participant_id > CASE WHEN n.node_id = ?1 THEN ?2 ELSE '' END
@@ -202,6 +203,7 @@ pub(crate) async fn list_nodes(
         Ok(collect_page(&mut rows, limit, |row| {
             let node_id: NodeId = parse_col(row, 0)?;
             let cursor = node_id.to_string();
+            let catalog: RosterCatalog = parse_opt_json(row, 9)?.unwrap_or_default();
             let entry = NodeSummary {
                 node_id,
                 display_name: row.get(1)?,
@@ -209,6 +211,8 @@ pub(crate) async fn list_nodes(
                 generation: row.get(3)?,
                 session_epoch: row.get(4)?,
                 capabilities: parse_json(row, 5)?,
+                templates: catalog.templates,
+                workflows: catalog.workflows,
                 last_seen_at_ms: row.get(6)?,
                 enrolled_at_ms: row.get(7)?,
                 revoked_at_ms: row.get(8)?,
@@ -253,6 +257,7 @@ pub(crate) async fn list_participants(
     };
 
     let after_node = after_node.map_or_else(String::new, |id| id.to_string());
+    let can_manage = caller.require_scope(ServiceScope::Manage).is_ok();
     read_tx(&state.reads, move |tx| {
         let mut statement = match &allowed {
             None => tx.prepare_cached(LIST_PARTICIPANTS_UNSCOPED)?,
@@ -269,6 +274,11 @@ pub(crate) async fn list_participants(
             let node_id: NodeId = parse_col(row, 0)?;
             let participant_id: ParticipantId = parse_col(row, 1)?;
             let cursor = format!("{node_id}.{participant_id}");
+            let mut approval: ApprovalView = parse_opt_json(row, 10)?.unwrap_or_default();
+            // The catalog query has already intersected the caller's allowed nodes.
+            if state == ParticipantState::AwaitingApproval && !can_manage {
+                approval.redact();
+            }
             let entry = HubParticipantSummary {
                 node_id,
                 participant_id,
@@ -279,6 +289,11 @@ pub(crate) async fn list_participants(
                 state,
                 intake_state: state.intake_state(),
                 capabilities: parse_json(row, 7)?,
+                wait_kind: approval.wait_kind,
+                approval_id: approval.approval_id,
+                action_hint: approval.action_hint,
+                summary: approval.summary,
+                can_respond_remotely: approval.can_respond_remotely,
                 synced_epoch: row.get(8)?,
                 updated_at_ms: row.get(9)?,
             };

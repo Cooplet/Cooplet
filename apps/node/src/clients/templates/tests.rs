@@ -305,3 +305,23 @@ fn validates_limits_ids_and_named_json() -> TestResult {
     }
     Ok(())
 }
+
+#[test]
+fn roster_uses_only_manifest_metadata_and_skips_invalid_templates() -> TestResult {
+    let tree = Tree::new()?;
+    tree.template(
+        "draft",
+        br#"{"schema":1,"client":"mock","instructions_file":"missing.md"}"#,
+    )?;
+    tree.template("broken", b"not a manifest")?;
+    tree.user_template("broken", br#"{"schema":1,"client":"mock"}"#)?;
+    tree.template(
+        "blank-title",
+        br#"{"schema":1,"client":"mock","title":" "}"#,
+    )?;
+    assert!(tree.list().is_err());
+    let summary = list_with_mode(&tree.workspace(), Some(tree.config()), ListMode::Roster)?;
+    assert_eq!(summary.len(), 1);
+    assert_eq!(summary[0].template_id, "draft");
+    Ok(())
+}

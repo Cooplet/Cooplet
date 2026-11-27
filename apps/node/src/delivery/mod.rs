@@ -2,24 +2,28 @@
 
 mod envelope;
 mod model;
+mod outbound;
 pub(crate) mod queries;
 mod questions;
 mod queue;
+pub(crate) mod relay;
 mod send;
 
 #[cfg(test)]
 mod tests;
 
 pub use model::{MessagePage, MessageView, SendMessageRequest, SendMessageResponse};
+pub(crate) use send::InboundHubMessage;
 
 use std::{
     collections::HashMap,
+    hash::Hash,
     io,
     path::PathBuf,
-    sync::{Arc, Mutex, MutexGuard},
+    sync::{Arc, Mutex, MutexGuard, Weak},
 };
 
-use cooplet_protocol::{AttachmentRef, ErrorCode, MessageId, ParticipantId};
+use cooplet_protocol::{AttachmentRef, BlobId, ErrorCode, MessageId, ParticipantId, ThreadId};
 use cooplet_storage::{BlobDiskStore, DbActor, ReadPool, StorageError};
 use rusqlite::params;
 use tokio::sync::{RwLock, watch};
@@ -50,6 +54,8 @@ pub struct DeliveryService {
     closing: watch::Sender<bool>,
     activity: RwLock<()>,
     workers: Mutex<HashMap<ParticipantId, bool>>,
+    pub(crate) relay_locks: KeyedLocks<BlobId>,
+    pub(crate) thread_locks: KeyedLocks<(ThreadId, ParticipantId)>,
 }
 
 impl DeliveryService {
@@ -92,6 +98,8 @@ impl DeliveryService {
             closing: watch::channel(false).0,
             activity: RwLock::new(()),
             workers: Mutex::default(),
+            relay_locks: KeyedLocks::default(),
+            thread_locks: KeyedLocks::default(),
         });
         let weak = Arc::downgrade(&service);
         service.agents.set_queue_wakeup(Arc::new(move |id| {
@@ -130,6 +138,7 @@ impl DeliveryService {
         let can_read_all = authorize_read(caller)?;
         let actor = caller.actor_id().to_owned();
         let limit = queries::checked_page_limit(limit)?;
+        let now = (self.clock)()?;
         self.reads
             .read(move |conn| {
                 Ok(queries::read_page(
@@ -138,6 +147,7 @@ impl DeliveryService {
                     can_read_all,
                     after.as_ref(),
                     limit,
+                    now,
                 ))
             })
             .await?
@@ -146,8 +156,9 @@ impl DeliveryService {
     pub async fn show(&self, caller: &Principal, id: MessageId) -> Result<MessageView> {
         let can_read_all = authorize_read(caller)?;
         let actor = caller.actor_id().to_owned();
+        let now = (self.clock)()?;
         self.reads
-            .read(move |conn| Ok(queries::read_one(conn, &id, &actor, can_read_all)))
+            .read(move |conn| Ok(queries::read_one(conn, &id, &actor, can_read_all, now)))
             .await?
     }
 
@@ -184,7 +195,9 @@ impl DeliveryService {
                 Ok(Some((_, _))) => {}
                 Ok(None) => return Ok(false),
                 Err(
-                    error @ (StorageError::BlobUnverified(_) | StorageError::InvalidBlobPath(_)),
+                    error @ (StorageError::BlobUnverified(_)
+                    | StorageError::InvalidBlobPath(_)
+                    | StorageError::BlobMissing(_)),
                 ) => {
                     tracing::warn!(blob_id = %attachment.blob_id, %error, "Attached blob failed integrity verification");
                     return Ok(false);
@@ -199,6 +212,38 @@ impl DeliveryService {
         self.workers
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+}
+
+pub(crate) struct KeyedLocks<K>(Mutex<HashMap<K, Weak<tokio::sync::Mutex<()>>>>);
+
+impl<K> Default for KeyedLocks<K> {
+    fn default() -> Self {
+        Self(Mutex::default())
+    }
+}
+
+impl<K: Hash + Eq> KeyedLocks<K> {
+    fn gate(&self, key: K) -> Arc<tokio::sync::Mutex<()>> {
+        let mut locks = self
+            .0
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        locks.retain(|_, gate| gate.strong_count() != 0);
+        let entry = locks.entry(key).or_default();
+        entry.upgrade().unwrap_or_else(|| {
+            let gate = Arc::new(tokio::sync::Mutex::new(()));
+            *entry = Arc::downgrade(&gate);
+            gate
+        })
+    }
+
+    pub(crate) async fn lock(&self, key: K) -> tokio::sync::OwnedMutexGuard<()> {
+        self.gate(key).lock_owned().await
+    }
+
+    pub(crate) fn try_lock(&self, key: K) -> Option<tokio::sync::OwnedMutexGuard<()>> {
+        self.gate(key).try_lock_owned().ok()
     }
 }
 

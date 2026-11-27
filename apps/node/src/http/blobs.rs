@@ -13,7 +13,10 @@ use axum::{
     response::{IntoResponse, Response},
 };
 use bytes::{Bytes, BytesMut};
-use cooplet_client::{X_COOPLET_FILENAME, X_COOPLET_SHA256};
+use cooplet_client::{
+    BlobUploadOutcome, BlobUploadSpec, ClientError, UploadVerification, X_COOPLET_FILENAME,
+    X_COOPLET_SHA256,
+};
 use cooplet_protocol::{
     AggregateType, AttachmentRef, BlobId, ErrorCode, EventKind, ProblemDetails, canonical_sha256,
     validate_attachment_name, validate_media_type, validate_sha256,
@@ -48,7 +51,9 @@ use utoipa::{
     },
 };
 
-use super::{Caller, NodeState, Path, extract::one_header, idempotency_key};
+use super::{
+    Caller, NodeState, Path, bridge::bridge_participant, extract::one_header, idempotency_key,
+};
 use crate::{
     auth::Principal,
     error::{NodeError, Result},
@@ -130,6 +135,87 @@ pub(crate) async fn put(
     tasks
         .run(async move { put_inner(state, principal, upload, body).await })
         .await
+}
+
+#[utoipa::path(
+    post, path = "/v1/bridge/blobs", security(("bearer" = [])),
+    params(
+        ("X-Cooplet-Filename" = String, Header, description = "Original filename, percent-encoded UTF-8"),
+        ("Content-Length" = Option<u64>, Header, description = "Declared byte length"),
+        ("X-Cooplet-Sha256" = Option<String>, Header, description = "Expected SHA-256 in lowercase hexadecimal"),
+        ("Idempotency-Key" = Option<String>, Header, description = "Operation key")
+    ),
+    request_body(
+        description = "Raw attachment bytes to relay to the enrolled Hub. Set Content-Type to the concrete media type.",
+        content(
+            (inline(BlobBytes) = "application/octet-stream"),
+            (inline(BlobBytes) = "*/*")
+        )
+    ),
+    responses(
+        (status = 201, description = "Attachment stored by the Hub", body = AttachmentRef),
+        (status = 200, description = "Replayed Hub attachment receipt", body = AttachmentRef),
+        (status = 502, description = "Hub bridge unavailable", body = ProblemDetails, content_type = "application/problem+json")
+    )
+)]
+pub(crate) async fn relay(
+    State(state): State<NodeState>,
+    Caller(principal): Caller,
+    headers: HeaderMap,
+    body: Body,
+) -> Result<(StatusCode, Json<AttachmentRef>)> {
+    let participant_id = bridge_participant(&principal)?;
+    let connection = state.bridge.connection()?;
+    let limit = state.max_blob_bytes;
+    let upload = Upload::parse(&headers, limit)?;
+    let tasks = state.tasks.clone();
+    tasks
+        .run(async move {
+            let _slot = state.tasks.try_acquire_upload_slot()?;
+            let spec = BlobUploadSpec {
+                filename: upload.name,
+                mime_type: upload.mime_type,
+                verification: UploadVerification::HubReceipt,
+                expected_sha256: upload.sha256,
+                idempotency_key: upload.key,
+                content_length: upload.size,
+                participant_id: Some(participant_id),
+            };
+            let reader =
+                BodyReader::new(upload_chunks(body, state.shutdown.subscribe())).with_limit(limit);
+            let (status, outcome) = connection
+                .client()
+                .upload_blob_with_status(spec, reader)
+                .await
+                .map_err(relay_upload_error)?;
+            let receipt = match outcome {
+                BlobUploadOutcome::CompleteWithHubDigest(receipt)
+                | BlobUploadOutcome::AcknowledgedWithoutLocalVerification(receipt)
+                | BlobUploadOutcome::VerifiedLocal(receipt) => receipt,
+            };
+            Ok((status, Json(receipt)))
+        })
+        .await
+}
+
+fn relay_upload_error(error: ClientError) -> NodeError {
+    match error {
+        ClientError::Problem(problem) => NodeError(problem),
+        ClientError::HubIdentityMismatch { .. } => {
+            NodeError::new(ErrorCode::HubIdentityMismatch, "Hub identity mismatch")
+        }
+        ClientError::Io(cause) => body_error(&cause),
+        ClientError::BlobTooLarge { max_bytes } => blob_too_large(max_bytes),
+        ClientError::BlobLengthMismatch { .. } => invalid_body(),
+        ClientError::BlobDigestMismatch { .. } => NodeError::new(
+            ErrorCode::BlobDigestMismatch,
+            "The upload digest does not match",
+        ),
+        _ => NodeError::new(
+            ErrorCode::DeliveryUnknown,
+            "The Hub did not confirm the upload outcome",
+        ),
+    }
 }
 
 async fn put_inner(
@@ -215,7 +301,7 @@ async fn put_inner(
                 }
             }
             Err(match error {
-                StorageError::Io(cause) => body_error(cause),
+                StorageError::Io(cause) => body_error(&cause),
                 other => other.into(),
             })
         }
@@ -251,7 +337,7 @@ pub(crate) async fn get(
     let metadata = load_download(&state.reads, &principal, id.clone()).await?;
     let opened = match state.blobs.open_blob(&id).await {
         Ok(opened) => opened,
-        Err(error @ StorageError::BlobUnverified(_)) => {
+        Err(error @ (StorageError::BlobMissing(_) | StorageError::BlobUnverified(_))) => {
             tracing::warn!(%id, %error, "Could not open registered blob");
             return Err(blob_not_found());
         }
@@ -662,7 +748,7 @@ async fn read_fingerprint(
     let mut digest = Sha256::new();
     let mut bytes = 0u64;
     while let Some(chunk) = chunks.next().await {
-        let chunk = chunk.map_err(body_error)?;
+        let chunk = chunk.map_err(|error| body_error(&error))?;
         bytes = bytes.saturating_add(chunk.len() as u64);
         if bytes > limit {
             return Err(blob_too_large(limit));
@@ -699,6 +785,8 @@ enum UploadBodyError {
     Timeout,
     #[error("Node is shutting down")]
     Stopping,
+    #[error("upload body exceeds the Node byte limit")]
+    TooLarge(u64),
 }
 
 fn upload_chunks(body: Body, shutdown: watch::Receiver<bool>) -> UploadChunks {
@@ -734,6 +822,8 @@ fn upload_chunks(body: Body, shutdown: watch::Receiver<bool>) -> UploadChunks {
 struct BodyReader {
     chunks: UploadChunks,
     pending: Bytes,
+    remaining: Option<u64>,
+    limit: u64,
 }
 
 impl BodyReader {
@@ -741,7 +831,15 @@ impl BodyReader {
         Self {
             chunks,
             pending: Bytes::new(),
+            remaining: None,
+            limit: 0,
         }
+    }
+
+    fn with_limit(mut self, limit: u64) -> Self {
+        self.remaining = Some(limit);
+        self.limit = limit;
+        self
     }
 }
 
@@ -757,7 +855,17 @@ impl AsyncRead for BodyReader {
         }
         while this.pending.is_empty() {
             match ready!(this.chunks.poll_next_unpin(cx)) {
-                Some(Ok(chunk)) => this.pending = chunk,
+                Some(Ok(chunk)) => {
+                    if let Some(remaining) = &mut this.remaining {
+                        let Some(after) = remaining.checked_sub(chunk.len() as u64) else {
+                            return Poll::Ready(Err(io::Error::other(UploadBodyError::TooLarge(
+                                this.limit,
+                            ))));
+                        };
+                        *remaining = after;
+                    }
+                    this.pending = chunk;
+                }
                 Some(Err(error)) => return Poll::Ready(Err(error)),
                 None => return Poll::Ready(Ok(())),
             }
@@ -768,7 +876,7 @@ impl AsyncRead for BodyReader {
     }
 }
 
-fn body_error(error: io::Error) -> NodeError {
+fn body_error(error: &io::Error) -> NodeError {
     match error
         .get_ref()
         .and_then(|cause| cause.downcast_ref::<UploadBodyError>())
@@ -782,6 +890,7 @@ fn body_error(error: io::Error) -> NodeError {
         Some(UploadBodyError::Stopping) => {
             NodeError::new(ErrorCode::Overloaded, "Node is shutting down")
         }
+        Some(UploadBodyError::TooLarge(limit)) => blob_too_large(*limit),
         None => NodeError::internal(error),
     }
 }

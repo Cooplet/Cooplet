@@ -137,6 +137,15 @@ fn check_pin(headers: &HeaderMap, hub_id: &HubId, access: Access) -> Result<(), 
     .with_extension("actual_hub_id", hub_id.as_str()))
 }
 
+pub(crate) fn bridge_token<'a>(
+    headers: &'a HeaderMap,
+    hub_id: &HubId,
+) -> Result<&'a str, HubError> {
+    check_pin(headers, hub_id, Access::Bearer)?;
+    check_body_headers(headers, true, Access::Bearer)?;
+    bearer(single_authorization(headers)?)
+}
+
 fn single_authorization(headers: &HeaderMap) -> Result<Option<&axum::http::HeaderValue>, HubError> {
     let (authorization, duplicate) = header_value(headers, &header::AUTHORIZATION);
     if duplicate {

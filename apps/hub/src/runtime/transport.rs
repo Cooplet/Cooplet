@@ -80,7 +80,11 @@ pub(super) async fn serve_http1(
         configure_tcp(&stream);
         let mut shutdown = force_close_rx.clone();
         let forced = Box::pin(async move {
-            let _ = shutdown.changed().await;
+            // An upgraded connection is owned by the bridge after the HTTP
+            // task exits. Only an explicit force-close invalidates its I/O.
+            if shutdown.changed().await.is_err() {
+                std::future::pending::<()>().await;
+            }
         });
         let io = TokioIo::new(WriteIdle::new(stream, config.write_idle_timeout, forced));
         let router = app.clone();

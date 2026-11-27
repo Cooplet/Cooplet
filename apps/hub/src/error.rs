@@ -53,6 +53,10 @@ impl HubError {
     pub(crate) fn from_problem(problem: ProblemDetails) -> Self {
         Self(Box::new(problem))
     }
+
+    pub(crate) fn into_problem(self) -> ProblemDetails {
+        *self.0
+    }
 }
 
 impl fmt::Display for HubError {
@@ -94,11 +98,18 @@ pub(crate) fn bounded_problem_json(problem: &ProblemDetails) -> serde_json::Resu
                 | "existing_answer_id"
                 | "oldest_available_seq"
                 | "latest_seq"
+                | "floor_seq"
+                | "head_seq"
+                | "current_version"
+                | "thread_id"
                 | "operation_id"
                 | "message_id"
                 | "approval_id"
                 | "reason"
                 | "action_hint"
+                | "wait_kind"
+                | "summary"
+                | "can_respond_remotely"
         ) && serde_json::to_vec(value).is_ok_and(|bytes| bytes.len() <= 1024)
     });
     serde_json::to_vec(&problem)

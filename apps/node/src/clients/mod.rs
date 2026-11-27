@@ -13,6 +13,7 @@ pub use cooplet_protocol::{ApprovalAction, ApprovalDecision, ApprovalWait, Appro
 pub use pi::PiAdapter;
 pub use registry::AdapterRegistry;
 pub use runtime::*;
+pub(crate) use templates::list_template_summaries;
 pub use templates::{
     AgentOverrides, AgentTemplate, EffectiveAgentOptions, list_templates, load_template,
     load_template_options,

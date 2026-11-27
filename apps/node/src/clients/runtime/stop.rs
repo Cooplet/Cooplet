@@ -23,7 +23,7 @@ use crate::{
     clients::{LifecycleBlock, LifecycleBlockKind, ProcessOwnership, StopMode, StopOutcome},
     error::Result,
     now_ms,
-    operations::Operation,
+    operations::{DelegatedOperation, Operation, OperationGuard, admission_expired},
     storage::revoke_participant_credentials,
 };
 
@@ -63,7 +63,12 @@ async fn await_interrupt(
             }
             response.as_mut().now_or_never().flatten()
         }
-        result = response.as_mut() => result,
+        result = response.as_mut() => {
+            if result.is_none() {
+                admission.expire();
+            }
+            result
+        },
     }
 }
 
@@ -74,6 +79,18 @@ pub struct StopAgentRequest {
     pub cancel_turn_only: bool,
     #[serde(default)]
     pub acknowledge_manual_cleanup: bool,
+}
+
+impl StopAgentRequest {
+    fn validate(self) -> Result<()> {
+        if self.cancel_turn_only && self.acknowledge_manual_cleanup {
+            return Err(invalid(
+                "conflicting_stop_options",
+                "Cancellation and manual cleanup acknowledgment cannot be combined",
+            ));
+        }
+        Ok(())
+    }
 }
 
 #[derive(Clone, Copy, Debug, Deserialize, Serialize, ToSchema)]
@@ -108,16 +125,36 @@ impl AgentService {
         id: ParticipantId,
         request: StopAgentRequest,
     ) -> Result<StopAgentResponse> {
-        if request.cancel_turn_only && request.acknowledge_manual_cleanup {
-            return Err(invalid(
-                "conflicting_stop_options",
-                "Cancellation and manual cleanup acknowledgment cannot be combined",
-            ));
-        }
+        request.validate()?;
         let guard = self
             .0
             .operations
             .guard(actor, key, "agent.stop", &(&id, request))?;
+        self.stop_guarded(guard, id, request, None).await
+    }
+
+    pub(crate) async fn stop_delegated(
+        &self,
+        delegated: &DelegatedOperation,
+        id: ParticipantId,
+        request: StopAgentRequest,
+    ) -> Result<StopAgentResponse> {
+        request.validate()?;
+        let guard = self
+            .0
+            .operations
+            .guard_delegated(delegated, "agent.stop", &(&id, request))?;
+        self.stop_guarded(guard, id, request, Some(&delegated.admission))
+            .await
+    }
+
+    async fn stop_guarded(
+        &self,
+        guard: OperationGuard,
+        id: ParticipantId,
+        request: StopAgentRequest,
+        admission: Option<&AdmissionGuard>,
+    ) -> Result<StopAgentResponse> {
         let op = &guard.operation;
         if let Some(value) = self.0.operations.lookup(op).await? {
             return decode(value);
@@ -126,6 +163,7 @@ impl AgentService {
         let now = now_ms()?;
         let live = self.live_session(&id);
         let write_op = op.clone();
+        let write_admission = admission.cloned();
         let reserve = self
             .0
             .db
@@ -156,6 +194,15 @@ impl AgentService {
                     )
                 {
                     return Err(busy("lifecycle_in_progress", true).into());
+                }
+                // For a full stop, revoking credentials and entering stopping
+                // is the first irreversible effect. Complete that transition
+                // once admitted, even if the bridge disconnects afterwards.
+                if write_admission
+                    .as_ref()
+                    .is_some_and(AdmissionGuard::is_expired)
+                {
+                    return Err(admission_expired().into());
                 }
                 let mut events = Vec::new();
                 let work = if request.acknowledge_manual_cleanup {
@@ -228,7 +275,9 @@ impl AgentService {
                         }
                         Ok(response)
                     }
-                    StopWork::Cancel(state, live) => self.cancel_turn(op, state, &live).await,
+                    StopWork::Cancel(state, live) => {
+                        self.cancel_turn(op, state, &live, admission).await
+                    }
                     StopWork::Disconnect(row) => {
                         let clean = self.stop_transport(&row).await;
                         if clean {
@@ -252,12 +301,18 @@ impl AgentService {
         operation: &Operation,
         state: ParticipantState,
         live: &LiveSession,
+        delegated: Option<&AdmissionGuard>,
     ) -> Result<StopAgentResponse> {
         let disconnected = live.event_stop();
-        let outcome = if live.state() == ParticipantState::Unknown {
+        let admission = delegated
+            .cloned()
+            .unwrap_or_else(|| AdmissionGuard::new(STOP_REQUEST_TIMEOUT));
+        let expired = delegated.is_some_and(AdmissionGuard::is_expired);
+        let outcome = if expired {
+            None
+        } else if live.state() == ParticipantState::Unknown {
             Some(StopOutcome::AlreadyGone)
         } else {
-            let admission = AdmissionGuard::new(STOP_REQUEST_TIMEOUT);
             await_interrupt(disconnected, &admission, async {
                 live.adapter
                     .cancel_or_stop(
@@ -282,11 +337,15 @@ impl AgentService {
             stop_outcome: StopDisposition::TurnCancelled,
         };
         let error = match outcome {
+            None if expired => Some(admission_expired()),
             Some(StopOutcome::TurnCancelled) => None,
             Some(StopOutcome::Unsupported(_)) => Some(invalid(
                 "cancel_unsupported",
                 "This adapter cannot cancel a turn",
             )),
+            Some(StopOutcome::Unavailable(_)) if delegated.is_some() && admission.is_expired() => {
+                Some(admission_expired())
+            }
             Some(StopOutcome::Unavailable(_)) => Some(busy("cancel_unavailable", true)),
             Some(StopOutcome::AlreadyGone) => Some(busy("no_live_session", true)),
             _ => Some(unknown("cancel_outcome_unconfirmed")),

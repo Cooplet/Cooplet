@@ -37,6 +37,14 @@ enum Identity {
         id: NodeId,
         generation: u64,
     },
+    NodeParticipant {
+        node_id: NodeId,
+        generation: u64,
+        epoch: Option<u64>,
+        participant: ParticipantId,
+        author_kind: AuthorKind,
+        actor_key: String,
+    },
 }
 
 #[derive(Clone, PartialEq, Eq)]
@@ -54,6 +62,7 @@ impl AuthenticatedCaller {
             Identity::Human { id, .. } => id.as_str(),
             Identity::Service { id, .. } => id.as_str(),
             Identity::Node { id, .. } => id.as_str(),
+            Identity::NodeParticipant { actor_key, .. } => actor_key,
         }
     }
 
@@ -62,20 +71,30 @@ impl AuthenticatedCaller {
             Identity::Human { participant, .. } => Some(participant),
             Identity::Service { participant, .. } => participant.as_ref(),
             Identity::Node { .. } => None,
+            Identity::NodeParticipant { participant, .. } => Some(participant),
         }
     }
 
-    pub(crate) fn is_hub_recipient(
-        &self,
-        node: Option<&NodeId>,
-        participant: &ParticipantId,
-    ) -> bool {
-        node.is_none() && self.participant_id() == Some(participant)
+    pub(crate) fn is_party(&self, node: Option<&NodeId>, participant: &ParticipantId) -> bool {
+        self.participant_id() == Some(participant) && self.source_node_id() == node
     }
 
     pub(crate) fn node_id(&self) -> Option<&NodeId> {
+        self.node_bridge_identity()
+            .map(|(id, _)| id)
+            .or_else(|| self.source_node_id())
+    }
+
+    pub(crate) fn source_node_id(&self) -> Option<&NodeId> {
         match &self.identity {
-            Identity::Node { id, .. } => Some(id),
+            Identity::NodeParticipant { node_id, .. } => Some(node_id),
+            _ => None,
+        }
+    }
+
+    pub(crate) fn node_bridge_identity(&self) -> Option<(&NodeId, u64)> {
+        match &self.identity {
+            Identity::Node { id, generation } => Some((id, *generation)),
             _ => None,
         }
     }
@@ -97,6 +116,7 @@ impl AuthenticatedCaller {
             Identity::Human { .. } => Some(AuthorKind::Human),
             Identity::Service { .. } => Some(AuthorKind::Service),
             Identity::Node { .. } => None,
+            Identity::NodeParticipant { author_kind, .. } => Some(author_kind),
         }
     }
 
@@ -118,9 +138,10 @@ impl AuthenticatedCaller {
     }
 
     pub(crate) fn require_scope(&self, scope: ServiceScope) -> Result<(), HubError> {
-        if self
-            .token()
-            .is_some_and(|token| token.scope.contains(&scope))
+        if (self.source_node_id().is_some() && scope <= ServiceScope::Collaborate)
+            || self
+                .token()
+                .is_some_and(|token| token.scope.contains(&scope))
         {
             Ok(())
         } else {
@@ -138,6 +159,9 @@ impl AuthenticatedCaller {
     pub(crate) fn allows_node(&self, node_id: &NodeId) -> bool {
         match &self.identity {
             Identity::Node { id, .. } => id == node_id,
+            Identity::NodeParticipant {
+                node_id: source, ..
+            } => source == node_id,
             _ => self
                 .allowed_nodes()
                 .is_none_or(|nodes| nodes.contains(node_id)),
@@ -153,7 +177,7 @@ impl AuthenticatedCaller {
             Identity::Human { .. } if self.is_admin() => PrincipalKind::HumanAdmin,
             Identity::Human { .. } => PrincipalKind::HumanMember,
             Identity::Service { .. } => PrincipalKind::Service,
-            Identity::Node { .. } => PrincipalKind::Node,
+            Identity::Node { .. } | Identity::NodeParticipant { .. } => PrincipalKind::Node,
         };
         WhoamiResponse {
             actor_id: self.actor_id().into(),
@@ -170,7 +194,7 @@ impl AuthenticatedCaller {
     fn token(&self) -> Option<&TokenAuthority> {
         match &self.identity {
             Identity::Human { token, .. } | Identity::Service { token, .. } => Some(token),
-            Identity::Node { .. } => None,
+            Identity::Node { .. } | Identity::NodeParticipant { .. } => None,
         }
     }
 }
@@ -200,7 +224,8 @@ const SELECT_REVERIFY_TOKEN: &str = "
     WHERE t.token_id = ?1 AND t.principal_id = ?2";
 
 const SELECT_NODE: &str = "
-    SELECT credential_hmac, generation, status = 'revoked' OR revoked_at_ms IS NOT NULL, display_name
+    SELECT credential_hmac, generation, status = 'revoked' OR revoked_at_ms IS NOT NULL,
+           display_name, session_epoch
     FROM nodes WHERE node_id = ?1";
 
 struct TokenRow {
@@ -334,6 +359,7 @@ struct NodeRow {
     generation: u64,
     revoked: bool,
     display_name: String,
+    epoch: u64,
 }
 
 fn node(conn: &Connection, id: &NodeId) -> Result<NodeRow, HubError> {
@@ -345,6 +371,7 @@ fn node(conn: &Connection, id: &NodeId) -> Result<NodeRow, HubError> {
                 generation: row.get(1)?,
                 revoked: row.get(2)?,
                 display_name: row.get(3)?,
+                epoch: row.get(4)?,
             })
         })
         .optional()?
@@ -374,10 +401,88 @@ pub(crate) async fn authenticate(
 ) -> Result<AuthenticatedCaller, HubError> {
     // Reject malformed Bearer syntax before touching the blocking read pool.
     let credential = ApiCredential::parse(secret).ok_or_else(unauthorized)?;
+    authenticate_credential(reads, master, credential).await
+}
+
+pub(crate) async fn authenticate_node(
+    reads: &ReadPool,
+    master: &std::sync::Arc<Master>,
+    secret: &str,
+) -> Result<AuthenticatedCaller, HubError> {
+    let credential = ApiCredential::parse(secret)
+        .filter(|credential| matches!(credential, ApiCredential::Node(..)))
+        .ok_or_else(unauthorized)?;
+    authenticate_credential(reads, master, credential).await
+}
+
+async fn authenticate_credential(
+    reads: &ReadPool,
+    master: &std::sync::Arc<Master>,
+    credential: ApiCredential,
+) -> Result<AuthenticatedCaller, HubError> {
     let master = master.clone();
     reads
         .read(move |conn| Ok(authenticate_on(conn, &master, &credential)))
         .await?
+}
+
+pub(crate) fn attest_node_participant(
+    conn: &Connection,
+    node_id: &NodeId,
+    participant: &ParticipantId,
+    session: Option<(u64, u64)>,
+) -> Result<AuthenticatedCaller, HubError> {
+    let row = node(conn, node_id)?;
+    if row.revoked {
+        return Err(HubError::new(
+            ErrorCode::NodeRevoked,
+            "The Hub has revoked this node credential.",
+        ));
+    }
+    if session.is_some_and(|(generation, epoch)| generation != row.generation || epoch != row.epoch)
+    {
+        return Err(unauthorized());
+    }
+    let mut statement = conn.prepare_cached(
+        "SELECT p.kind, p.name FROM node_participants p JOIN nodes n USING (node_id)
+         WHERE p.node_id = ?1 AND p.participant_id = ?2 AND p.kind IN ('human', 'agent')
+           AND (?3 IS NULL OR (
+                 n.status = 'online' AND p.synced_epoch = ?3
+                 AND (p.kind = 'human' OR p.state IN ('starting', 'idle', 'working', 'awaiting_approval', 'stopping'))
+           ))",
+    )?;
+    let (kind, name): (String, String) = statement
+        .query_row(
+            params![
+                node_id.as_str(),
+                participant.as_str(),
+                session.map(|(_, epoch)| epoch)
+            ],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .optional()?
+        .ok_or_else(|| {
+            HubError::new(
+                ErrorCode::Forbidden,
+                "The node cannot attest this participant.",
+            )
+        })?;
+    let author_kind = if kind == "human" {
+        AuthorKind::Human
+    } else {
+        AuthorKind::Agent
+    };
+    Ok(AuthenticatedCaller {
+        identity: Identity::NodeParticipant {
+            node_id: node_id.clone(),
+            generation: row.generation,
+            epoch: session.map(|(_, epoch)| epoch),
+            participant: participant.clone(),
+            author_kind,
+            actor_key: format!("{node_id}/{participant}"),
+        },
+        display_name: name,
+    })
 }
 
 fn authenticate_on(
@@ -454,8 +559,22 @@ fn reverify_on(conn: &Connection, caller: &AuthenticatedCaller, now: i64) -> Res
             }
             node_caller(id.clone(), row)?
         }
+        Identity::NodeParticipant {
+            node_id,
+            generation,
+            epoch,
+            participant,
+            ..
+        } => {
+            let session = epoch.map(|epoch| (*generation, epoch));
+            attest_node_participant(conn, node_id, participant, session)?
+        }
     };
-    if current.identity != caller.identity {
+    let stale_attestation = matches!(
+        caller.identity,
+        Identity::NodeParticipant { epoch: Some(_), .. }
+    ) && current.display_name != caller.display_name;
+    if current.identity != caller.identity || stale_attestation {
         return Err(HubError::new(
             ErrorCode::Forbidden,
             "The caller's authority has changed.",

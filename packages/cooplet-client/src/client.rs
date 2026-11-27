@@ -13,17 +13,19 @@ use futures_core::Stream;
 use futures_util::future::{BoxFuture, FutureExt, WeakShared};
 
 use cooplet_protocol::{
-    HealthResponse, HubId, InfoResponse, WhoamiResponse, validate_idempotency_key,
+    BRIDGE_PROTOCOL_VERSION, HealthResponse, HubId, InfoResponse, WhoamiResponse,
+    validate_idempotency_key,
 };
 use http::{Method, header::AUTHORIZATION};
 use percent_encoding::{NON_ALPHANUMERIC, percent_decode_str, utf8_percent_encode};
-use reqwest::{Certificate, RequestBuilder, Response};
+use reqwest::{RequestBuilder, Response};
 use serde::{Serialize, de::DeserializeOwned};
-use url::{Host, Url};
+use url::Url;
 
 use crate::{
-    BearerToken, ClientError, IDEMPOTENCY_KEY, X_COOPLET_HUB,
+    BearerToken, ClientError, IDEMPOTENCY_KEY, X_COOPLET_HUB, build_rustls_client_config,
     error::{parse_failure, read_bounded},
+    tls::{validate_hub_origin, validate_origin},
 };
 
 pub(crate) type ResponseChunks = Pin<Box<dyn Stream<Item = reqwest::Result<Bytes>> + Send>>;
@@ -135,18 +137,97 @@ impl CoopletClient {
         base_url: &Url,
         root_certificates_pem: &[Vec<u8>],
     ) -> Result<InfoResponse, ClientError> {
-        let loopback = validate_origin(base_url, false)?;
-        let http = build_http(DEFAULT_CONNECT_TIMEOUT, loopback, root_certificates_pem)?;
+        Self::discover_info_with_timeout(base_url, root_certificates_pem, DEFAULT_REQUEST_TIMEOUT)
+            .await
+    }
+
+    /// Discover the public identity within the caller's remaining attempt budget.
+    pub async fn discover_info_with_timeout(
+        base_url: &Url,
+        root_certificates_pem: &[Vec<u8>],
+        budget: Duration,
+    ) -> Result<InfoResponse, ClientError> {
+        let loopback = validate_hub_origin(base_url)?;
+        let http = build_http(
+            budget.min(DEFAULT_CONNECT_TIMEOUT),
+            loopback,
+            root_certificates_pem,
+        )?;
         let url = make_url(base_url, "/v1/info", &[])?;
-        timeout(DEFAULT_REQUEST_TIMEOUT, "public info", async {
+        timeout(budget, "public info", async {
             let response = http.get(url).send().await?;
             decode_json(response, DEFAULT_JSON_BYTES, None, false).await
         })
         .await
     }
 
+    /// Redeem a one-shot token without authentication, redirects, or retries.
+    /// The caller must pin the origin using its public identity before this call.
+    pub async fn enroll<Req: Serialize + ?Sized, Resp: DeserializeOwned>(
+        base_url: &Url,
+        expected_hub_id: &HubId,
+        root_certificates_pem: &[Vec<u8>],
+        budget: Duration,
+        body: &Req,
+    ) -> Result<Resp, ClientError> {
+        let loopback = validate_hub_origin(base_url)?;
+        let http = build_http(
+            budget.min(DEFAULT_CONNECT_TIMEOUT),
+            loopback,
+            root_certificates_pem,
+        )?;
+        let url = make_url(base_url, "/v1/enrollment/token", &[])?;
+        let body = serde_json::to_vec(body)
+            .map_err(|_| ClientError::invalid("could not serialize enrollment body"))?;
+        timeout(budget, "enrollment", async {
+            let response = http
+                .post(url)
+                .header(X_COOPLET_HUB, expected_hub_id.as_str())
+                .header(http::header::CONTENT_TYPE, "application/json")
+                .body(body)
+                .send()
+                .await?;
+            decode_json(response, DEFAULT_JSON_BYTES, Some(expected_hub_id), false).await
+        })
+        .await
+    }
+
     pub async fn verify_hub_identity(&self) -> Result<(), ClientError> {
         self.verify_hub_epoch().await.map(|_| ())
+    }
+
+    /// Obtain a fresh public proof before opening a separate authenticated
+    /// transport. The successful proof also warms this client's HTTP pin cache.
+    pub async fn verify_hub_identity_with_timeout(
+        &self,
+        budget: Duration,
+    ) -> Result<(), ClientError> {
+        let Some(expected) = self.expected_hub() else {
+            return Ok(());
+        };
+        let previous = self.verified_epoch.load(Ordering::Acquire);
+        match timeout(budget, "hub identity", self.check_hub_identity(expected)).await {
+            Ok(()) => {
+                let mut state = self
+                    .hub_pin
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                self.store_verified_pin(&mut state);
+                Ok(())
+            }
+            Err(error) => {
+                self.observe_error(&error, previous);
+                Err(error)
+            }
+        }
+    }
+
+    fn store_verified_pin(&self, state: &mut HubPinState) -> u64 {
+        state.next_epoch += 1;
+        let epoch = state.next_epoch;
+        state.pin = HubPin::Verified(epoch);
+        self.verified_epoch.store(epoch, Ordering::Release);
+        epoch
     }
 
     async fn verify_hub_epoch(&self) -> Result<u64, ClientError> {
@@ -177,13 +258,7 @@ impl CoopletClient {
                                 .lock()
                                 .unwrap_or_else(std::sync::PoisonError::into_inner);
                             match result {
-                                Ok(()) => {
-                                    state.next_epoch += 1;
-                                    let epoch = state.next_epoch;
-                                    state.pin = HubPin::Verified(epoch);
-                                    client.verified_epoch.store(epoch, Ordering::Release);
-                                    Ok(epoch)
-                                }
+                                Ok(()) => Ok(client.store_verified_pin(&mut state)),
                                 Err(error) => {
                                     state.pin = HubPin::Unverified(None);
                                     client.verified_epoch.store(0, Ordering::Release);
@@ -224,7 +299,13 @@ impl CoopletClient {
 
     async fn check_hub_identity(&self, expected: &HubId) -> Result<(), ClientError> {
         let actual = match self.info().await? {
-            InfoResponse::Hub(info) if &info.hub_id == expected => return Ok(()),
+            InfoResponse::Hub(info) if &info.hub_id == expected => {
+                return if info.protocol_version == BRIDGE_PROTOCOL_VERSION {
+                    Ok(())
+                } else {
+                    Err(ClientError::protocol("unsupported Hub protocol version"))
+                };
+            }
             InfoResponse::Hub(info) => Some(info.hub_id.to_string()),
             InfoResponse::Node(_) => None,
         };
@@ -292,7 +373,17 @@ impl CoopletClient {
         path: &str,
         idempotency_key: Option<&str>,
     ) -> Result<Resp, ClientError> {
-        let url = self.url(path, &[])?;
+        self.delete_json_with_query(path, &[], idempotency_key)
+            .await
+    }
+
+    pub async fn delete_json_with_query<Resp: DeserializeOwned>(
+        &self,
+        path: &str,
+        query: &[(&str, String)],
+        idempotency_key: Option<&str>,
+    ) -> Result<Resp, ClientError> {
+        let url = self.url(path, query)?;
         let (request, pin_epoch) = self.protected(Method::DELETE, url, idempotency_key).await?;
         self.execute_json(request, Some(pin_epoch), false).await
     }
@@ -435,24 +526,15 @@ fn build_http(
     loopback: bool,
     root_certificates_pem: &[Vec<u8>],
 ) -> Result<reqwest::Client, ClientError> {
+    let tls = build_rustls_client_config(root_certificates_pem)?;
     let mut builder = reqwest::Client::builder()
-        .use_rustls_tls()
+        .use_preconfigured_tls((*tls).clone())
         .connect_timeout(connect_timeout)
         .tcp_keepalive(Some(DEFAULT_TCP_KEEPALIVE))
         .redirect(reqwest::redirect::Policy::none())
         .retry(reqwest::retry::never());
     if loopback {
         builder = builder.no_proxy();
-    }
-    for pem in root_certificates_pem {
-        let certs = Certificate::from_pem_bundle(pem)
-            .map_err(|_| ClientError::invalid("invalid root certificate PEM"))?;
-        if certs.is_empty() {
-            return Err(ClientError::invalid("invalid root certificate PEM"));
-        }
-        for cert in certs {
-            builder = builder.add_root_certificate(cert);
-        }
     }
     builder.build().map_err(|error| {
         if error.is_builder() {
@@ -461,31 +543,6 @@ fn build_http(
             error.into()
         }
     })
-}
-
-fn validate_origin(base: &Url, local_node: bool) -> Result<bool, ClientError> {
-    if base.host().is_none()
-        || !matches!(base.path(), "" | "/")
-        || base.query().is_some()
-        || base.fragment().is_some()
-        || !base.username().is_empty()
-        || base.password().is_some()
-    {
-        return Err(ClientError::invalid("base URL must be a bare HTTP origin"));
-    }
-    let loopback = match base.host() {
-        Some(Host::Ipv4(ip)) => ip.is_loopback(),
-        Some(Host::Ipv6(ip)) => ip.is_loopback(),
-        _ => false,
-    };
-    if (local_node && !loopback)
-        || !(base.scheme() == "https" || (base.scheme() == "http" && loopback))
-    {
-        return Err(ClientError::invalid(
-            "Local Node requires loopback and remote Hub requires HTTPS",
-        ));
-    }
-    Ok(loopback)
 }
 
 /// Build an API route from individual path segments.
@@ -560,6 +617,9 @@ pub(crate) async fn timeout<T>(
     activity: &'static str,
     operation: impl Future<Output = Result<T, ClientError>>,
 ) -> Result<T, ClientError> {
+    if duration.is_zero() {
+        return Err(ClientError::Timeout(activity));
+    }
     tokio::time::timeout(duration, operation)
         .await
         .map_err(|_| ClientError::Timeout(activity))?

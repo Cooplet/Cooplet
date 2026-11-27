@@ -211,6 +211,7 @@ fn thread(authors: &[AuthorKind]) -> TestResult<TurnInput> {
                 .last()
                 .map(|post: &InboundThreadPost| post.post_id.clone()),
             body: direct.body,
+            mentions: Vec::new(),
             attachments: direct.attachments,
             question: None,
             answer: None,

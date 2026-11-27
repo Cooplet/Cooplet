@@ -1,7 +1,9 @@
 use axum::body::Body;
-use cooplet_client::{IDEMPOTENCY_KEY, X_COOPLET_FILENAME, X_COOPLET_SHA256};
+use cooplet_client::{
+    IDEMPOTENCY_KEY, X_COOPLET_FILENAME, X_COOPLET_PARTICIPANT, X_COOPLET_SHA256,
+};
 use cooplet_protocol::{
-    AggregateType, AttachmentRef, BlobId, ErrorCode, EventKind, HubId, ServiceScope,
+    AggregateType, AttachmentRef, BlobId, ErrorCode, EventKind, HubId, ParticipantId, ServiceScope,
     canonical_sha256, validate_attachment_name, validate_idempotency_key, validate_media_type,
     validate_sha256,
 };
@@ -17,13 +19,12 @@ use tokio::io::AsyncReadExt;
 
 use crate::{
     AppState,
-    auth::{AuthenticatedCaller, reverify_caller_tx},
+    auth::{AuthenticatedCaller, attest_node_participant, reverify_caller_tx},
     error::HubError,
-    now_ms,
     storage::{
         events::{EventAudience, NewEvent, append, blob_event_data},
         operations::{self, NewOperation},
-        sql::read_verified_tx,
+        sql::read_verified_tx_with_clock,
     },
 };
 
@@ -41,6 +42,24 @@ pub(crate) async fn upload(
     headers: &HeaderMap,
     body: Body,
 ) -> Result<(StatusCode, AttachmentRef), HubError> {
+    let attributed = match header_value(headers, X_COOPLET_PARTICIPANT.as_str())? {
+        Some(value) => {
+            let (node_id, _) = caller.node_bridge_identity().ok_or_else(blob_forbidden)?;
+            let node_id = node_id.clone();
+            let participant_id = ParticipantId::parse(value)?;
+            Some(
+                read_verified_tx_with_clock(
+                    &state.reads,
+                    caller,
+                    state.wall_clock.clone(),
+                    move |db, _, _| attest_node_participant(db, &node_id, &participant_id, None),
+                )
+                .await?,
+            )
+        }
+        None => None,
+    };
+    let caller = attributed.as_ref().unwrap_or(caller);
     require_blob_scope(caller, ServiceScope::Collaborate)?;
     let request = UploadHeaders::parse(headers, state.max_blob_bytes)?;
     if let Some(key) = &request.key
@@ -60,6 +79,7 @@ pub(crate) async fn upload(
     let register = {
         let caller = caller.clone();
         let hub_id = state.meta.hub_id.clone();
+        let wall_clock = state.wall_clock.clone();
         move |tx: &Transaction<'_>, stored: &StoredBlob| {
             register(
                 tx,
@@ -68,6 +88,7 @@ pub(crate) async fn upload(
                 request.key.as_deref(),
                 &request.mime_type,
                 stored,
+                wall_clock(),
             )
         }
     };
@@ -227,9 +248,12 @@ async fn read_receipt(
     key: &str,
 ) -> Result<Option<PriorUpload>, HubError> {
     let key = key.to_owned();
-    read_verified_tx(&state.reads, caller, move |snapshot, caller, _| {
-        lookup_receipt(snapshot, caller, &key)
-    })
+    read_verified_tx_with_clock(
+        &state.reads,
+        caller,
+        state.wall_clock.clone(),
+        move |snapshot, caller, now| lookup_receipt(snapshot, caller, &key, now),
+    )
     .await
 }
 
@@ -237,6 +261,7 @@ fn lookup_receipt(
     conn: &Connection,
     caller: &AuthenticatedCaller,
     key: &str,
+    now: i64,
 ) -> Result<Option<PriorUpload>, HubError> {
     let Some(saved) = operations::load(conn, caller.actor_id(), key)? else {
         return Ok(None);
@@ -253,7 +278,7 @@ fn lookup_receipt(
                     .ok_or_else(|| HubError::internal("missing successful upload receipt"))?,
             )?;
             match lookup_blob(conn, &receipt.attachment.blob_id)? {
-                Some(blob) => blob.require_read(caller)?,
+                Some(blob) => blob.require_read(conn, caller, now)?,
                 None if receipt.ever_attached && !caller.is_global_reader() => {
                     return Err(blob_forbidden());
                 }
@@ -385,8 +410,8 @@ fn register(
     key: Option<&str>,
     mime_type: &str,
     stored: &StoredBlob,
+    now_ms: i64,
 ) -> Result<WriteOutcome<AttachmentRef>, WriteError<RegistrationError>> {
-    let now_ms = now_ms();
     reverify_caller_tx(tx, caller, now_ms)?;
     let attachment = AttachmentRef {
         blob_id: stored.blob_id.clone(),
@@ -406,7 +431,7 @@ fn register(
         })
         .transpose()?;
     if let (Some(key), Some(digest)) = (key, &digest)
-        && let Some(prior) = lookup_receipt(tx, caller, key)?
+        && let Some(prior) = lookup_receipt(tx, caller, key, now_ms)?
     {
         if prior.request_sha256 != *digest {
             return Err(receipt_conflict().into());
@@ -486,16 +511,21 @@ async fn observe_registration(
     caller: &AuthenticatedCaller,
     blob_id: BlobId,
 ) -> Result<Option<AttachmentRef>, HubError> {
-    read_verified_tx(&state.reads, caller, move |snapshot, caller, _| {
-        let Some(blob) = lookup_blob(snapshot, &blob_id)? else {
-            return Ok(None);
-        };
-        if blob.owner_actor_id != caller.actor_id() {
-            return Err(blob_forbidden());
-        }
-        blob.require_read(caller)?;
-        Ok(Some(blob.attachment))
-    })
+    read_verified_tx_with_clock(
+        &state.reads,
+        caller,
+        state.wall_clock.clone(),
+        move |snapshot, caller, now| {
+            let Some(blob) = lookup_blob(snapshot, &blob_id)? else {
+                return Ok(None);
+            };
+            if blob.owner_actor_id != caller.actor_id() {
+                return Err(blob_forbidden());
+            }
+            blob.require_read(snapshot, caller, now)?;
+            Ok(Some(blob.attachment))
+        },
+    )
     .await
 }
 

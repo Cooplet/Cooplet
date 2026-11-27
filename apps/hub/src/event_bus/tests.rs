@@ -429,6 +429,7 @@ async fn quiet_stream_reconciles_a_durable_commit_without_a_wake() -> TestResult
         0,
         wake,
         fixture.state.revocations.subscribe(),
+        fixture.state.thread_acl_watch.subscribe(),
         fixture.state.shutdown.clone(),
     )
     .await?
@@ -643,5 +644,425 @@ async fn stream_closes_naturally_when_token_ttl_expires_without_revocation_bump(
     .await?;
     let mut body = fixture.stream(&caller, 0).await?;
     assert_eq!(next_frame(&mut body).await?, None);
+    fixture.close().await
+}
+
+#[tokio::test]
+async fn thread_retention_hides_logically_expired_posts_before_collection() -> TestResult {
+    use std::sync::atomic::{AtomicI64, Ordering};
+
+    use axum::body::{Body, to_bytes};
+    use cooplet_client::X_COOPLET_FILENAME;
+    use http::{HeaderMap, HeaderValue, header};
+
+    use crate::{blobs, threads};
+    use cooplet_protocol::{
+        ThreadCreateRequest, ThreadPinSetRequest, ThreadPostRequest, ThreadReadQuery,
+    };
+
+    let mut fixture = Fixture::new().await?;
+    let initial = now_ms();
+    let wall = Arc::new(AtomicI64::new(initial));
+    let injected = wall.clone();
+    fixture.state.wall_clock = Arc::new(move || injected.load(Ordering::Relaxed));
+    let board = threads::create(
+        &fixture.state,
+        &fixture.admin,
+        "thread-test-create",
+        ThreadCreateRequest {
+            title: "Retention".into(),
+            topic: None,
+            creator_handle: None,
+            members: Vec::new(),
+        },
+    )
+    .await?;
+    let mut headers = HeaderMap::new();
+    headers.insert(header::CONTENT_TYPE, HeaderValue::from_static("text/plain"));
+    headers.insert(X_COOPLET_FILENAME, HeaderValue::from_static("report.txt"));
+    let (_, attachment) = blobs::upload(
+        &fixture.state,
+        &fixture.admin,
+        &headers,
+        Body::from("retained attachment"),
+    )
+    .await?;
+    let mut receipts = Vec::new();
+    for (index, time) in [
+        (1, initial),
+        (2, initial - 1000),
+        (3, initial + 86_400_000),
+        (4, initial + threads::RETENTION_MS + 1),
+    ] {
+        wall.store(time, Ordering::Relaxed);
+        receipts.push(
+            threads::post(
+                &fixture.state,
+                &fixture.admin,
+                board.thread_id.clone(),
+                &format!("thread-test-post-{index}"),
+                ThreadPostRequest {
+                    body: format!("post {index}"),
+                    mentions: vec![],
+                    attachments: if matches!(index, 1 | 3) {
+                        vec![attachment.clone()]
+                    } else {
+                        vec![]
+                    },
+                    question: None,
+                    answer: None,
+                    in_reply_to: None,
+                },
+            )
+            .await?,
+        );
+    }
+    assert_eq!(receipts[0].created_at_ms, receipts[1].created_at_ms);
+    let live = threads::read(
+        &fixture.state,
+        &fixture.admin,
+        board.thread_id.clone(),
+        ThreadReadQuery::default(),
+    )
+    .await?;
+    assert_eq!((live.floor_seq, live.head_seq), (2, 4));
+    assert_eq!(live.posts[0].post_id, receipts[2].post_id);
+    assert_eq!(
+        live.posts[0].attachments.as_slice(),
+        std::slice::from_ref(&attachment)
+    );
+    let file = blobs::download(&fixture.state, &fixture.admin, attachment.blob_id.clone()).await?;
+    assert_eq!(
+        to_bytes(file.into_body(), 64).await?.as_ref(),
+        b"retained attachment"
+    );
+
+    let error = threads::read(
+        &fixture.state,
+        &fixture.admin,
+        board.thread_id.clone(),
+        ThreadReadQuery {
+            since_seq: Some(1),
+            ..ThreadReadQuery::default()
+        },
+    )
+    .await
+    .err()
+    .ok_or("obsolete cursor was accepted")?;
+    assert_eq!(error.problem().code, ErrorCode::ResyncRequired);
+    assert_eq!(error.problem().extensions["floor_seq"], 2);
+    assert_eq!(error.problem().extensions["head_seq"], 4);
+    let error = threads::set_pin(
+        &fixture.state,
+        &fixture.admin,
+        board.thread_id,
+        "old".into(),
+        "thread-test-old-pin",
+        ThreadPinSetRequest {
+            value_json: json!("keep"),
+            post_id: Some(receipts[0].post_id.clone()),
+            expected_version: Some(0),
+        },
+    )
+    .await
+    .err()
+    .ok_or("logically expired post was pinnable")?;
+    assert_eq!(error.problem().code, ErrorCode::NotFound);
+    fixture.close().await
+}
+
+#[tokio::test]
+async fn thread_acl_change_discards_initial_frames_at_the_retained_event_floor() -> TestResult {
+    use crate::threads;
+    use cooplet_protocol::{
+        ThreadCreateRequest, ThreadMemberJoinRequest, ThreadMemberLeaveRequest, ThreadRole,
+    };
+
+    let fixture = Fixture::new().await?;
+    let (service, _) = fixture.service(&[]).await?;
+    let board = threads::create(
+        &fixture.state,
+        &fixture.admin,
+        "acl-board-create",
+        ThreadCreateRequest {
+            title: "Scoped board".into(),
+            topic: None,
+            creator_handle: None,
+            members: vec![ThreadMemberJoinRequest {
+                member_key: service.actor_id().into(),
+                handle: Some("reader".into()),
+                role: Some(ThreadRole::Observer),
+                wake_policy: None,
+                delivery_mode: None,
+            }],
+        },
+    )
+    .await?;
+    fixture
+        .state
+        .db
+        .write_sqlite(|tx| {
+            tx.execute(
+                "UPDATE hub_meta SET events_pruned_through_seq=1 WHERE id=1",
+                [],
+            )?;
+            tx.execute("DELETE FROM events WHERE seq=1", [])?;
+            Ok(WriteOutcome::new(()))
+        })
+        .await?;
+
+    let mut body = fixture.stream(&service, 0).await?;
+    threads::leave(
+        &fixture.state,
+        &fixture.admin,
+        board.thread_id,
+        "acl-board-leave",
+        ThreadMemberLeaveRequest {
+            member_key: Some(service.actor_id().into()),
+        },
+    )
+    .await?;
+    fixture
+        .publish(vec![(
+            EventAudience::OwnerOnly {
+                actor_id: service.actor_id().into(),
+            },
+            json!({"visible":true}),
+        )])
+        .await?;
+
+    let response = tokio::time::timeout(Duration::from_secs(2), body.next())
+        .await?
+        .ok_or("stream ended before the visible event")??;
+    let EventStreamFrame::Event { event } = serde_json::from_slice(&response)? else {
+        return Err("expected the visible event, not a resync frame".into());
+    };
+    assert_eq!(event.payload["visible"], true);
+    drop(body);
+    fixture.close().await
+}
+
+#[tokio::test]
+async fn closed_thread_expiry_and_gc_discard_buffered_frames_for_members() -> TestResult {
+    use std::sync::atomic::{AtomicI64, Ordering};
+
+    use crate::threads;
+    use cooplet_protocol::{ThreadCreateRequest, ThreadMemberJoinRequest};
+
+    let mut fixture = Fixture::new().await?;
+    let (service, _) = fixture.service(&[]).await?;
+    let now = now_ms();
+    let wall = Arc::new(AtomicI64::new(now));
+    let injected = wall.clone();
+    fixture.state.wall_clock = Arc::new(move || injected.load(Ordering::Relaxed));
+    let board = threads::create(
+        &fixture.state,
+        &fixture.admin,
+        "expiry-board-create",
+        ThreadCreateRequest {
+            title: "Expiring board".into(),
+            topic: None,
+            creator_handle: None,
+            members: vec![ThreadMemberJoinRequest {
+                member_key: service.actor_id().into(),
+                handle: Some("reader".into()),
+                role: None,
+                wake_policy: None,
+                delivery_mode: None,
+            }],
+        },
+    )
+    .await?;
+    threads::close(
+        &fixture.state,
+        &fixture.admin,
+        board.thread_id.clone(),
+        "expiry-board-close",
+    )
+    .await?;
+    let thread = board.thread_id.clone();
+    fixture
+        .state
+        .db
+        .write_sqlite(move |tx| {
+            tx.execute(
+                "UPDATE threads SET expires_at_ms=?1 WHERE thread_id=?2",
+                params![now + 50, thread.as_str()],
+            )?;
+            Ok(WriteOutcome::new(()))
+        })
+        .await?;
+
+    let mut member_stream = fixture.stream(&service, 0).await?;
+    let mut rollback_stream = fixture.stream(&service, 0).await?;
+    let mut archive = fixture.stream(&fixture.admin, 0).await?;
+    wall.store(now + 51, Ordering::Relaxed);
+    fixture
+        .publish(vec![(
+            EventAudience::OwnerOnly {
+                actor_id: service.actor_id().into(),
+            },
+            json!({"after_expiry":true}),
+        )])
+        .await?;
+    let first = tokio::time::timeout(Duration::from_secs(2), member_stream.next())
+        .await?
+        .ok_or("member stream ended early")??;
+    let EventStreamFrame::Event { event } = serde_json::from_slice(&first)? else {
+        return Err("expected an event after expiry".into());
+    };
+    assert_eq!(event.payload["after_expiry"], true);
+
+    // Keep the intermediate state from the first committed GC batch. The
+    // second member stream is still holding frames from before this write.
+    let thread = board.thread_id.clone();
+    fixture
+        .state
+        .db
+        .write_sqlite(move |tx| {
+            let marked = tx.execute(
+                "UPDATE threads SET expires_at_ms=0 WHERE thread_id=?1 AND expires_at_ms<=?2",
+                params![thread.as_str(), now + 51],
+            )?;
+            assert_eq!(marked, 1);
+            Ok(WriteOutcome::new(()))
+        })
+        .await?;
+    wall.store(now, Ordering::Relaxed);
+    let first = tokio::time::timeout(Duration::from_secs(2), rollback_stream.next())
+        .await?
+        .ok_or("member stream ended on the clock rollback")??;
+    let EventStreamFrame::Event { event } = serde_json::from_slice(&first)? else {
+        return Err("expected a visible event after rollback".into());
+    };
+    assert_eq!(event.payload["after_expiry"], true);
+
+    let first = tokio::time::timeout(Duration::from_secs(2), archive.next())
+        .await?
+        .ok_or("archive stream ended early")??;
+    let EventStreamFrame::Event { event } = serde_json::from_slice(&first)? else {
+        return Err("expected a retained archive event".into());
+    };
+    assert_eq!(event.kind, EventKind::ThreadCreated);
+    assert_eq!(event.aggregate_id, board.thread_id.as_str());
+    drop(member_stream);
+    drop(rollback_stream);
+    drop(archive);
+    fixture.close().await
+}
+
+#[tokio::test]
+async fn a_nodes_departure_does_not_remove_it_from_historical_thread_acl() -> TestResult {
+    use crate::threads;
+    use cooplet_protocol::{
+        ParticipantId, ThreadCreateRequest, ThreadListQuery, ThreadMemberJoinRequest,
+        ThreadMemberLeaveRequest,
+    };
+
+    let fixture = Fixture::new().await?;
+    let (service, _) = fixture.service(&[]).await?;
+    let board = threads::create(
+        &fixture.state,
+        &fixture.admin,
+        "history-board-create",
+        ThreadCreateRequest {
+            title: "Historical scopes".into(),
+            topic: None,
+            creator_handle: None,
+            members: vec![ThreadMemberJoinRequest {
+                member_key: service.actor_id().into(),
+                handle: Some("reader".into()),
+                role: None,
+                wake_policy: None,
+                delivery_mode: None,
+            }],
+        },
+    )
+    .await?;
+    assert_eq!(
+        threads::list(&fixture.state, &service, ThreadListQuery::default())
+            .await?
+            .items
+            .len(),
+        1
+    );
+
+    let node = NodeId::generate()?;
+    let agent = ParticipantId::generate()?;
+    let key = format!("{node}/{agent}");
+    let node_for_write = node.clone();
+    let owner = fixture.admin.actor_id().to_owned();
+    fixture.state.db.write_sqlite(move |tx| {
+        tx.execute(
+            "INSERT INTO nodes(node_id,display_name,owner_principal_id,credential_hmac,status,enrolled_at_ms)
+             VALUES(?1,'Worker',?2,'worker credential','online',1)",
+            params![node_for_write.as_str(), owner],
+        )?;
+        tx.execute(
+            "INSERT INTO node_participants(node_id,participant_id,kind,name,state,synced_epoch,updated_at_ms)
+             VALUES(?1,?2,'agent','Worker','idle',0,1)",
+            params![node_for_write.as_str(), agent.as_str()],
+        )?;
+        Ok(WriteOutcome::new(()))
+    }).await?;
+
+    let mut buffered = fixture.stream(&service, 0).await?;
+    threads::join(
+        &fixture.state,
+        &fixture.admin,
+        board.thread_id.clone(),
+        "history-board-join",
+        ThreadMemberJoinRequest {
+            member_key: key.clone(),
+            handle: Some("worker".into()),
+            role: None,
+            wake_policy: None,
+            delivery_mode: None,
+        },
+    )
+    .await?;
+    threads::leave(
+        &fixture.state,
+        &fixture.admin,
+        board.thread_id.clone(),
+        "history-board-leave",
+        ThreadMemberLeaveRequest {
+            member_key: Some(key),
+        },
+    )
+    .await?;
+    fixture
+        .state
+        .db
+        .write_sqlite(move |tx| {
+            tx.execute("DELETE FROM nodes WHERE node_id=?1", [node.as_str()])?;
+            Ok(WriteOutcome::new(()))
+        })
+        .await?;
+    let hidden = threads::get(&fixture.state, &service, board.thread_id).await;
+    assert!(hidden.is_err_and(|error| error.problem().code == ErrorCode::NotFound));
+    assert!(
+        threads::list(&fixture.state, &service, ThreadListQuery::default())
+            .await?
+            .items
+            .is_empty()
+    );
+
+    fixture
+        .publish(vec![(
+            EventAudience::OwnerOnly {
+                actor_id: service.actor_id().into(),
+            },
+            json!({"outside":true}),
+        )])
+        .await?;
+    let bytes = tokio::time::timeout(Duration::from_secs(2), buffered.next())
+        .await?
+        .ok_or("missing visible event")??;
+    let EventStreamFrame::Event { event } = serde_json::from_slice(&bytes)? else {
+        return Err("expected the outside event".into());
+    };
+    assert_eq!(event.payload["outside"], true);
+    drop(buffered);
     fixture.close().await
 }

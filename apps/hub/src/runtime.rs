@@ -13,6 +13,7 @@ use std::{
 
 use clap::{Args, Parser, Subcommand};
 use cooplet_client::{BearerToken, ClientConfig, CoopletClient, Destination};
+use cooplet_platform::MonotonicClock;
 use cooplet_protocol::{HubId, RequestId, validate_idempotency_key};
 use serde::Serialize;
 use tokio::{
@@ -26,9 +27,9 @@ use url::{Host, Url};
 use crate::{
     AppState,
     admin::{IssueEnrollmentRequest, IssuedEnrollmentResponse},
-    bridge::OfflineBridge,
+    bridge::LiveBridge,
     credentials::{EnrollmentCredential, enrollment_node_id},
-    http::{RequestLimits, router},
+    http::{DEFAULT_BRIDGE_CONCURRENCY, RequestLimits, router},
     openapi::openapi_bytes,
     storage::{self, HubStorage},
 };
@@ -39,6 +40,7 @@ const WRITE_IDLE_TIMEOUT: Duration = Duration::from_secs(30);
 const DRAIN_TIMEOUT: Duration = Duration::from_secs(5);
 const FORCE_CLOSE_TIMEOUT: Duration = Duration::from_secs(1);
 const BACKGROUND_DRAIN_TIMEOUT: Duration = Duration::from_secs(5);
+const BRIDGE_DRAIN_TIMEOUT: Duration = Duration::from_secs(5);
 const MAX_ADMIN_TOKEN_BYTES: u64 = 1024;
 const MAX_ENROLLMENT_TTL_MS: i64 = 86_400_000;
 
@@ -95,6 +97,12 @@ struct RunArgs {
     max_active_event_streams: usize,
     #[arg(long, default_value_t = 32)]
     max_concurrent_blob_transfers: usize,
+    #[arg(long, default_value_t = DEFAULT_BRIDGE_CONCURRENCY)]
+    handshake_permits: usize,
+    #[arg(long, default_value_t = DEFAULT_BRIDGE_CONCURRENCY)]
+    max_active_bridges: usize,
+    #[arg(long, default_value_t = true, action = clap::ArgAction::Set)]
+    agents_can_create_threads: bool,
 }
 
 #[derive(Subcommand)]
@@ -323,7 +331,8 @@ async fn run(args: RunArgs) -> CliResult<()> {
         args.max_concurrent_requests,
         args.max_active_event_streams,
         args.max_concurrent_blob_transfers,
-    )?;
+    )?
+    .with_bridges(args.handshake_permits, args.max_active_bridges)?;
     tracing_subscriber::fmt()
         .with_writer(io::stderr)
         .try_init()?;
@@ -341,14 +350,18 @@ async fn run(args: RunArgs) -> CliResult<()> {
     .await?;
     let served = async {
         let (shutdown, shutdown_rx) = watch::channel(());
-        let state = AppState::new(
+        let mut state = AppState::new(
             &engine,
             meta,
             master,
-            Arc::new(OfflineBridge),
+            Arc::new(LiveBridge::new(
+                limits.active_bridges(),
+                Arc::new(MonotonicClock),
+            )),
             shutdown_rx,
             args.max_blob_bytes,
         )?;
+        state.agents_can_create_threads = args.agents_can_create_threads;
         let socket = TcpListener::bind(args.listen).await?;
         writeln!(
             io::stderr().lock(),
@@ -404,6 +417,12 @@ async fn serve(
             result
         }
     };
+    if time::timeout(BRIDGE_DRAIN_TIMEOUT, bridge.drain())
+        .await
+        .is_err()
+    {
+        tracing::warn!("Bridge drain timed out during Hub shutdown");
+    }
     if time::timeout(BACKGROUND_DRAIN_TIMEOUT, background.drain())
         .await
         .is_err()

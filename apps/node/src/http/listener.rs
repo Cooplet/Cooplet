@@ -18,7 +18,7 @@ use tokio::{
 
 const CONNECTION_GRACE: Duration = Duration::from_secs(2);
 const INITIAL_HEADER_TIMEOUT: Duration = Duration::from_secs(15);
-const IDLE_CONNECTION_TIMEOUT: Duration = Duration::from_secs(60);
+const IDLE_CONNECTION_TIMEOUT: Duration = Duration::from_secs(85);
 const PROGRESS_READ_THRESHOLD: usize = 4096;
 const MAX_CONCURRENT_CONNECTIONS: usize = 256;
 
@@ -414,9 +414,9 @@ mod tests {
         let mut resp = [0u8; 64];
         let _ = client.read(&mut resp).await?;
 
-        // Sit idle for 55s (< 60s), then send a small (< 4096B) keep-alive request 2,
-        // wait 25s for a slow handler (80s total > 60s), and verify the response succeeds.
-        tokio::time::advance(Duration::from_secs(55)).await;
+        // A small keep-alive request resets the deadline even when it arrives
+        // just before expiry. The response then crosses the original deadline.
+        tokio::time::advance(IDLE_CONNECTION_TIMEOUT - Duration::from_secs(5)).await;
         client
             .write_all(
                 b"POST /v1/messages HTTP/1.1\r\nHost: localhost\r\nContent-Length: 2\r\n\r\n{}",
@@ -444,14 +444,15 @@ mod tests {
             drained += client.read(&mut resp).await?;
         }
 
-        // Active upload in 1448-byte chunks (< 4096B) spanning > 70s must keep resetting idle.
-        for _ in 0..8 {
+        // An upload spanning more than one idle window remains alive while
+        // its small chunks keep making progress.
+        for _ in 0..(IDLE_CONNECTION_TIMEOUT.as_secs() / 10 + 2) {
             tokio::time::advance(Duration::from_secs(10)).await;
-            client.write_all(&vec![b'a'; 1448]).await?;
+            client.write_all(&[b'a'; 1448]).await?;
             assert_eq!(server.read(&mut buf).await?, 1448);
         }
         // Genuine inactivity beyond idle_timeout closes with TimedOut.
-        tokio::time::advance(Duration::from_secs(61)).await;
+        tokio::time::advance(IDLE_CONNECTION_TIMEOUT + Duration::from_secs(1)).await;
         let before = Instant::now();
         client.write_all(b"x").await?;
         let err = server

@@ -149,13 +149,17 @@ pub(super) fn enter_awaiting_approval(
             events,
         )?;
     } else if previous_state != ParticipantState::AwaitingApproval {
+        let mut state_payload = payload.clone();
+        if matches!(source, ApprovalSource::Initial { created_by: None }) {
+            state_payload["reason"] = Value::from("resumed");
+        }
         participant_event(
             tx,
             now,
             EventKind::ParticipantStateChanged,
             id,
             None,
-            payload.clone(),
+            state_payload,
             events,
         )?;
     }

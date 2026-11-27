@@ -14,8 +14,8 @@ use tokio::{
     time::Instant,
 };
 
-use super::{Budget, Cursor, Reader, StreamSnapshot, Watermarks};
-use crate::{auth, error::HubError, now_ms};
+use super::{Budget, BufferedFrame, Cursor, Reader, StreamSnapshot, Watermarks};
+use crate::{auth, error::HubError};
 
 const STREAM_SCAN_LIMIT: usize = 256;
 const PING_INTERVAL: Duration = Duration::from_secs(15);
@@ -61,7 +61,8 @@ pub(super) async fn response(
     reader: Arc<Reader>,
     after: u64,
     mut wake: watch::Receiver<Watermark>,
-    mut revocations: watch::Receiver<u64>,
+    revocations: watch::Receiver<u64>,
+    mut thread_acl: watch::Receiver<u64>,
     mut shutdown: watch::Receiver<()>,
 ) -> Result<Response, HubError> {
     let budget = Budget {
@@ -69,6 +70,7 @@ pub(super) async fn response(
         items: STREAM_SCAN_LIMIT,
     };
     wake.borrow_and_update();
+    thread_acl.borrow_and_update();
     let initial = tokio::select! {
         biased;
         _ = shutdown.changed() => return Err(HubError::new(
@@ -81,19 +83,25 @@ pub(super) async fn response(
         },
     };
     if revocations.has_changed().unwrap_or(true) {
-        revocations.borrow_and_update();
         auth::reverify_caller(&reader.reads, &reader.caller).await?;
     }
     let now = Instant::now();
+    let confirmed_cursor = if initial.frames.is_empty() {
+        initial.next_seq
+    } else {
+        initial.start
+    };
     let state = EventStream {
         reader,
         wake,
         revocations,
+        thread_acl,
         shutdown,
         budget,
         pending: initial.frames.into(),
         pending_resync: None,
         cursor: initial.next_seq,
+        confirmed_cursor,
         needs_scan: initial.has_more,
         closed: false,
         ping_at: now + PING_INTERVAL,
@@ -114,11 +122,13 @@ struct EventStream {
     reader: Arc<Reader>,
     wake: watch::Receiver<Watermark>,
     revocations: watch::Receiver<u64>,
+    thread_acl: watch::Receiver<u64>,
     shutdown: watch::Receiver<()>,
     budget: Budget,
-    pending: VecDeque<Bytes>,
+    pending: VecDeque<BufferedFrame>,
     pending_resync: Option<Watermarks>,
     cursor: u64,
+    confirmed_cursor: u64,
     needs_scan: bool,
     closed: bool,
     ping_at: Instant,
@@ -134,8 +144,12 @@ impl EventStream {
 
             let now = Instant::now();
             let expiry = self.expiry_wait()?;
-            if self.revocations.has_changed().ok()? || now >= self.recheck_at {
-                self.revocations.borrow_and_update();
+            if self.revocations.has_changed().ok()? || self.thread_acl.has_changed().ok()? {
+                self.discard_and_rescan().await?;
+                // Check for a second authorization change during the snapshot.
+                continue;
+            }
+            if now >= self.recheck_at {
                 if self.pending.is_empty() && self.pending_resync.is_none() {
                     // An uncertain commit can leave a durable event without a wake.
                     // This snapshot also reverifies the caller in the same read transaction.
@@ -175,7 +189,30 @@ impl EventStream {
                 self.ping_at = now + PING_INTERVAL;
                 return Some(Bytes::from_static(PING_FRAME));
             }
-            if let Some(frame) = self.pending.pop_front() {
+            if let Some((_, Some(expiry), _)) = self.pending.front() {
+                // GC can clear a closed board during a forward clock step. A clock
+                // rollback cannot restore access to a frame fetched before that commit.
+                let retained = (self.reader.clock)() < expiry.at_ms
+                    && tokio::select! {
+                        biased;
+                        _ = self.shutdown.changed() => return None,
+                        retained = self.reader.closed_thread_retained(&expiry.thread_id) => retained.ok()?,
+                    };
+                if self.revocations.has_changed().ok()? || self.thread_acl.has_changed().ok()? {
+                    continue;
+                }
+                self.expiry_wait()?;
+                if !retained || (self.reader.clock)() >= expiry.at_ms {
+                    self.discard_and_rescan().await?;
+                    continue;
+                }
+            }
+            if let Some((seq, _, frame)) = self.pending.pop_front() {
+                self.confirmed_cursor = if self.pending.is_empty() {
+                    self.cursor
+                } else {
+                    seq
+                };
                 return Some(frame);
             }
             if self.needs_scan {
@@ -191,6 +228,11 @@ impl EventStream {
                     change.ok()?;
                     self.recheck_at = Instant::now();
                 }
+                change = self.thread_acl.changed() => {
+                    change.ok()?;
+                    // There are no buffered frames in this branch.
+                    self.needs_scan = true;
+                }
                 change = self.wake.changed() => {
                     change.ok()?;
                     self.needs_scan = true;
@@ -198,6 +240,17 @@ impl EventStream {
                 () = tokio::time::sleep_until(deadline) => {},
             }
         }
+    }
+
+    async fn discard_and_rescan(&mut self) -> Option<()> {
+        self.revocations.borrow_and_update();
+        self.thread_acl.borrow_and_update();
+        self.pending.clear();
+        self.pending_resync = None;
+        self.cursor = self.confirmed_cursor;
+        self.scan().await?;
+        self.recheck_at = Instant::now() + AUTH_INTERVAL;
+        Some(())
     }
 
     async fn scan(&mut self) -> Option<()> {
@@ -213,6 +266,9 @@ impl EventStream {
             StreamSnapshot::Batch(batch) => {
                 self.pending = batch.frames.into();
                 self.cursor = batch.next_seq;
+                if self.pending.is_empty() {
+                    self.confirmed_cursor = self.cursor;
+                }
                 self.needs_scan = batch.has_more;
             }
             StreamSnapshot::CursorLost(watermarks) => {
@@ -233,7 +289,7 @@ impl EventStream {
         let Some(expires_at) = expires_at else {
             return Some(AUTH_INTERVAL);
         };
-        let remaining = expires_at.saturating_sub(now_ms());
+        let remaining = expires_at.saturating_sub((self.reader.clock)());
         if remaining <= 0 {
             return None;
         }

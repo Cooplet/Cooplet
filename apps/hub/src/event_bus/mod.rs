@@ -3,7 +3,7 @@ mod stream;
 #[cfg(test)]
 mod tests;
 
-use std::sync::Arc;
+use std::{collections::HashMap, sync::Arc};
 
 use axum::response::Response;
 use bytes::Bytes;
@@ -23,7 +23,7 @@ use crate::{
     error::HubError,
     storage::{
         events::{EventAudience, StoredEvent},
-        sql::{json_byte_len, read_verified_tx},
+        sql::{json_byte_len, read_verified_tx_with_clock},
     },
 };
 
@@ -135,27 +135,10 @@ pub(crate) async fn stream(
         query.after,
         state.event_wake.subscribe(),
         revocations,
+        state.thread_acl_watch.subscribe(),
         state.shutdown.clone(),
     )
     .await
-}
-
-/// A deliberately restricted ACL until the Hub has a Threads membership lifecycle.
-pub(crate) fn can_access_thread_scope(caller: &AuthenticatedCaller, _thread_id: &ThreadId) -> bool {
-    caller.is_global_reader()
-}
-
-fn visible(caller: &AuthenticatedCaller, audience: &EventAudience) -> bool {
-    match audience {
-        EventAudience::OwnerOnly { actor_id } => {
-            !actor_id.is_empty() && (caller.actor_id() == actor_id || caller.is_global_reader())
-        }
-        EventAudience::Nodes { node_ids } => {
-            !node_ids.is_empty() && node_ids.iter().all(|id| caller.allows_node(id))
-        }
-        EventAudience::Thread { thread_id } => can_access_thread_scope(caller, thread_id),
-        EventAudience::GlobalArchiveOnly => caller.is_global_reader(),
-    }
 }
 
 struct Reader {
@@ -163,6 +146,7 @@ struct Reader {
     caller: AuthenticatedCaller,
     hub_id: HubId,
     kinds: Vec<EventKind>,
+    clock: Arc<dyn Fn() -> i64 + Send + Sync>,
 }
 
 impl Reader {
@@ -172,6 +156,7 @@ impl Reader {
             caller: caller.clone(),
             hub_id: state.meta.hub_id.clone(),
             kinds,
+            clock: state.wall_clock.clone(),
         })
     }
 
@@ -181,9 +166,12 @@ impl Reader {
         budget: Budget,
     ) -> Result<PageSnapshot, HubError> {
         let reader = Arc::clone(self);
-        read_verified_tx(&self.reads, &self.caller, move |tx, _, _| {
-            read_page_snapshot(tx, &reader, cursor, budget)
-        })
+        read_verified_tx_with_clock(
+            &self.reads,
+            &self.caller,
+            self.clock.clone(),
+            move |tx, _, now| read_page_snapshot(tx, &reader, cursor, budget, now),
+        )
         .await
     }
 
@@ -193,10 +181,30 @@ impl Reader {
         budget: Budget,
     ) -> Result<StreamSnapshot, HubError> {
         let reader = Arc::clone(self);
-        read_verified_tx(&self.reads, &self.caller, move |tx, _, _| {
-            read_stream_snapshot(tx, &reader, cursor, budget)
-        })
+        read_verified_tx_with_clock(
+            &self.reads,
+            &self.caller,
+            self.clock.clone(),
+            move |tx, _, now| read_stream_snapshot(tx, &reader, cursor, budget, now),
+        )
         .await
+    }
+
+    async fn closed_thread_retained(&self, thread_id: &ThreadId) -> Result<bool, HubError> {
+        let thread_id = thread_id.clone();
+        let clock = self.clock.clone();
+        self.reads
+            .read(move |db| {
+                let mut statement = db.prepare_cached(
+                    "SELECT EXISTS(
+                       SELECT 1 FROM threads
+                       WHERE thread_id=?1 AND status='closed' AND expires_at_ms!=0 AND expires_at_ms>?2
+                     )",
+                )?;
+                Ok(statement.query_row(params![thread_id.as_str(), clock()], |row| row.get(0))?)
+            })
+            .await
+            .map_err(HubError::from)
     }
 }
 
@@ -274,10 +282,18 @@ impl PageSnapshot {
 }
 
 struct StreamBatch {
-    frames: Vec<Bytes>,
+    start: u64,
+    frames: Vec<BufferedFrame>,
     next_seq: u64,
     has_more: bool,
 }
+
+struct ClosedThreadExpiry {
+    thread_id: ThreadId,
+    at_ms: i64,
+}
+
+type BufferedFrame = (u64, Option<ClosedThreadExpiry>, Bytes);
 
 enum StreamSnapshot {
     Batch(StreamBatch),
@@ -289,6 +305,7 @@ fn read_page_snapshot(
     reader: &Reader,
     cursor: Cursor,
     budget: Budget,
+    now: i64,
 ) -> Result<PageSnapshot, HubError> {
     let watermarks = Watermarks::read(db)?;
     let Some(start) = watermarks.resolve(cursor) else {
@@ -304,8 +321,14 @@ fn read_page_snapshot(
     // Reserve the maximum envelope overhead: next_seq cannot have more digits than head,
     // and false is one byte longer than true. Count every serialized item and comma below.
     let mut page_bytes = json_byte_len(&page)?;
-    let (next_seq, has_more) =
-        scan_events(db, reader, start, watermarks.head, budget.rows, |event| {
+    let (next_seq, has_more) = scan_events(
+        db,
+        reader,
+        start,
+        watermarks.head,
+        budget.rows,
+        now,
+        |event, _| {
             if page.items.len() >= budget.items {
                 return Ok(false);
             }
@@ -316,7 +339,8 @@ fn read_page_snapshot(
             page_bytes += item_bytes;
             page.items.push(event);
             Ok(true)
-        })?;
+        },
+    )?;
     page.next_seq = next_seq;
     page.has_more = has_more;
     Ok(PageSnapshot::Page(page))
@@ -327,6 +351,7 @@ fn read_stream_snapshot(
     reader: &Reader,
     cursor: Cursor,
     budget: Budget,
+    now: i64,
 ) -> Result<StreamSnapshot, HubError> {
     let watermarks = Watermarks::read(db)?;
     let Some(start) = watermarks.resolve(cursor) else {
@@ -334,25 +359,80 @@ fn read_stream_snapshot(
     };
     let mut frames = Vec::new();
     let mut buffered_bytes = 0usize;
-    let (next_seq, has_more) =
-        scan_events(db, reader, start, watermarks.head, budget.rows, |event| {
+    let (next_seq, has_more) = scan_events(
+        db,
+        reader,
+        start,
+        watermarks.head,
+        budget.rows,
+        now,
+        |event, expiry| {
             if frames.len() >= budget.items {
                 return Ok(false);
             }
+            let seq = event.seq;
             let mut encoded = serde_json::to_vec(&EventStreamFrame::Event { event })?;
             encoded.push(b'\n');
             if !frames.is_empty() && buffered_bytes + encoded.len() > MAX_PAGE_BYTES {
                 return Ok(false);
             }
             buffered_bytes += encoded.len();
-            frames.push(Bytes::from(encoded));
+            frames.push((seq, expiry, Bytes::from(encoded)));
             Ok(true)
-        })?;
+        },
+    )?;
     Ok(StreamSnapshot::Batch(StreamBatch {
+        start,
         frames,
         next_seq,
         has_more,
     }))
+}
+
+type Projected = (EventEnvelope, Option<ClosedThreadExpiry>);
+
+struct Projection<'a> {
+    db: &'a Connection,
+    reader: &'a Reader,
+    now: i64,
+    thread_expiries: HashMap<ThreadId, Option<i64>>,
+}
+
+impl Projection<'_> {
+    // Some(None) is public for the life of this authorization snapshot.
+    fn audience_expiry(
+        &mut self,
+        audience: &EventAudience,
+    ) -> Result<Option<Option<ClosedThreadExpiry>>, HubError> {
+        let caller = &self.reader.caller;
+        let visible = match audience {
+            EventAudience::OwnerOnly { actor_id } => {
+                !actor_id.is_empty() && (caller.actor_id() == actor_id || caller.is_global_reader())
+            }
+            EventAudience::Nodes { node_ids } => {
+                !node_ids.is_empty() && node_ids.iter().all(|id| caller.allows_node(id))
+            }
+            EventAudience::Thread { .. } if caller.is_global_reader() => true,
+            EventAudience::Thread { thread_id } => {
+                let expiry = if let Some(expiry) = self.thread_expiries.get(thread_id) {
+                    *expiry
+                } else {
+                    let expiry =
+                        crate::threads::thread_scope_expiry(self.db, caller, thread_id, self.now)?;
+                    self.thread_expiries.insert(thread_id.clone(), expiry);
+                    expiry
+                };
+                return Ok(expiry.map(|at_ms| {
+                    (at_ms != i64::MAX).then(|| ClosedThreadExpiry {
+                        thread_id: thread_id.clone(),
+                        at_ms,
+                    })
+                }));
+            }
+            EventAudience::GlobalArchiveOnly => caller.is_global_reader(),
+        };
+        Ok(visible.then_some(None))
+    }
 }
 
 fn scan_events(
@@ -361,8 +441,15 @@ fn scan_events(
     start: u64,
     head: u64,
     row_limit: usize,
-    accept: impl FnMut(EventEnvelope) -> Result<bool, HubError>,
+    now: i64,
+    accept: impl FnMut(EventEnvelope, Option<ClosedThreadExpiry>) -> Result<bool, HubError>,
 ) -> Result<(u64, bool), HubError> {
+    let mut projection = Projection {
+        db,
+        reader,
+        now,
+        thread_expiries: HashMap::new(),
+    };
     if reader.kinds.len() == 1 {
         let mut statement = db.prepare_cached(SELECT_SINGLE_KIND_EVENTS)?;
         let mut rows = statement.query(params![
@@ -371,23 +458,23 @@ fn scan_events(
             head,
             row_limit + 1
         ])?;
-        return scan_rows(&mut rows, reader, start, head, row_limit, accept);
+        return scan_rows(&mut rows, &mut projection, start, head, row_limit, accept);
     }
     if (2..=MAX_INDEXED_KINDS).contains(&reader.kinds.len()) {
-        return scan_multi_kind(db, reader, start, head, row_limit, accept);
+        return scan_multi_kind(&mut projection, start, head, row_limit, accept);
     }
     let mut statement = db.prepare_cached(SELECT_ALL_EVENTS)?;
     let mut rows = statement.query(params![start, head, row_limit + 1])?;
-    scan_rows(&mut rows, reader, start, head, row_limit, accept)
+    scan_rows(&mut rows, &mut projection, start, head, row_limit, accept)
 }
 
 fn scan_rows(
     rows: &mut rusqlite::Rows<'_>,
-    reader: &Reader,
+    projection: &mut Projection<'_>,
     start: u64,
     head: u64,
     row_limit: usize,
-    mut accept: impl FnMut(EventEnvelope) -> Result<bool, HubError>,
+    mut accept: impl FnMut(EventEnvelope, Option<ClosedThreadExpiry>) -> Result<bool, HubError>,
 ) -> Result<(u64, bool), HubError> {
     let mut next_seq = start;
     for _ in 0..row_limit {
@@ -395,8 +482,8 @@ fn scan_rows(
             return Ok((head, false));
         };
         let seq: u64 = row.get(0)?;
-        if let Some(event) = project(row, reader, seq)?
-            && !accept(event)?
+        if let Some((event, expiry)) = project(row, projection, seq)?
+            && !accept(event, expiry)?
         {
             // Leave this event strictly after next_seq so it remains visible next time.
             return Ok((next_seq, true));
@@ -411,16 +498,16 @@ fn scan_rows(
 }
 
 fn scan_multi_kind(
-    db: &Connection,
-    reader: &Reader,
+    projection: &mut Projection<'_>,
     start: u64,
     head: u64,
     row_limit: usize,
-    mut accept: impl FnMut(EventEnvelope) -> Result<bool, HubError>,
+    mut accept: impl FnMut(EventEnvelope, Option<ClosedThreadExpiry>) -> Result<bool, HubError>,
 ) -> Result<(u64, bool), HubError> {
+    let db = projection.db;
     let mut candidates = Vec::new();
     let mut seq_query = db.prepare_cached(SELECT_KIND_SEQS)?;
-    for kind in &reader.kinds {
+    for kind in &projection.reader.kinds {
         let mut rows = seq_query.query(params![kind.as_str(), start, head, row_limit + 1])?;
         while let Some(row) = rows.next()? {
             candidates.push(row.get::<_, u64>(0)?);
@@ -434,11 +521,11 @@ fn scan_multi_kind(
     let mut next_seq = start;
     for seq in candidates {
         let maybe_event = row_query
-            .query_row([seq], |row| Ok(project(row, reader, seq)))
+            .query_row([seq], |row| Ok(project(row, projection, seq)))
             .optional()?
             .transpose()?;
-        if let Some(Some(event)) = maybe_event
-            && !accept(event)?
+        if let Some(Some((event, expiry))) = maybe_event
+            && !accept(event, expiry)?
         {
             return Ok((next_seq, true));
         }
@@ -450,7 +537,11 @@ fn scan_multi_kind(
     Ok((next_seq, more_candidates))
 }
 
-fn project(row: &Row<'_>, reader: &Reader, seq: u64) -> Result<Option<EventEnvelope>, HubError> {
+fn project(
+    row: &Row<'_>,
+    projection: &mut Projection<'_>,
+    seq: u64,
+) -> Result<Option<Projected>, HubError> {
     let Ok(kind) = row
         .get_ref(2)?
         .as_str()
@@ -459,7 +550,7 @@ fn project(row: &Row<'_>, reader: &Reader, seq: u64) -> Result<Option<EventEnvel
     else {
         return Ok(None);
     };
-    if !reader.kinds.is_empty() && !reader.kinds.contains(&kind) {
+    if !projection.reader.kinds.is_empty() && !projection.reader.kinds.contains(&kind) {
         return Ok(None);
     }
     let raw = row.get_ref(6)?.as_str().map_err(HubError::internal)?;
@@ -467,12 +558,27 @@ fn project(row: &Row<'_>, reader: &Reader, seq: u64) -> Result<Option<EventEnvel
     let Ok(head) = serde_json::from_str::<StoredEvent<IgnoredAny>>(raw) else {
         return Ok(None);
     };
-    if !visible(&reader.caller, &head.audience) {
-        return Ok(None);
-    }
-    let Ok(stored) = serde_json::from_str::<StoredEvent>(raw) else {
+    let Some(expiry) = projection.audience_expiry(&head.audience)? else {
         return Ok(None);
     };
+    let Ok(mut stored) = serde_json::from_str::<StoredEvent>(raw) else {
+        return Ok(None);
+    };
+    let can_manage_node = matches!(&stored.audience, EventAudience::Nodes { node_ids } if node_ids.len() == 1)
+        && projection
+            .reader
+            .caller
+            .require_scope(ServiceScope::Manage)
+            .is_ok();
+    if matches!(
+        kind,
+        EventKind::ParticipantCreated
+            | EventKind::ParticipantStateChanged
+            | EventKind::ParticipantAwaitingApproval
+    ) && !can_manage_node
+    {
+        crate::bridge::redact_approval_value(&mut stored.data);
+    }
     let event_id = row
         .get::<_, String>(1)?
         .parse::<EventId>()
@@ -481,16 +587,19 @@ fn project(row: &Row<'_>, reader: &Reader, seq: u64) -> Result<Option<EventEnvel
         .get::<_, String>(3)?
         .parse::<AggregateType>()
         .map_err(HubError::internal)?;
-    Ok(Some(EventEnvelope {
-        seq,
-        event_id,
-        source_kind: SourceKind::Hub,
-        source_id: reader.hub_id.clone().into(),
-        kind,
-        aggregate_type,
-        aggregate_id: row.get(4)?,
-        actor_id: row.get(5)?,
-        payload: stored.data,
-        created_at_ms: row.get(7)?,
-    }))
+    Ok(Some((
+        EventEnvelope {
+            seq,
+            event_id,
+            source_kind: SourceKind::Hub,
+            source_id: projection.reader.hub_id.clone().into(),
+            kind,
+            aggregate_type,
+            aggregate_id: row.get(4)?,
+            actor_id: row.get(5)?,
+            payload: stored.data,
+            created_at_ms: row.get(7)?,
+        },
+        expiry,
+    )))
 }

@@ -519,7 +519,7 @@ async fn real_stdio_mcp_preserves_author_and_operator_can_answer() -> TestResult
     )?;
     let (output, reply) = json_line(output).await?;
     let tools = reply["result"]["tools"].as_array().ok_or("Missing tools")?;
-    assert_eq!(tools.len(), 5);
+    assert_eq!(tools.len(), 11);
     assert!(tools.iter().all(|tool| tool["name"] != "respond_approval"));
 
     send_tool(&mut input, 3, "whoami", json!({}))?;

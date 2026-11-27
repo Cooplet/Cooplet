@@ -19,8 +19,17 @@ use crate::{
 const PAGE_LIMIT_BYTES: usize = 4 * 1024 * 1024;
 const CACHED_MESSAGE_TTL_MS: i64 = 30 * 24 * 60 * 60 * 1000;
 const PROJECTION: &str =
-    "message_id,sender_id,recipient_id,body,attachments_json,delivery_mode,delivery_state,
-     created_at_ms,in_reply_to,question_json,answer_json,operation_id,delivery_detail,delivered_at_ms";
+    "m.message_id,m.sender_id,m.recipient_id,m.body,m.attachments_json,m.delivery_mode,m.delivery_state,
+     m.created_at_ms, CASE WHEN m.hub_parent_message_id IS NULL THEN m.in_reply_to ELSE parent.message_id END,
+     m.question_json,m.answer_json,m.operation_id,m.delivery_detail,m.delivered_at_ms";
+const JOIN_PARENT: &str = "FROM messages m LEFT JOIN messages parent
+    ON parent.hub_message_id = m.hub_parent_message_id AND parent.expires_at_ms > ?4
+    AND (?5 OR parent.sender_id = ?3 OR parent.recipient_id = ?3)";
+
+pub(super) struct HubProjection<'a> {
+    pub message: &'a MessageId,
+    pub parent: Option<&'a MessageId>,
+}
 
 pub(super) struct Recipient {
     pub id: ParticipantId,
@@ -58,14 +67,19 @@ pub(super) fn read_one(
     id: &MessageId,
     actor: &str,
     can_read_all: bool,
+    now: i64,
 ) -> Result<MessageView> {
     let sql = format!(
-        "SELECT {PROJECTION} FROM messages
-         WHERE message_id = ?1 AND (?2 OR sender_id = ?3 OR recipient_id = ?3)",
+        "SELECT {PROJECTION} {JOIN_PARENT}
+         WHERE m.message_id = ?1 AND (?5 OR m.sender_id = ?3 OR m.recipient_id = ?3)",
     );
-    conn.query_row(&sql, params![id.as_str(), can_read_all, actor], read_view)
-        .optional()?
-        .ok_or_else(message_missing)
+    conn.query_row(
+        &sql,
+        params![id.as_str(), rusqlite::types::Null, actor, now, can_read_all],
+        read_view,
+    )
+    .optional()?
+    .ok_or_else(message_missing)
 }
 
 pub(super) fn committed_pending_answer(
@@ -76,7 +90,8 @@ pub(super) fn committed_pending_answer(
         "SELECT m.message_id, m.in_reply_to FROM messages m
          JOIN operations o ON o.operation_id = m.operation_id
          WHERE o.operation_id = ?1 AND o.kind = 'message.send'
-           AND o.state IN ('accepted', 'in_progress') AND m.answer_json IS NOT NULL",
+           AND o.state IN ('accepted', 'in_progress') AND o.bridge_origin IS NULL
+           AND m.answer_json IS NOT NULL",
         [operation_id],
         |row| {
             Ok(SendMessageResponse {
@@ -92,14 +107,14 @@ pub(super) fn committed_pending_answer(
 
 pub(crate) fn scoped_messages_sql() -> String {
     format!(
-        "SELECT {PROJECTION} FROM messages
-         WHERE message_id IN (
+        "SELECT {PROJECTION} {JOIN_PARENT}
+         WHERE m.message_id IN (
              SELECT message_id FROM messages WHERE sender_id = ?3 AND message_id > ?1
              UNION
              SELECT message_id FROM messages WHERE recipient_id = ?3 AND message_id > ?1
              ORDER BY message_id LIMIT ?2
          )
-         ORDER BY message_id",
+         ORDER BY m.message_id",
     )
 }
 
@@ -109,27 +124,20 @@ pub(super) fn read_page(
     can_read_all: bool,
     after: Option<&MessageId>,
     limit: usize,
+    now: i64,
 ) -> Result<MessagePage> {
     let cursor = after.map_or("", MessageId::as_str);
     let size = i64::try_from(limit + 1).map_err(NodeError::internal)?;
     // Keep the one-owner path indexable without fetching large bodies to sort.
-    let (sql, bindings): (String, [&dyn rusqlite::ToSql; 3]) = if can_read_all {
-        (
-            format!(
-                "SELECT {PROJECTION} FROM messages WHERE message_id > ?1 ORDER BY message_id LIMIT ?2"
-            ),
-            [&cursor, &size, &actor],
+    let sql = if can_read_all {
+        format!(
+            "SELECT {PROJECTION} {JOIN_PARENT} WHERE m.message_id > ?1 ORDER BY m.message_id LIMIT ?2"
         )
     } else {
-        (scoped_messages_sql(), [&cursor, &size, &actor])
+        scoped_messages_sql()
     };
     let mut statement = conn.prepare_cached(&sql)?;
-    let bindings = if can_read_all {
-        &bindings[..2]
-    } else {
-        &bindings[..]
-    };
-    let mut rows = statement.query(bindings)?;
+    let mut rows = statement.query(params![cursor, size, actor, now, can_read_all])?;
     let mut items = Vec::new();
     let mut bytes = br#"{"items":[]}"#.len();
     let mut current = rows.next()?.map(read_view).transpose()?;
@@ -228,13 +236,14 @@ pub(super) fn store_message(
     tx: &Transaction<'_>,
     view: &MessageView,
     attachments_json: &str,
+    hub: Option<HubProjection<'_>>,
 ) -> Result<EventNotice> {
     tx.execute(
         "INSERT INTO messages
            (message_id,sender_id,recipient_id,in_reply_to,body,attachments_json,
             question_json,answer_json,delivery_mode,delivery_state,operation_id,
-            created_at_ms,delivered_at_ms,expires_at_ms)
-         VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14)",
+            created_at_ms,delivered_at_ms,expires_at_ms,hub_message_id,hub_parent_message_id)
+         VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16)",
         params![
             view.message_id.as_str(),
             view.sender_id,
@@ -258,6 +267,9 @@ pub(super) fn store_message(
             view.created_at_ms,
             view.delivered_at_ms,
             view.created_at_ms.saturating_add(CACHED_MESSAGE_TTL_MS),
+            hub.as_ref().map(|projection| projection.message.as_str()),
+            hub.and_then(|projection| projection.parent)
+                .map(MessageId::as_str),
         ],
     )?;
     append_event(

@@ -76,6 +76,7 @@ async fn adapter_receives_readable_attachment_paths_for_both_delivery_modes() ->
                 expected_sha256: None,
                 idempotency_key: Some("attachment-upload".into()),
                 content_length: None,
+                participant_id: None,
             };
             let BlobUploadOutcome::VerifiedLocal(attachment) =
                 node.client.upload_blob(spec, b"hello".as_slice()).await?
@@ -933,6 +934,7 @@ async fn answer_target_matrix_and_queue_attachment_unavailable() -> TestResult {
         expected_sha256: None,
         idempotency_key: Some("vanish-upload".into()),
         content_length: None,
+        participant_id: None,
     };
     let BlobUploadOutcome::VerifiedLocal(attachment) =
         node.client.upload_blob(spec, b"vanish".as_slice()).await?

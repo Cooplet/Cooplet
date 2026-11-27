@@ -5,6 +5,7 @@ use http::header::{HeaderName, HeaderValue};
 use crate::ClientError;
 
 pub const X_COOPLET_HUB: HeaderName = HeaderName::from_static("x-cooplet-hub");
+pub const X_COOPLET_PARTICIPANT: HeaderName = HeaderName::from_static("x-cooplet-participant");
 pub const IDEMPOTENCY_KEY: HeaderName = HeaderName::from_static("idempotency-key");
 pub const X_COOPLET_FILENAME: HeaderName = HeaderName::from_static("x-cooplet-filename");
 pub const X_COOPLET_SHA256: HeaderName = HeaderName::from_static("x-cooplet-sha256");

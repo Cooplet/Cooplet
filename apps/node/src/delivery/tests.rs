@@ -749,6 +749,7 @@ async fn reconcile_self_pending_and_failed_receipt_distinction() -> TestResult {
         key: "self-reconcile-key".into(),
         kind: "message.send",
         hash: "self-hash".into(),
+        bridge_origin: None,
     };
     {
         let op = op.clone();
@@ -816,6 +817,7 @@ async fn reconcile_self_pending_and_failed_receipt_distinction() -> TestResult {
         key: "self-answer-key".into(),
         kind: "message.send",
         hash: "ans-hash".into(),
+        bridge_origin: None,
     };
     {
         let ans_op = ans_op.clone();
@@ -868,6 +870,7 @@ async fn reconcile_self_pending_and_failed_receipt_distinction() -> TestResult {
         key: "stored-failed-key".into(),
         kind: "message.send",
         hash: "failed-hash".into(),
+        bridge_origin: None,
     };
     {
         let failed_op = failed_op.clone();
@@ -896,5 +899,324 @@ async fn reconcile_self_pending_and_failed_receipt_distinction() -> TestResult {
         looked,
         ReceiptLookup::Failed(problem) if problem.code() == ErrorCode::ParticipantBusy
     ));
+    fixture.stop().await
+}
+
+#[tokio::test]
+async fn hub_attachment_cache_reuses_bytes_refreshes_ttl_and_recovers_only_safe_damage()
+-> TestResult {
+    use std::{os::unix::fs::PermissionsExt, sync::atomic::AtomicUsize, time::Duration};
+
+    use axum::{Router, routing::get};
+    use cooplet_client::{ClientConfig, CoopletClient, Destination};
+    use cooplet_platform::AdmissionGuard;
+    use cooplet_protocol::{AttachmentRef, BlobId};
+    use sha2::{Digest, Sha256};
+
+    use super::relay::refresh_hub_attachments;
+
+    let fixture = Fixture::start().await?;
+    let now = crate::now_ms()?;
+    fixture.clock.store(now, Ordering::SeqCst);
+    let contents = b"retained attachment";
+    let declared = AttachmentRef {
+        blob_id: BlobId::generate()?,
+        name: "readable plan.txt".into(),
+        mime_type: "text/plain".into(),
+        size_bytes: contents.len() as u64,
+        sha256: format!("{:x}", Sha256::digest(contents)),
+    };
+    let gets = Arc::new(AtomicUsize::new(0));
+    let handler_gets = gets.clone();
+    let etag = format!("\"{}\"", declared.sha256);
+    let app = Router::new().route(
+        "/v1/blobs/{id}",
+        get(move || {
+            let etag = etag.clone();
+            let gets = handler_gets.clone();
+            async move {
+                gets.fetch_add(1, Ordering::SeqCst);
+                (
+                    [("content-type", "text/plain".to_owned()), ("etag", etag)],
+                    contents.as_slice(),
+                )
+            }
+        }),
+    );
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
+    let origin = format!("http://{}", listener.local_addr()?).parse()?;
+    let server = tokio::spawn(async move { axum::serve(listener, app).await });
+    let hub = CoopletClient::new(ClientConfig::new(origin, Destination::LocalNode, None))?;
+    let first = fixture
+        .service
+        .load_hub_attachments(
+            &hub,
+            std::slice::from_ref(&declared),
+            &AdmissionGuard::new(Duration::from_secs(5)),
+            4096,
+        )
+        .await?
+        .pop()
+        .ok_or("missing resolved attachment")?;
+    let initial_id = first.local.blob_id.clone();
+    let path = PathBuf::from(first.resolved().local_path.ok_or("missing cache path")?);
+    assert_eq!(
+        path.file_name().and_then(|name| name.to_str()),
+        Some("readable plan.txt")
+    );
+    assert_eq!(fs::read(&path)?, contents);
+    assert_eq!(gets.load(Ordering::SeqCst), 1);
+    let advanced = now + 60_000;
+    fixture.clock.store(advanced, Ordering::SeqCst);
+    let warm = fixture
+        .service
+        .load_hub_attachments(
+            &hub,
+            std::slice::from_ref(&declared),
+            &AdmissionGuard::new(Duration::from_secs(5)),
+            4096,
+        )
+        .await?;
+    let warm_id = warm
+        .first()
+        .ok_or("missing warm attachment")?
+        .local
+        .blob_id
+        .clone();
+    assert_eq!(warm_id, initial_id);
+    assert_eq!(gets.load(Ordering::SeqCst), 1);
+    fixture
+        .service
+        .operations
+        .finalize(move |tx| {
+            refresh_hub_attachments(tx, &warm, advanced)?;
+            Ok(WriteOutcome::new(()))
+        })
+        .await?;
+    let check = warm_id.clone();
+    let expiry = fixture
+        .open
+        .engine
+        .reads()
+        .read(move |conn| {
+            Ok(conn.query_row(
+                "SELECT expires_at_ms FROM blobs WHERE blob_id = ?1",
+                [check.as_str()],
+                |row| row.get::<_, i64>(0),
+            )?)
+        })
+        .await?;
+    assert_eq!(expiry, advanced + 7 * 24 * 60 * 60 * 1000);
+
+    // Advance the fixture clock, leaving GC's actual clock behind the expiry.
+    fixture.clock.store(expiry, Ordering::SeqCst);
+    let reopened = fixture
+        .service
+        .load_hub_attachments(
+            &hub,
+            std::slice::from_ref(&declared),
+            &AdmissionGuard::new(Duration::from_secs(5)),
+            4096,
+        )
+        .await?
+        .pop()
+        .ok_or("missing refreshed attachment")?;
+    assert_eq!(reopened.local.blob_id, initial_id);
+    assert_eq!(gets.load(Ordering::SeqCst), 1);
+
+    let permissions = fs::metadata(&path)?.permissions();
+    fs::set_permissions(&path, fs::Permissions::from_mode(0o644))?;
+    assert!(
+        fixture
+            .service
+            .load_hub_attachments(
+                &hub,
+                std::slice::from_ref(&declared),
+                &AdmissionGuard::new(Duration::from_secs(5)),
+                4096,
+            )
+            .await
+            .is_err()
+    );
+    assert_eq!(gets.load(Ordering::SeqCst), 1);
+    let check = initial_id.clone();
+    let live_after_bad_permissions = fixture
+        .open
+        .engine
+        .reads()
+        .read(move |conn| {
+            Ok(conn.query_row(
+                "SELECT deleted_at_ms IS NULL FROM blobs WHERE blob_id = ?1",
+                [check.as_str()],
+                |row| row.get::<_, bool>(0),
+            )?)
+        })
+        .await?;
+    assert!(live_after_bad_permissions);
+
+    fs::set_permissions(&path, permissions)?;
+    fs::remove_file(&path)?;
+    let replaced = fixture
+        .service
+        .load_hub_attachments(
+            &hub,
+            std::slice::from_ref(&declared),
+            &AdmissionGuard::new(Duration::from_secs(5)),
+            4096,
+        )
+        .await?
+        .pop()
+        .ok_or("missing replacement attachment")?;
+    assert_ne!(replaced.local.blob_id, initial_id);
+    assert_eq!(gets.load(Ordering::SeqCst), 2);
+    let deletes = fixture
+        .open
+        .engine
+        .reads()
+        .read(move |conn| {
+            Ok(conn.query_row(
+                "SELECT COUNT(*) FROM events WHERE kind = 'blob.deleted' AND aggregate_id = ?1",
+                [initial_id.as_str()],
+                |row| row.get::<_, u64>(0),
+            )?)
+        })
+        .await?;
+    assert_eq!(deletes, 1);
+
+    let replaced_path = PathBuf::from(
+        replaced
+            .resolved()
+            .local_path
+            .ok_or("missing replacement path")?,
+    );
+    let sealed = fs::metadata(&replaced_path)?.permissions();
+    fs::set_permissions(&replaced_path, fs::Permissions::from_mode(0o600))?;
+    fs::write(&replaced_path, vec![0_u8; contents.len()])?;
+    fs::set_permissions(&replaced_path, sealed)?;
+    fixture
+        .clock
+        .store(expiry + 7 * 24 * 60 * 60 * 1000, Ordering::SeqCst);
+    let repaired = fixture
+        .service
+        .load_hub_attachments(
+            &hub,
+            std::slice::from_ref(&declared),
+            &AdmissionGuard::new(Duration::from_secs(5)),
+            4096,
+        )
+        .await?
+        .pop()
+        .ok_or("missing repaired attachment")?;
+    assert_ne!(repaired.local.blob_id, replaced.local.blob_id);
+    assert_eq!(gets.load(Ordering::SeqCst), 3);
+    server.abort();
+    fixture.stop().await
+}
+
+#[tokio::test]
+async fn early_hub_reply_links_at_read_time_and_equal_local_id_is_not_a_party() -> TestResult {
+    use std::time::Duration;
+
+    use cooplet_client::{ClientConfig, CoopletClient, Destination};
+    use cooplet_platform::AdmissionGuard;
+    use cooplet_protocol::{AuthorKind, HubId, NodeId, OperationId};
+
+    use super::InboundHubMessage;
+    use crate::{clients::VerifiedAuthor, operations::DelegatedOperation};
+
+    let fixture = Fixture::start().await?;
+    let source = NodeId::generate()?;
+    let assigned = NodeId::generate()?;
+    let hub_id = HubId::generate()?;
+    let colliding = fixture.stopped_agent().await?;
+    let recipient = fixture.open.operator.participant_id.clone();
+    let qualified = format!("{source}/{colliding}");
+    let hub = CoopletClient::new(ClientConfig::new(
+        "http://127.0.0.1:1".parse()?,
+        Destination::LocalNode,
+        None,
+    ))?;
+    let parent = MessageId::generate()?;
+    let mut input = message(recipient.as_str(), "Arrived before the parent receipt");
+    input.in_reply_to = Some(parent.clone());
+    let context = DelegatedOperation {
+        id: OperationId::generate()?,
+        origin: format!("{hub_id}/{assigned}"),
+        actor_id: qualified.clone(),
+        admission: AdmissionGuard::new(Duration::from_secs(5)),
+    };
+    let incoming = fixture
+        .service
+        .send_delegated(
+            &context,
+            &hub,
+            1024,
+            InboundHubMessage {
+                message_id: MessageId::generate()?,
+                sender_id: qualified.clone(),
+                author: VerifiedAuthor {
+                    kind: AuthorKind::Agent,
+                    actor_id: qualified.clone(),
+                    name: "remote".into(),
+                    source_node_id: Some(source),
+                },
+                input,
+            },
+        )
+        .await?;
+    let local_reply = incoming.message_id.ok_or("missing local reply")?;
+    assert!(
+        fixture
+            .service
+            .show(&fixture.operator()?, local_reply.clone())
+            .await?
+            .in_reply_to
+            .is_none()
+    );
+    let local = fixture.principal(colliding, PrincipalKind::Participant, "same local ID")?;
+    let denial = fixture
+        .service
+        .show(&local, local_reply.clone())
+        .await
+        .err()
+        .ok_or("a colliding participant read a remote reply")?;
+    assert_eq!(denial.code(), ErrorCode::NotFound);
+    assert!(
+        fixture
+            .service
+            .list(&local, None, None)
+            .await?
+            .items
+            .is_empty()
+    );
+
+    let local_parent = MessageId::generate()?;
+    let id = local_parent.clone();
+    let remote = qualified.clone();
+    fixture.open.engine.db().write_sqlite(move |tx| {
+        tx.execute(
+            "INSERT INTO messages (
+               message_id, sender_id, recipient_id, body, delivery_mode, delivery_state, hub_message_id,
+               created_at_ms, expires_at_ms
+             ) VALUES (?1, ?2, ?3, 'original', 'direct_now', 'delivered', ?4, ?5, ?6)",
+            params![id.as_str(), recipient.as_str(), remote, parent.as_str(), NOW, NOW + 60_000],
+        )?;
+        Ok(WriteOutcome::new(()))
+    }).await?;
+    let view = fixture
+        .service
+        .show(&fixture.operator()?, local_reply.clone())
+        .await?;
+    assert_eq!(view.sender_id, qualified);
+    assert_eq!(view.in_reply_to, Some(local_parent));
+    fixture.clock.store(NOW + 60_000, Ordering::SeqCst);
+    assert!(
+        fixture
+            .service
+            .show(&fixture.operator()?, local_reply)
+            .await?
+            .in_reply_to
+            .is_none()
+    );
     fixture.stop().await
 }

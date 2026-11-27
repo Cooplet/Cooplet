@@ -192,6 +192,7 @@ fn finish_unconfirmed_answers(
              )
          FROM messages AS m
          WHERE o.state IN ('accepted', 'in_progress') AND o.kind = 'message.send'
+           AND o.bridge_origin IS NULL
            AND m.operation_id = o.operation_id AND m.answer_json IS NOT NULL
            AND m.delivery_state = 'unknown'";
     match operation_id {

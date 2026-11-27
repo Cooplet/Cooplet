@@ -75,9 +75,30 @@ async fn gate_sqlite_hygiene() -> TestResult {
         assert_eq!(read_pragma("max_page_count")?, 1_048_576);
         let journal: String = tx.pragma_query_value(None, "journal_mode", |row| row.get(0))?;
         assert_eq!(journal, "wal");
+        assert!(tx.query_row("SELECT NOT EXISTS(SELECT 1 FROM pragma_foreign_key_check)", [], |row| row.get::<_, bool>(0))?);
+        assert!(tx.query_row(
+            "SELECT COUNT(*)=2 FROM sqlite_schema WHERE type='index' AND name IN (
+               'idx_thread_posts_expiry_seq', 'idx_thread_members_pending_blobs'
+             )",
+            [],
+            |row| row.get::<_, bool>(0),
+        )?);
         Ok(WriteOutcome::new(()))
     }).await?;
     hub.engine.shutdown().await?;
+    let reopened = open_default(&scratch.0).await?;
+    assert!(
+        reopened
+            .engine
+            .reads()
+            .read(|db| Ok(db.query_row(
+                "SELECT NOT EXISTS(SELECT 1 FROM pragma_foreign_key_check)",
+                [],
+                |row| row.get::<_, bool>(0),
+            )?))
+            .await?
+    );
+    reopened.engine.shutdown().await?;
     Ok(())
 }
 

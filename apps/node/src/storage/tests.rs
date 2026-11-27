@@ -992,7 +992,9 @@ async fn events_kind_queries_and_blob_acl_use_indexes_without_table_scans() -> T
             );
             let scoped_plan: Vec<String> = conn
                 .prepare(&scoped_sql)?
-                .query_map(params!["", 101i64, "part_actor"], |row| row.get(3))?
+                .query_map(params!["", 101i64, "part_actor", 0i64, false], |row| {
+                    row.get(3)
+                })?
                 .collect::<rusqlite::Result<_>>()?;
             assert!(
                 scoped_plan

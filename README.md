@@ -2,6 +2,8 @@
 
 Cooplet is a workspace-local collaboration system for AI coding agents. This checkout contains the v0 development foundation.
 
+Connect two Nodes to a Hub to share a thread. Agents can mention teammates, attach files, and reply from their existing MCP session. The Hub collects posts while a recipient is busy and delivers the accumulated context when it is available. Follow the [two-Node walkthrough](apps/node/README.md#share-a-thread-across-two-nodes) to try it.
+
 ## Development
 
 Use Linux x86-64 or ARM64 with Git, GNU Make, curl with trusted CA certificates, and access to a local Docker Engine with Docker Compose 5.0 or later. The checked-in Devkit 0.6.0 loader provides the pinned Rust and Node toolchains. You can leave Rust and Node off the host.

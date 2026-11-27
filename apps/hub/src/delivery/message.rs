@@ -12,11 +12,11 @@ use crate::{
     auth::AuthenticatedCaller,
     blobs::{attach_to_node, preflight_node_attachments},
     error::HubError,
-    now_ms,
     storage::{
         events::{self, NewEvent, message_delivery_updated_data, question_answered_data},
         sql::{
             dialog_node_ids, nodes_audience, parse_col, parse_json, parse_opt_col, parse_opt_json,
+            read_verified_tx_with_clock,
         },
     },
 };
@@ -26,7 +26,7 @@ use super::{
 };
 
 const MESSAGE_TTL_MS: i64 = 90 * 24 * 60 * 60 * 1_000;
-pub(super) const MAX_MESSAGE_ATTACHMENTS: usize = 32;
+pub(super) const MAX_MESSAGE_ATTACHMENTS: usize = 64;
 
 impl MessageRequest {
     pub(super) fn normalize(&mut self) -> Result<(), HubError> {
@@ -37,7 +37,7 @@ impl MessageRequest {
         }
         if self.attachments.len() > MAX_MESSAGE_ATTACHMENTS {
             return Err(HubError::invalid(
-                "A message may carry at most 32 attachments.",
+                "A message may carry at most 64 attachments.",
             ));
         }
         for attachment in &self.attachments {
@@ -69,12 +69,6 @@ impl MessageRequest {
                 "An answer requires the message ID of its question.",
             ));
         }
-        if self.answer.is_none() && self.target_node_id.is_none() {
-            return Err(HubError::invalid(
-                "A direct message requires a target node.",
-            ));
-        }
-
         let delivery_mode = self.delivery_mode.unwrap_or(DeliveryMode::DirectNow);
         self.queue_ttl_ms = match delivery_mode {
             DeliveryMode::QueueUntilIdle => {
@@ -102,11 +96,13 @@ impl MessageRequest {
         message_id: &MessageId,
         sender_kind: AuthorKind,
         sender_name: &str,
+        sender_node_id: Option<NodeId>,
     ) -> BridgeCommand {
         BridgeCommand::SendMessage {
             message_id: message_id.clone(),
             sender_kind,
             sender_name: sender_name.to_owned(),
+            sender_node_id,
             recipient_id: self.target_participant_id.clone(),
             in_reply_to: self.in_reply_to.clone(),
             body: self.body.clone(),
@@ -127,66 +123,160 @@ pub(super) fn preflight(
         return answer_target(db, caller, request, answer, now);
     }
 
-    let node_id = request
-        .target_node_id
+    let parent = request
+        .in_reply_to
         .as_ref()
-        .ok_or_else(|| HubError::invalid("A direct message requires a target node."))?;
-    if !active_node(db, node_id)? {
-        return Err(HubError::new(
-            ErrorCode::NotFound,
-            "The target node is unavailable.",
-        ));
-    }
-    participant_kind(db, node_id, &request.target_participant_id)?;
-    if let Some(parent_id) = &request.in_reply_to {
-        let parent = load(db, parent_id, now)?;
+        .map(|id| load(db, id, now))
+        .transpose()?;
+    if let Some(parent) = &parent {
         parent.authorize(caller)?;
-        if parent.node_ids.as_slice() != std::slice::from_ref(node_id) {
-            return Err(HubError::invalid(
-                "Replies must remain within the same single-node dialogue.",
-            ));
-        }
-        let same_sender = parent.view.sender_node_id.is_none()
-            && caller.participant_id() == Some(&parent.view.sender_actor_id);
-        let reversed_sender = parent.view.target_node_id.is_none()
-            && caller.participant_id() == Some(&parent.view.target_participant_id);
-        if !same_sender && !reversed_sender && !caller.is_admin() {
+        let sender = caller.is_party(
+            parent.view.sender_node_id.as_ref(),
+            &parent.view.sender_actor_id,
+        );
+        let recipient = caller.is_party(
+            parent.view.target_node_id.as_ref(),
+            &parent.view.target_participant_id,
+        );
+        let targets_sender = matches_target(
+            request,
+            parent.view.sender_node_id.as_ref(),
+            &parent.view.sender_actor_id,
+        );
+        let targets_recipient = matches_target(
+            request,
+            parent.view.target_node_id.as_ref(),
+            &parent.view.target_participant_id,
+        );
+        if !sender && !recipient && !caller.is_admin() {
             return Err(HubError::new(
                 ErrorCode::Forbidden,
                 "This caller is not a participant in the referenced dialogue.",
             ));
         }
-        let target_matches = (same_sender
-            && parent.view.target_node_id.as_ref() == Some(node_id)
-            && parent.view.target_participant_id == request.target_participant_id)
-            || (reversed_sender
-                && parent.view.sender_node_id.as_ref() == Some(node_id)
-                && parent.view.sender_actor_id == request.target_participant_id)
-            || (caller.is_admin()
-                && !same_sender
-                && !reversed_sender
-                && ((parent.view.sender_node_id.as_ref() == Some(node_id)
-                    && parent.view.sender_actor_id == request.target_participant_id)
-                    || (parent.view.target_node_id.as_ref() == Some(node_id)
-                        && parent.view.target_participant_id == request.target_participant_id)));
-        if !target_matches {
+        if !(sender && targets_recipient
+            || recipient && targets_sender
+            || caller.is_admin() && (targets_sender || targets_recipient))
+        {
             return Err(HubError::invalid(
                 "A reply must remain between the original dialogue participants.",
             ));
         }
+    }
+    match &request.target_node_id {
+        Some(node_id) => {
+            if !active_node(db, node_id)? {
+                return Err(HubError::new(
+                    ErrorCode::NotFound,
+                    "The target node is unavailable.",
+                ));
+            }
+            participant_kind(db, node_id, &request.target_participant_id)?;
+        }
+        None if parent.is_none() => {
+            if caller.source_node_id().is_none() {
+                return Err(HubError::invalid(
+                    "A direct message requires a target node.",
+                ));
+            }
+            let active: bool = db.query_row(
+                "SELECT EXISTS(SELECT 1 FROM principals
+                   WHERE participant_id = ?1 AND disabled_at_ms IS NULL)",
+                [request.target_participant_id.as_str()],
+                |row| row.get(0),
+            )?;
+            if !active {
+                return Err(HubError::new(
+                    ErrorCode::NotFound,
+                    "The target participant is unavailable.",
+                ));
+            }
+        }
+        None => {}
     }
     if let Some(question) = &request.question
         && question.expires_at_ms.is_some_and(|expires| expires <= now)
     {
         return Err(HubError::invalid("Question expiry must be in the future."));
     }
-    preflight_node_attachments(db, caller, node_id, &request.attachments, now)?;
-    Ok(Target {
-        notify: Some(node_id.clone()),
-        attachment_node: Some(node_id.clone()),
-        required_nodes: vec![node_id.clone()],
-        message_expires_at_ms: now.saturating_add(MESSAGE_TTL_MS),
-    })
+    let target = message_target(
+        caller,
+        request,
+        parent.as_ref(),
+        request.target_node_id.clone(),
+        now.saturating_add(MESSAGE_TTL_MS),
+    );
+    target.validate_attachments(db, caller, request, now)?;
+    Ok(target)
+}
+
+fn matches_target(request: &MessageRequest, node: Option<&NodeId>, id: &ParticipantId) -> bool {
+    request.target_node_id.as_ref() == node && &request.target_participant_id == id
+}
+
+fn message_target(
+    caller: &AuthenticatedCaller,
+    request: &MessageRequest,
+    parent: Option<&MessageRecord>,
+    notify: Option<NodeId>,
+    expires_at_ms: i64,
+) -> Target {
+    let mut required_nodes = dialog_node_ids(
+        caller.source_node_id().cloned(),
+        request.target_node_id.clone(),
+        parent.and_then(|p| p.view.sender_node_id.clone()),
+        parent.and_then(|p| p.view.target_node_id.clone()),
+    );
+    if let Some(parent) = parent {
+        required_nodes.extend(parent.node_ids.iter().cloned());
+        required_nodes.sort_unstable();
+        required_nodes.dedup();
+    }
+    let attachment_node = request
+        .target_node_id
+        .clone()
+        .or_else(|| required_nodes.first().cloned());
+    let attachment_peer = required_nodes
+        .iter()
+        .find(|node| Some(*node) != attachment_node.as_ref())
+        .cloned();
+    Target {
+        notify,
+        attachment_node,
+        attachment_peer,
+        required_nodes,
+        message_expires_at_ms: expires_at_ms,
+    }
+}
+
+impl Target {
+    fn validate_attachments(
+        &self,
+        db: &Connection,
+        caller: &AuthenticatedCaller,
+        request: &MessageRequest,
+        now: i64,
+    ) -> Result<(), HubError> {
+        if request.attachments.is_empty() {
+            return Ok(());
+        }
+        let node = self
+            .attachment_node
+            .as_ref()
+            .ok_or_else(no_attachment_scope)?;
+        preflight_node_attachments(
+            db,
+            caller,
+            node,
+            self.attachment_peer.as_ref(),
+            &request.attachments,
+            now,
+        )
+    }
+}
+
+fn no_attachment_scope() -> HubError {
+    HubError::new(ErrorCode::Forbidden, "The message has no attachment scope.")
 }
 
 fn answer_target(
@@ -207,24 +297,15 @@ fn answer_target(
             HubError::invalid("The referenced message does not contain a question.")
         })?;
 
-    let addressed_to_caller = caller.is_hub_recipient(
+    let addressed_to_caller = caller.is_party(
         parent.view.target_node_id.as_ref(),
         &parent.view.target_participant_id,
     );
     if !addressed_to_caller && !caller.is_admin() {
-        let target_is_agent = match &parent.view.target_node_id {
-            Some(node_id) => {
-                find_participant_kind(db, node_id, &parent.view.target_participant_id)?.as_deref()
-                    == Some("agent")
-            }
-            None => false,
-        };
-        if !target_is_agent {
-            return Err(HubError::new(
-                ErrorCode::Forbidden,
-                "This caller cannot answer the question.",
-            ));
-        }
+        return Err(HubError::new(
+            ErrorCode::Forbidden,
+            "This caller cannot answer the question.",
+        ));
     }
     if request.target_node_id != parent.view.sender_node_id
         || request.target_participant_id != parent.view.sender_actor_id
@@ -259,19 +340,15 @@ fn answer_target(
         Some(node_id) if active_node(db, node_id)? => Some(node_id.clone()),
         _ => None,
     };
-    let attachment_node = parent.view.sender_node_id.or(parent.view.target_node_id);
-    if !request.attachments.is_empty() {
-        let node_id = attachment_node.as_ref().ok_or_else(|| {
-            HubError::new(ErrorCode::Forbidden, "The message has no attachment scope.")
-        })?;
-        preflight_node_attachments(db, caller, node_id, &request.attachments, now)?;
-    }
-    Ok(Target {
+    let target = message_target(
+        caller,
+        request,
+        Some(&parent),
         notify,
-        attachment_node,
-        required_nodes: parent.node_ids,
-        message_expires_at_ms: now.saturating_add(MESSAGE_TTL_MS).min(parent.expires_at_ms),
-    })
+        now.saturating_add(MESSAGE_TTL_MS).min(parent.expires_at_ms),
+    );
+    target.validate_attachments(db, caller, request, now)?;
+    Ok(target)
 }
 
 pub(super) fn find_participant_kind(
@@ -293,16 +370,17 @@ pub(crate) async fn get_message(
     id: MessageId,
 ) -> Result<HubMessageView, HubError> {
     caller.require_scope(ServiceScope::Read)?;
-    let caller = caller.clone();
-    state
-        .reads
-        .read(move |db| {
-            Ok(load(db, &id, now_ms()).and_then(|message| {
-                message.authorize(&caller)?;
-                Ok(message.view)
-            }))
-        })
-        .await?
+    read_verified_tx_with_clock(
+        &state.reads,
+        caller,
+        state.wall_clock.clone(),
+        move |db, caller, now| {
+            let message = load(db, &id, now)?;
+            message.authorize(caller)?;
+            Ok(message.view)
+        },
+    )
+    .await
 }
 
 struct MessageRecord {
@@ -313,11 +391,20 @@ struct MessageRecord {
 
 impl MessageRecord {
     fn authorize(&self, caller: &AuthenticatedCaller) -> Result<(), HubError> {
-        if !self.node_ids.is_empty() {
+        let party = caller.is_party(
+            self.view.sender_node_id.as_ref(),
+            &self.view.sender_actor_id,
+        ) || caller.is_party(
+            self.view.target_node_id.as_ref(),
+            &self.view.target_participant_id,
+        );
+        if caller.source_node_id().is_some() {
+            if party {
+                return Ok(());
+            }
+        } else if !self.node_ids.is_empty() {
             return check_node_access(caller, &self.node_ids);
-        }
-        if caller.is_global_reader() || caller.participant_id() == Some(&self.view.sender_actor_id)
-        {
+        } else if caller.is_global_reader() || party {
             return Ok(());
         }
         Err(HubError::new(
@@ -399,10 +486,18 @@ pub(super) fn insert(
         state,
     } = message;
     if !body.attachments.is_empty() {
-        let node_id = target.attachment_node.as_ref().ok_or_else(|| {
-            HubError::new(ErrorCode::Forbidden, "The message has no attachment scope.")
-        })?;
-        attach_to_node(tx, caller, node_id, &body.attachments, now)?;
+        let node_id = target
+            .attachment_node
+            .as_ref()
+            .ok_or_else(no_attachment_scope)?;
+        attach_to_node(
+            tx,
+            caller,
+            node_id,
+            target.attachment_peer.as_ref(),
+            &body.attachments,
+            now,
+        )?;
     }
     let question_json = body
         .question
@@ -416,14 +511,15 @@ pub(super) fn insert(
         .transpose()?;
     tx.prepare_cached(
         "INSERT INTO hub_messages (
-             message_id, sender_actor_id, target_node_id, target_participant_id, in_reply_to,
+             message_id, sender_actor_id, sender_node_id, target_node_id, target_participant_id, in_reply_to,
              body, attachments_json, question_json, answer_json, delivery_mode, delivery_state,
              operation_id, created_at_ms, delivered_at_ms, expires_at_ms
-         ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15)",
+         ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16)",
     )?
     .execute(params![
         id.as_str(),
         sender.as_str(),
+        caller.source_node_id().map(NodeId::as_str),
         body.target_node_id.as_ref().map(NodeId::as_str),
         body.target_participant_id.as_str(),
         body.in_reply_to.as_ref().map(MessageId::as_str),
@@ -453,7 +549,7 @@ pub(super) fn insert(
                 aggregate_id: question_id.as_str(),
                 actor_id: Some(caller.actor_id()),
                 created_at_ms: now,
-                data: question_answered_data(question_id, id, sender, answer),
+                data: question_answered_data(question_id, id, caller.actor_id(), answer, None),
                 audience: audience.clone(),
             },
         )?);
@@ -462,6 +558,7 @@ pub(super) fn insert(
     let data = serde_json::to_value(MessageCreated {
         message_id: id,
         sender_id: sender,
+        sender_node_id: caller.source_node_id(),
         recipient_id: &body.target_participant_id,
         target_node_id: body.target_node_id.as_ref(),
         in_reply_to: body.in_reply_to.as_ref(),
@@ -494,6 +591,8 @@ pub(super) fn insert(
 struct MessageCreated<'a> {
     message_id: &'a MessageId,
     sender_id: &'a ParticipantId,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    sender_node_id: Option<&'a NodeId>,
     recipient_id: &'a ParticipantId,
     target_node_id: Option<&'a NodeId>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -522,17 +621,39 @@ pub(super) fn finalize(
     hub_id: &HubId,
     update: DeliveryUpdate<'_>,
 ) -> Result<Option<EventNotice>, HubError> {
+    finalize_inner(tx, hub_id, update, None)
+}
+
+pub(super) fn finalize_reconciled(
+    tx: &Transaction<'_>,
+    hub_id: &HubId,
+    update: DeliveryUpdate<'_>,
+    operation_id: &OperationId,
+) -> Result<Option<EventNotice>, HubError> {
+    finalize_inner(tx, hub_id, update, Some(operation_id))
+}
+
+fn finalize_inner(
+    tx: &Transaction<'_>,
+    hub_id: &HubId,
+    update: DeliveryUpdate<'_>,
+    reconciled_operation: Option<&OperationId>,
+) -> Result<Option<EventNotice>, HubError> {
     let delivered_at_ms = (update.delivery_state == DeliveryState::Delivered).then_some(update.now);
     let changed = tx
         .prepare_cached(
             "UPDATE hub_messages SET delivery_state = ?2, delivery_detail = ?3, delivered_at_ms = ?4
-             WHERE message_id = ?1 AND delivery_state IN ('accepted', 'dispatched')",
+             WHERE message_id = ?1 AND (
+                 (?5 IS NULL AND delivery_state IN ('accepted', 'dispatched'))
+                 OR (operation_id = ?5 AND delivery_state IN ('accepted', 'dispatched', 'unknown'))
+             )",
         )?
         .execute(params![
             update.message_id.as_str(),
             update.delivery_state.as_str(),
             update.detail,
-            delivered_at_ms
+            delivered_at_ms,
+            reconciled_operation.map(OperationId::as_str)
         ])?;
     if changed == 0 {
         return Ok(None);

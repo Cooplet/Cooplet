@@ -465,7 +465,7 @@ fn check_or_claim_root(
 }
 
 fn object_missing(record: &BlobRecord) -> StorageError {
-    StorageError::BlobUnverified(format!("object missing for {}", record.blob_id))
+    StorageError::BlobMissing(record.blob_id.clone())
 }
 
 struct StageWriter {

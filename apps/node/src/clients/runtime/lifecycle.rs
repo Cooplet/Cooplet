@@ -1,9 +1,9 @@
 use std::{path::PathBuf, sync::Arc, time::Duration};
 
-use cooplet_platform::PrivateFs;
+use cooplet_platform::{AdmissionGuard, PrivateFs};
 use cooplet_protocol::{
-    ErrorCode, EventKind, NodeId, OperationId, ParticipantId, ParticipantKind, ParticipantState,
-    PrincipalKind, RunId,
+    ApprovalWait, ErrorCode, EventKind, IntakeState, NodeId, OperationId, ParticipantId,
+    ParticipantKind, ParticipantState, PrincipalKind, RunId,
 };
 use cooplet_storage::{WriteError, WriteOutcome};
 use rusqlite::params;
@@ -22,7 +22,7 @@ use crate::{
     config::CREDS_DIR,
     error::{NodeError, Result},
     now_ms,
-    operations::{Operation, OperationGuard},
+    operations::{DelegatedOperation, Operation, OperationGuard, admission_expired},
     storage::revoke_participant_credentials,
 };
 
@@ -59,6 +59,15 @@ pub struct AgentResponse {
     pub name: String,
     pub client_kind: String,
     pub node_id: NodeId,
+}
+
+#[derive(Serialize)]
+pub(crate) struct AgentInspectionView {
+    participant_id: ParticipantId,
+    state: ParticipantState,
+    intake_state: IntakeState,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    approval: Option<ApprovalWait>,
 }
 
 struct OpenPlan {
@@ -99,18 +108,42 @@ impl AgentService {
         &self,
         actor: &str,
         key: &str,
-        mut request: CreateAgentRequest,
+        request: CreateAgentRequest,
         ephemeral_for_run_id: Option<RunId>,
     ) -> Result<AgentResponse> {
-        request.overrides = request
-            .overrides
-            .filter(|overrides| overrides != &AgentOverrides::default());
+        let request = normalized_request(request);
         let guard = self.0.operations.guard(
             actor,
             key,
             "agent.create",
             &(request.clone(), &ephemeral_for_run_id),
         )?;
+        self.create_guarded(guard, request, ephemeral_for_run_id, None)
+            .await
+    }
+
+    pub(crate) async fn create_delegated(
+        &self,
+        delegated: &DelegatedOperation,
+        request: CreateAgentRequest,
+    ) -> Result<AgentResponse> {
+        let request = normalized_request(request);
+        let guard = self.0.operations.guard_delegated(
+            delegated,
+            "agent.create",
+            &(&request, Option::<RunId>::None),
+        )?;
+        self.create_guarded(guard, request, None, Some(&delegated.admission))
+            .await
+    }
+
+    async fn create_guarded(
+        &self,
+        guard: OperationGuard,
+        request: CreateAgentRequest,
+        ephemeral_for_run_id: Option<RunId>,
+        admission: Option<&AdmissionGuard>,
+    ) -> Result<AgentResponse> {
         if let Some(value) = self.0.operations.lookup(&guard.operation).await? {
             return decode(value);
         }
@@ -148,7 +181,7 @@ impl AgentService {
                 ephemeral_for_run_id,
             })
             .await?;
-        self.open(&guard, plan).await
+        self.open(&guard, plan, admission).await
     }
 
     pub async fn resume(&self, actor: &str, key: &str, id: ParticipantId) -> Result<AgentResponse> {
@@ -176,7 +209,7 @@ impl AgentService {
                 ephemeral_for_run_id: None,
             })
             .await?;
-        self.open(&guard, plan).await
+        self.open(&guard, plan, None).await
     }
 
     async fn plan(&self, input: OpenPlanInput) -> Result<OpenPlan> {
@@ -271,7 +304,12 @@ impl AgentService {
         })
     }
 
-    async fn open(&self, guard: &OperationGuard, plan: OpenPlan) -> Result<AgentResponse> {
+    async fn open(
+        &self,
+        guard: &OperationGuard,
+        plan: OpenPlan,
+        admission: Option<&AdmissionGuard>,
+    ) -> Result<AgentResponse> {
         let op = &guard.operation;
         let generation = match &plan.previous {
             Some(previous) => previous
@@ -288,7 +326,14 @@ impl AgentService {
         )?;
         let boot_id = self.0.boot.current();
         let reservation = self
-            .reserve_open(op, &plan, generation, credential.clone(), boot_id.clone())
+            .reserve_open(
+                op,
+                &plan,
+                generation,
+                credential.clone(),
+                boot_id.clone(),
+                admission.cloned(),
+            )
             .await?;
         if let Reservation::Replay(value) = reservation {
             return decode(value);
@@ -302,7 +347,7 @@ impl AgentService {
         let previous_ownership = plan.previous.as_ref().map(|previous| previous.ownership);
         let preparation = OpenPreparation::default();
         let result = self
-            .start_open(&plan, &key, &credential, &preparation)
+            .start_open(&plan, &key, &credential, &preparation, admission)
             .await;
         let (opened, mode) = match result {
             Ok(opened) => opened,
@@ -380,6 +425,7 @@ impl AgentService {
         generation: u64,
         credential: Credential,
         boot_id: Option<String>,
+        admission: Option<AdmissionGuard>,
     ) -> Result<Reservation<()>> {
         let now = now_ms()?;
         let id = plan.id.clone();
@@ -413,6 +459,9 @@ impl AgentService {
             )?;
             if conflicts {
                 return Err(busy("name_in_use", false).into());
+            }
+            if admission.as_ref().is_some_and(AdmissionGuard::is_expired) {
+                return Err(admission_expired().into());
             }
             let core = CoreBinding {
                 overrides,
@@ -458,6 +507,7 @@ impl AgentService {
         key: &SessionKey,
         credential: &Credential,
         preparation: &OpenPreparation,
+        admission: Option<&AdmissionGuard>,
     ) -> Result<(OpenedSession, ParticipantState)> {
         let state_dir = self.0.config.state_dir.clone();
         let prep_key = key.clone();
@@ -499,6 +549,9 @@ impl AgentService {
         };
         let result = self
             .cancel_on_shutdown(async {
+                if admission.is_some_and(AdmissionGuard::is_expired) {
+                    return Err(admission_expired());
+                }
                 tokio::time::timeout(OPEN_REQUEST_TIMEOUT, plan.adapter.create_or_resume(request))
                     .await
                     .map_err(|_| unknown("native_open_timed_out"))?
@@ -618,7 +671,7 @@ impl AgentService {
             } else {
                 participant_event(tx, now,
                     if creating { EventKind::ParticipantCreated } else { EventKind::ParticipantStateChanged },
-                    &key.0, Some(&op.actor_id), json!({}), &mut events,
+                    &key.0, Some(&op.actor_id), if creating { json!({}) } else { json!({"reason": "resumed"}) }, &mut events,
                 )?;
             }
             op.succeed(tx, now, &response)?;
@@ -756,6 +809,37 @@ impl AgentService {
         })
         .await
     }
+
+    pub(crate) async fn inspect_delegated(&self, id: ParticipantId) -> Result<AgentInspectionView> {
+        let row = self.participant_row(&id).await?;
+        if row.kind != ParticipantKind::Agent {
+            return Err(invalid(
+                "not_an_agent",
+                "The participant has no client adapter",
+            ));
+        }
+        let approval = (row.state == ParticipantState::AwaitingApproval)
+            .then(|| {
+                row.binding
+                    .core
+                    .pending_approval
+                    .map(|pending| pending.as_wait())
+            })
+            .flatten();
+        Ok(AgentInspectionView {
+            participant_id: id,
+            state: row.state,
+            intake_state: row.state.intake_state(),
+            approval,
+        })
+    }
+}
+
+fn normalized_request(mut request: CreateAgentRequest) -> CreateAgentRequest {
+    request.overrides = request
+        .overrides
+        .filter(|overrides| overrides != &AgentOverrides::default());
+    request
 }
 
 fn adapter_read_timeout() -> NodeError {

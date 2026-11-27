@@ -32,6 +32,8 @@ pub enum StorageError {
     BlobCollision,
     #[error("blob path is invalid: {0}")]
     InvalidBlobPath(String),
+    #[error("blob object is missing: {0}")]
+    BlobMissing(cooplet_protocol::BlobId),
     #[error("blob state could not be verified: {0}")]
     BlobUnverified(String),
     #[error("blob input ended without a successful EOF")]

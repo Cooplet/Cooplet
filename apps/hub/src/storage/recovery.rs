@@ -33,7 +33,8 @@ pub(super) async fn recover(engine: &StorageEngine, hub_id: &HubId) -> Result<()
             Ok(connection.query_row(
                 "SELECT NOT (EXISTS (SELECT 1 FROM nodes WHERE status = 'online')
                           OR EXISTS (SELECT 1 FROM operations WHERE state IN ('accepted','in_progress'))
-                          OR EXISTS (SELECT 1 FROM hub_messages WHERE delivery_state IN ('accepted','dispatched')))",
+                          OR EXISTS (SELECT 1 FROM hub_messages WHERE delivery_state IN ('accepted','dispatched'))
+                          OR EXISTS (SELECT 1 FROM thread_members WHERE state='active' AND pending_delivery_id IS NOT NULL))",
                 [],
                 |row| row.get::<_, bool>(0),
             )?)
@@ -61,6 +62,7 @@ fn recover_state(
         params![now, unknown],
     )?;
     recover_messages(tx, hub_id, now, &mut events)?;
+    crate::threads::recover_pending(tx, hub_id, now, &mut events)?;
     if let Some(last) = events.last() {
         advance_head(tx, last.seq)?;
     }

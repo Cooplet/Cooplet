@@ -10,7 +10,7 @@ use std::{
 
 use bytes::{Bytes, BytesMut};
 use cooplet_protocol::{
-    AttachmentRef, validate_attachment_name, validate_media_type, validate_sha256,
+    AttachmentRef, ParticipantId, validate_attachment_name, validate_media_type, validate_sha256,
 };
 use futures_util::stream;
 use http::{
@@ -26,8 +26,8 @@ use tokio::{
 
 use super::{check_digest, checked_blob_size};
 use crate::{
-    ClientError, CoopletClient, X_COOPLET_FILENAME, X_COOPLET_SHA256, client::timeout,
-    error::read_bounded,
+    ClientError, CoopletClient, X_COOPLET_FILENAME, X_COOPLET_PARTICIPANT, X_COOPLET_SHA256,
+    client::timeout, error::read_bounded,
 };
 
 const CHUNK_BYTES: usize = 64 * 1024;
@@ -47,6 +47,8 @@ pub struct BlobUploadSpec {
     pub expected_sha256: Option<String>,
     pub idempotency_key: Option<String>,
     pub content_length: Option<u64>,
+    /// Attribute a machine's Hub upload to its locally authenticated participant.
+    pub participant_id: Option<ParticipantId>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -60,15 +62,54 @@ impl CoopletClient {
     pub async fn upload_blob<R: AsyncRead + Unpin>(
         &self,
         spec: BlobUploadSpec,
-        mut reader: R,
+        reader: R,
     ) -> Result<BlobUploadOutcome, ClientError> {
-        let url = self.url("/v1/blobs", &[])?;
-        let headers = UploadHeaders::validate(&spec, self.config.max_blob_bytes)?;
-        if spec.verification == UploadVerification::HubReceipt && self.expected_hub().is_none() {
+        self.upload_blob_with_status(spec, reader)
+            .await
+            .map(|(_, outcome)| outcome)
+    }
+
+    pub async fn upload_blob_with_status<R: AsyncRead + Unpin>(
+        &self,
+        spec: BlobUploadSpec,
+        reader: R,
+    ) -> Result<(StatusCode, BlobUploadOutcome), ClientError> {
+        if self.expected_hub().is_none()
+            && (spec.verification == UploadVerification::HubReceipt
+                || spec.participant_id.is_some())
+        {
             return Err(ClientError::invalid(
-                "Hub receipt verification requires a pinned Hub",
+                "Hub upload options require a pinned Hub",
             ));
         }
+        self.upload_on_route("/v1/blobs", spec, reader).await
+    }
+
+    /// Stream an upload through the loopback Node, preserving Hub receipt verification.
+    pub async fn upload_bridge_blob<R: AsyncRead + Unpin>(
+        &self,
+        spec: BlobUploadSpec,
+        reader: R,
+    ) -> Result<BlobUploadOutcome, ClientError> {
+        if self.expected_hub().is_some()
+            || spec.verification != UploadVerification::HubReceipt
+            || spec.participant_id.is_some()
+        {
+            return Err(ClientError::invalid("invalid Node relay upload options"));
+        }
+        self.upload_on_route("/v1/bridge/blobs", spec, reader)
+            .await
+            .map(|(_, outcome)| outcome)
+    }
+
+    async fn upload_on_route<R: AsyncRead + Unpin>(
+        &self,
+        path: &str,
+        spec: BlobUploadSpec,
+        mut reader: R,
+    ) -> Result<(StatusCode, BlobUploadOutcome), ClientError> {
+        let url = self.url(path, &[])?;
+        let headers = UploadHeaders::validate(&spec, self.config.max_blob_bytes)?;
         let (request, pin_epoch) = self
             .protected(Method::POST, url, spec.idempotency_key.as_deref())
             .await?;
@@ -80,6 +121,9 @@ impl CoopletClient {
         }
         if let Some(sha256) = spec.expected_sha256.as_deref() {
             request = request.header(X_COOPLET_SHA256, sha256);
+        }
+        if let Some(participant_id) = spec.participant_id.as_ref() {
+            request = request.header(X_COOPLET_PARTICIPANT, participant_id.as_str());
         }
 
         let (response, stats) = if spec.content_length == Some(0) {
@@ -129,21 +173,23 @@ impl CoopletClient {
         }
         if let Some(stats) = stats {
             check_length(stats.bytes, receipt.size_bytes)?;
-            return match stats.sha256 {
+            let outcome = match stats.sha256 {
                 Some(sha256) => {
                     check_digest(&sha256, &receipt.sha256)?;
-                    Ok(BlobUploadOutcome::VerifiedLocal(receipt))
+                    BlobUploadOutcome::VerifiedLocal(receipt)
                 }
-                None => Ok(BlobUploadOutcome::CompleteWithHubDigest(receipt)),
+                None => BlobUploadOutcome::CompleteWithHubDigest(receipt),
             };
+            return Ok((status, outcome));
         }
         if status == StatusCode::OK
             && spec.idempotency_key.is_some()
             && spec.content_length.is_some()
             && spec.expected_sha256.is_some()
         {
-            return Ok(BlobUploadOutcome::AcknowledgedWithoutLocalVerification(
-                receipt,
+            return Ok((
+                status,
+                BlobUploadOutcome::AcknowledgedWithoutLocalVerification(receipt),
             ));
         }
         Err(ClientError::protocol(

@@ -44,6 +44,14 @@
         ],
         "type": "string"
       },
+      "ApprovalWaitKind": {
+        "enum": [
+          "permission",
+          "question",
+          "unspecified"
+        ],
+        "type": "string"
+      },
       "AttachmentRef": {
         "additionalProperties": false,
         "properties": {
@@ -73,6 +81,14 @@
           "sha256"
         ],
         "type": "object"
+      },
+      "AuthorKind": {
+        "enum": [
+          "human",
+          "agent",
+          "service"
+        ],
+        "type": "string"
       },
       "BlobId": {
         "pattern": "^blob_[0-7][0-9a-hjkmnpqrstvwxyz]{25}$",
@@ -794,6 +810,74 @@
           }
         ]
       },
+      "MemberView": {
+        "additionalProperties": false,
+        "properties": {
+          "confirmed_seq": {
+            "format": "int64",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "delivery_generation": {
+            "format": "int64",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "delivery_mode": {
+            "$ref": "#/components/schemas/DeliveryMode"
+          },
+          "handle": {
+            "type": "string"
+          },
+          "member_key": {
+            "type": "string"
+          },
+          "node_id": {
+            "oneOf": [
+              {
+                "type": "null"
+              },
+              {
+                "$ref": "#/components/schemas/NodeId"
+              }
+            ]
+          },
+          "participant_id": {
+            "type": "string"
+          },
+          "pending": {
+            "oneOf": [
+              {
+                "type": "null"
+              },
+              {
+                "$ref": "#/components/schemas/PendingThreadDelivery"
+              }
+            ]
+          },
+          "role": {
+            "$ref": "#/components/schemas/ThreadRole"
+          },
+          "state": {
+            "$ref": "#/components/schemas/ThreadMemberState"
+          },
+          "wake_policy": {
+            "$ref": "#/components/schemas/ThreadWakePolicy"
+          }
+        },
+        "required": [
+          "member_key",
+          "participant_id",
+          "handle",
+          "role",
+          "wake_policy",
+          "delivery_mode",
+          "state",
+          "delivery_generation",
+          "confirmed_seq"
+        ],
+        "type": "object"
+      },
       "MessageId": {
         "pattern": "^msg_[0-7][0-9a-hjkmnpqrstvwxyz]{25}$",
         "type": "string"
@@ -845,7 +929,7 @@
             "items": {
               "$ref": "#/components/schemas/AttachmentRef"
             },
-            "maxItems": 32,
+            "maxItems": 64,
             "type": "array"
           },
           "body": {
@@ -949,6 +1033,30 @@
           "unknown"
         ],
         "type": "string"
+      },
+      "PendingThreadDelivery": {
+        "additionalProperties": false,
+        "properties": {
+          "delivery_id": {
+            "$ref": "#/components/schemas/OperationId"
+          },
+          "from_seq": {
+            "format": "int64",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "to_seq": {
+            "format": "int64",
+            "minimum": 0,
+            "type": "integer"
+          }
+        },
+        "required": [
+          "delivery_id",
+          "from_seq",
+          "to_seq"
+        ],
+        "type": "object"
       },
       "PrincipalKind": {
         "enum": [
@@ -1300,6 +1408,683 @@
         ],
         "type": "object"
       },
+      "TemplateSummary": {
+        "additionalProperties": false,
+        "properties": {
+          "client_kind": {
+            "type": "string"
+          },
+          "description": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "template_id": {
+            "type": "string"
+          },
+          "title": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "template_id",
+          "title",
+          "client_kind"
+        ],
+        "type": "object"
+      },
+      "ThreadCreateRequest": {
+        "additionalProperties": false,
+        "properties": {
+          "creator_handle": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "members": {
+            "items": {
+              "$ref": "#/components/schemas/ThreadMemberJoinRequest"
+            },
+            "type": "array"
+          },
+          "title": {
+            "type": "string"
+          },
+          "topic": {
+            "type": [
+              "string",
+              "null"
+            ]
+          }
+        },
+        "required": [
+          "title"
+        ],
+        "type": "object"
+      },
+      "ThreadId": {
+        "pattern": "^thr_[0-7][0-9a-hjkmnpqrstvwxyz]{25}$",
+        "type": "string"
+      },
+      "ThreadListResponse": {
+        "additionalProperties": false,
+        "properties": {
+          "items": {
+            "items": {
+              "$ref": "#/components/schemas/ThreadSummary"
+            },
+            "type": "array"
+          },
+          "next_after": {
+            "oneOf": [
+              {
+                "type": "null"
+              },
+              {
+                "$ref": "#/components/schemas/ThreadId"
+              }
+            ]
+          }
+        },
+        "required": [
+          "items"
+        ],
+        "type": "object"
+      },
+      "ThreadMemberJoinRequest": {
+        "additionalProperties": false,
+        "properties": {
+          "delivery_mode": {
+            "oneOf": [
+              {
+                "type": "null"
+              },
+              {
+                "$ref": "#/components/schemas/DeliveryMode"
+              }
+            ]
+          },
+          "handle": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "member_key": {
+            "type": "string"
+          },
+          "role": {
+            "oneOf": [
+              {
+                "type": "null"
+              },
+              {
+                "$ref": "#/components/schemas/ThreadRole"
+              }
+            ]
+          },
+          "wake_policy": {
+            "oneOf": [
+              {
+                "type": "null"
+              },
+              {
+                "$ref": "#/components/schemas/ThreadWakePolicy"
+              }
+            ]
+          }
+        },
+        "required": [
+          "member_key"
+        ],
+        "type": "object"
+      },
+      "ThreadMemberLeaveRequest": {
+        "additionalProperties": false,
+        "properties": {
+          "member_key": {
+            "type": [
+              "string",
+              "null"
+            ]
+          }
+        },
+        "type": "object"
+      },
+      "ThreadMemberResumeRequest": {
+        "additionalProperties": false,
+        "properties": {
+          "after_seq": {
+            "format": "int64",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "member_key": {
+            "type": [
+              "string",
+              "null"
+            ]
+          }
+        },
+        "required": [
+          "after_seq"
+        ],
+        "type": "object"
+      },
+      "ThreadMemberState": {
+        "enum": [
+          "active",
+          "paused_unknown",
+          "left"
+        ],
+        "type": "string"
+      },
+      "ThreadMembersResponse": {
+        "additionalProperties": false,
+        "properties": {
+          "items": {
+            "items": {
+              "$ref": "#/components/schemas/MemberView"
+            },
+            "type": "array"
+          },
+          "next_after": {
+            "type": [
+              "string",
+              "null"
+            ]
+          }
+        },
+        "required": [
+          "items"
+        ],
+        "type": "object"
+      },
+      "ThreadPinDeleteResponse": {
+        "additionalProperties": false,
+        "properties": {
+          "deleted": {
+            "type": "boolean"
+          },
+          "pin_key": {
+            "type": "string"
+          },
+          "thread_id": {
+            "$ref": "#/components/schemas/ThreadId"
+          },
+          "version": {
+            "format": "int64",
+            "minimum": 0,
+            "type": "integer"
+          }
+        },
+        "required": [
+          "thread_id",
+          "pin_key",
+          "deleted",
+          "version"
+        ],
+        "type": "object"
+      },
+      "ThreadPinSetRequest": {
+        "additionalProperties": false,
+        "properties": {
+          "expected_version": {
+            "format": "int64",
+            "minimum": 0,
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "post_id": {
+            "oneOf": [
+              {
+                "type": "null"
+              },
+              {
+                "$ref": "#/components/schemas/MessageId"
+              }
+            ]
+          },
+          "value_json": {}
+        },
+        "required": [
+          "value_json"
+        ],
+        "type": "object"
+      },
+      "ThreadPinView": {
+        "additionalProperties": false,
+        "properties": {
+          "pin_key": {
+            "type": "string"
+          },
+          "post_id": {
+            "oneOf": [
+              {
+                "type": "null"
+              },
+              {
+                "$ref": "#/components/schemas/MessageId"
+              }
+            ]
+          },
+          "thread_id": {
+            "$ref": "#/components/schemas/ThreadId"
+          },
+          "updated_at_ms": {
+            "format": "int64",
+            "type": "integer"
+          },
+          "updated_by_actor_id": {
+            "type": "string"
+          },
+          "value_json": {},
+          "version": {
+            "format": "int64",
+            "minimum": 0,
+            "type": "integer"
+          }
+        },
+        "required": [
+          "thread_id",
+          "pin_key",
+          "value_json",
+          "version",
+          "updated_by_actor_id",
+          "updated_at_ms"
+        ],
+        "type": "object"
+      },
+      "ThreadPostReceipt": {
+        "additionalProperties": false,
+        "properties": {
+          "created_at_ms": {
+            "format": "int64",
+            "type": "integer"
+          },
+          "post_id": {
+            "$ref": "#/components/schemas/MessageId"
+          },
+          "seq": {
+            "format": "int64",
+            "minimum": 0,
+            "type": "integer"
+          }
+        },
+        "required": [
+          "post_id",
+          "seq",
+          "created_at_ms"
+        ],
+        "type": "object"
+      },
+      "ThreadPostRequest": {
+        "additionalProperties": false,
+        "properties": {
+          "answer": {
+            "oneOf": [
+              {
+                "type": "null"
+              },
+              {
+                "$ref": "#/components/schemas/AnswerPayload"
+              }
+            ]
+          },
+          "attachments": {
+            "items": {
+              "$ref": "#/components/schemas/AttachmentRef"
+            },
+            "maxItems": 64,
+            "type": "array"
+          },
+          "body": {
+            "type": "string"
+          },
+          "in_reply_to": {
+            "oneOf": [
+              {
+                "type": "null"
+              },
+              {
+                "$ref": "#/components/schemas/MessageId"
+              }
+            ]
+          },
+          "mentions": {
+            "items": {
+              "type": "string"
+            },
+            "type": "array"
+          },
+          "question": {
+            "oneOf": [
+              {
+                "type": "null"
+              },
+              {
+                "$ref": "#/components/schemas/QuestionPayload"
+              }
+            ]
+          }
+        },
+        "required": [
+          "body"
+        ],
+        "type": "object"
+      },
+      "ThreadPostWire": {
+        "additionalProperties": false,
+        "properties": {
+          "answer": {
+            "oneOf": [
+              {
+                "type": "null"
+              },
+              {
+                "$ref": "#/components/schemas/AnswerPayload"
+              }
+            ]
+          },
+          "attachments": {
+            "items": {
+              "$ref": "#/components/schemas/AttachmentRef"
+            },
+            "type": "array"
+          },
+          "author_actor_id": {
+            "type": "string"
+          },
+          "author_handle": {
+            "type": "string"
+          },
+          "author_kind": {
+            "$ref": "#/components/schemas/AuthorKind"
+          },
+          "body": {
+            "type": "string"
+          },
+          "created_at_ms": {
+            "format": "int64",
+            "type": "integer"
+          },
+          "in_reply_to_post_id": {
+            "oneOf": [
+              {
+                "type": "null"
+              },
+              {
+                "$ref": "#/components/schemas/MessageId"
+              }
+            ]
+          },
+          "mentions": {
+            "items": {
+              "type": "string"
+            },
+            "type": "array"
+          },
+          "post_id": {
+            "$ref": "#/components/schemas/MessageId"
+          },
+          "question": {
+            "oneOf": [
+              {
+                "type": "null"
+              },
+              {
+                "$ref": "#/components/schemas/QuestionPayload"
+              }
+            ]
+          },
+          "seq": {
+            "format": "int64",
+            "minimum": 0,
+            "type": "integer"
+          }
+        },
+        "required": [
+          "seq",
+          "post_id",
+          "author_actor_id",
+          "author_kind",
+          "author_handle",
+          "body",
+          "created_at_ms"
+        ],
+        "type": "object"
+      },
+      "ThreadReadResponse": {
+        "additionalProperties": false,
+        "properties": {
+          "floor_seq": {
+            "format": "int64",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "has_more": {
+            "type": "boolean"
+          },
+          "head_seq": {
+            "format": "int64",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "next_since_seq": {
+            "format": "int64",
+            "minimum": 0,
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "pins": {
+            "items": {
+              "$ref": "#/components/schemas/ThreadPinView"
+            },
+            "type": "array"
+          },
+          "posts": {
+            "items": {
+              "$ref": "#/components/schemas/ThreadPostWire"
+            },
+            "type": "array"
+          },
+          "thread": {
+            "$ref": "#/components/schemas/ThreadSummary"
+          }
+        },
+        "required": [
+          "thread",
+          "head_seq",
+          "floor_seq",
+          "pins",
+          "posts",
+          "has_more"
+        ],
+        "type": "object"
+      },
+      "ThreadRole": {
+        "enum": [
+          "owner",
+          "member",
+          "observer"
+        ],
+        "type": "string"
+      },
+      "ThreadStatus": {
+        "enum": [
+          "open",
+          "closed"
+        ],
+        "type": "string"
+      },
+      "ThreadSummary": {
+        "additionalProperties": false,
+        "properties": {
+          "closed_at_ms": {
+            "format": "int64",
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "created_at_ms": {
+            "format": "int64",
+            "type": "integer"
+          },
+          "created_by_actor_id": {
+            "type": "string"
+          },
+          "floor_seq": {
+            "format": "int64",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "head_seq": {
+            "format": "int64",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "status": {
+            "$ref": "#/components/schemas/ThreadStatus"
+          },
+          "thread_id": {
+            "$ref": "#/components/schemas/ThreadId"
+          },
+          "title": {
+            "type": "string"
+          },
+          "topic": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "updated_at_ms": {
+            "format": "int64",
+            "type": "integer"
+          }
+        },
+        "required": [
+          "thread_id",
+          "title",
+          "created_by_actor_id",
+          "status",
+          "head_seq",
+          "floor_seq",
+          "created_at_ms",
+          "updated_at_ms"
+        ],
+        "type": "object"
+      },
+      "ThreadWaitRequest": {
+        "additionalProperties": false,
+        "properties": {
+          "since_seq": {
+            "format": "int64",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "wake_policy": {
+            "oneOf": [
+              {
+                "type": "null"
+              },
+              {
+                "$ref": "#/components/schemas/ThreadWakePolicy"
+              }
+            ]
+          }
+        },
+        "required": [
+          "since_seq"
+        ],
+        "type": "object"
+      },
+      "ThreadWaitResponse": {
+        "oneOf": [
+          {
+            "additionalProperties": false,
+            "properties": {
+              "floor_seq": {
+                "format": "int64",
+                "minimum": 0,
+                "type": "integer"
+              },
+              "has_more": {
+                "type": "boolean"
+              },
+              "head_seq": {
+                "format": "int64",
+                "minimum": 0,
+                "type": "integer"
+              },
+              "next_since_seq": {
+                "format": "int64",
+                "minimum": 0,
+                "type": [
+                  "integer",
+                  "null"
+                ]
+              },
+              "posts": {
+                "items": {
+                  "$ref": "#/components/schemas/ThreadPostWire"
+                },
+                "type": "array"
+              },
+              "status": {
+                "enum": [
+                  "ready"
+                ],
+                "type": "string"
+              }
+            },
+            "required": [
+              "head_seq",
+              "floor_seq",
+              "posts",
+              "has_more",
+              "status"
+            ],
+            "type": "object"
+          },
+          {
+            "additionalProperties": false,
+            "properties": {
+              "head_seq": {
+                "format": "int64",
+                "minimum": 0,
+                "type": "integer"
+              },
+              "status": {
+                "enum": [
+                  "waiting"
+                ],
+                "type": "string"
+              }
+            },
+            "required": [
+              "head_seq",
+              "status"
+            ],
+            "type": "object"
+          }
+        ]
+      },
+      "ThreadWakePolicy": {
+        "enum": [
+          "mentions_only",
+          "all",
+          "muted"
+        ],
+        "type": "string"
+      },
       "TokenId": {
         "pattern": "^tok_[0-7][0-9a-hjkmnpqrstvwxyz]{25}$",
         "type": "string"
@@ -1416,6 +2201,30 @@
           "principal_kind",
           "name",
           "scopes"
+        ],
+        "type": "object"
+      },
+      "WorkflowSummary": {
+        "additionalProperties": false,
+        "properties": {
+          "description": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "title": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "workflow_name": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "workflow_name"
         ],
         "type": "object"
       }
@@ -2205,6 +3014,22 @@
             }
           },
           {
+            "description": "Participant attributed by the enrolled Node credential.",
+            "in": "header",
+            "name": "X-Cooplet-Participant",
+            "required": false,
+            "schema": {
+              "oneOf": [
+                {
+                  "type": "null"
+                },
+                {
+                  "$ref": "#/components/schemas/ParticipantId"
+                }
+              ]
+            }
+          },
+          {
             "description": "Lowercase SHA-256 hex digest.",
             "in": "header",
             "name": "X-Cooplet-Sha256",
@@ -2800,6 +3625,295 @@
         },
         "tags": [
           "Files"
+        ]
+      },
+      "parameters": [
+        {
+          "description": "Expected Hub ID. A mismatched or duplicated pin is rejected before credential verification.",
+          "in": "header",
+          "name": "X-Cooplet-Hub",
+          "required": true,
+          "schema": {
+            "pattern": "^hub_[0-7][0-9a-hjkmnpqrstvwxyz]{25}$",
+            "type": "string"
+          }
+        }
+      ]
+    },
+    "/v1/bridge/connect": {
+      "get": {
+        "description": "Upgrade an enrolled Node to the Cooplet WebSocket bridge with its node bearer credential.",
+        "operationId": "connect",
+        "parameters": [
+          {
+            "description": "Must include the Upgrade token.",
+            "in": "header",
+            "name": "Connection",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "description": "websocket",
+            "in": "header",
+            "name": "Upgrade",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "description": "13",
+            "in": "header",
+            "name": "Sec-WebSocket-Version",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "description": "Base64-encoded 16-byte WebSocket handshake nonce.",
+            "in": "header",
+            "name": "Sec-WebSocket-Key",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "description": "Must offer cooplet.v1.",
+            "in": "header",
+            "name": "Sec-WebSocket-Protocol",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "101": {
+            "description": "WebSocket upgrade accepted.",
+            "headers": {
+              "Cache-Control": {
+                "schema": {
+                  "enum": [
+                    "no-store"
+                  ],
+                  "type": "string"
+                }
+              },
+              "Connection": {
+                "description": "Upgrade",
+                "schema": {
+                  "type": "string"
+                }
+              },
+              "Sec-WebSocket-Accept": {
+                "description": "RFC 6455 handshake proof.",
+                "schema": {
+                  "type": "string"
+                }
+              },
+              "Sec-WebSocket-Protocol": {
+                "description": "cooplet.v1",
+                "schema": {
+                  "type": "string"
+                }
+              },
+              "Upgrade": {
+                "description": "websocket",
+                "schema": {
+                  "type": "string"
+                }
+              },
+              "X-Cooplet-Hub": {
+                "schema": {
+                  "pattern": "^hub_[0-7][0-9a-hjkmnpqrstvwxyz]{25}$",
+                  "type": "string"
+                }
+              }
+            }
+          },
+          "400": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Invalid WebSocket handshake or subprotocol.",
+            "headers": {
+              "Cache-Control": {
+                "schema": {
+                  "enum": [
+                    "no-store"
+                  ],
+                  "type": "string"
+                }
+              },
+              "X-Cooplet-Hub": {
+                "schema": {
+                  "pattern": "^hub_[0-7][0-9a-hjkmnpqrstvwxyz]{25}$",
+                  "type": "string"
+                }
+              }
+            }
+          },
+          "401": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Invalid or revoked node credential.",
+            "headers": {
+              "Cache-Control": {
+                "schema": {
+                  "enum": [
+                    "no-store"
+                  ],
+                  "type": "string"
+                }
+              },
+              "WWW-Authenticate": {
+                "schema": {
+                  "enum": [
+                    "Bearer realm=\"cooplet-hub\""
+                  ],
+                  "type": "string"
+                }
+              },
+              "X-Cooplet-Bridge-Error": {
+                "description": "node_revoked when the node credential was revoked.",
+                "schema": {
+                  "type": "string"
+                }
+              },
+              "X-Cooplet-Hub": {
+                "schema": {
+                  "pattern": "^hub_[0-7][0-9a-hjkmnpqrstvwxyz]{25}$",
+                  "type": "string"
+                }
+              }
+            }
+          },
+          "409": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Missing or mismatched Hub identity pin.",
+            "headers": {
+              "Cache-Control": {
+                "schema": {
+                  "enum": [
+                    "no-store"
+                  ],
+                  "type": "string"
+                }
+              },
+              "X-Cooplet-Bridge-Error": {
+                "description": "hub_identity_mismatch",
+                "schema": {
+                  "type": "string"
+                }
+              },
+              "X-Cooplet-Hub": {
+                "schema": {
+                  "pattern": "^hub_[0-7][0-9a-hjkmnpqrstvwxyz]{25}$",
+                  "type": "string"
+                }
+              }
+            }
+          },
+          "413": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Request body exceeds the route limit.",
+            "headers": {
+              "Cache-Control": {
+                "schema": {
+                  "enum": [
+                    "no-store"
+                  ],
+                  "type": "string"
+                }
+              },
+              "X-Cooplet-Hub": {
+                "schema": {
+                  "pattern": "^hub_[0-7][0-9a-hjkmnpqrstvwxyz]{25}$",
+                  "type": "string"
+                }
+              }
+            }
+          },
+          "500": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Unexpected Hub failure.",
+            "headers": {
+              "Cache-Control": {
+                "schema": {
+                  "enum": [
+                    "no-store"
+                  ],
+                  "type": "string"
+                }
+              },
+              "X-Cooplet-Hub": {
+                "schema": {
+                  "pattern": "^hub_[0-7][0-9a-hjkmnpqrstvwxyz]{25}$",
+                  "type": "string"
+                }
+              }
+            }
+          },
+          "503": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Bridge handshake or session capacity exceeded.",
+            "headers": {
+              "Cache-Control": {
+                "schema": {
+                  "enum": [
+                    "no-store"
+                  ],
+                  "type": "string"
+                }
+              },
+              "X-Cooplet-Hub": {
+                "schema": {
+                  "pattern": "^hub_[0-7][0-9a-hjkmnpqrstvwxyz]{25}$",
+                  "type": "string"
+                }
+              }
+            }
+          }
+        },
+        "tags": [
+          "Bridge"
         ]
       },
       "parameters": [
@@ -5735,6 +6849,18 @@
                           },
                           "status": {
                             "$ref": "#/components/schemas/NodeStatus"
+                          },
+                          "templates": {
+                            "items": {
+                              "$ref": "#/components/schemas/TemplateSummary"
+                            },
+                            "type": "array"
+                          },
+                          "workflows": {
+                            "items": {
+                              "$ref": "#/components/schemas/WorkflowSummary"
+                            },
+                            "type": "array"
                           }
                         },
                         "required": [
@@ -5744,6 +6870,8 @@
                           "generation",
                           "session_epoch",
                           "capabilities",
+                          "templates",
+                          "workflows",
                           "enrolled_at_ms"
                         ],
                         "type": "object"
@@ -6568,6 +7696,24 @@
                     "items": {
                       "items": {
                         "properties": {
+                          "action_hint": {
+                            "type": [
+                              "string",
+                              "null"
+                            ]
+                          },
+                          "approval_id": {
+                            "type": [
+                              "string",
+                              "null"
+                            ]
+                          },
+                          "can_respond_remotely": {
+                            "type": [
+                              "boolean",
+                              "null"
+                            ]
+                          },
                           "capabilities": {},
                           "client_kind": {
                             "type": [
@@ -6593,6 +7739,12 @@
                           "state": {
                             "$ref": "#/components/schemas/ParticipantState"
                           },
+                          "summary": {
+                            "type": [
+                              "string",
+                              "null"
+                            ]
+                          },
                           "synced_epoch": {
                             "format": "int64",
                             "minimum": 0,
@@ -6601,6 +7753,16 @@
                           "updated_at_ms": {
                             "format": "int64",
                             "type": "integer"
+                          },
+                          "wait_kind": {
+                            "oneOf": [
+                              {
+                                "type": "null"
+                              },
+                              {
+                                "$ref": "#/components/schemas/ApprovalWaitKind"
+                              }
+                            ]
                           },
                           "workspace_dir": {
                             "type": [
@@ -9223,6 +10385,3730 @@
         },
         "tags": [
           "Principals"
+        ]
+      }
+    },
+    "/v1/threads": {
+      "get": {
+        "operationId": "list",
+        "parameters": [
+          {
+            "in": "query",
+            "name": "limit",
+            "required": false,
+            "schema": {
+              "default": 20,
+              "format": "int32",
+              "maximum": 100,
+              "minimum": 1,
+              "type": "integer"
+            }
+          },
+          {
+            "in": "query",
+            "name": "after",
+            "required": false,
+            "schema": {
+              "$ref": "#/components/schemas/ThreadId"
+            }
+          },
+          {
+            "in": "query",
+            "name": "status",
+            "required": false,
+            "schema": {
+              "$ref": "#/components/schemas/ThreadStatus"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ThreadListResponse"
+                }
+              }
+            },
+            "description": "Visible threads in thread ID order.",
+            "headers": {
+              "Cache-Control": {
+                "schema": {
+                  "enum": [
+                    "no-store"
+                  ],
+                  "type": "string"
+                }
+              },
+              "X-Cooplet-Hub": {
+                "schema": {
+                  "pattern": "^hub_[0-7][0-9a-hjkmnpqrstvwxyz]{25}$",
+                  "type": "string"
+                }
+              }
+            }
+          },
+          "400": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Invalid request.",
+            "headers": {
+              "Cache-Control": {
+                "schema": {
+                  "enum": [
+                    "no-store"
+                  ],
+                  "type": "string"
+                }
+              },
+              "X-Cooplet-Hub": {
+                "schema": {
+                  "pattern": "^hub_[0-7][0-9a-hjkmnpqrstvwxyz]{25}$",
+                  "type": "string"
+                }
+              }
+            }
+          },
+          "401": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Credential missing, invalid, expired, or revoked.",
+            "headers": {
+              "Cache-Control": {
+                "schema": {
+                  "enum": [
+                    "no-store"
+                  ],
+                  "type": "string"
+                }
+              },
+              "WWW-Authenticate": {
+                "schema": {
+                  "enum": [
+                    "Bearer realm=\"cooplet-hub\""
+                  ],
+                  "type": "string"
+                }
+              },
+              "X-Cooplet-Hub": {
+                "schema": {
+                  "pattern": "^hub_[0-7][0-9a-hjkmnpqrstvwxyz]{25}$",
+                  "type": "string"
+                }
+              }
+            }
+          },
+          "403": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "The caller lacks read scope.",
+            "headers": {
+              "Cache-Control": {
+                "schema": {
+                  "enum": [
+                    "no-store"
+                  ],
+                  "type": "string"
+                }
+              },
+              "X-Cooplet-Hub": {
+                "schema": {
+                  "pattern": "^hub_[0-7][0-9a-hjkmnpqrstvwxyz]{25}$",
+                  "type": "string"
+                }
+              }
+            }
+          },
+          "409": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Hub identity mismatch or route-specific conflict.",
+            "headers": {
+              "Cache-Control": {
+                "schema": {
+                  "enum": [
+                    "no-store"
+                  ],
+                  "type": "string"
+                }
+              },
+              "X-Cooplet-Hub": {
+                "schema": {
+                  "pattern": "^hub_[0-7][0-9a-hjkmnpqrstvwxyz]{25}$",
+                  "type": "string"
+                }
+              }
+            }
+          },
+          "413": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Request body exceeds the route limit.",
+            "headers": {
+              "Cache-Control": {
+                "schema": {
+                  "enum": [
+                    "no-store"
+                  ],
+                  "type": "string"
+                }
+              },
+              "X-Cooplet-Hub": {
+                "schema": {
+                  "pattern": "^hub_[0-7][0-9a-hjkmnpqrstvwxyz]{25}$",
+                  "type": "string"
+                }
+              }
+            }
+          },
+          "500": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Unexpected Hub failure.",
+            "headers": {
+              "Cache-Control": {
+                "schema": {
+                  "enum": [
+                    "no-store"
+                  ],
+                  "type": "string"
+                }
+              },
+              "X-Cooplet-Hub": {
+                "schema": {
+                  "pattern": "^hub_[0-7][0-9a-hjkmnpqrstvwxyz]{25}$",
+                  "type": "string"
+                }
+              }
+            }
+          },
+          "503": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Hub temporarily unavailable or unable to confirm the delivery outcome.",
+            "headers": {
+              "Cache-Control": {
+                "schema": {
+                  "enum": [
+                    "no-store"
+                  ],
+                  "type": "string"
+                }
+              },
+              "X-Cooplet-Hub": {
+                "schema": {
+                  "pattern": "^hub_[0-7][0-9a-hjkmnpqrstvwxyz]{25}$",
+                  "type": "string"
+                }
+              }
+            }
+          }
+        },
+        "tags": [
+          "Threads"
+        ]
+      },
+      "parameters": [
+        {
+          "description": "Expected Hub ID. A mismatched or duplicated pin is rejected before credential verification.",
+          "in": "header",
+          "name": "X-Cooplet-Hub",
+          "required": true,
+          "schema": {
+            "pattern": "^hub_[0-7][0-9a-hjkmnpqrstvwxyz]{25}$",
+            "type": "string"
+          }
+        }
+      ],
+      "post": {
+        "operationId": "create",
+        "parameters": [
+          {
+            "description": "8 to 128 visible ASCII characters. Reuse the same key and body after an ambiguous request outcome.",
+            "in": "header",
+            "name": "Idempotency-Key",
+            "required": true,
+            "schema": {
+              "pattern": "^[!-~]{8,128}$",
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/ThreadCreateRequest"
+              }
+            }
+          },
+          "description": "JSON body. Limit 64 KiB.",
+          "required": true
+        },
+        "responses": {
+          "201": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ThreadSummary"
+                }
+              }
+            },
+            "description": "Thread created.",
+            "headers": {
+              "Cache-Control": {
+                "schema": {
+                  "enum": [
+                    "no-store"
+                  ],
+                  "type": "string"
+                }
+              },
+              "X-Cooplet-Hub": {
+                "schema": {
+                  "pattern": "^hub_[0-7][0-9a-hjkmnpqrstvwxyz]{25}$",
+                  "type": "string"
+                }
+              }
+            }
+          },
+          "400": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Invalid request.",
+            "headers": {
+              "Cache-Control": {
+                "schema": {
+                  "enum": [
+                    "no-store"
+                  ],
+                  "type": "string"
+                }
+              },
+              "X-Cooplet-Hub": {
+                "schema": {
+                  "pattern": "^hub_[0-7][0-9a-hjkmnpqrstvwxyz]{25}$",
+                  "type": "string"
+                }
+              }
+            }
+          },
+          "401": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Credential missing, invalid, expired, or revoked.",
+            "headers": {
+              "Cache-Control": {
+                "schema": {
+                  "enum": [
+                    "no-store"
+                  ],
+                  "type": "string"
+                }
+              },
+              "WWW-Authenticate": {
+                "schema": {
+                  "enum": [
+                    "Bearer realm=\"cooplet-hub\""
+                  ],
+                  "type": "string"
+                }
+              },
+              "X-Cooplet-Hub": {
+                "schema": {
+                  "pattern": "^hub_[0-7][0-9a-hjkmnpqrstvwxyz]{25}$",
+                  "type": "string"
+                }
+              }
+            }
+          },
+          "403": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "The caller cannot create threads or add a listed node.",
+            "headers": {
+              "Cache-Control": {
+                "schema": {
+                  "enum": [
+                    "no-store"
+                  ],
+                  "type": "string"
+                }
+              },
+              "X-Cooplet-Hub": {
+                "schema": {
+                  "pattern": "^hub_[0-7][0-9a-hjkmnpqrstvwxyz]{25}$",
+                  "type": "string"
+                }
+              }
+            }
+          },
+          "409": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Hub identity mismatch or route-specific conflict.",
+            "headers": {
+              "Cache-Control": {
+                "schema": {
+                  "enum": [
+                    "no-store"
+                  ],
+                  "type": "string"
+                }
+              },
+              "X-Cooplet-Hub": {
+                "schema": {
+                  "pattern": "^hub_[0-7][0-9a-hjkmnpqrstvwxyz]{25}$",
+                  "type": "string"
+                }
+              }
+            }
+          },
+          "413": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Request body exceeds the route limit.",
+            "headers": {
+              "Cache-Control": {
+                "schema": {
+                  "enum": [
+                    "no-store"
+                  ],
+                  "type": "string"
+                }
+              },
+              "X-Cooplet-Hub": {
+                "schema": {
+                  "pattern": "^hub_[0-7][0-9a-hjkmnpqrstvwxyz]{25}$",
+                  "type": "string"
+                }
+              }
+            }
+          },
+          "500": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Unexpected Hub failure.",
+            "headers": {
+              "Cache-Control": {
+                "schema": {
+                  "enum": [
+                    "no-store"
+                  ],
+                  "type": "string"
+                }
+              },
+              "X-Cooplet-Hub": {
+                "schema": {
+                  "pattern": "^hub_[0-7][0-9a-hjkmnpqrstvwxyz]{25}$",
+                  "type": "string"
+                }
+              }
+            }
+          },
+          "503": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Hub temporarily unavailable or unable to confirm the delivery outcome.",
+            "headers": {
+              "Cache-Control": {
+                "schema": {
+                  "enum": [
+                    "no-store"
+                  ],
+                  "type": "string"
+                }
+              },
+              "X-Cooplet-Hub": {
+                "schema": {
+                  "pattern": "^hub_[0-7][0-9a-hjkmnpqrstvwxyz]{25}$",
+                  "type": "string"
+                }
+              }
+            }
+          }
+        },
+        "tags": [
+          "Threads"
+        ]
+      }
+    },
+    "/v1/threads/{id}": {
+      "get": {
+        "operationId": "read_thread",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "id",
+            "required": true,
+            "schema": {
+              "$ref": "#/components/schemas/ThreadId"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ThreadSummary"
+                }
+              }
+            },
+            "description": "Thread and retained sequence range.",
+            "headers": {
+              "Cache-Control": {
+                "schema": {
+                  "enum": [
+                    "no-store"
+                  ],
+                  "type": "string"
+                }
+              },
+              "X-Cooplet-Hub": {
+                "schema": {
+                  "pattern": "^hub_[0-7][0-9a-hjkmnpqrstvwxyz]{25}$",
+                  "type": "string"
+                }
+              }
+            }
+          },
+          "400": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Invalid request.",
+            "headers": {
+              "Cache-Control": {
+                "schema": {
+                  "enum": [
+                    "no-store"
+                  ],
+                  "type": "string"
+                }
+              },
+              "X-Cooplet-Hub": {
+                "schema": {
+                  "pattern": "^hub_[0-7][0-9a-hjkmnpqrstvwxyz]{25}$",
+                  "type": "string"
+                }
+              }
+            }
+          },
+          "401": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Credential missing, invalid, expired, or revoked.",
+            "headers": {
+              "Cache-Control": {
+                "schema": {
+                  "enum": [
+                    "no-store"
+                  ],
+                  "type": "string"
+                }
+              },
+              "WWW-Authenticate": {
+                "schema": {
+                  "enum": [
+                    "Bearer realm=\"cooplet-hub\""
+                  ],
+                  "type": "string"
+                }
+              },
+              "X-Cooplet-Hub": {
+                "schema": {
+                  "pattern": "^hub_[0-7][0-9a-hjkmnpqrstvwxyz]{25}$",
+                  "type": "string"
+                }
+              }
+            }
+          },
+          "404": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Thread missing or not visible.",
+            "headers": {
+              "Cache-Control": {
+                "schema": {
+                  "enum": [
+                    "no-store"
+                  ],
+                  "type": "string"
+                }
+              },
+              "X-Cooplet-Hub": {
+                "schema": {
+                  "pattern": "^hub_[0-7][0-9a-hjkmnpqrstvwxyz]{25}$",
+                  "type": "string"
+                }
+              }
+            }
+          },
+          "409": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Hub identity mismatch or route-specific conflict.",
+            "headers": {
+              "Cache-Control": {
+                "schema": {
+                  "enum": [
+                    "no-store"
+                  ],
+                  "type": "string"
+                }
+              },
+              "X-Cooplet-Hub": {
+                "schema": {
+                  "pattern": "^hub_[0-7][0-9a-hjkmnpqrstvwxyz]{25}$",
+                  "type": "string"
+                }
+              }
+            }
+          },
+          "413": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Request body exceeds the route limit.",
+            "headers": {
+              "Cache-Control": {
+                "schema": {
+                  "enum": [
+                    "no-store"
+                  ],
+                  "type": "string"
+                }
+              },
+              "X-Cooplet-Hub": {
+                "schema": {
+                  "pattern": "^hub_[0-7][0-9a-hjkmnpqrstvwxyz]{25}$",
+                  "type": "string"
+                }
+              }
+            }
+          },
+          "500": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Unexpected Hub failure.",
+            "headers": {
+              "Cache-Control": {
+                "schema": {
+                  "enum": [
+                    "no-store"
+                  ],
+                  "type": "string"
+                }
+              },
+              "X-Cooplet-Hub": {
+                "schema": {
+                  "pattern": "^hub_[0-7][0-9a-hjkmnpqrstvwxyz]{25}$",
+                  "type": "string"
+                }
+              }
+            }
+          },
+          "503": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Hub temporarily unavailable or unable to confirm the delivery outcome.",
+            "headers": {
+              "Cache-Control": {
+                "schema": {
+                  "enum": [
+                    "no-store"
+                  ],
+                  "type": "string"
+                }
+              },
+              "X-Cooplet-Hub": {
+                "schema": {
+                  "pattern": "^hub_[0-7][0-9a-hjkmnpqrstvwxyz]{25}$",
+                  "type": "string"
+                }
+              }
+            }
+          }
+        },
+        "tags": [
+          "Threads"
+        ]
+      },
+      "parameters": [
+        {
+          "description": "Expected Hub ID. A mismatched or duplicated pin is rejected before credential verification.",
+          "in": "header",
+          "name": "X-Cooplet-Hub",
+          "required": true,
+          "schema": {
+            "pattern": "^hub_[0-7][0-9a-hjkmnpqrstvwxyz]{25}$",
+            "type": "string"
+          }
+        }
+      ]
+    },
+    "/v1/threads/{id}/close": {
+      "parameters": [
+        {
+          "description": "Expected Hub ID. A mismatched or duplicated pin is rejected before credential verification.",
+          "in": "header",
+          "name": "X-Cooplet-Hub",
+          "required": true,
+          "schema": {
+            "pattern": "^hub_[0-7][0-9a-hjkmnpqrstvwxyz]{25}$",
+            "type": "string"
+          }
+        }
+      ],
+      "post": {
+        "operationId": "close",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "id",
+            "required": true,
+            "schema": {
+              "$ref": "#/components/schemas/ThreadId"
+            }
+          },
+          {
+            "description": "8 to 128 visible ASCII characters. Reuse the same key and body after an ambiguous request outcome.",
+            "in": "header",
+            "name": "Idempotency-Key",
+            "required": true,
+            "schema": {
+              "pattern": "^[!-~]{8,128}$",
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/EmptyJson"
+              }
+            }
+          },
+          "description": "Optional empty JSON object. Omit the body or send {}.",
+          "required": false
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ThreadSummary"
+                }
+              }
+            },
+            "description": "Thread closed.",
+            "headers": {
+              "Cache-Control": {
+                "schema": {
+                  "enum": [
+                    "no-store"
+                  ],
+                  "type": "string"
+                }
+              },
+              "X-Cooplet-Hub": {
+                "schema": {
+                  "pattern": "^hub_[0-7][0-9a-hjkmnpqrstvwxyz]{25}$",
+                  "type": "string"
+                }
+              }
+            }
+          },
+          "400": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Invalid request.",
+            "headers": {
+              "Cache-Control": {
+                "schema": {
+                  "enum": [
+                    "no-store"
+                  ],
+                  "type": "string"
+                }
+              },
+              "X-Cooplet-Hub": {
+                "schema": {
+                  "pattern": "^hub_[0-7][0-9a-hjkmnpqrstvwxyz]{25}$",
+                  "type": "string"
+                }
+              }
+            }
+          },
+          "401": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Credential missing, invalid, expired, or revoked.",
+            "headers": {
+              "Cache-Control": {
+                "schema": {
+                  "enum": [
+                    "no-store"
+                  ],
+                  "type": "string"
+                }
+              },
+              "WWW-Authenticate": {
+                "schema": {
+                  "enum": [
+                    "Bearer realm=\"cooplet-hub\""
+                  ],
+                  "type": "string"
+                }
+              },
+              "X-Cooplet-Hub": {
+                "schema": {
+                  "pattern": "^hub_[0-7][0-9a-hjkmnpqrstvwxyz]{25}$",
+                  "type": "string"
+                }
+              }
+            }
+          },
+          "403": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "The caller cannot close this thread.",
+            "headers": {
+              "Cache-Control": {
+                "schema": {
+                  "enum": [
+                    "no-store"
+                  ],
+                  "type": "string"
+                }
+              },
+              "X-Cooplet-Hub": {
+                "schema": {
+                  "pattern": "^hub_[0-7][0-9a-hjkmnpqrstvwxyz]{25}$",
+                  "type": "string"
+                }
+              }
+            }
+          },
+          "404": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Thread missing or not visible.",
+            "headers": {
+              "Cache-Control": {
+                "schema": {
+                  "enum": [
+                    "no-store"
+                  ],
+                  "type": "string"
+                }
+              },
+              "X-Cooplet-Hub": {
+                "schema": {
+                  "pattern": "^hub_[0-7][0-9a-hjkmnpqrstvwxyz]{25}$",
+                  "type": "string"
+                }
+              }
+            }
+          },
+          "409": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "The thread is already closed or the idempotency key conflicts.",
+            "headers": {
+              "Cache-Control": {
+                "schema": {
+                  "enum": [
+                    "no-store"
+                  ],
+                  "type": "string"
+                }
+              },
+              "X-Cooplet-Hub": {
+                "schema": {
+                  "pattern": "^hub_[0-7][0-9a-hjkmnpqrstvwxyz]{25}$",
+                  "type": "string"
+                }
+              }
+            }
+          },
+          "413": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Request body exceeds the route limit.",
+            "headers": {
+              "Cache-Control": {
+                "schema": {
+                  "enum": [
+                    "no-store"
+                  ],
+                  "type": "string"
+                }
+              },
+              "X-Cooplet-Hub": {
+                "schema": {
+                  "pattern": "^hub_[0-7][0-9a-hjkmnpqrstvwxyz]{25}$",
+                  "type": "string"
+                }
+              }
+            }
+          },
+          "500": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Unexpected Hub failure.",
+            "headers": {
+              "Cache-Control": {
+                "schema": {
+                  "enum": [
+                    "no-store"
+                  ],
+                  "type": "string"
+                }
+              },
+              "X-Cooplet-Hub": {
+                "schema": {
+                  "pattern": "^hub_[0-7][0-9a-hjkmnpqrstvwxyz]{25}$",
+                  "type": "string"
+                }
+              }
+            }
+          },
+          "503": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Hub temporarily unavailable or unable to confirm the delivery outcome.",
+            "headers": {
+              "Cache-Control": {
+                "schema": {
+                  "enum": [
+                    "no-store"
+                  ],
+                  "type": "string"
+                }
+              },
+              "X-Cooplet-Hub": {
+                "schema": {
+                  "pattern": "^hub_[0-7][0-9a-hjkmnpqrstvwxyz]{25}$",
+                  "type": "string"
+                }
+              }
+            }
+          }
+        },
+        "tags": [
+          "Threads"
+        ]
+      }
+    },
+    "/v1/threads/{id}/members": {
+      "get": {
+        "operationId": "list_members",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "id",
+            "required": true,
+            "schema": {
+              "$ref": "#/components/schemas/ThreadId"
+            }
+          },
+          {
+            "in": "query",
+            "name": "limit",
+            "required": false,
+            "schema": {
+              "default": 20,
+              "format": "int32",
+              "maximum": 100,
+              "minimum": 1,
+              "type": "integer"
+            }
+          },
+          {
+            "in": "query",
+            "name": "after",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ThreadMembersResponse"
+                }
+              }
+            },
+            "description": "Thread membership and delivery state.",
+            "headers": {
+              "Cache-Control": {
+                "schema": {
+                  "enum": [
+                    "no-store"
+                  ],
+                  "type": "string"
+                }
+              },
+              "X-Cooplet-Hub": {
+                "schema": {
+                  "pattern": "^hub_[0-7][0-9a-hjkmnpqrstvwxyz]{25}$",
+                  "type": "string"
+                }
+              }
+            }
+          },
+          "400": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Invalid request.",
+            "headers": {
+              "Cache-Control": {
+                "schema": {
+                  "enum": [
+                    "no-store"
+                  ],
+                  "type": "string"
+                }
+              },
+              "X-Cooplet-Hub": {
+                "schema": {
+                  "pattern": "^hub_[0-7][0-9a-hjkmnpqrstvwxyz]{25}$",
+                  "type": "string"
+                }
+              }
+            }
+          },
+          "401": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Credential missing, invalid, expired, or revoked.",
+            "headers": {
+              "Cache-Control": {
+                "schema": {
+                  "enum": [
+                    "no-store"
+                  ],
+                  "type": "string"
+                }
+              },
+              "WWW-Authenticate": {
+                "schema": {
+                  "enum": [
+                    "Bearer realm=\"cooplet-hub\""
+                  ],
+                  "type": "string"
+                }
+              },
+              "X-Cooplet-Hub": {
+                "schema": {
+                  "pattern": "^hub_[0-7][0-9a-hjkmnpqrstvwxyz]{25}$",
+                  "type": "string"
+                }
+              }
+            }
+          },
+          "404": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Thread missing or not visible.",
+            "headers": {
+              "Cache-Control": {
+                "schema": {
+                  "enum": [
+                    "no-store"
+                  ],
+                  "type": "string"
+                }
+              },
+              "X-Cooplet-Hub": {
+                "schema": {
+                  "pattern": "^hub_[0-7][0-9a-hjkmnpqrstvwxyz]{25}$",
+                  "type": "string"
+                }
+              }
+            }
+          },
+          "409": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Hub identity mismatch or route-specific conflict.",
+            "headers": {
+              "Cache-Control": {
+                "schema": {
+                  "enum": [
+                    "no-store"
+                  ],
+                  "type": "string"
+                }
+              },
+              "X-Cooplet-Hub": {
+                "schema": {
+                  "pattern": "^hub_[0-7][0-9a-hjkmnpqrstvwxyz]{25}$",
+                  "type": "string"
+                }
+              }
+            }
+          },
+          "413": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Request body exceeds the route limit.",
+            "headers": {
+              "Cache-Control": {
+                "schema": {
+                  "enum": [
+                    "no-store"
+                  ],
+                  "type": "string"
+                }
+              },
+              "X-Cooplet-Hub": {
+                "schema": {
+                  "pattern": "^hub_[0-7][0-9a-hjkmnpqrstvwxyz]{25}$",
+                  "type": "string"
+                }
+              }
+            }
+          },
+          "500": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Unexpected Hub failure.",
+            "headers": {
+              "Cache-Control": {
+                "schema": {
+                  "enum": [
+                    "no-store"
+                  ],
+                  "type": "string"
+                }
+              },
+              "X-Cooplet-Hub": {
+                "schema": {
+                  "pattern": "^hub_[0-7][0-9a-hjkmnpqrstvwxyz]{25}$",
+                  "type": "string"
+                }
+              }
+            }
+          },
+          "503": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Hub temporarily unavailable or unable to confirm the delivery outcome.",
+            "headers": {
+              "Cache-Control": {
+                "schema": {
+                  "enum": [
+                    "no-store"
+                  ],
+                  "type": "string"
+                }
+              },
+              "X-Cooplet-Hub": {
+                "schema": {
+                  "pattern": "^hub_[0-7][0-9a-hjkmnpqrstvwxyz]{25}$",
+                  "type": "string"
+                }
+              }
+            }
+          }
+        },
+        "tags": [
+          "Threads"
+        ]
+      },
+      "parameters": [
+        {
+          "description": "Expected Hub ID. A mismatched or duplicated pin is rejected before credential verification.",
+          "in": "header",
+          "name": "X-Cooplet-Hub",
+          "required": true,
+          "schema": {
+            "pattern": "^hub_[0-7][0-9a-hjkmnpqrstvwxyz]{25}$",
+            "type": "string"
+          }
+        }
+      ]
+    },
+    "/v1/threads/{id}/members/join": {
+      "parameters": [
+        {
+          "description": "Expected Hub ID. A mismatched or duplicated pin is rejected before credential verification.",
+          "in": "header",
+          "name": "X-Cooplet-Hub",
+          "required": true,
+          "schema": {
+            "pattern": "^hub_[0-7][0-9a-hjkmnpqrstvwxyz]{25}$",
+            "type": "string"
+          }
+        }
+      ],
+      "post": {
+        "operationId": "join",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "id",
+            "required": true,
+            "schema": {
+              "$ref": "#/components/schemas/ThreadId"
+            }
+          },
+          {
+            "description": "8 to 128 visible ASCII characters. Reuse the same key and body after an ambiguous request outcome.",
+            "in": "header",
+            "name": "Idempotency-Key",
+            "required": true,
+            "schema": {
+              "pattern": "^[!-~]{8,128}$",
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/ThreadMemberJoinRequest"
+              }
+            }
+          },
+          "description": "JSON body. Limit 64 KiB.",
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/MemberView"
+                }
+              }
+            },
+            "description": "Member joined.",
+            "headers": {
+              "Cache-Control": {
+                "schema": {
+                  "enum": [
+                    "no-store"
+                  ],
+                  "type": "string"
+                }
+              },
+              "X-Cooplet-Hub": {
+                "schema": {
+                  "pattern": "^hub_[0-7][0-9a-hjkmnpqrstvwxyz]{25}$",
+                  "type": "string"
+                }
+              }
+            }
+          },
+          "400": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Invalid request.",
+            "headers": {
+              "Cache-Control": {
+                "schema": {
+                  "enum": [
+                    "no-store"
+                  ],
+                  "type": "string"
+                }
+              },
+              "X-Cooplet-Hub": {
+                "schema": {
+                  "pattern": "^hub_[0-7][0-9a-hjkmnpqrstvwxyz]{25}$",
+                  "type": "string"
+                }
+              }
+            }
+          },
+          "401": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Credential missing, invalid, expired, or revoked.",
+            "headers": {
+              "Cache-Control": {
+                "schema": {
+                  "enum": [
+                    "no-store"
+                  ],
+                  "type": "string"
+                }
+              },
+              "WWW-Authenticate": {
+                "schema": {
+                  "enum": [
+                    "Bearer realm=\"cooplet-hub\""
+                  ],
+                  "type": "string"
+                }
+              },
+              "X-Cooplet-Hub": {
+                "schema": {
+                  "pattern": "^hub_[0-7][0-9a-hjkmnpqrstvwxyz]{25}$",
+                  "type": "string"
+                }
+              }
+            }
+          },
+          "403": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "The caller cannot add a member.",
+            "headers": {
+              "Cache-Control": {
+                "schema": {
+                  "enum": [
+                    "no-store"
+                  ],
+                  "type": "string"
+                }
+              },
+              "X-Cooplet-Hub": {
+                "schema": {
+                  "pattern": "^hub_[0-7][0-9a-hjkmnpqrstvwxyz]{25}$",
+                  "type": "string"
+                }
+              }
+            }
+          },
+          "404": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Thread missing or not visible.",
+            "headers": {
+              "Cache-Control": {
+                "schema": {
+                  "enum": [
+                    "no-store"
+                  ],
+                  "type": "string"
+                }
+              },
+              "X-Cooplet-Hub": {
+                "schema": {
+                  "pattern": "^hub_[0-7][0-9a-hjkmnpqrstvwxyz]{25}$",
+                  "type": "string"
+                }
+              }
+            }
+          },
+          "409": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "The member or request conflicts.",
+            "headers": {
+              "Cache-Control": {
+                "schema": {
+                  "enum": [
+                    "no-store"
+                  ],
+                  "type": "string"
+                }
+              },
+              "X-Cooplet-Hub": {
+                "schema": {
+                  "pattern": "^hub_[0-7][0-9a-hjkmnpqrstvwxyz]{25}$",
+                  "type": "string"
+                }
+              }
+            }
+          },
+          "413": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Request body exceeds the route limit.",
+            "headers": {
+              "Cache-Control": {
+                "schema": {
+                  "enum": [
+                    "no-store"
+                  ],
+                  "type": "string"
+                }
+              },
+              "X-Cooplet-Hub": {
+                "schema": {
+                  "pattern": "^hub_[0-7][0-9a-hjkmnpqrstvwxyz]{25}$",
+                  "type": "string"
+                }
+              }
+            }
+          },
+          "500": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Unexpected Hub failure.",
+            "headers": {
+              "Cache-Control": {
+                "schema": {
+                  "enum": [
+                    "no-store"
+                  ],
+                  "type": "string"
+                }
+              },
+              "X-Cooplet-Hub": {
+                "schema": {
+                  "pattern": "^hub_[0-7][0-9a-hjkmnpqrstvwxyz]{25}$",
+                  "type": "string"
+                }
+              }
+            }
+          },
+          "503": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Hub temporarily unavailable or unable to confirm the delivery outcome.",
+            "headers": {
+              "Cache-Control": {
+                "schema": {
+                  "enum": [
+                    "no-store"
+                  ],
+                  "type": "string"
+                }
+              },
+              "X-Cooplet-Hub": {
+                "schema": {
+                  "pattern": "^hub_[0-7][0-9a-hjkmnpqrstvwxyz]{25}$",
+                  "type": "string"
+                }
+              }
+            }
+          }
+        },
+        "tags": [
+          "Threads"
+        ]
+      }
+    },
+    "/v1/threads/{id}/members/leave": {
+      "parameters": [
+        {
+          "description": "Expected Hub ID. A mismatched or duplicated pin is rejected before credential verification.",
+          "in": "header",
+          "name": "X-Cooplet-Hub",
+          "required": true,
+          "schema": {
+            "pattern": "^hub_[0-7][0-9a-hjkmnpqrstvwxyz]{25}$",
+            "type": "string"
+          }
+        }
+      ],
+      "post": {
+        "operationId": "leave",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "id",
+            "required": true,
+            "schema": {
+              "$ref": "#/components/schemas/ThreadId"
+            }
+          },
+          {
+            "description": "8 to 128 visible ASCII characters. Reuse the same key and body after an ambiguous request outcome.",
+            "in": "header",
+            "name": "Idempotency-Key",
+            "required": true,
+            "schema": {
+              "pattern": "^[!-~]{8,128}$",
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/ThreadMemberLeaveRequest"
+              }
+            }
+          },
+          "description": "JSON body. Limit 64 KiB.",
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/MemberView"
+                }
+              }
+            },
+            "description": "Member left.",
+            "headers": {
+              "Cache-Control": {
+                "schema": {
+                  "enum": [
+                    "no-store"
+                  ],
+                  "type": "string"
+                }
+              },
+              "X-Cooplet-Hub": {
+                "schema": {
+                  "pattern": "^hub_[0-7][0-9a-hjkmnpqrstvwxyz]{25}$",
+                  "type": "string"
+                }
+              }
+            }
+          },
+          "400": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Invalid request.",
+            "headers": {
+              "Cache-Control": {
+                "schema": {
+                  "enum": [
+                    "no-store"
+                  ],
+                  "type": "string"
+                }
+              },
+              "X-Cooplet-Hub": {
+                "schema": {
+                  "pattern": "^hub_[0-7][0-9a-hjkmnpqrstvwxyz]{25}$",
+                  "type": "string"
+                }
+              }
+            }
+          },
+          "401": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Credential missing, invalid, expired, or revoked.",
+            "headers": {
+              "Cache-Control": {
+                "schema": {
+                  "enum": [
+                    "no-store"
+                  ],
+                  "type": "string"
+                }
+              },
+              "WWW-Authenticate": {
+                "schema": {
+                  "enum": [
+                    "Bearer realm=\"cooplet-hub\""
+                  ],
+                  "type": "string"
+                }
+              },
+              "X-Cooplet-Hub": {
+                "schema": {
+                  "pattern": "^hub_[0-7][0-9a-hjkmnpqrstvwxyz]{25}$",
+                  "type": "string"
+                }
+              }
+            }
+          },
+          "403": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "The caller cannot remove this member.",
+            "headers": {
+              "Cache-Control": {
+                "schema": {
+                  "enum": [
+                    "no-store"
+                  ],
+                  "type": "string"
+                }
+              },
+              "X-Cooplet-Hub": {
+                "schema": {
+                  "pattern": "^hub_[0-7][0-9a-hjkmnpqrstvwxyz]{25}$",
+                  "type": "string"
+                }
+              }
+            }
+          },
+          "404": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "The thread or member is missing or not visible.",
+            "headers": {
+              "Cache-Control": {
+                "schema": {
+                  "enum": [
+                    "no-store"
+                  ],
+                  "type": "string"
+                }
+              },
+              "X-Cooplet-Hub": {
+                "schema": {
+                  "pattern": "^hub_[0-7][0-9a-hjkmnpqrstvwxyz]{25}$",
+                  "type": "string"
+                }
+              }
+            }
+          },
+          "409": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "The thread still needs its last owner or the request conflicts.",
+            "headers": {
+              "Cache-Control": {
+                "schema": {
+                  "enum": [
+                    "no-store"
+                  ],
+                  "type": "string"
+                }
+              },
+              "X-Cooplet-Hub": {
+                "schema": {
+                  "pattern": "^hub_[0-7][0-9a-hjkmnpqrstvwxyz]{25}$",
+                  "type": "string"
+                }
+              }
+            }
+          },
+          "413": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Request body exceeds the route limit.",
+            "headers": {
+              "Cache-Control": {
+                "schema": {
+                  "enum": [
+                    "no-store"
+                  ],
+                  "type": "string"
+                }
+              },
+              "X-Cooplet-Hub": {
+                "schema": {
+                  "pattern": "^hub_[0-7][0-9a-hjkmnpqrstvwxyz]{25}$",
+                  "type": "string"
+                }
+              }
+            }
+          },
+          "500": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Unexpected Hub failure.",
+            "headers": {
+              "Cache-Control": {
+                "schema": {
+                  "enum": [
+                    "no-store"
+                  ],
+                  "type": "string"
+                }
+              },
+              "X-Cooplet-Hub": {
+                "schema": {
+                  "pattern": "^hub_[0-7][0-9a-hjkmnpqrstvwxyz]{25}$",
+                  "type": "string"
+                }
+              }
+            }
+          },
+          "503": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Hub temporarily unavailable or unable to confirm the delivery outcome.",
+            "headers": {
+              "Cache-Control": {
+                "schema": {
+                  "enum": [
+                    "no-store"
+                  ],
+                  "type": "string"
+                }
+              },
+              "X-Cooplet-Hub": {
+                "schema": {
+                  "pattern": "^hub_[0-7][0-9a-hjkmnpqrstvwxyz]{25}$",
+                  "type": "string"
+                }
+              }
+            }
+          }
+        },
+        "tags": [
+          "Threads"
+        ]
+      }
+    },
+    "/v1/threads/{id}/members/resume": {
+      "parameters": [
+        {
+          "description": "Expected Hub ID. A mismatched or duplicated pin is rejected before credential verification.",
+          "in": "header",
+          "name": "X-Cooplet-Hub",
+          "required": true,
+          "schema": {
+            "pattern": "^hub_[0-7][0-9a-hjkmnpqrstvwxyz]{25}$",
+            "type": "string"
+          }
+        }
+      ],
+      "post": {
+        "operationId": "resume",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "id",
+            "required": true,
+            "schema": {
+              "$ref": "#/components/schemas/ThreadId"
+            }
+          },
+          {
+            "description": "8 to 128 visible ASCII characters. Reuse the same key and body after an ambiguous request outcome.",
+            "in": "header",
+            "name": "Idempotency-Key",
+            "required": true,
+            "schema": {
+              "pattern": "^[!-~]{8,128}$",
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/ThreadMemberResumeRequest"
+              }
+            }
+          },
+          "description": "JSON body. Limit 64 KiB.",
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/MemberView"
+                }
+              }
+            },
+            "description": "Uncertain delivery resolved at the supplied cursor.",
+            "headers": {
+              "Cache-Control": {
+                "schema": {
+                  "enum": [
+                    "no-store"
+                  ],
+                  "type": "string"
+                }
+              },
+              "X-Cooplet-Hub": {
+                "schema": {
+                  "pattern": "^hub_[0-7][0-9a-hjkmnpqrstvwxyz]{25}$",
+                  "type": "string"
+                }
+              }
+            }
+          },
+          "400": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Invalid request.",
+            "headers": {
+              "Cache-Control": {
+                "schema": {
+                  "enum": [
+                    "no-store"
+                  ],
+                  "type": "string"
+                }
+              },
+              "X-Cooplet-Hub": {
+                "schema": {
+                  "pattern": "^hub_[0-7][0-9a-hjkmnpqrstvwxyz]{25}$",
+                  "type": "string"
+                }
+              }
+            }
+          },
+          "401": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Credential missing, invalid, expired, or revoked.",
+            "headers": {
+              "Cache-Control": {
+                "schema": {
+                  "enum": [
+                    "no-store"
+                  ],
+                  "type": "string"
+                }
+              },
+              "WWW-Authenticate": {
+                "schema": {
+                  "enum": [
+                    "Bearer realm=\"cooplet-hub\""
+                  ],
+                  "type": "string"
+                }
+              },
+              "X-Cooplet-Hub": {
+                "schema": {
+                  "pattern": "^hub_[0-7][0-9a-hjkmnpqrstvwxyz]{25}$",
+                  "type": "string"
+                }
+              }
+            }
+          },
+          "403": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "The caller cannot resume this member.",
+            "headers": {
+              "Cache-Control": {
+                "schema": {
+                  "enum": [
+                    "no-store"
+                  ],
+                  "type": "string"
+                }
+              },
+              "X-Cooplet-Hub": {
+                "schema": {
+                  "pattern": "^hub_[0-7][0-9a-hjkmnpqrstvwxyz]{25}$",
+                  "type": "string"
+                }
+              }
+            }
+          },
+          "404": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "The thread or member is missing or not visible.",
+            "headers": {
+              "Cache-Control": {
+                "schema": {
+                  "enum": [
+                    "no-store"
+                  ],
+                  "type": "string"
+                }
+              },
+              "X-Cooplet-Hub": {
+                "schema": {
+                  "pattern": "^hub_[0-7][0-9a-hjkmnpqrstvwxyz]{25}$",
+                  "type": "string"
+                }
+              }
+            }
+          },
+          "409": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "The member is not paused or the request conflicts.",
+            "headers": {
+              "Cache-Control": {
+                "schema": {
+                  "enum": [
+                    "no-store"
+                  ],
+                  "type": "string"
+                }
+              },
+              "X-Cooplet-Hub": {
+                "schema": {
+                  "pattern": "^hub_[0-7][0-9a-hjkmnpqrstvwxyz]{25}$",
+                  "type": "string"
+                }
+              }
+            }
+          },
+          "410": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "The cursor predates the retained range.",
+            "headers": {
+              "Cache-Control": {
+                "schema": {
+                  "enum": [
+                    "no-store"
+                  ],
+                  "type": "string"
+                }
+              },
+              "X-Cooplet-Hub": {
+                "schema": {
+                  "pattern": "^hub_[0-7][0-9a-hjkmnpqrstvwxyz]{25}$",
+                  "type": "string"
+                }
+              }
+            }
+          },
+          "413": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Request body exceeds the route limit.",
+            "headers": {
+              "Cache-Control": {
+                "schema": {
+                  "enum": [
+                    "no-store"
+                  ],
+                  "type": "string"
+                }
+              },
+              "X-Cooplet-Hub": {
+                "schema": {
+                  "pattern": "^hub_[0-7][0-9a-hjkmnpqrstvwxyz]{25}$",
+                  "type": "string"
+                }
+              }
+            }
+          },
+          "500": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Unexpected Hub failure.",
+            "headers": {
+              "Cache-Control": {
+                "schema": {
+                  "enum": [
+                    "no-store"
+                  ],
+                  "type": "string"
+                }
+              },
+              "X-Cooplet-Hub": {
+                "schema": {
+                  "pattern": "^hub_[0-7][0-9a-hjkmnpqrstvwxyz]{25}$",
+                  "type": "string"
+                }
+              }
+            }
+          },
+          "503": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Hub temporarily unavailable or unable to confirm the delivery outcome.",
+            "headers": {
+              "Cache-Control": {
+                "schema": {
+                  "enum": [
+                    "no-store"
+                  ],
+                  "type": "string"
+                }
+              },
+              "X-Cooplet-Hub": {
+                "schema": {
+                  "pattern": "^hub_[0-7][0-9a-hjkmnpqrstvwxyz]{25}$",
+                  "type": "string"
+                }
+              }
+            }
+          }
+        },
+        "tags": [
+          "Threads"
+        ]
+      }
+    },
+    "/v1/threads/{id}/pins/{pin_key}": {
+      "delete": {
+        "operationId": "delete_pin",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "id",
+            "required": true,
+            "schema": {
+              "$ref": "#/components/schemas/ThreadId"
+            }
+          },
+          {
+            "in": "path",
+            "name": "pin_key",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "in": "query",
+            "name": "expected_version",
+            "required": false,
+            "schema": {
+              "format": "int64",
+              "minimum": 0,
+              "type": "integer"
+            }
+          },
+          {
+            "description": "8 to 128 visible ASCII characters. Reuse the same key and body after an ambiguous request outcome.",
+            "in": "header",
+            "name": "Idempotency-Key",
+            "required": true,
+            "schema": {
+              "pattern": "^[!-~]{8,128}$",
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ThreadPinDeleteResponse"
+                }
+              }
+            },
+            "description": "Pin deleted or already absent.",
+            "headers": {
+              "Cache-Control": {
+                "schema": {
+                  "enum": [
+                    "no-store"
+                  ],
+                  "type": "string"
+                }
+              },
+              "X-Cooplet-Hub": {
+                "schema": {
+                  "pattern": "^hub_[0-7][0-9a-hjkmnpqrstvwxyz]{25}$",
+                  "type": "string"
+                }
+              }
+            }
+          },
+          "400": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Invalid request.",
+            "headers": {
+              "Cache-Control": {
+                "schema": {
+                  "enum": [
+                    "no-store"
+                  ],
+                  "type": "string"
+                }
+              },
+              "X-Cooplet-Hub": {
+                "schema": {
+                  "pattern": "^hub_[0-7][0-9a-hjkmnpqrstvwxyz]{25}$",
+                  "type": "string"
+                }
+              }
+            }
+          },
+          "401": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Credential missing, invalid, expired, or revoked.",
+            "headers": {
+              "Cache-Control": {
+                "schema": {
+                  "enum": [
+                    "no-store"
+                  ],
+                  "type": "string"
+                }
+              },
+              "WWW-Authenticate": {
+                "schema": {
+                  "enum": [
+                    "Bearer realm=\"cooplet-hub\""
+                  ],
+                  "type": "string"
+                }
+              },
+              "X-Cooplet-Hub": {
+                "schema": {
+                  "pattern": "^hub_[0-7][0-9a-hjkmnpqrstvwxyz]{25}$",
+                  "type": "string"
+                }
+              }
+            }
+          },
+          "403": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "The caller cannot modify pins on this thread.",
+            "headers": {
+              "Cache-Control": {
+                "schema": {
+                  "enum": [
+                    "no-store"
+                  ],
+                  "type": "string"
+                }
+              },
+              "X-Cooplet-Hub": {
+                "schema": {
+                  "pattern": "^hub_[0-7][0-9a-hjkmnpqrstvwxyz]{25}$",
+                  "type": "string"
+                }
+              }
+            }
+          },
+          "404": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Thread missing or not visible.",
+            "headers": {
+              "Cache-Control": {
+                "schema": {
+                  "enum": [
+                    "no-store"
+                  ],
+                  "type": "string"
+                }
+              },
+              "X-Cooplet-Hub": {
+                "schema": {
+                  "pattern": "^hub_[0-7][0-9a-hjkmnpqrstvwxyz]{25}$",
+                  "type": "string"
+                }
+              }
+            }
+          },
+          "409": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "The pin version or request conflicts.",
+            "headers": {
+              "Cache-Control": {
+                "schema": {
+                  "enum": [
+                    "no-store"
+                  ],
+                  "type": "string"
+                }
+              },
+              "X-Cooplet-Hub": {
+                "schema": {
+                  "pattern": "^hub_[0-7][0-9a-hjkmnpqrstvwxyz]{25}$",
+                  "type": "string"
+                }
+              }
+            }
+          },
+          "413": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Request body exceeds the route limit.",
+            "headers": {
+              "Cache-Control": {
+                "schema": {
+                  "enum": [
+                    "no-store"
+                  ],
+                  "type": "string"
+                }
+              },
+              "X-Cooplet-Hub": {
+                "schema": {
+                  "pattern": "^hub_[0-7][0-9a-hjkmnpqrstvwxyz]{25}$",
+                  "type": "string"
+                }
+              }
+            }
+          },
+          "500": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Unexpected Hub failure.",
+            "headers": {
+              "Cache-Control": {
+                "schema": {
+                  "enum": [
+                    "no-store"
+                  ],
+                  "type": "string"
+                }
+              },
+              "X-Cooplet-Hub": {
+                "schema": {
+                  "pattern": "^hub_[0-7][0-9a-hjkmnpqrstvwxyz]{25}$",
+                  "type": "string"
+                }
+              }
+            }
+          },
+          "503": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Hub temporarily unavailable or unable to confirm the delivery outcome.",
+            "headers": {
+              "Cache-Control": {
+                "schema": {
+                  "enum": [
+                    "no-store"
+                  ],
+                  "type": "string"
+                }
+              },
+              "X-Cooplet-Hub": {
+                "schema": {
+                  "pattern": "^hub_[0-7][0-9a-hjkmnpqrstvwxyz]{25}$",
+                  "type": "string"
+                }
+              }
+            }
+          }
+        },
+        "tags": [
+          "Threads"
+        ]
+      },
+      "parameters": [
+        {
+          "description": "Expected Hub ID. A mismatched or duplicated pin is rejected before credential verification.",
+          "in": "header",
+          "name": "X-Cooplet-Hub",
+          "required": true,
+          "schema": {
+            "pattern": "^hub_[0-7][0-9a-hjkmnpqrstvwxyz]{25}$",
+            "type": "string"
+          }
+        }
+      ],
+      "put": {
+        "operationId": "set_pin",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "id",
+            "required": true,
+            "schema": {
+              "$ref": "#/components/schemas/ThreadId"
+            }
+          },
+          {
+            "in": "path",
+            "name": "pin_key",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "description": "8 to 128 visible ASCII characters. Reuse the same key and body after an ambiguous request outcome.",
+            "in": "header",
+            "name": "Idempotency-Key",
+            "required": true,
+            "schema": {
+              "pattern": "^[!-~]{8,128}$",
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/ThreadPinSetRequest"
+              }
+            }
+          },
+          "description": "JSON body. Limit 64 KiB.",
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ThreadPinView"
+                }
+              }
+            },
+            "description": "Pin committed with a new version.",
+            "headers": {
+              "Cache-Control": {
+                "schema": {
+                  "enum": [
+                    "no-store"
+                  ],
+                  "type": "string"
+                }
+              },
+              "X-Cooplet-Hub": {
+                "schema": {
+                  "pattern": "^hub_[0-7][0-9a-hjkmnpqrstvwxyz]{25}$",
+                  "type": "string"
+                }
+              }
+            }
+          },
+          "400": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Invalid request.",
+            "headers": {
+              "Cache-Control": {
+                "schema": {
+                  "enum": [
+                    "no-store"
+                  ],
+                  "type": "string"
+                }
+              },
+              "X-Cooplet-Hub": {
+                "schema": {
+                  "pattern": "^hub_[0-7][0-9a-hjkmnpqrstvwxyz]{25}$",
+                  "type": "string"
+                }
+              }
+            }
+          },
+          "401": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Credential missing, invalid, expired, or revoked.",
+            "headers": {
+              "Cache-Control": {
+                "schema": {
+                  "enum": [
+                    "no-store"
+                  ],
+                  "type": "string"
+                }
+              },
+              "WWW-Authenticate": {
+                "schema": {
+                  "enum": [
+                    "Bearer realm=\"cooplet-hub\""
+                  ],
+                  "type": "string"
+                }
+              },
+              "X-Cooplet-Hub": {
+                "schema": {
+                  "pattern": "^hub_[0-7][0-9a-hjkmnpqrstvwxyz]{25}$",
+                  "type": "string"
+                }
+              }
+            }
+          },
+          "403": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "The caller cannot modify pins on this thread.",
+            "headers": {
+              "Cache-Control": {
+                "schema": {
+                  "enum": [
+                    "no-store"
+                  ],
+                  "type": "string"
+                }
+              },
+              "X-Cooplet-Hub": {
+                "schema": {
+                  "pattern": "^hub_[0-7][0-9a-hjkmnpqrstvwxyz]{25}$",
+                  "type": "string"
+                }
+              }
+            }
+          },
+          "404": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "The thread or referenced post is missing or not visible.",
+            "headers": {
+              "Cache-Control": {
+                "schema": {
+                  "enum": [
+                    "no-store"
+                  ],
+                  "type": "string"
+                }
+              },
+              "X-Cooplet-Hub": {
+                "schema": {
+                  "pattern": "^hub_[0-7][0-9a-hjkmnpqrstvwxyz]{25}$",
+                  "type": "string"
+                }
+              }
+            }
+          },
+          "409": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "The pin version or request conflicts.",
+            "headers": {
+              "Cache-Control": {
+                "schema": {
+                  "enum": [
+                    "no-store"
+                  ],
+                  "type": "string"
+                }
+              },
+              "X-Cooplet-Hub": {
+                "schema": {
+                  "pattern": "^hub_[0-7][0-9a-hjkmnpqrstvwxyz]{25}$",
+                  "type": "string"
+                }
+              }
+            }
+          },
+          "413": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Request body exceeds the route limit.",
+            "headers": {
+              "Cache-Control": {
+                "schema": {
+                  "enum": [
+                    "no-store"
+                  ],
+                  "type": "string"
+                }
+              },
+              "X-Cooplet-Hub": {
+                "schema": {
+                  "pattern": "^hub_[0-7][0-9a-hjkmnpqrstvwxyz]{25}$",
+                  "type": "string"
+                }
+              }
+            }
+          },
+          "500": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Unexpected Hub failure.",
+            "headers": {
+              "Cache-Control": {
+                "schema": {
+                  "enum": [
+                    "no-store"
+                  ],
+                  "type": "string"
+                }
+              },
+              "X-Cooplet-Hub": {
+                "schema": {
+                  "pattern": "^hub_[0-7][0-9a-hjkmnpqrstvwxyz]{25}$",
+                  "type": "string"
+                }
+              }
+            }
+          },
+          "503": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Hub temporarily unavailable or unable to confirm the delivery outcome.",
+            "headers": {
+              "Cache-Control": {
+                "schema": {
+                  "enum": [
+                    "no-store"
+                  ],
+                  "type": "string"
+                }
+              },
+              "X-Cooplet-Hub": {
+                "schema": {
+                  "pattern": "^hub_[0-7][0-9a-hjkmnpqrstvwxyz]{25}$",
+                  "type": "string"
+                }
+              }
+            }
+          }
+        },
+        "tags": [
+          "Threads"
+        ]
+      }
+    },
+    "/v1/threads/{id}/posts": {
+      "get": {
+        "operationId": "read_posts",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "id",
+            "required": true,
+            "schema": {
+              "$ref": "#/components/schemas/ThreadId"
+            }
+          },
+          {
+            "in": "query",
+            "name": "since_seq",
+            "required": false,
+            "schema": {
+              "format": "int64",
+              "minimum": 0,
+              "type": "integer"
+            }
+          },
+          {
+            "in": "query",
+            "name": "limit",
+            "required": false,
+            "schema": {
+              "default": 20,
+              "format": "int32",
+              "maximum": 100,
+              "minimum": 1,
+              "type": "integer"
+            }
+          },
+          {
+            "in": "query",
+            "name": "include_pins",
+            "required": false,
+            "schema": {
+              "type": "boolean"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ThreadReadResponse"
+                }
+              }
+            },
+            "description": "Retained posts in sequence order.",
+            "headers": {
+              "Cache-Control": {
+                "schema": {
+                  "enum": [
+                    "no-store"
+                  ],
+                  "type": "string"
+                }
+              },
+              "X-Cooplet-Hub": {
+                "schema": {
+                  "pattern": "^hub_[0-7][0-9a-hjkmnpqrstvwxyz]{25}$",
+                  "type": "string"
+                }
+              }
+            }
+          },
+          "400": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Invalid request.",
+            "headers": {
+              "Cache-Control": {
+                "schema": {
+                  "enum": [
+                    "no-store"
+                  ],
+                  "type": "string"
+                }
+              },
+              "X-Cooplet-Hub": {
+                "schema": {
+                  "pattern": "^hub_[0-7][0-9a-hjkmnpqrstvwxyz]{25}$",
+                  "type": "string"
+                }
+              }
+            }
+          },
+          "401": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Credential missing, invalid, expired, or revoked.",
+            "headers": {
+              "Cache-Control": {
+                "schema": {
+                  "enum": [
+                    "no-store"
+                  ],
+                  "type": "string"
+                }
+              },
+              "WWW-Authenticate": {
+                "schema": {
+                  "enum": [
+                    "Bearer realm=\"cooplet-hub\""
+                  ],
+                  "type": "string"
+                }
+              },
+              "X-Cooplet-Hub": {
+                "schema": {
+                  "pattern": "^hub_[0-7][0-9a-hjkmnpqrstvwxyz]{25}$",
+                  "type": "string"
+                }
+              }
+            }
+          },
+          "404": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Thread missing or not visible.",
+            "headers": {
+              "Cache-Control": {
+                "schema": {
+                  "enum": [
+                    "no-store"
+                  ],
+                  "type": "string"
+                }
+              },
+              "X-Cooplet-Hub": {
+                "schema": {
+                  "pattern": "^hub_[0-7][0-9a-hjkmnpqrstvwxyz]{25}$",
+                  "type": "string"
+                }
+              }
+            }
+          },
+          "409": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Hub identity mismatch or route-specific conflict.",
+            "headers": {
+              "Cache-Control": {
+                "schema": {
+                  "enum": [
+                    "no-store"
+                  ],
+                  "type": "string"
+                }
+              },
+              "X-Cooplet-Hub": {
+                "schema": {
+                  "pattern": "^hub_[0-7][0-9a-hjkmnpqrstvwxyz]{25}$",
+                  "type": "string"
+                }
+              }
+            }
+          },
+          "410": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "The cursor predates the retained range.",
+            "headers": {
+              "Cache-Control": {
+                "schema": {
+                  "enum": [
+                    "no-store"
+                  ],
+                  "type": "string"
+                }
+              },
+              "X-Cooplet-Hub": {
+                "schema": {
+                  "pattern": "^hub_[0-7][0-9a-hjkmnpqrstvwxyz]{25}$",
+                  "type": "string"
+                }
+              }
+            }
+          },
+          "413": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Request body exceeds the route limit.",
+            "headers": {
+              "Cache-Control": {
+                "schema": {
+                  "enum": [
+                    "no-store"
+                  ],
+                  "type": "string"
+                }
+              },
+              "X-Cooplet-Hub": {
+                "schema": {
+                  "pattern": "^hub_[0-7][0-9a-hjkmnpqrstvwxyz]{25}$",
+                  "type": "string"
+                }
+              }
+            }
+          },
+          "500": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Unexpected Hub failure.",
+            "headers": {
+              "Cache-Control": {
+                "schema": {
+                  "enum": [
+                    "no-store"
+                  ],
+                  "type": "string"
+                }
+              },
+              "X-Cooplet-Hub": {
+                "schema": {
+                  "pattern": "^hub_[0-7][0-9a-hjkmnpqrstvwxyz]{25}$",
+                  "type": "string"
+                }
+              }
+            }
+          },
+          "503": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Hub temporarily unavailable or unable to confirm the delivery outcome.",
+            "headers": {
+              "Cache-Control": {
+                "schema": {
+                  "enum": [
+                    "no-store"
+                  ],
+                  "type": "string"
+                }
+              },
+              "X-Cooplet-Hub": {
+                "schema": {
+                  "pattern": "^hub_[0-7][0-9a-hjkmnpqrstvwxyz]{25}$",
+                  "type": "string"
+                }
+              }
+            }
+          }
+        },
+        "tags": [
+          "Threads"
+        ]
+      },
+      "parameters": [
+        {
+          "description": "Expected Hub ID. A mismatched or duplicated pin is rejected before credential verification.",
+          "in": "header",
+          "name": "X-Cooplet-Hub",
+          "required": true,
+          "schema": {
+            "pattern": "^hub_[0-7][0-9a-hjkmnpqrstvwxyz]{25}$",
+            "type": "string"
+          }
+        }
+      ],
+      "post": {
+        "operationId": "post_message",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "id",
+            "required": true,
+            "schema": {
+              "$ref": "#/components/schemas/ThreadId"
+            }
+          },
+          {
+            "description": "8 to 128 visible ASCII characters. Reuse the same key and body after an ambiguous request outcome.",
+            "in": "header",
+            "name": "Idempotency-Key",
+            "required": true,
+            "schema": {
+              "pattern": "^[!-~]{8,128}$",
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/ThreadPostRequest"
+              }
+            }
+          },
+          "description": "JSON body. Limit 64 KiB.",
+          "required": true
+        },
+        "responses": {
+          "201": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ThreadPostReceipt"
+                }
+              }
+            },
+            "description": "Post committed to the thread.",
+            "headers": {
+              "Cache-Control": {
+                "schema": {
+                  "enum": [
+                    "no-store"
+                  ],
+                  "type": "string"
+                }
+              },
+              "X-Cooplet-Hub": {
+                "schema": {
+                  "pattern": "^hub_[0-7][0-9a-hjkmnpqrstvwxyz]{25}$",
+                  "type": "string"
+                }
+              }
+            }
+          },
+          "400": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Invalid request.",
+            "headers": {
+              "Cache-Control": {
+                "schema": {
+                  "enum": [
+                    "no-store"
+                  ],
+                  "type": "string"
+                }
+              },
+              "X-Cooplet-Hub": {
+                "schema": {
+                  "pattern": "^hub_[0-7][0-9a-hjkmnpqrstvwxyz]{25}$",
+                  "type": "string"
+                }
+              }
+            }
+          },
+          "401": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Credential missing, invalid, expired, or revoked.",
+            "headers": {
+              "Cache-Control": {
+                "schema": {
+                  "enum": [
+                    "no-store"
+                  ],
+                  "type": "string"
+                }
+              },
+              "WWW-Authenticate": {
+                "schema": {
+                  "enum": [
+                    "Bearer realm=\"cooplet-hub\""
+                  ],
+                  "type": "string"
+                }
+              },
+              "X-Cooplet-Hub": {
+                "schema": {
+                  "pattern": "^hub_[0-7][0-9a-hjkmnpqrstvwxyz]{25}$",
+                  "type": "string"
+                }
+              }
+            }
+          },
+          "403": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "The caller cannot post to this thread.",
+            "headers": {
+              "Cache-Control": {
+                "schema": {
+                  "enum": [
+                    "no-store"
+                  ],
+                  "type": "string"
+                }
+              },
+              "X-Cooplet-Hub": {
+                "schema": {
+                  "pattern": "^hub_[0-7][0-9a-hjkmnpqrstvwxyz]{25}$",
+                  "type": "string"
+                }
+              }
+            }
+          },
+          "404": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "The thread or referenced resource is missing or not visible.",
+            "headers": {
+              "Cache-Control": {
+                "schema": {
+                  "enum": [
+                    "no-store"
+                  ],
+                  "type": "string"
+                }
+              },
+              "X-Cooplet-Hub": {
+                "schema": {
+                  "pattern": "^hub_[0-7][0-9a-hjkmnpqrstvwxyz]{25}$",
+                  "type": "string"
+                }
+              }
+            }
+          },
+          "409": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "The thread is closed, the question already has an answer, or the request conflicts.",
+            "headers": {
+              "Cache-Control": {
+                "schema": {
+                  "enum": [
+                    "no-store"
+                  ],
+                  "type": "string"
+                }
+              },
+              "X-Cooplet-Hub": {
+                "schema": {
+                  "pattern": "^hub_[0-7][0-9a-hjkmnpqrstvwxyz]{25}$",
+                  "type": "string"
+                }
+              }
+            }
+          },
+          "413": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Request body exceeds the route limit.",
+            "headers": {
+              "Cache-Control": {
+                "schema": {
+                  "enum": [
+                    "no-store"
+                  ],
+                  "type": "string"
+                }
+              },
+              "X-Cooplet-Hub": {
+                "schema": {
+                  "pattern": "^hub_[0-7][0-9a-hjkmnpqrstvwxyz]{25}$",
+                  "type": "string"
+                }
+              }
+            }
+          },
+          "500": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Unexpected Hub failure.",
+            "headers": {
+              "Cache-Control": {
+                "schema": {
+                  "enum": [
+                    "no-store"
+                  ],
+                  "type": "string"
+                }
+              },
+              "X-Cooplet-Hub": {
+                "schema": {
+                  "pattern": "^hub_[0-7][0-9a-hjkmnpqrstvwxyz]{25}$",
+                  "type": "string"
+                }
+              }
+            }
+          },
+          "503": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Hub temporarily unavailable or unable to confirm the delivery outcome.",
+            "headers": {
+              "Cache-Control": {
+                "schema": {
+                  "enum": [
+                    "no-store"
+                  ],
+                  "type": "string"
+                }
+              },
+              "X-Cooplet-Hub": {
+                "schema": {
+                  "pattern": "^hub_[0-7][0-9a-hjkmnpqrstvwxyz]{25}$",
+                  "type": "string"
+                }
+              }
+            }
+          }
+        },
+        "tags": [
+          "Threads"
+        ]
+      }
+    },
+    "/v1/threads/{id}/wait": {
+      "parameters": [
+        {
+          "description": "Expected Hub ID. A mismatched or duplicated pin is rejected before credential verification.",
+          "in": "header",
+          "name": "X-Cooplet-Hub",
+          "required": true,
+          "schema": {
+            "pattern": "^hub_[0-7][0-9a-hjkmnpqrstvwxyz]{25}$",
+            "type": "string"
+          }
+        }
+      ],
+      "post": {
+        "operationId": "wait",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "id",
+            "required": true,
+            "schema": {
+              "$ref": "#/components/schemas/ThreadId"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/ThreadWaitRequest"
+              }
+            }
+          },
+          "description": "JSON body. Limit 64 KiB.",
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ThreadWaitResponse"
+                }
+              }
+            },
+            "description": "Current context or a registered wait.",
+            "headers": {
+              "Cache-Control": {
+                "schema": {
+                  "enum": [
+                    "no-store"
+                  ],
+                  "type": "string"
+                }
+              },
+              "X-Cooplet-Hub": {
+                "schema": {
+                  "pattern": "^hub_[0-7][0-9a-hjkmnpqrstvwxyz]{25}$",
+                  "type": "string"
+                }
+              }
+            }
+          },
+          "400": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Invalid request.",
+            "headers": {
+              "Cache-Control": {
+                "schema": {
+                  "enum": [
+                    "no-store"
+                  ],
+                  "type": "string"
+                }
+              },
+              "X-Cooplet-Hub": {
+                "schema": {
+                  "pattern": "^hub_[0-7][0-9a-hjkmnpqrstvwxyz]{25}$",
+                  "type": "string"
+                }
+              }
+            }
+          },
+          "401": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Credential missing, invalid, expired, or revoked.",
+            "headers": {
+              "Cache-Control": {
+                "schema": {
+                  "enum": [
+                    "no-store"
+                  ],
+                  "type": "string"
+                }
+              },
+              "WWW-Authenticate": {
+                "schema": {
+                  "enum": [
+                    "Bearer realm=\"cooplet-hub\""
+                  ],
+                  "type": "string"
+                }
+              },
+              "X-Cooplet-Hub": {
+                "schema": {
+                  "pattern": "^hub_[0-7][0-9a-hjkmnpqrstvwxyz]{25}$",
+                  "type": "string"
+                }
+              }
+            }
+          },
+          "403": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "The caller cannot wait on this thread.",
+            "headers": {
+              "Cache-Control": {
+                "schema": {
+                  "enum": [
+                    "no-store"
+                  ],
+                  "type": "string"
+                }
+              },
+              "X-Cooplet-Hub": {
+                "schema": {
+                  "pattern": "^hub_[0-7][0-9a-hjkmnpqrstvwxyz]{25}$",
+                  "type": "string"
+                }
+              }
+            }
+          },
+          "404": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Thread missing or not visible.",
+            "headers": {
+              "Cache-Control": {
+                "schema": {
+                  "enum": [
+                    "no-store"
+                  ],
+                  "type": "string"
+                }
+              },
+              "X-Cooplet-Hub": {
+                "schema": {
+                  "pattern": "^hub_[0-7][0-9a-hjkmnpqrstvwxyz]{25}$",
+                  "type": "string"
+                }
+              }
+            }
+          },
+          "409": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Hub identity mismatch or route-specific conflict.",
+            "headers": {
+              "Cache-Control": {
+                "schema": {
+                  "enum": [
+                    "no-store"
+                  ],
+                  "type": "string"
+                }
+              },
+              "X-Cooplet-Hub": {
+                "schema": {
+                  "pattern": "^hub_[0-7][0-9a-hjkmnpqrstvwxyz]{25}$",
+                  "type": "string"
+                }
+              }
+            }
+          },
+          "410": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "The cursor predates the retained range.",
+            "headers": {
+              "Cache-Control": {
+                "schema": {
+                  "enum": [
+                    "no-store"
+                  ],
+                  "type": "string"
+                }
+              },
+              "X-Cooplet-Hub": {
+                "schema": {
+                  "pattern": "^hub_[0-7][0-9a-hjkmnpqrstvwxyz]{25}$",
+                  "type": "string"
+                }
+              }
+            }
+          },
+          "413": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Request body exceeds the route limit.",
+            "headers": {
+              "Cache-Control": {
+                "schema": {
+                  "enum": [
+                    "no-store"
+                  ],
+                  "type": "string"
+                }
+              },
+              "X-Cooplet-Hub": {
+                "schema": {
+                  "pattern": "^hub_[0-7][0-9a-hjkmnpqrstvwxyz]{25}$",
+                  "type": "string"
+                }
+              }
+            }
+          },
+          "500": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Unexpected Hub failure.",
+            "headers": {
+              "Cache-Control": {
+                "schema": {
+                  "enum": [
+                    "no-store"
+                  ],
+                  "type": "string"
+                }
+              },
+              "X-Cooplet-Hub": {
+                "schema": {
+                  "pattern": "^hub_[0-7][0-9a-hjkmnpqrstvwxyz]{25}$",
+                  "type": "string"
+                }
+              }
+            }
+          },
+          "503": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Hub temporarily unavailable or unable to confirm the delivery outcome.",
+            "headers": {
+              "Cache-Control": {
+                "schema": {
+                  "enum": [
+                    "no-store"
+                  ],
+                  "type": "string"
+                }
+              },
+              "X-Cooplet-Hub": {
+                "schema": {
+                  "pattern": "^hub_[0-7][0-9a-hjkmnpqrstvwxyz]{25}$",
+                  "type": "string"
+                }
+              }
+            }
+          }
+        },
+        "tags": [
+          "Threads"
         ]
       }
     },

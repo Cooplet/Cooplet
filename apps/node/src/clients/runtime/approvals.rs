@@ -6,6 +6,7 @@ use std::{
     time::Duration,
 };
 
+use cooplet_platform::AdmissionGuard;
 use cooplet_protocol::{ErrorCode, OperationId, ParticipantId, ParticipantState, canonical_sha256};
 use cooplet_storage::{WriteError, WriteOutcome};
 use rusqlite::{OptionalExtension, Transaction, params};
@@ -26,7 +27,9 @@ use crate::{
     },
     error::{NodeError, Result},
     now_ms,
-    operations::{Operation, abandon_pending},
+    operations::{
+        DelegatedOperation, Operation, OperationGuard, abandon_pending, admission_expired,
+    },
 };
 
 const APPROVAL_TIMEOUT: Duration = Duration::from_secs(30);
@@ -56,16 +59,37 @@ impl AgentService {
         id: ParticipantId,
         decision: ApprovalDecision,
     ) -> Result<ApprovalResponse> {
-        if decision.approval_id.len() > 32 || decision.validate().is_err() {
-            return Err(invalid(
-                "invalid_approval_id",
-                "The public approval ID is invalid",
-            ));
-        }
+        validate_decision(&decision)?;
         let guard = self
             .0
             .operations
             .guard(actor, key, "approval.respond", &(&id, &decision))?;
+        self.respond_approval_guarded(guard, id, decision, None)
+            .await
+    }
+
+    pub(crate) async fn respond_approval_delegated(
+        &self,
+        delegated: &DelegatedOperation,
+        id: ParticipantId,
+        decision: ApprovalDecision,
+    ) -> Result<ApprovalResponse> {
+        validate_decision(&decision)?;
+        let guard =
+            self.0
+                .operations
+                .guard_delegated(delegated, "approval.respond", &(&id, &decision))?;
+        self.respond_approval_guarded(guard, id, decision, Some(&delegated.admission))
+            .await
+    }
+
+    async fn respond_approval_guarded(
+        &self,
+        guard: OperationGuard,
+        id: ParticipantId,
+        decision: ApprovalDecision,
+        admission: Option<&AdmissionGuard>,
+    ) -> Result<ApprovalResponse> {
         let op = &guard.operation;
         let participant_id = id.clone();
         if let Some(value) = self
@@ -98,7 +122,7 @@ impl AgentService {
         }
         let _mutation = self.mutation(&id)?;
         let reserved = self
-            .reserve_approval(op, &id, &decision.approval_id)
+            .reserve_approval(op, &id, &decision.approval_id, admission.cloned())
             .await?;
         let (live, native_id) = match reserved {
             ApprovalReservation::Call { live, native_id } => (live, native_id),
@@ -113,6 +137,7 @@ impl AgentService {
                 approval_id: native_id,
                 action,
             },
+            admission,
         )
         .await;
         let response = ApprovalResponse {
@@ -122,25 +147,28 @@ impl AgentService {
             action,
         };
         let (state, error) = match outcome {
-            ApprovalRespondOutcome::Accepted => (Some(ApprovalResponseState::Responded), None),
-            ApprovalRespondOutcome::Unsupported(_) => (
+            None => (None, Some(admission_expired())),
+            Some(ApprovalRespondOutcome::Accepted) => {
+                (Some(ApprovalResponseState::Responded), None)
+            }
+            Some(ApprovalRespondOutcome::Unsupported(_)) => (
                 None,
                 Some(invalid(
                     "approval_unsupported",
                     "The adapter cannot respond to this approval",
                 )),
             ),
-            ApprovalRespondOutcome::Stale(_) => (
+            Some(ApprovalRespondOutcome::Stale(_)) => (
                 None,
                 Some(invalid(
                     "approval_stale",
                     "The adapter no longer awaits this approval",
                 )),
             ),
-            ApprovalRespondOutcome::Unavailable(_) => {
+            Some(ApprovalRespondOutcome::Unavailable(_)) => {
                 (None, Some(busy("approval_unavailable", true)))
             }
-            ApprovalRespondOutcome::Unknown(_) => (
+            Some(ApprovalRespondOutcome::Unknown(_)) => (
                 Some(ApprovalResponseState::Unknown),
                 Some(unknown("approval_outcome_unconfirmed")),
             ),
@@ -159,6 +187,7 @@ impl AgentService {
         op: &Operation,
         id: &ParticipantId,
         approval_id: &str,
+        admission: Option<AdmissionGuard>,
     ) -> Result<ApprovalReservation> {
         let live = self.live_session(id);
         let id = id.clone();
@@ -226,6 +255,9 @@ impl AgentService {
                             && live.state() != ParticipantState::Unknown
                     })
                     .ok_or_else(|| busy("no_live_session", true))?;
+                if admission.as_ref().is_some_and(AdmissionGuard::is_expired) {
+                    return Err(admission_expired().into());
+                }
                 row.binding.core.approval_response = Some(ApprovalResponseRecord {
                     operation_id: op.id.clone(),
                     public_id: approval_id,
@@ -304,6 +336,16 @@ impl AgentService {
     }
 }
 
+fn validate_decision(decision: &ApprovalDecision) -> Result<()> {
+    if decision.approval_id.len() > 32 || decision.validate().is_err() {
+        return Err(invalid(
+            "invalid_approval_id",
+            "The public approval ID is invalid",
+        ));
+    }
+    Ok(())
+}
+
 pub(super) fn abandon_inflight_approval(
     tx: &Transaction<'_>,
     row: &mut ParticipantRow,
@@ -320,34 +362,44 @@ pub(super) fn abandon_inflight_approval(
     Ok(true)
 }
 
-async fn send_approval(live: &LiveSession, decision: ApprovalDecision) -> ApprovalRespondOutcome {
+async fn send_approval(
+    live: &LiveSession,
+    decision: ApprovalDecision,
+    admission: Option<&AdmissionGuard>,
+) -> Option<ApprovalRespondOutcome> {
     let mut disconnected = live.event_stop();
     if live.state() == ParticipantState::Unknown {
-        return ApprovalRespondOutcome::Unavailable(
+        return Some(ApprovalRespondOutcome::Unavailable(
             "session closed before approval response".into(),
-        );
+        ));
     }
     let started = AtomicBool::new(false);
     let acknowledged = async {
+        if admission.is_some_and(AdmissionGuard::is_expired) {
+            return None;
+        }
         started.store(true, Ordering::Relaxed);
-        tokio::time::timeout(
-            APPROVAL_TIMEOUT,
-            live.adapter.respond_approval(&live.handle, decision),
+        Some(
+            tokio::time::timeout(
+                APPROVAL_TIMEOUT,
+                live.adapter.respond_approval(&live.handle, decision),
+            )
+            .await
+            .unwrap_or_else(|_| {
+                ApprovalRespondOutcome::Unknown("approval acknowledgment timed out".into())
+            }),
         )
-        .await
     };
     tokio::select! {
         biased;
         _ = disconnected.changed() => {
             if started.load(Ordering::Relaxed) {
-                ApprovalRespondOutcome::Unknown("session closed during approval response".into())
+                Some(ApprovalRespondOutcome::Unknown("session closed during approval response".into()))
             } else {
-                ApprovalRespondOutcome::Unavailable("session closed before approval response".into())
+                Some(ApprovalRespondOutcome::Unavailable("session closed before approval response".into()))
             }
         }
-        result = acknowledged => result.unwrap_or_else(|_| {
-            ApprovalRespondOutcome::Unknown("approval acknowledgment timed out".into())
-        }),
+        result = acknowledged => result,
     }
 }
 

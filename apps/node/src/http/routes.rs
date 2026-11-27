@@ -305,9 +305,10 @@ pub async fn send_message(
     }
     let key = required_key(&headers)?;
     let service = state.delivery.clone();
+    let bridge = state.bridge.clone();
     let result = state
         .tasks
-        .run(async move { service.send_in_place(caller, key, input).await })
+        .run(async move { service.send_routed(&bridge, caller, key, input).await })
         .await?;
     Ok((result.status(), ResponseJson(result)))
 }

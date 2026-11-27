@@ -5,10 +5,12 @@ use cooplet_storage::{BlobDiskStore, DbActor, ReadPool};
 use tokio::sync::watch;
 
 use crate::{
-    auth::Auth, clients::AgentService, delivery::DeliveryService, operations::OperationBook,
+    auth::Auth, bridge::NodeBridge, clients::AgentService, delivery::DeliveryService,
+    operations::OperationBook,
 };
 
 pub(crate) mod blobs;
+mod bridge;
 pub(crate) mod events;
 mod extract;
 pub(crate) mod listener;
@@ -17,6 +19,7 @@ mod problem;
 mod router;
 mod routes;
 mod tasks;
+mod threads;
 
 pub use extract::{Caller, Json, OptionalJson, Path, Query, idempotency_key};
 pub use openapi::openapi_json;
@@ -34,6 +37,7 @@ pub struct NodeState {
     pub operations: OperationBook,
     pub agents: Arc<AgentService>,
     pub delivery: Arc<DeliveryService>,
+    pub bridge: Arc<NodeBridge>,
     pub shutdown: watch::Sender<bool>,
     pub tasks: Arc<Tasks>,
 }

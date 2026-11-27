@@ -885,6 +885,7 @@ async fn notify_revocation(state: &AppState, notify: &Notify, verify: bool) {
                 Ok(false) => return,
                 Err(error) => {
                     tracing::warn!(%error, %node_id, "Could not confirm node revocation");
+                    state.bridge.disconnect_transient(node_id);
                     return;
                 }
             }

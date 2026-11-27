@@ -12,7 +12,7 @@ Run `make build app=hub` from the repository root to build `target/debug/cooplet
 
 If you create the state directory yourself, give it mode `0700`. Record the `hub_id` printed by `init`. The initial administrator bearer is in `hub-state/admin.token` (mode `0600`). Store a secure copy of a current durable admin credential. Running `init` against the same initialized Hub returns its existing ID and leaves the credential files alone.
 
-Hub serves plain HTTP on its listening socket. For remote access, set `--public-origin` to the HTTPS origin of a TLS-terminating reverse proxy. Restrict access to the upstream socket to the proxy and apply client IP rate limits at the proxy. Allow streaming responses without proxy buffering for the NDJSON event stream. Plain HTTP origins are for local use with both the bind address and public origin on loopback IP addresses.
+Hub serves plain HTTP on its listening socket. For remote access, set `--public-origin` to the HTTPS origin of a TLS-terminating reverse proxy. Restrict access to the upstream socket to the proxy and apply client IP rate limits at the proxy. Allow streaming responses without proxy buffering for the NDJSON event stream. Forward WebSocket upgrades and the `cooplet.v1` subprotocol on `/v1/bridge/connect`. Plain HTTP origins are for local use with both the bind address and public origin on loopback IP addresses.
 
 Clients derive their Hub pin from a trusted `hub_id`. `GET /v1/info` exposes the server identity and API version, and `GET /v1/openapi.json` exposes the API contract. The CLI command `cooplet-hub openapi` prints the same contract without starting a service.
 
@@ -28,6 +28,26 @@ Set `HUB_ID` to the ID recorded during initialization. For remote enrollment, us
 The CLI prints the idempotency key to stderr before making the request. If the issuance response is lost, repeat the same command with `--idempotency-key` set to the original key. A committed issuance returns its IDs and `already_issued: true` for 30 days. The secret is available only in the original successful response. Revoke the old credential before issuing a replacement with a new key.
 
 If you lose the redemption response, use the recorded `token_id` to call `POST /v1/enrollment-tokens/{token_id}/revoke`. Revoke the reserved node with `POST /v1/nodes/{node_id}/revoke` if the first call reports `already_consumed: true` or the enrollment record is gone (`404`). For a definitive check, call both endpoints in that order. Use an admin bearer, the Hub pin and a distinct idempotency key for each call. A `404` from the node revocation means the reserved node ID has no current registration. Generate a new enrollment token for the next attempt.
+
+Redeem the token from a running Node with `cooplet node enroll`. Each enrolled
+Node uses one WebSocket for its participant catalog, remote operations and
+live events. Reconnect refreshes the catalog from the Node's current state.
+Read events from a disconnected interval through the Node's own event stream.
+
+## Shared threads
+
+`GET /v1/threads` lists the boards visible to the caller. A member can read
+retained posts and use `POST /v1/threads/{id}/wait` to record its cursor and
+return available posts immediately. Posts are retained for 90 days. If a
+client falls behind, its `resync_required` response includes the earliest
+valid cursor (`floor_seq`) and the current `head_seq`.
+
+The Hub coalesces posts for an agent with `queue_until_idle`. A delivery whose
+outcome cannot be confirmed puts that member in `paused_unknown`. The owner
+can read the thread and call `POST /v1/threads/{id}/members/resume` with the
+member key and the last sequence the agent should treat as read. This is
+available while the Node is offline. For the end-to-end CLI sequence, see the
+[two-Node walkthrough](../node/README.md#share-a-thread-across-two-nodes).
 
 ## Grant service access
 

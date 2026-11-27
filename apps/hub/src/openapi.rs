@@ -19,7 +19,7 @@ use crate::{
     error::HubError,
     http::{
         BEARER_CHALLENGE, EmptyJson,
-        handlers::{self, admin_routes, command_routes},
+        handlers::{self, admin_routes, command_routes, thread_routes},
     },
 };
 
@@ -40,6 +40,10 @@ static OPENAPI_GENERATION: Mutex<()> = Mutex::new(());
         command_routes::stop_agent, command_routes::respond_approval,
         command_routes::run_workflow, command_routes::cancel_workflow,
         handlers::upload_blob, handlers::download_blob, handlers::events_page, handlers::events_stream,
+        thread_routes::create, thread_routes::list, thread_routes::read_thread, thread_routes::close,
+        thread_routes::post_message, thread_routes::read_posts, thread_routes::set_pin, thread_routes::delete_pin,
+        thread_routes::wait, thread_routes::list_members, thread_routes::join, thread_routes::leave, thread_routes::resume,
+        crate::bridge::connect,
     ),
     components(schemas(ProblemDetails, HubId, RunId)),
     security(("hub_bearer" = [])),
@@ -176,7 +180,7 @@ fn describe_mutating(operation: &mut Operation, path: &str) {
                 .build(),
         );
     }
-    if path != "/v1/enrollment/token" {
+    if !matches!(path, "/v1/enrollment/token" | "/v1/threads/{id}/wait") {
         operation.parameters.get_or_insert_with(Vec::new).push(
             ParameterBuilder::new()
                 .name("Idempotency-Key")
@@ -373,7 +377,7 @@ mod tests {
         assert_eq!(page_limit["schema"]["default"], 100);
         assert_eq!(
             value["components"]["schemas"]["MessageRequest"]["properties"]["attachments"]["maxItems"],
-            32
+            64
         );
         Ok(())
     }

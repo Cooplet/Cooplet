@@ -1,8 +1,8 @@
 use std::collections::HashSet;
 
 use cooplet_protocol::{
-    AnswerPayload, AttachmentRef, DeliveryMode, DeliveryState, ErrorCode, MessageId, OperationId,
-    ParticipantId, QuestionPayload, RunId, ServicePrincipalId, UserId,
+    AnswerPayload, AttachmentRef, DeliveryMode, DeliveryState, ErrorCode, HubId, MessageId, NodeId,
+    OperationId, ParticipantId, QuestionPayload, RunId, ServicePrincipalId, UserId,
 };
 use http::StatusCode;
 use serde::{Deserialize, Serialize};
@@ -22,7 +22,9 @@ fn direct_mode() -> DeliveryMode {
 #[derive(Clone, Debug, Deserialize, Serialize, ToSchema)]
 #[serde(deny_unknown_fields)]
 pub struct SendMessageRequest {
-    #[schema(pattern = r"^(part|usr|sp|run)_[0-7][0-9a-hjkmnpqrstvwxyz]{25}$")]
+    #[schema(
+        pattern = r"^((node|hub)_[0-7][0-9a-hjkmnpqrstvwxyz]{25}/part_[0-7][0-9a-hjkmnpqrstvwxyz]{25}|(part|usr|sp|run)_[0-7][0-9a-hjkmnpqrstvwxyz]{25})$"
+    )]
     pub to: String,
     pub body: String,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -43,7 +45,15 @@ pub struct SendMessageRequest {
 
 impl SendMessageRequest {
     pub(super) fn normalize(&mut self) -> Result<()> {
-        if ParticipantId::parse(&self.to).is_err()
+        let qualified = self
+            .to
+            .split_once('/')
+            .is_some_and(|(prefix, participant)| {
+                ParticipantId::parse(participant).is_ok()
+                    && (NodeId::parse(prefix).is_ok() || HubId::parse(prefix).is_ok())
+            });
+        if !qualified
+            && ParticipantId::parse(&self.to).is_err()
             && UserId::parse(&self.to).is_err()
             && ServicePrincipalId::parse(&self.to).is_err()
             && RunId::parse(&self.to).is_err()

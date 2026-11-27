@@ -33,6 +33,10 @@ pub struct Hub {
 
 impl Hub {
     pub async fn start() -> TestResult<Self> {
+        Self::start_with_args(&[]).await
+    }
+
+    pub async fn start_with_args(server_args: &[&str]) -> TestResult<Self> {
         let _ = rustls::crypto::ring::default_provider().install_default();
         let state = Scratch::new()?;
         let init = hub_command()
@@ -72,6 +76,7 @@ impl Hub {
                 .arg("127.0.0.1:0")
                 .arg("--public-origin")
                 .arg("http://127.0.0.1:0")
+                .args(server_args)
                 .stdout(Stdio::null())
                 .stderr(Stdio::piped())
                 .spawn()?,

@@ -319,6 +319,7 @@ async fn verify(case: Case) -> TestResult {
                     expected_sha256: known.map(str::to_owned),
                     idempotency_key: Some("fresh-relay-id".into()),
                     content_length: Some(SIZE as u64),
+                    participant_id: None,
                 },
                 Source {
                     cursor: Cursor::new(vec![0x42; SIZE]),

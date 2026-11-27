@@ -15,20 +15,53 @@ use http::{
 use crate::error::{NodeError, Result};
 
 use super::{
-    NodeState, blobs, events,
+    NodeState, blobs, bridge, events,
     extract::{BodyLimit, buffer},
     problem::{invalid_request, payload_too_large},
     routes::*,
+    threads,
 };
 
 const CONTROL_BODY_LIMIT: usize = 64 * 1024;
+const ENROLL_BODY_LIMIT: usize = 128 * 1024;
 const MESSAGE_BODY_LIMIT: usize = 2 * 1024 * 1024;
+const THREAD_BODY_LIMIT: usize = 192 * 1024;
 
 pub fn router(state: NodeState) -> Router {
     let messages = Router::new()
         .route("/v1/messages", post(send_message))
         .layer(DefaultBodyLimit::max(MESSAGE_BODY_LIMIT))
         .layer(Extension(BodyLimit(MESSAGE_BODY_LIMIT)));
+    let enrollment = Router::new()
+        .route("/v1/bridge/enroll", post(bridge::enroll))
+        .layer(DefaultBodyLimit::max(ENROLL_BODY_LIMIT))
+        .layer(Extension(BodyLimit(ENROLL_BODY_LIMIT)));
+    let threads = Router::new()
+        .route("/v1/threads", get(threads::list).post(threads::create))
+        .route("/v1/threads/{thread_id}", get(threads::get))
+        .route("/v1/threads/{thread_id}/close", post(threads::close))
+        .route(
+            "/v1/threads/{thread_id}/posts",
+            get(threads::read).post(threads::post),
+        )
+        .route(
+            "/v1/threads/{thread_id}/pins/{pin_key}",
+            axum::routing::put(threads::pin_set).delete(threads::pin_delete),
+        )
+        .route("/v1/threads/{thread_id}/wait", post(threads::wait))
+        .route("/v1/threads/{thread_id}/members", get(threads::members))
+        .route("/v1/threads/{thread_id}/members/join", post(threads::join))
+        .route(
+            "/v1/threads/{thread_id}/members/leave",
+            post(threads::leave),
+        )
+        .route(
+            "/v1/threads/{thread_id}/members/resume",
+            post(threads::resume),
+        )
+        .layer(middleware::from_fn_with_state(state.clone(), bound_get))
+        .layer(DefaultBodyLimit::max(THREAD_BODY_LIMIT))
+        .layer(Extension(BodyLimit(THREAD_BODY_LIMIT)));
     let control = Router::new()
         .route("/v1/info", get(info))
         .route("/v1/openapi.json", get(openapi))
@@ -53,8 +86,11 @@ pub fn router(state: NodeState) -> Router {
         .merge(messages);
     let blobs = Router::new()
         .route("/v1/blobs", post(blobs::put))
+        .route("/v1/bridge/blobs", post(blobs::relay))
         .layer(DefaultBodyLimit::disable());
     control
+        .merge(enrollment)
+        .merge(threads)
         .merge(blobs)
         .fallback(not_found)
         .method_not_allowed_fallback(method_not_allowed)
