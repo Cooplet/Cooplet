@@ -741,7 +741,6 @@ async fn expired_blobs_survive_startup_until_gc_commits_their_scoped_event() -> 
     for seq in 1..=3 {
         let event = committed.try_recv()?;
         assert_eq!((event.seq, event.kind), (seq, EventKind::BlobDeleted));
-        assert!(event.payload.get("audience").is_none());
     }
     hub.engine.shutdown().await?;
     Ok(())

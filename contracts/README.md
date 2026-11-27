@@ -1,9 +1,10 @@
 # API contracts
 
-`openapi-hub.json` is generated from the Hub's Rust routes and schema types. The `gate_openapi_drift` test compares this file with the output of `cooplet-hub openapi`. The same bytes are served at `GET /v1/openapi.json`.
+`openapi-node.json` and `openapi-hub.json` are generated from the Node and Hub Rust routes and schema types. Each crate's `gate_openapi_drift` test compares its checked-in file against the generated schema, and each service serves the same bytes at `GET /v1/openapi.json`.
 
-Run this command from the workspace root to regenerate the contract.
+Run these commands from the workspace root to regenerate the contracts.
 
 ```sh
+make exec toolchain=rust command='cargo run --quiet --locked --offline -p cooplet-node -- openapi' > contracts/openapi-node.json
 make exec toolchain=rust command='cargo run --quiet --locked --offline -p cooplet-hub -- openapi' > contracts/openapi-hub.json
 ```

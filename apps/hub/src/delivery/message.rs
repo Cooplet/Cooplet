@@ -1,8 +1,9 @@
 use cooplet_protocol::{
     AggregateType, AnswerPayload, AttachmentRef, BridgeCommand, DeliveryMode, DeliveryState,
-    ErrorCode, EventEnvelope, EventKind, HubId, MessageId, NodeId, OperationId, ParticipantId,
-    QuestionPayload, ServiceScope,
+    ErrorCode, EventKind, HubId, MessageId, NodeId, OperationId, ParticipantId, QuestionPayload,
+    ServiceScope,
 };
+use cooplet_storage::EventNotice;
 use rusqlite::{Connection, OptionalExtension, Transaction, params};
 use serde::Serialize;
 
@@ -354,7 +355,7 @@ pub(super) fn insert(
     target: &Target,
     message: NewMessage<'_>,
     now: i64,
-) -> Result<Vec<EventEnvelope>, HubError> {
+) -> Result<Vec<EventNotice>, HubError> {
     let NewMessage {
         id,
         operation_id,
@@ -485,7 +486,7 @@ pub(super) fn finalize(
     tx: &Transaction<'_>,
     hub_id: &HubId,
     update: DeliveryUpdate<'_>,
-) -> Result<Option<EventEnvelope>, HubError> {
+) -> Result<Option<EventNotice>, HubError> {
     let delivered_at_ms = (update.delivery_state == DeliveryState::Delivered).then_some(update.now);
     let changed = tx
         .prepare_cached(

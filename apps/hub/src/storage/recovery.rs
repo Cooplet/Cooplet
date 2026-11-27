@@ -1,8 +1,7 @@
 use cooplet_protocol::{
-    AggregateType, DeliveryState, ErrorCode, EventEnvelope, EventKind, HubId, MessageId, NodeId,
-    ProblemDetails,
+    AggregateType, DeliveryState, ErrorCode, EventKind, HubId, MessageId, NodeId, ProblemDetails,
 };
-use cooplet_storage::{StorageEngine, StorageError, WriteOutcome};
+use cooplet_storage::{EventNotice, StorageEngine, StorageError, WriteOutcome};
 use rusqlite::{Transaction, params};
 
 use super::{
@@ -72,7 +71,7 @@ fn recover_nodes(
     tx: &Transaction<'_>,
     hub_id: &HubId,
     now: i64,
-    events: &mut Vec<EventEnvelope>,
+    events: &mut Vec<EventNotice>,
 ) -> rusqlite::Result<()> {
     let mut statement =
         tx.prepare("SELECT node_id, session_epoch FROM nodes WHERE status = 'online'")?;
@@ -107,7 +106,7 @@ fn recover_messages(
     tx: &Transaction<'_>,
     hub_id: &HubId,
     now: i64,
-    events: &mut Vec<EventEnvelope>,
+    events: &mut Vec<EventNotice>,
 ) -> rusqlite::Result<()> {
     let mut statement = tx.prepare(RECOVERABLE_MESSAGES)?;
     let mut rows = statement.query([])?;

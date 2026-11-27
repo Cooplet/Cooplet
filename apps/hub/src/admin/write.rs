@@ -1,8 +1,8 @@
 use cooplet_protocol::{
-    AggregateType, ErrorCode, EventEnvelope, EventKind, NodeId, OperationId, ParticipantId,
-    ServicePrincipalId, ServiceScope, TokenId, UserId, canonical_sha256, validate_idempotency_key,
+    AggregateType, ErrorCode, EventKind, NodeId, OperationId, ParticipantId, ServicePrincipalId,
+    ServiceScope, TokenId, UserId, canonical_sha256, validate_idempotency_key,
 };
-use cooplet_storage::{StorageError, WriteError, WriteFailure, WriteOutcome};
+use cooplet_storage::{EventNotice, StorageError, WriteError, WriteFailure, WriteOutcome};
 use rusqlite::{Connection, OptionalExtension, Transaction, params};
 use serde::{Serialize, de::DeserializeOwned};
 
@@ -713,7 +713,7 @@ struct AdminCommit<T> {
     resource_id: Option<String>,
     secret: Option<SecretToken>,
     changed: bool,
-    events: Vec<EventEnvelope>,
+    events: Vec<EventNotice>,
 }
 
 impl<T> AdminCommit<T> {
