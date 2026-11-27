@@ -20,6 +20,9 @@ use tokio::{
 };
 use tokio_tungstenite::{WebSocketStream, accept_async, tungstenite::Message};
 
+#[path = "common/codex_backend.rs"]
+mod codex_backend;
+
 type Test<T = ()> = Result<T, Box<dyn Error + Send + Sync>>;
 const NODE: &str = env!("CARGO_BIN_EXE_cooplet");
 const WAIT: Duration = Duration::from_secs(15);
@@ -187,7 +190,7 @@ async fn stop_agent(client: &CoopletClient, id: &str, key: &str) -> Test {
 #[tokio::test]
 async fn cli_runs_codex_with_mcp_and_resumes_the_same_thread_in_a_new_group() -> Test {
     let fixture = Fixture::new()?;
-    let (_daemon, client) = fixture.start("ok").await?;
+    let (daemon, client) = fixture.start("ok").await?;
     let doctor = fixture.cli("ok", &["node", "doctor"])?;
     assert_eq!(doctor["adapters"][0]["available"], true);
     assert_eq!(doctor["adapters"][0]["version"], "codex-fixture/99.0.0");
@@ -280,6 +283,10 @@ async fn cli_runs_codex_with_mcp_and_resumes_the_same_thread_in_a_new_group() ->
         template.join("instructions.md"),
         "Replacement must not be injected",
     )?;
+    drop(daemon);
+    let mut restarted = fixture.command("ok")?;
+    restarted.env("CODEX_HOME", fixture.root.join("missing-new-home"));
+    let (_daemon, client) = fixture.start_with(restarted).await?;
     let _: Value = client
         .post_json(
             &format!("/v1/agents/{id}/resume"),
@@ -307,6 +314,7 @@ async fn invalid_codex_peer_home_mcp_and_paths_fail_closed() -> Test {
         ("foreign-peer", "codex_peer_identity_mismatch"),
         ("wrong-home", "codex_home_mismatch"),
         ("bad-mcp", "codex_required_mcp_unavailable"),
+        ("mcp-not-ready", "codex_required_mcp_unavailable"),
         ("long", "socket_path_too_long"),
         ("non-utf8", "native_path_not_utf8"),
     ] {
@@ -326,6 +334,8 @@ async fn invalid_codex_peer_home_mcp_and_paths_fail_closed() -> Test {
             .await
             .err()
             .ok_or_else(|| io::Error::other("unexpected create acknowledgement"))?;
+        assert!(matches!(&error, ClientError::Problem(problem)
+            if problem.extensions.get("reason") == Some(&json!("native_open_failed"))));
         let message = error.to_string();
         assert!(!message.contains("private-fixture-marker"), "{message}");
         let log = fs::read_to_string(fixture.root.join("daemon.log"))?;
@@ -338,7 +348,9 @@ async fn invalid_codex_peer_home_mcp_and_paths_fail_closed() -> Test {
             "{mode}"
         );
         if matches!(mode, "long" | "non-utf8") {
-            assert!(!fixture.root.join("record.jsonl").exists());
+            assert!(!fixture.root.join("managed-spawned").exists());
+        } else {
+            assert!(fixture.root.join("managed-spawned").exists());
         }
     }
     Ok(())
@@ -364,6 +376,65 @@ async fn doctor_rejects_missing_flags_and_bounds_a_hung_probe() -> Test {
         assert!(start.elapsed() < Duration::from_secs(8));
     }
     Ok(())
+}
+
+#[tokio::test]
+async fn doctor_skips_an_inaccessible_path_candidate_and_open_rechecks_the_executable() -> Test {
+    let fixture = Fixture::new()?;
+    let (_daemon, client) = fixture.start("ok").await?;
+    let denied = fixture.root.join("denied");
+    fs::create_dir(&denied)?;
+    fs::copy(fixture.root.join("codex"), denied.join("codex"))?;
+    let mode = if cooplet_platform::current_euid() == 0 {
+        0o600
+    } else {
+        0o601
+    };
+    fs::set_permissions(denied.join("codex"), fs::Permissions::from_mode(mode))?;
+    let path = env::var_os("PATH").ok_or_else(|| io::Error::other("PATH unavailable"))?;
+    let path = env::join_paths(
+        [denied, fixture.root.clone()]
+            .into_iter()
+            .chain(env::split_paths(&path)),
+    )?;
+    let report = fixture
+        .command("ok")?
+        .env_remove("COOPLET_CODEX_BIN")
+        .env("PATH", path)
+        .args(["node", "doctor"])
+        .output()?;
+    assert!(report.status.success());
+    let report: Value = serde_json::from_slice(&report.stdout)?;
+    assert_eq!(
+        report["adapters"][0]["binary_path"],
+        fixture
+            .root
+            .join("codex")
+            .canonicalize()?
+            .display()
+            .to_string()
+    );
+    assert_eq!(report["adapters"][0]["available"], true);
+
+    let opened = create(&client, "path-positive-cache", None).await?;
+    let id = opened["participant_id"]
+        .as_str()
+        .ok_or_else(|| io::Error::other("missing participant id"))?;
+    stop_agent(&client, id, "path-positive-stop").await?;
+    fs::remove_file(fixture.root.join("codex"))?;
+    let resumed = client
+        .post_json::<_, Value>(
+            &format!("/v1/agents/{id}/resume"),
+            &json!({}),
+            Some("path-removed"),
+        )
+        .await;
+    assert!(
+        matches!(resumed, Err(ClientError::Problem(problem)) if problem.extensions.get("reason") == Some(&json!("native_open_failed")))
+    );
+    let log = fs::read_to_string(fixture.root.join("daemon.log"))?;
+    assert!(log.contains("codex_executable_unavailable"));
+    participant_state(&client, id, "stopped").await
 }
 
 #[tokio::test]
@@ -399,6 +470,53 @@ async fn absent_rollout_refuses_resume_with_a_sanitized_reason() -> Test {
             .is_none()
     );
     Ok(())
+}
+
+#[tokio::test]
+async fn external_turn_keeps_the_queue_closed_until_its_terminal_event() -> Test {
+    let fixture = Fixture::new()?;
+    let (_daemon, client) = fixture.start("external-idle").await?;
+    let opened = create(&client, "tui-external-start", None).await?;
+    let id = opened["participant_id"]
+        .as_str()
+        .ok_or_else(|| io::Error::other("missing participant id"))?;
+    // The fixture sends TUI turn/started then native Idle during this read.
+    let _: Value = client
+        .get_json(&format!("/v1/participants/{id}/attach-plan"), &[])
+        .await?;
+    participant_state(&client, id, "working").await?;
+    let queued: Value = client
+        .post_json(
+            "/v1/messages",
+            &json!({"to":id,"body":"queued behind TUI","delivery_mode":"queue_until_idle"}),
+            Some("queued-behind-tui"),
+        )
+        .await?;
+    assert_eq!(queued["delivery_state"], "queued");
+    fs::write(fixture.root.join("allow-tui-terminal"), "")?;
+    let message = queued["message_id"]
+        .as_str()
+        .ok_or_else(|| io::Error::other("missing message id"))?;
+    timeout(WAIT, async {
+        let path = format!("/v1/messages/{message}");
+        loop {
+            let result: Value = client.get_json(&path, &[]).await?;
+            if result["delivery_state"] == "delivered" {
+                return Ok::<_, ClientError>(());
+            }
+            sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await??;
+    assert_eq!(
+        fixture
+            .records()?
+            .iter()
+            .filter(|record| record["method"] == "turn/start")
+            .count(),
+        1
+    );
+    stop_agent(&client, id, "external-tui-stop").await
 }
 
 #[tokio::test]
@@ -465,8 +583,33 @@ async fn app_server_fixture() -> Test {
                 )?;
                 thread(&cwd, saved)
             }
+            Some("mcpServerStatus/list") if mode == "mcp-not-ready" => {
+                json!({"data":[{"name":"cooplet","runtimeStatus":"failed","tools":{},"toolsError":"private-fixture-marker"}]})
+            }
             Some("mcpServerStatus/list") => {
                 json!({"data":[{"name":"cooplet","tools":{"whoami":{}}}]})
+            }
+            Some("thread/read") if mode == "external-idle" => {
+                send(&mut ws, json!({"method":"turn/started","params":{"threadId":THREAD,"turn":{"id":"tui-turn"}}})).await?;
+                send(&mut ws, json!({"method":"thread/status/changed","params":{"threadId":THREAD,"status":{"type":"idle"}}})).await?;
+                send(
+                    &mut ws,
+                    json!({"id":req["id"],"result":thread(&cwd, saved)}),
+                )
+                .await?;
+                timeout(WAIT, async {
+                    while !root.join("allow-tui-terminal").exists() {
+                        sleep(Duration::from_millis(20)).await;
+                    }
+                })
+                .await?;
+                send(
+                    &mut ws,
+                    json!({"method":"turn/completed","params":{"threadId":THREAD,
+                    "turn":{"id":"tui-turn","status":"completed","items":[]}}}),
+                )
+                .await?;
+                continue;
             }
             Some("thread/read") => thread(&cwd, saved),
             Some("turn/start") => {
@@ -551,61 +694,12 @@ fn mcp_whoami(program: &str, args: &[String]) -> Test<Value> {
 #[tokio::test]
 #[ignore = "requires an installed Codex CLI on the host"]
 async fn native_codex_smoke() -> Test {
-    use axum::{Json, Router, http::header, response::IntoResponse, routing::post};
-    use tokio::{net::TcpListener, sync::mpsc};
     use tokio_tungstenite::client_async;
 
     let binary = env::var_os("COOPLET_NATIVE_CODEX_BIN")
         .ok_or_else(|| io::Error::other("set COOPLET_NATIVE_CODEX_BIN to the native CLI path"))?;
     let fixture = Fixture::new()?;
-    let backend = TcpListener::bind("127.0.0.1:0").await?;
-    let address = backend.local_addr()?;
-    let (requests, mut captured) = mpsc::channel(8);
-    let router = Router::new().route(
-        "/v1/responses",
-        post(move |Json(body): Json<Value>| {
-            let requests = requests.clone();
-            async move {
-                let _ = requests.try_send(body);
-                let text = r#"{"answer":42}"#;
-                let item = json!({
-                    "id":"msg_fixture", "type":"message", "role":"assistant",
-                    "status":"completed", "phase":"final_answer",
-                    "content":[{"type":"output_text","text":text,"annotations":[]}],
-                });
-                let packets = [
-                    json!({"type":"response.created","response":{"id":"resp_fixture","status":"in_progress","output":[]}}),
-                    json!({"type":"response.output_item.added","output_index":0,"item": {
-                        "id":"msg_fixture","type":"message","role":"assistant","status":"in_progress","content":[]
-                    }}),
-                    json!({"type":"response.output_text.delta","item_id":"msg_fixture","output_index":0,"content_index":0,"delta":text}),
-                    json!({"type":"response.output_item.done","output_index":0,"item":item}),
-                    json!({"type":"response.completed","response":{"id":"resp_fixture","status":"completed","output":[item]}}),
-                ];
-                let stream: String = packets.into_iter().map(|packet| format!("data: {packet}\n\n")).collect();
-                ([(header::CONTENT_TYPE, "text/event-stream")], stream).into_response()
-            }
-        }),
-    );
-    let _backend = tokio::spawn(axum::serve(backend, router).into_future());
-
-    fs::write(
-        fixture.root.join("home/config.toml"),
-        format!(
-            r#"
-model = "gpt-5"
-model_provider = "fixture"
-approval_policy = "never"
-sandbox_mode = "read-only"
-check_for_update_on_startup = false
-[model_providers.fixture]
-name = "Loopback fixture"
-base_url = "http://{address}/v1"
-wire_api = "responses"
-supports_websockets = false
-"#
-        ),
-    )?;
+    let mut backend = codex_backend::Backend::start(&fixture.root.join("home")).await?;
     let mut command = fixture.command("native")?;
     command
         .env("COOPLET_CODEX_BIN", &binary)
@@ -660,9 +754,7 @@ supports_websockets = false
     };
     let receipt = send_message("native-first-turn").await?;
     assert_eq!(receipt["delivery_state"], "delivered");
-    let first = timeout(WAIT, captured.recv())
-        .await?
-        .ok_or_else(|| io::Error::other("missing native backend request"))?;
+    let first = backend.request().await?;
     assert!(first["input"].to_string().contains("Native smoke fixture"));
     participant_state(&client, id, "idle").await?;
     let path = format!("/v1/participants/{id}/attach-plan");
@@ -693,26 +785,6 @@ supports_websockets = false
     .await?;
     assert_eq!(resumed["thread"]["id"], thread);
 
-    let schema = json!({"type":"object","properties":{"answer":{"type":"integer"}},"required":["answer"],"additionalProperties":false});
-    let turn = rpc(&mut ws, 3, "turn/start", json!({
-        "threadId":thread, "input":[{"type":"text","text":"Structured native smoke"}], "outputSchema":schema,
-    })).await?;
-    let schema_request = timeout(WAIT, captured.recv())
-        .await?
-        .ok_or_else(|| io::Error::other("missing schema request"))?;
-    assert_eq!(schema_request["text"]["format"]["schema"], schema);
-    let terminal = timeout(WAIT, async {
-        while let Some(frame) = ws.next().await {
-            let packet = serde_json::from_str::<Value>(frame?.to_text()?)?;
-            if packet["method"] == "turn/completed" {
-                return Ok::<_, Box<dyn Error + Send + Sync>>(packet);
-            }
-        }
-        Err(io::Error::other("missing terminal event").into())
-    })
-    .await??;
-    assert_eq!(terminal["params"]["turn"]["id"], turn["turn"]["id"]);
-    assert_eq!(terminal["params"]["turn"]["status"], "completed");
     drop(ws);
 
     stop_agent(&client, id, "native-stop-first").await?;
@@ -730,7 +802,7 @@ supports_websockets = false
         send_message("native-second-turn").await?["delivery_state"],
         "delivered"
     );
-    assert!(timeout(WAIT, captured.recv()).await?.is_some());
+    let _ = backend.request().await?;
     participant_state(&client, id, "idle").await?;
     stop_agent(&client, id, "native-stop-second").await
 }

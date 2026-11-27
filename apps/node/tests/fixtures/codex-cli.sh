@@ -15,6 +15,7 @@ case "$1" in
         printf '    --listen <URL>\n'
         ;;
     --stdio)
+        [ -d "$CODEX_HOME" ]
         IFS= read -r request
         case "$request" in *initialize*) ;; *) exit 1 ;; esac
         if [ "${COOPLET_FIXTURE_MODE:-}" = probe-timeout ]; then
@@ -29,6 +30,7 @@ case "$1" in
         printf '%s\n' '{"definitions":{"TurnToolOutput":{"properties":{"namespace":{},"name":{},"output":{},"retain":{}}}},"properties":{"toolOutput":{},"outputSchema":{}}}' > "$3/v2/TurnStartParams.json"
         ;;
     --listen)
+        touch "$COOPLET_FIXTURE_ROOT/managed-spawned"
         export COOPLET_FIXTURE_SOCKET="${2#unix://}"
         shift 2
         while [ "$#" -gt 0 ]; do

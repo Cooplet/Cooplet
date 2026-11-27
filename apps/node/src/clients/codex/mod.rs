@@ -81,7 +81,7 @@ impl CodexAdapter {
         let home = home_directory(&request.mode)?;
         let namespace = path_text(&home)?;
         let schema_directory = runtime.join("schema");
-        let features = wire_features(&program, &schema_directory).await;
+        let features = wire_features(&program, &schema_directory, &home).await;
         let environment_allows = provider::environment_allows_named_output();
 
         let mut command = Command::new(&program);
@@ -385,8 +385,10 @@ impl ClientAdapter for CodexAdapter {
             Ok(
                 match live.session.request(Operation::Interrupt(turn)).await {
                     Ok(_) => StopOutcome::TurnCancelled,
-                    Err(Failure::Stale) => StopOutcome::AlreadyGone,
-                    Err(Failure::Rejected(_)) => {
+                    Err(Failure::Stale | Failure::Rejected(Rejection::StaleTurn)) => {
+                        StopOutcome::AlreadyGone
+                    }
+                    Err(Failure::Rejected(Rejection::NoIntake | Rejection::UnsupportedMethod)) => {
                         StopOutcome::Unsupported("Codex rejected the interrupt".into())
                     }
                     Err(Failure::NotSent(reason)) => StopOutcome::Unsupported(reason.into()),

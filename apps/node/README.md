@@ -89,8 +89,8 @@ participants share a name.
 Install and sign in to the Codex CLI, then run `cooplet node doctor` to check
 discovery. The Node finds `codex` on `PATH`. Set `COOPLET_CODEX_BIN` to select
 a specific executable for both `node doctor` and `node run`. Discovery checks
-app-server initialization and the required CLI flags. The reported version is
-diagnostic.
+app-server initialization in an isolated temporary Codex home and checks the
+required CLI flags. The reported version is diagnostic.
 
 Create a participant with `POST /v1/agents` and `"client_kind": "codex"` or a
 template using that client. A template can set `model`, `effort`, `approval`
@@ -123,7 +123,10 @@ that a request was resolved without identifying which client answered, so
 Cooplet can return `delivery_unknown` for a submitted approval response.
 Follow the participant's current state for any remaining requests.
 
-The ignored native smoke test uses an installed Codex CLI and a loopback model
-fixture. It covers discovery, delivery, structured output, remote attach
-protocol and cold resume. From a host shell after building the test binary,
-run it with `COOPLET_NATIVE_CODEX_BIN` set to the absolute Codex executable path.
+The ignored native smoke tests use an installed Codex CLI and a loopback model
+fixture. Run `make test app=node` and set `COOPLET_NATIVE_CODEX_BIN` to the
+absolute Codex executable path on the host. Run the `codex_process` test binary
+with `--ignored --exact native_codex_smoke` for the CLI lifecycle and remote
+attach. Run the `cooplet_node` unit test binary with
+`--ignored --exact clients::codex::tests::native_structured_smoke` for the
+adapter's structured result.

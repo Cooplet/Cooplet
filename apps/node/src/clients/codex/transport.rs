@@ -7,11 +7,12 @@ use std::{
         Arc,
         atomic::{AtomicU8, Ordering},
     },
+    task::Poll,
     time::Duration,
 };
 
 use cooplet_platform::{AdmissionGuard, ProcessIdentity};
-use futures_util::{Sink, SinkExt, StreamExt, stream::SplitSink};
+use futures_util::{Sink, Stream};
 use serde_json::{Value, json};
 use tokio::{
     net::UnixStream,
@@ -20,7 +21,7 @@ use tokio::{
 };
 use tokio_tungstenite::{
     WebSocketStream, client_async_with_config,
-    tungstenite::{Message, protocol::WebSocketConfig},
+    tungstenite::{Error as WireError, Message, protocol::WebSocketConfig},
 };
 
 use super::{
@@ -43,7 +44,6 @@ const STARTED: u8 = 1;
 const CANCELLED: u8 = 2;
 
 type Wire = WebSocketStream<UnixStream>;
-type Writer = SplitSink<Wire, Message>;
 
 #[derive(Debug)]
 pub(super) enum Failure {
@@ -63,6 +63,8 @@ pub(super) enum Rejection {
     NoIntake,
     Mcp,
     NoRollout,
+    StaleTurn,
+    UnsupportedMethod,
     Other,
 }
 
@@ -81,6 +83,13 @@ impl Rejection {
                 Self::NoIntake
             }
             (Some(-32600), msg) if msg.starts_with("thread not found: ") => Self::NoIntake,
+            (Some(-32600), "no active turn to interrupt") => Self::StaleTurn,
+            (Some(-32600), msg)
+                if msg.starts_with("expected active turn id ") && msg.contains(" but found ") =>
+            {
+                Self::StaleTurn
+            }
+            (Some(-32601), _) => Self::UnsupportedMethod,
             (Some(-32603), msg) if msg.contains("required MCP servers failed to initialize") => {
                 Self::Mcp
             }
@@ -275,20 +284,18 @@ pub(super) async fn connect(socket: &Path, process: &ProcessIdentity) -> Protoco
 }
 
 async fn drive(
-    wire: Wire,
+    mut wire: Wire,
     mut commands: mpsc::Receiver<Command>,
     mut stop: watch::Receiver<()>,
     mut observed: Observations,
     generation: u64,
 ) {
-    let (mut writer, mut reader) = wire.split();
     let mut pending = BTreeMap::new();
     let mut next_id = 1;
     let mut staged = None;
     let mut flush = None;
     let mut check_cancelled = interval(Duration::from_millis(100));
     let reason = loop {
-        let flushing = flush.is_some();
         tokio::select! {
             biased;
             _ = stop.changed() => break "codex_transport_stopped",
@@ -301,38 +308,46 @@ async fn drive(
                 }
                 pending.retain(|_, entry| !entry.result.is_closed());
             }
-            frame = reader.next() => match frame {
-                Some(Ok(Message::Text(text))) => {
-                    if let Err(reason) = receive(text.as_str(), &mut pending, &mut observed) {
-                        break reason;
+            progress = poll_fn(|cx| {
+                // Read ready notifications before admitting the next write. Use the
+                // actual WebSocket sink: a split sink can defer the first possible
+                // write to a later poll, after these observations become obsolete.
+                let mut wire = Pin::new(&mut wire);
+                if let Poll::Ready(frame) = wire.as_mut().poll_next(cx) {
+                    return Poll::Ready(WireProgress::Read(frame));
+                }
+                if flush.is_some() {
+                    return wire.poll_flush(cx).map(WireProgress::Flushed);
+                }
+                if staged.is_some() {
+                    return wire.poll_ready(cx).map(WireProgress::Writable);
+                }
+                Poll::Pending
+            }) => match progress {
+                WireProgress::Read(frame) => match frame {
+                    Some(Ok(Message::Text(text))) => {
+                        if let Err(reason) = receive(text.as_str(), &mut pending, &mut observed) {
+                            break reason;
+                        }
+                    }
+                    Some(Ok(Message::Ping(_))) => {
+                        flush.get_or_insert_with(|| Instant::now() + WRITE_TIMEOUT);
+                    }
+                    Some(Ok(Message::Pong(_))) => {}
+                    Some(Ok(Message::Close(_))) | None => break "codex_event_stream_closed",
+                    _ => break "codex_websocket_protocol_error",
+                },
+                WireProgress::Flushed(Ok(())) => flush = None,
+                WireProgress::Writable(Ok(())) => {
+                    if let Some(command) = staged.take() {
+                        if let Err(reason) = send(command, &mut wire, &mut pending, &mut observed, &mut next_id) {
+                            break reason;
+                        }
+                        flush = Some(Instant::now() + WRITE_TIMEOUT);
                     }
                 }
-                Some(Ok(Message::Ping(_))) => {
-                    flush.get_or_insert_with(|| Instant::now() + WRITE_TIMEOUT);
-                }
-                Some(Ok(Message::Pong(_))) => {}
-                Some(Ok(Message::Close(_))) | None => break "codex_event_stream_closed",
-                _ => break "codex_websocket_protocol_error",
+                WireProgress::Writable(Err(_)) | WireProgress::Flushed(Err(_)) => break "codex_websocket_writer_failed",
             },
-            result = poll_fn(|cx| {
-                if flushing {
-                    Pin::new(&mut writer).poll_flush(cx)
-                } else {
-                    Pin::new(&mut writer).poll_ready(cx)
-                }
-            }), if flushing || staged.is_some() => {
-                if result.is_err() {
-                    break "codex_websocket_writer_failed";
-                }
-                if flushing {
-                    flush = None;
-                } else if let Some(command) = staged.take() {
-                    if let Err(reason) = send(command, &mut writer, &mut pending, &mut observed, &mut next_id) {
-                        break reason;
-                    }
-                    flush = Some(Instant::now() + WRITE_TIMEOUT);
-                }
-            }
             command = commands.recv(), if staged.is_none() => match command {
                 Some(command) => staged = Some(command),
                 None => break "codex_transport_stopped",
@@ -348,13 +363,19 @@ async fn drive(
     drop(staged);
     // Complete an intentional disconnect before Node terminates the group.
     if reason == "codex_transport_stopped" {
-        let _ = timeout(Duration::from_millis(250), writer.close()).await;
+        let _ = timeout(Duration::from_millis(250), wire.close(None)).await;
     }
+}
+
+enum WireProgress {
+    Read(Option<Result<Message, WireError>>),
+    Flushed(Result<(), WireError>),
+    Writable(Result<(), WireError>),
 }
 
 fn send(
     command: Command,
-    writer: &mut Writer,
+    wire: &mut Wire,
     pending: &mut BTreeMap<u64, Pending>,
     observed: &mut Observations,
     next_id: &mut u64,
@@ -391,7 +412,7 @@ fn send(
     {
         return Ok(());
     }
-    Pin::new(writer)
+    Pin::new(wire)
         .start_send(Message::Text(text.into()))
         .map_err(|_| "codex_websocket_write_failed")?;
 
@@ -480,14 +501,13 @@ fn prepare(operation: &Operation, observed: &Observations, id: u64) -> Result<Pr
             Ok(rpc("turn/start", params, Exchange::Turn))
         }
         Operation::Approval(decision) => {
-            let callback =
-                observed
-                    .approvals
-                    .current()
-                    .ok_or_else(|| match observed.snapshot.state {
-                        State::AwaitingApproval(_) => Failure::Unsupported,
-                        _ => Failure::Stale,
-                    })?;
+            let callback = observed
+                .approvals
+                .current()
+                .ok_or(match observed.snapshot.state {
+                    State::AwaitingApproval(_) => Failure::Unsupported,
+                    _ => Failure::Stale,
+                })?;
             if !matches!(observed.snapshot.state, State::AwaitingApproval(_))
                 || observed.snapshot.active_turn.as_deref() != Some(&callback.turn_id)
             {

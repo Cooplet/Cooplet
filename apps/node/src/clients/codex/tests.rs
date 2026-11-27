@@ -584,3 +584,193 @@ async fn separate_native_approval_ids_and_unknown_application_do_not_allow_a_rep
     );
     Ok(())
 }
+
+#[path = "../../../tests/common/codex_backend.rs"]
+mod codex_backend;
+
+#[tokio::test]
+#[ignore = "requires an installed Codex CLI on the host"]
+async fn native_structured_smoke() -> Test {
+    use cooplet_platform::{PrivateFs, ProcessHandle, TerminateOutcome};
+    use cooplet_protocol::RequestId;
+
+    struct TestTree(PathBuf);
+
+    impl Drop for TestTree {
+        fn drop(&mut self) {
+            let _ = fs::remove_dir_all(&self.0);
+        }
+    }
+
+    let binary: PathBuf = env::var_os("COOPLET_NATIVE_CODEX_BIN")
+        .map(PathBuf::from)
+        .ok_or_else(|| io::Error::other("set COOPLET_NATIVE_CODEX_BIN to the native CLI path"))?;
+    let root = TestTree(PrivateFs::ensure_private_dir(
+        &env::temp_dir().join(format!("cx-{}", RequestId::generate()?)),
+    )?);
+    let home = PrivateFs::ensure_private_dir(&root.0.join("home"))?;
+    let workspace = PrivateFs::ensure_private_dir(&root.0.join("work"))?;
+    let mut backend = codex_backend::Backend::start(&home).await?;
+    let features = wire_features(&binary, &root.0.join("schema"), &home).await;
+    assert!(
+        features.output_schema,
+        "the native schema generator must report outputSchema"
+    );
+    let socket = root.0.join("c.sock");
+    let socket_url = format!("unix://{}", path_text(&socket)?);
+    let mut launch = Command::new(&binary);
+    launch
+        .args(["app-server", "--listen", &socket_url])
+        .current_dir(&workspace)
+        .env("CODEX_HOME", &home)
+        .env_remove("OPENAI_API_KEY")
+        .env_remove("OPENAI_BASE_URL")
+        .env("HTTP_PROXY", "http://127.0.0.1:1")
+        .env("HTTPS_PROXY", "http://127.0.0.1:1")
+        .env("ALL_PROXY", "http://127.0.0.1:1")
+        .env("NO_PROXY", "localhost,127.0.0.1")
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null());
+    let mut process = ProcessHandle::spawn_isolated_group(&mut launch)?;
+    let socket = transport::connect(&socket, process.identity()).await?;
+    let (session, mut events) = Session::start(socket, 1, "attach".into());
+    let checked = |result: std::result::Result<Value, Failure>| {
+        result.map_err(|error| io::Error::other(format!("native smoke RPC: {error:?}")))
+    };
+    checked(session.rpc("initialize", initialize_params()).await)?;
+    checked(session.request(Operation::Initialized).await)?;
+    let opened = checked(session.rpc("thread/start", json!({"cwd":workspace})).await)?;
+    let thread = native_id(&opened["thread"]["id"])?;
+    let handle = SessionHandle::new(
+        Live {
+            session,
+            program: binary,
+            socket_url,
+            hint: "attach".into(),
+            output_schema: features.output_schema,
+            named_output_revision: None,
+        },
+        PersistedSessionRef {
+            participant_id: ParticipantId::generate()?,
+            generation: 1,
+            native_key: Some(NativeSessionKey {
+                client_kind: KIND.into(),
+                store_namespace: path_text(&home)?.into(),
+                native_session_id: thread.into(),
+            }),
+            process_ownership: ProcessOwnership::Managed,
+            workspace_dir: workspace,
+            runtime_dir: root.0.clone(),
+            process_identity: Some(process.identity().clone()),
+            adapter_binding: Value::Null,
+        },
+    );
+    let adapter = CodexAdapter::new(None);
+    let schema = json!({"type":"object","properties":{"answer":{"type":"integer"}},"required":["answer"],"additionalProperties":false});
+    let outcome = adapter
+        .submit_turn(
+            &handle,
+            submission(input(Some(AuthorKind::Human))?, Some(schema.clone())),
+        )
+        .await;
+    let SubmitOutcome::Accepted {
+        native_turn_id: Some(accepted),
+    } = outcome
+    else {
+        return Err(io::Error::other(format!("expected native intake, got {outcome:?}")).into());
+    };
+    assert_eq!(backend.request().await?["text"]["format"]["schema"], schema);
+    assert!(
+        matches!(completion(&mut events).await?, AdapterEventKind::TurnCompleted {
+        native_turn_id: Some(id), status: TurnFinishStatus::Completed, structured: Some(value), ..
+    } if id == accepted && value == json!({"answer":42}))
+    );
+    assert!(matches!(
+        adapter
+            .cancel_or_stop(&handle, StopMode::StopSession)
+            .await?,
+        StopOutcome::Stopped
+    ));
+    assert_ne!(
+        process
+            .terminate_and_reap(Duration::from_millis(200))?
+            .outcome,
+        TerminateOutcome::CleanupUnverified
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn interrupt_refusal_for_a_replaced_turn_reports_the_old_turn_gone() -> Test {
+    let (mut peer, handle, mut events) = live(None, true).await?;
+    let adapter = CodexAdapter::new(None);
+    peer.begin("old").await?;
+    assert!(matches!(
+        next(&mut events).await?.kind,
+        AdapterEventKind::StateChanged(State::Working)
+    ));
+    let (outcome, checked) = tokio::join!(
+        adapter.cancel_or_stop(&handle, StopMode::CancelTurn),
+        async {
+            let request = peer.recv().await?;
+            assert_eq!(request["method"], "turn/interrupt");
+            assert_eq!(request["params"]["turnId"], "old");
+            peer.finish("old", "completed", json!([])).await?;
+            peer.begin("new").await?;
+            peer.send(json!({"id":request["id"],"error":{"code":-32600,
+                "message":"expected active turn id old but found new"}}))
+                .await?;
+            assert!(
+                timeout(Duration::from_millis(25), peer.0.next())
+                    .await
+                    .is_err()
+            );
+            Ok::<_, Box<dyn Error + Send + Sync>>(())
+        }
+    );
+    checked?;
+    assert!(matches!(outcome?, StopOutcome::AlreadyGone));
+    Ok(())
+}
+
+#[tokio::test]
+async fn initial_workspace_routing_update_rechecks_evidence_once() -> Test {
+    let (mut peer, handle, _events) = live(None, true).await?;
+    let session = &handle
+        .downcast_ref::<Live>()
+        .ok_or_else(|| io::Error::other("missing live fixture"))?
+        .session;
+    let opened = json!({"modelProvider":"openai","thread":{"modelProvider":"openai"}});
+    let (revision, fixture) = tokio::join!(
+        provider::named_output_revision(session, &opened, "/workspace", true),
+        async {
+            for iteration in 0..2 {
+                for _ in 0..4 {
+                    let request = peer.recv().await?;
+                    let response = match request["method"].as_str() {
+                        Some("account/read") => {
+                            assert_eq!(request["params"]["refreshToken"], false);
+                            if iteration == 0 {
+                                peer.send(json!({"method":"account/updated","params":{"reason":"workspaceRoutingReady"}})).await?;
+                            }
+                            json!({"requiresOpenaiAuth":true,"account":{"type":"chatgpt"},
+                                "workspaceRouting":{"backendOrigin":"https://chatgpt.com","accountRoutingOverride":"NO_CONSTRAINT"}})
+                        }
+                        Some("config/read") => json!({"config":{}}),
+                        Some("configRequirements/read") => json!({"requirements":null}),
+                        Some("modelProvider/list") => {
+                            json!({"data":[{"id":"openai","baseUrl":null}]})
+                        }
+                        _ => return Err(io::Error::other("unexpected provider probe").into()),
+                    };
+                    peer.ack(&request, response).await?;
+                }
+            }
+            Ok::<_, Box<dyn Error + Send + Sync>>(())
+        },
+    );
+    fixture?;
+    assert_eq!(revision, Some(1));
+    Ok(())
+}

@@ -5,6 +5,7 @@ use std::sync::{
 
 use cooplet_protocol::{ParticipantId, ParticipantState};
 use cooplet_storage::{StorageError, WriteOutcome};
+use futures_util::FutureExt;
 use serde_json::Value;
 use tokio::sync::{mpsc, watch};
 
@@ -395,6 +396,7 @@ impl SubmitSlot {
             return SubmitOutcome::Unavailable("session closed before submit".into());
         }
         self.native_started = true;
+        let admission = request.admission.clone();
         let started = AtomicBool::new(false);
         let acknowledged = async {
             started.store(true, Ordering::Relaxed);
@@ -404,16 +406,23 @@ impl SubmitSlot {
             )
             .await
         };
+        tokio::pin!(acknowledged);
         tokio::select! {
             biased;
             _ = disconnected.changed() => {
+                // Fence a possible first write before checking for an ACK that
+                // the adapter already received as its event stream closed.
+                admission.expire();
                 if started.load(Ordering::Relaxed) {
-                    SubmitOutcome::Unknown("session closed during submit".into())
+                    match acknowledged.as_mut().now_or_never() {
+                        Some(Ok(accepted @ SubmitOutcome::Accepted { .. })) => accepted,
+                        _ => SubmitOutcome::Unknown("session closed during submit".into()),
+                    }
                 } else {
                     SubmitOutcome::Unavailable("session closed before submit".into())
                 }
             }
-            result = acknowledged => match result {
+            result = acknowledged.as_mut() => match result {
                 Ok(outcome) => outcome,
                 Err(_) => SubmitOutcome::Unknown("submit acknowledgment timed out".into()),
             },
@@ -927,10 +936,20 @@ mod tests {
 
         fn submit_turn<'a>(
             &'a self,
-            _handle: &'a crate::clients::SessionHandle,
+            handle: &'a crate::clients::SessionHandle,
             _request: crate::clients::SubmitTurnRequest,
         ) -> futures_util::future::BoxFuture<'a, crate::clients::SubmitOutcome> {
-            Box::pin(async { crate::clients::SubmitOutcome::Unknown("stub".into()) })
+            Box::pin(async move {
+                let receiver = handle
+                    .downcast_ref::<StubAck>()
+                    .and_then(|ack| super::lock(ack).take());
+                if let Some(receiver) = receiver {
+                    return receiver
+                        .await
+                        .unwrap_or_else(|_| super::SubmitOutcome::Unknown("stub closed".into()));
+                }
+                super::SubmitOutcome::Unknown("stub".into())
+            })
         }
 
         fn respond_approval<'a>(
@@ -961,6 +980,7 @@ mod tests {
     }
 
     type SessionTestResult<T = ()> = Result<T, Box<dyn std::error::Error + Send + Sync>>;
+    type StubAck = std::sync::Mutex<Option<tokio::sync::oneshot::Receiver<super::SubmitOutcome>>>;
 
     fn test_turn_input() -> SessionTestResult<crate::clients::TurnInput> {
         Ok(crate::clients::TurnInput::direct(
@@ -983,6 +1003,12 @@ mod tests {
     }
 
     fn live_session() -> SessionTestResult<std::sync::Arc<super::LiveSession>> {
+        live_session_with(())
+    }
+
+    fn live_session_with<T: Send + Sync + 'static>(
+        transport: T,
+    ) -> SessionTestResult<std::sync::Arc<super::LiveSession>> {
         let participant_id = cooplet_protocol::ParticipantId::from_parts(1, [0; 10])?;
         let persisted = crate::clients::PersistedSessionRef {
             participant_id,
@@ -994,7 +1020,7 @@ mod tests {
             process_identity: None,
             adapter_binding: serde_json::json!({}),
         };
-        let handle = crate::clients::SessionHandle::new((), persisted);
+        let handle = crate::clients::SessionHandle::new(transport, persisted);
         Ok(std::sync::Arc::new(super::LiveSession::new(
             std::sync::Arc::new(StubAdapter),
             handle,
@@ -1002,6 +1028,48 @@ mod tests {
             ParticipantState::Idle,
             None,
         )))
+    }
+
+    #[tokio::test]
+    async fn positive_ack_already_ready_survives_event_stream_loss() -> SessionTestResult {
+        use super::{SubmitOutcome, SubmitTurnRequest};
+        use cooplet_platform::AdmissionGuard;
+        use std::{
+            future::Future,
+            task::{Context, Poll, Waker},
+            time::Duration,
+        };
+        let (ack, receiver) = tokio::sync::oneshot::channel();
+        let live = live_session_with(StubAck::new(Some(receiver)))?;
+        let mut slot = live
+            .try_submit("simultaneous-ack")
+            .map_err(|error| format!("{error:?}"))?;
+        let admission = AdmissionGuard::new(Duration::from_secs(10));
+        let submit = slot.submit(SubmitTurnRequest {
+            operation_key: "simultaneous-ack".into(),
+            message_id: None,
+            input: test_turn_input()?,
+            output_schema: None,
+            steer: false,
+            admission: admission.clone(),
+        });
+        tokio::pin!(submit);
+        assert!(matches!(
+            submit
+                .as_mut()
+                .poll(&mut Context::from_waker(Waker::noop())),
+            Poll::Pending
+        ));
+        ack.send(SubmitOutcome::Accepted {
+            native_turn_id: Some("acknowledged".into()),
+        })
+        .map_err(|_| "stub acknowledgement receiver closed")?;
+        live.disconnect();
+        assert!(
+            matches!(submit.await, SubmitOutcome::Accepted {native_turn_id: Some(id)} if id == "acknowledged")
+        );
+        assert!(admission.is_expired());
+        Ok(())
     }
 
     #[test]

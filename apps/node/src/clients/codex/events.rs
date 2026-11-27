@@ -59,6 +59,7 @@ pub(super) struct Observations {
 struct Turn {
     answer: Answer,
     schema: bool,
+    operation_key: Option<String>,
     foreign_input: bool,
 }
 
@@ -71,7 +72,6 @@ struct Answer {
 struct Submitted {
     operation_key: String,
     schema: bool,
-    colliding: bool,
 }
 
 enum Deferred {
@@ -152,6 +152,17 @@ impl Observations {
             return Ok(());
         }
         match method {
+            "thread/closed" => {
+                self.native_state = State::Unavailable {
+                    reason: "Codex closed the native thread".into(),
+                };
+                self.snapshot.active_turn = None;
+                self.snapshot.rollout_path = None;
+                self.approvals.clear();
+                self.turns.clear();
+                self.sync_snapshot();
+                self.publish_state()
+            }
             "thread/status/changed" => {
                 self.native_state = native_state(&params["status"], &self.hint);
                 if matches!(self.native_state, State::Unavailable { .. }) {
@@ -208,7 +219,6 @@ impl Observations {
         self.submitted = Some(Submitted {
             operation_key,
             schema,
-            colliding: self.snapshot.active_turn.is_some(),
         });
     }
 
@@ -218,11 +228,12 @@ impl Observations {
         };
         if let Some(id) = turn_id {
             let active = self.snapshot.active_turn.as_deref();
-            let colliding = submitted.colliding || active.is_some_and(|active| active != id);
+            let colliding = active.is_some_and(|active| active != id);
             let mut foreign_input = false;
             if !self.is_completed(id) {
                 let turn = self.turn(id)?;
                 turn.schema = submitted.schema;
+                turn.operation_key = Some(submitted.operation_key);
                 foreign_input = turn.foreign_input;
                 if self.snapshot.active_turn.is_none() {
                     self.started(id)?;
@@ -237,10 +248,7 @@ impl Observations {
                 }
             }
             if colliding || foreign_input {
-                tracing::warn!(
-                    generation = self.generation,
-                    "Codex acknowledged a turn with concurrent input"
-                );
+                self.report_concurrent_input();
             }
         }
         let deferred = std::mem::take(&mut self.deferred);
@@ -254,7 +262,7 @@ impl Observations {
     }
 
     pub(super) fn publish_state(&mut self) -> ProtocolResult<()> {
-        let state = self.with_approval(self.native_state.clone());
+        let state = self.admission_state();
         if state == self.snapshot.state {
             return Ok(());
         }
@@ -296,6 +304,16 @@ impl Observations {
         })
     }
 
+    fn admission_state(&self) -> State {
+        let state = self.with_approval(self.native_state.clone());
+        if state == State::Idle && self.snapshot.active_turn.is_some() {
+            // Codex can announce Idle before the active turn's terminal event.
+            // Publishing it here would spend the queue's only wake-up too early.
+            return State::Working;
+        }
+        state
+    }
+
     fn started(&mut self, turn_id: &str) -> ProtocolResult<()> {
         if self.is_completed(turn_id) {
             return Ok(());
@@ -313,19 +331,39 @@ impl Observations {
         if self.is_completed(turn_id) {
             return Ok(());
         }
-        let foreign_input = self.submitted.as_ref().is_some_and(|submitted| {
-            item["type"] == "userMessage"
-                && item["clientId"]
-                    .as_str()
-                    .is_some_and(|id| id != submitted.operation_key)
-        });
-        if foreign_input {
-            self.turn(turn_id)?.foreign_input = true;
+        if item["type"] == "userMessage"
+            && let Some(client_id) = item["clientId"].as_str()
+        {
+            let claimed = self
+                .turns
+                .get(turn_id)
+                .and_then(|turn| turn.operation_key.as_deref());
+            let pending = self
+                .submitted
+                .as_ref()
+                .map(|submitted| submitted.operation_key.as_str());
+            if claimed.or(pending).is_some_and(|key| client_id != key) {
+                let acknowledged = claimed.is_some();
+                let turn = self.turn(turn_id)?;
+                if !turn.foreign_input {
+                    turn.foreign_input = true;
+                    if acknowledged {
+                        self.report_concurrent_input();
+                    }
+                }
+            }
         }
         if item["type"] == "agentMessage" {
             self.turn(turn_id)?.answer.record(item)?;
         }
         Ok(())
+    }
+
+    fn report_concurrent_input(&self) {
+        tracing::warn!(
+            generation = self.generation,
+            "Codex acknowledged a turn with concurrent input"
+        );
     }
 
     fn completed(&mut self, turn: &Value) -> ProtocolResult<()> {

@@ -1,12 +1,13 @@
 use std::{
-    env, io,
-    os::unix::fs::PermissionsExt,
+    env, fs, io,
+    os::unix::fs::DirBuilderExt,
     path::{Path, PathBuf},
     process::{Command, Stdio},
     time::Duration,
 };
 
-use cooplet_platform::{ProcessHandle, SpawnError, TerminateOutcome};
+use cooplet_platform::{ProcessHandle, SpawnError, TerminateOutcome, can_execute};
+use cooplet_protocol::RequestId;
 use serde_json::{Value, json};
 use tokio::{
     io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader},
@@ -25,7 +26,7 @@ pub(super) fn executable(override_path: Option<&Path>) -> Option<PathBuf> {
     fn checked(path: &Path) -> Option<PathBuf> {
         let absolute = path.canonicalize().ok()?;
         let file = absolute.metadata().ok()?;
-        (file.is_file() && file.permissions().mode() & 0o111 != 0).then_some(absolute)
+        (file.is_file() && can_execute(&absolute).ok() == Some(true)).then_some(absolute)
     }
 
     match override_path {
@@ -65,32 +66,42 @@ pub(super) async fn discover(override_path: Option<&Path>) -> DiscoveryReport {
             return Err("Codex lacks the required --listen or --remote flag");
         }
 
+        let home = ProbeHome::new().map_err(|_| "Could not prepare an isolated Codex probe")?;
         let params = initialize_params();
         let mut cmd = Command::new(&binary);
-        cmd.args(["app-server", "--stdio"]).stdin(Stdio::piped());
-        run_probe(cmd, PROBE_TIMEOUT, false, |mut input, output| async move {
-            let input = input
-                .as_mut()
-                .ok_or_else(|| io::Error::other("missing probe stdin"))?;
-            let packet = json!({"id": 1, "method": "initialize", "params": params});
-            input.write_all(packet.to_string().as_bytes()).await?;
-            input.write_all(b"\n").await?;
-            let mut line = Vec::new();
-            BufReader::new(output.take(MAX_PROBE_BYTES))
-                .read_until(b'\n', &mut line)
-                .await?;
-            let message: Value = serde_json::from_slice(&line)?;
-            if message["id"] != 1
-                || !message["result"]["codexHome"]
+        cmd.args(["app-server", "--stdio"])
+            .env("CODEX_HOME", &home.0)
+            .current_dir(&home.0)
+            .stdin(Stdio::piped());
+        run_probe(
+            cmd,
+            PROBE_TIMEOUT,
+            false,
+            Some(home),
+            |mut input, output| async move {
+                let input = input
+                    .as_mut()
+                    .ok_or_else(|| io::Error::other("missing probe stdin"))?;
+                let packet = json!({"id": 1, "method": "initialize", "params": params});
+                input.write_all(packet.to_string().as_bytes()).await?;
+                input.write_all(b"\n").await?;
+                let mut line = Vec::new();
+                BufReader::new(output.take(MAX_PROBE_BYTES))
+                    .read_until(b'\n', &mut line)
+                    .await?;
+                let message: Value = serde_json::from_slice(&line)?;
+                if message["id"] != 1
+                    || !message["result"]["codexHome"]
+                        .as_str()
+                        .is_some_and(|home| !home.is_empty())
+                {
+                    return Err(io::Error::other("invalid initialize response"));
+                }
+                Ok(message["result"]["userAgent"]
                     .as_str()
-                    .is_some_and(|home| !home.is_empty())
-            {
-                return Err(io::Error::other("invalid initialize response"));
-            }
-            Ok(message["result"]["userAgent"]
-                .as_str()
-                .and_then(safe_version))
-        })
+                    .and_then(safe_version))
+            },
+        )
         .await
         .ok_or("Codex did not complete the stdio initialize probe")
     }
@@ -138,7 +149,7 @@ fn has_flag(help: &str, flag: &str) -> bool {
 async fn help(binary: &Path, args: &[&str]) -> Result<String, &'static str> {
     let mut command = Command::new(binary);
     command.args(args);
-    run_probe(command, HELP_TIMEOUT, true, |_, output| async move {
+    run_probe(command, HELP_TIMEOUT, true, None, |_, output| async move {
         let mut help = String::new();
         output
             .take(MAX_PROBE_BYTES)
@@ -156,12 +167,13 @@ pub(super) struct WireFeatures {
     pub(super) tool_output: bool,
 }
 
-pub(super) async fn wire_features(binary: &Path, directory: &Path) -> WireFeatures {
+pub(super) async fn wire_features(binary: &Path, directory: &Path, home: &Path) -> WireFeatures {
     let mut command = Command::new(binary);
     command
         .args(["app-server", "generate-json-schema", "--out"])
-        .arg(directory);
-    let generated = run_probe(command, PROBE_TIMEOUT, true, |_, output| async move {
+        .arg(directory)
+        .env("CODEX_HOME", home);
+    let generated = run_probe(command, PROBE_TIMEOUT, true, None, |_, output| async move {
         // Wait for command completion and bound output even if the CLI is broken.
         let bytes =
             tokio::io::copy(&mut output.take(MAX_PROBE_BYTES), &mut tokio::io::sink()).await?;
@@ -207,6 +219,7 @@ async fn run_probe<T, F, Fut>(
     mut command: Command,
     deadline: Duration,
     require_success: bool,
+    probe_home: Option<ProbeHome>,
     read: F,
 ) -> Option<T>
 where
@@ -217,6 +230,7 @@ where
     command.stdout(Stdio::piped()).stderr(Stdio::null());
     // This task retains the process group if the caller abandons the probe.
     tokio::spawn(async move {
+        let _probe_home = probe_home;
         let mut handle = tokio::task::spawn_blocking(move || {
             match ProcessHandle::spawn_isolated_group(&mut command) {
                 Ok(handle) => Some(handle),
@@ -263,4 +277,21 @@ where
     .await
     .ok()
     .flatten()
+}
+
+struct ProbeHome(PathBuf);
+
+impl ProbeHome {
+    fn new() -> io::Result<Self> {
+        let id = RequestId::generate().map_err(io::Error::other)?;
+        let path = env::temp_dir().join(format!("cooplet-codex-probe-{id}"));
+        fs::DirBuilder::new().mode(0o700).create(&path)?;
+        Ok(Self(path))
+    }
+}
+
+impl Drop for ProbeHome {
+    fn drop(&mut self) {
+        let _ = fs::remove_dir_all(&self.0);
+    }
 }

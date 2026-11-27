@@ -25,21 +25,28 @@ pub(super) async fn named_output_revision(
     {
         return None;
     }
-    let revision = session.snapshot().route_revision;
-    let evidence = timeout(Duration::from_secs(4), async {
-        tokio::try_join!(
-            session.rpc("account/read", json!({"refreshToken": false})),
-            session.rpc("config/read", json!({"cwd": cwd, "includeLayers": false})),
-            session.rpc("configRequirements/read", json!({})),
-            session.rpc("modelProvider/list", json!({})),
-        )
+    timeout(Duration::from_secs(4), async {
+        // Startup routing discovery can emit account/updated while the first
+        // account/read is pending. Confirm once more on the new observation.
+        for _ in 0..2 {
+            let revision = session.snapshot().route_revision;
+            let (account, config, requirements, providers) = tokio::try_join!(
+                session.rpc("account/read", json!({"refreshToken": false})),
+                session.rpc("config/read", json!({"cwd": cwd, "includeLayers": false})),
+                session.rpc("configRequirements/read", json!({})),
+                session.rpc("modelProvider/list", json!({})),
+            )
+            .ok()?;
+            if revision == session.snapshot().route_revision {
+                return compatible(&account, &config, &requirements, &providers)
+                    .then_some(revision);
+            }
+        }
+        None
     })
     .await
-    .ok()?
-    .ok()?;
-    compatible(&evidence.0, &evidence.1, &evidence.2, &evidence.3)
-        .then_some(revision)
-        .filter(|revision| *revision == session.snapshot().route_revision)
+    .ok()
+    .flatten()
 }
 
 fn compatible(account: &Value, config: &Value, requirements: &Value, providers: &Value) -> bool {
