@@ -123,6 +123,11 @@ that a request was resolved without identifying which client answered, so
 Cooplet can return `delivery_unknown` for a submitted approval response.
 Follow the participant's current state for any remaining requests.
 
+To interrupt the current turn and keep the participant running, send
+`POST /v1/agents/{id}/stop` with `"cancel_turn_only": true`. If Codex is
+temporarily unable to accept the interrupt, the response reports
+`cancel_unavailable`. Retry with a fresh operation key.
+
 The ignored native smoke tests use an installed Codex CLI and a loopback model
 fixture. Run `make test app=node` and set `COOPLET_NATIVE_CODEX_BIN` to the
 absolute Codex executable path on the host. Run the `codex_process` test binary

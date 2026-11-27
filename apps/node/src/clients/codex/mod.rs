@@ -330,7 +330,7 @@ impl ClientAdapter for CodexAdapter {
                 }
                 Err(Failure::Waiting(wait)) => SubmitOutcome::AwaitingApproval(wait),
                 Err(Failure::NotSent(reason)) => SubmitOutcome::Unavailable(reason.into()),
-                Err(Failure::Rejected(Rejection::NoIntake)) => {
+                Err(Failure::Rejected(Rejection::NoIntake | Rejection::MissingThread)) => {
                     SubmitOutcome::Unavailable("Codex rejected intake".into())
                 }
                 Err(Failure::Uncertain(reason)) => SubmitOutcome::Unknown(reason.into()),
@@ -371,10 +371,10 @@ impl ClientAdapter for CodexAdapter {
             let Some(live) = handle.downcast_ref::<Live>() else {
                 return Ok(StopOutcome::AlreadyGone);
             };
-            if mode == StopMode::StopSession {
+            let StopMode::CancelTurn { admission } = mode else {
                 live.session.stop().await;
                 return Ok(StopOutcome::Stopped);
-            }
+            };
             let snapshot = live.session.snapshot();
             let Some(turn) = snapshot.active_turn else {
                 return Ok(match snapshot.state {
@@ -383,13 +383,24 @@ impl ClientAdapter for CodexAdapter {
                 });
             };
             Ok(
-                match live.session.request(Operation::Interrupt(turn)).await {
+                match live
+                    .session
+                    .request(Operation::Interrupt {
+                        turn_id: turn,
+                        admission,
+                    })
+                    .await
+                {
                     Ok(_) => StopOutcome::TurnCancelled,
-                    Err(Failure::Stale | Failure::Rejected(Rejection::StaleTurn)) => {
-                        StopOutcome::AlreadyGone
-                    }
-                    Err(Failure::Rejected(Rejection::NoIntake | Rejection::UnsupportedMethod)) => {
+                    Err(
+                        Failure::Stale
+                        | Failure::Rejected(Rejection::StaleTurn | Rejection::MissingThread),
+                    ) => StopOutcome::AlreadyGone,
+                    Err(Failure::Rejected(Rejection::UnsupportedMethod)) => {
                         StopOutcome::Unsupported("Codex rejected the interrupt".into())
+                    }
+                    Err(Failure::Expired | Failure::Rejected(Rejection::NoIntake)) => {
+                        StopOutcome::Unavailable("Codex could not accept the interrupt".into())
                     }
                     Err(Failure::NotSent(reason) | Failure::Uncertain(reason)) => {
                         StopOutcome::Unknown(reason.into())

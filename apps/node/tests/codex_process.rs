@@ -520,6 +520,38 @@ async fn external_turn_keeps_the_queue_closed_until_its_terminal_event() -> Test
 }
 
 #[tokio::test]
+async fn overloaded_native_interrupt_reports_retryable_and_accepts_a_new_request() -> Test {
+    let fixture = Fixture::new()?;
+    let (_daemon, client) = fixture.start("cancel-overloaded").await?;
+    let opened = create(&client, "overload-create", None).await?;
+    let id = opened["participant_id"]
+        .as_str()
+        .ok_or_else(|| io::Error::other("missing participant id"))?;
+    let send: Value = client
+        .post_json(
+            "/v1/messages",
+            &json!({"to":id,"body":"Keep working"}),
+            Some("overload-turn"),
+        )
+        .await?;
+    assert_eq!(send["delivery_state"], "delivered");
+    participant_state(&client, id, "working").await?;
+    let path = format!("/v1/agents/{id}/stop");
+    let cancel = json!({"cancel_turn_only":true});
+    let overloaded = client
+        .post_json::<_, Value>(&path, &cancel, Some("overload-cancel"))
+        .await;
+    assert!(matches!(overloaded, Err(ClientError::Problem(problem))
+        if problem.retryable && problem.extensions.get("reason") == Some(&json!("cancel_unavailable"))));
+    let retried: Value = client
+        .post_json(&path, &cancel, Some("overload-cancel-retry"))
+        .await?;
+    assert_eq!(retried["stop_outcome"], "turn_cancelled");
+    participant_state(&client, id, "idle").await?;
+    stop_agent(&client, id, "overload-stop").await
+}
+
+#[tokio::test]
 async fn app_server_fixture() -> Test {
     let Some(socket) = env::var_os("COOPLET_FIXTURE_SOCKET").map(PathBuf::from) else {
         return Ok(());
@@ -542,6 +574,7 @@ async fn app_server_fixture() -> Test {
     let mut ws = accept_async(stream).await?;
     let cwd = env::current_dir()?;
     let mut saved = false;
+    let mut overload_interrupt = mode == "cancel-overloaded";
     while let Some(frame) = ws.next().await {
         let frame = frame?;
         if frame.is_close() {
@@ -623,8 +656,32 @@ async fn app_server_fixture() -> Test {
                     json!({"id":req["id"],"result":{"turn":{"id":"t"}}}),
                 )
                 .await?;
+                if mode == "cancel-overloaded" {
+                    continue;
+                }
                 send(&mut ws, json!({"method":"turn/completed","params":{"threadId":THREAD,
                     "turn":{"id":"t","status":"completed","items":[{"type":"agentMessage","phase":"final_answer","text":"Hello"}]}}})).await?;
+                continue;
+            }
+            Some("turn/interrupt") if mode == "cancel-overloaded" => {
+                assert_eq!(req["params"]["turnId"], "t");
+                if std::mem::take(&mut overload_interrupt) {
+                    send(
+                        &mut ws,
+                        json!({"id":req["id"],"error":{
+                            "code":-32001,"message":"Server overloaded; retry later."
+                        }}),
+                    )
+                    .await?;
+                } else {
+                    send(&mut ws, json!({"id":req["id"],"result":{}})).await?;
+                    send(
+                        &mut ws,
+                        json!({"method":"turn/completed","params":{"threadId":THREAD,
+                        "turn":{"id":"t","status":"interrupted","items":[]}}}),
+                    )
+                    .await?;
+                }
                 continue;
             }
             _ => return Err(io::Error::other("unsupported fixture request").into()),

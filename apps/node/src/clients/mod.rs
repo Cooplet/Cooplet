@@ -287,9 +287,12 @@ pub enum ApprovalRespondOutcome {
     Unknown(String),
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug)]
 pub enum StopMode {
-    CancelTurn,
+    /// Check admission immediately before the first possible interrupt write.
+    CancelTurn {
+        admission: AdmissionGuard,
+    },
     StopSession,
 }
 
@@ -298,6 +301,8 @@ pub enum StopOutcome {
     Stopped,
     TurnCancelled,
     Unsupported(String),
+    /// No interrupt was accepted because of a temporary condition.
+    Unavailable(String),
     AlreadyGone,
     Unknown(String),
 }

@@ -188,6 +188,12 @@ fn submission(input: TurnInput, schema: Option<Value>) -> SubmitTurnRequest {
     }
 }
 
+fn cancel_turn() -> StopMode {
+    StopMode::CancelTurn {
+        admission: AdmissionGuard::new(LIMIT),
+    }
+}
+
 async fn next(events: &mut mpsc::Receiver<AdapterEvent>) -> Test<AdapterEvent> {
     Ok(timeout(LIMIT, events.recv())
         .await?
@@ -387,16 +393,13 @@ async fn admission_interrupt_and_provider_failure_follow_native_state() -> Test 
             .await,
         SubmitOutcome::Busy
     ));
-    let (stop, reply) = tokio::join!(
-        adapter.cancel_or_stop(&handle, StopMode::CancelTurn),
-        async {
-            let rpc = peer.recv().await?;
-            assert_eq!(rpc["method"], "turn/interrupt");
-            assert_eq!(rpc["params"]["turnId"], "t");
-            peer.ack(&rpc, json!({})).await?;
-            peer.finish("t", "interrupted", json!([])).await
-        },
-    );
+    let (stop, reply) = tokio::join!(adapter.cancel_or_stop(&handle, cancel_turn()), async {
+        let rpc = peer.recv().await?;
+        assert_eq!(rpc["method"], "turn/interrupt");
+        assert_eq!(rpc["params"]["turnId"], "t");
+        peer.ack(&rpc, json!({})).await?;
+        peer.finish("t", "interrupted", json!([])).await
+    },);
     reply?;
     assert!(matches!(stop?, StopOutcome::TurnCancelled));
     assert!(matches!(
@@ -710,25 +713,22 @@ async fn interrupt_refusal_for_a_replaced_turn_reports_the_old_turn_gone() -> Te
         next(&mut events).await?.kind,
         AdapterEventKind::StateChanged(State::Working)
     ));
-    let (outcome, checked) = tokio::join!(
-        adapter.cancel_or_stop(&handle, StopMode::CancelTurn),
-        async {
-            let request = peer.recv().await?;
-            assert_eq!(request["method"], "turn/interrupt");
-            assert_eq!(request["params"]["turnId"], "old");
-            peer.finish("old", "completed", json!([])).await?;
-            peer.begin("new").await?;
-            peer.send(json!({"id":request["id"],"error":{"code":-32600,
+    let (outcome, checked) = tokio::join!(adapter.cancel_or_stop(&handle, cancel_turn()), async {
+        let request = peer.recv().await?;
+        assert_eq!(request["method"], "turn/interrupt");
+        assert_eq!(request["params"]["turnId"], "old");
+        peer.finish("old", "completed", json!([])).await?;
+        peer.begin("new").await?;
+        peer.send(json!({"id":request["id"],"error":{"code":-32600,
                 "message":"expected active turn id old but found new"}}))
-                .await?;
-            assert!(
-                timeout(Duration::from_millis(25), peer.0.next())
-                    .await
-                    .is_err()
-            );
-            Ok::<_, Box<dyn Error + Send + Sync>>(())
-        }
-    );
+            .await?;
+        assert!(
+            timeout(Duration::from_millis(25), peer.0.next())
+                .await
+                .is_err()
+        );
+        Ok::<_, Box<dyn Error + Send + Sync>>(())
+    });
     checked?;
     assert!(matches!(outcome?, StopOutcome::AlreadyGone));
     Ok(())
@@ -786,9 +786,31 @@ async fn cancel_after_transport_loss_reports_uncertainty_instead_of_missing_supp
     ));
     drop(peer);
     assert!(timeout(LIMIT, events.recv()).await?.is_none());
-    let cancelled = adapter
-        .cancel_or_stop(&handle, StopMode::CancelTurn)
-        .await?;
+    let cancelled = adapter.cancel_or_stop(&handle, cancel_turn()).await?;
     assert!(matches!(cancelled, StopOutcome::Unknown(_)));
+    Ok(())
+}
+
+#[tokio::test]
+async fn expired_interrupt_admission_prevents_the_first_write() -> Test {
+    let (mut peer, handle, mut events) = live(None, true).await?;
+    let adapter = CodexAdapter::new(None);
+    peer.begin("active").await?;
+    assert!(matches!(
+        next(&mut events).await?.kind,
+        AdapterEventKind::StateChanged(State::Working)
+    ));
+    let mode = StopMode::CancelTurn {
+        admission: AdmissionGuard::new(Duration::ZERO),
+    };
+    assert!(matches!(
+        adapter.cancel_or_stop(&handle, mode).await?,
+        StopOutcome::Unavailable(_)
+    ));
+    assert!(
+        timeout(Duration::from_millis(25), peer.0.next())
+            .await
+            .is_err()
+    );
     Ok(())
 }

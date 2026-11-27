@@ -61,6 +61,7 @@ pub(super) enum Failure {
 pub(super) enum Rejection {
     SchemaMismatch,
     NoIntake,
+    MissingThread,
     Mcp,
     NoRollout,
     StaleTurn,
@@ -82,7 +83,7 @@ impl Rejection {
             {
                 Self::NoIntake
             }
-            (Some(-32600), msg) if msg.starts_with("thread not found: ") => Self::NoIntake,
+            (Some(-32600), msg) if msg.starts_with("thread not found: ") => Self::MissingThread,
             (Some(-32600), "no active turn to interrupt") => Self::StaleTurn,
             (Some(-32600), msg)
                 if msg.starts_with("expected active turn id ") && msg.contains(" but found ") =>
@@ -117,7 +118,19 @@ pub(super) enum Operation {
         admission: AdmissionGuard,
     },
     Approval(ApprovalDecision),
-    Interrupt(String),
+    Interrupt {
+        turn_id: String,
+        admission: AdmissionGuard,
+    },
+}
+
+impl Operation {
+    fn admission(&self) -> Option<&AdmissionGuard> {
+        match self {
+            Self::Turn { admission, .. } | Self::Interrupt { admission, .. } => Some(admission),
+            _ => None,
+        }
+    }
 }
 
 struct Command {
@@ -185,13 +198,10 @@ impl Session {
     pub(super) async fn request(&self, operation: Operation) -> Result<Value, Failure> {
         let deadline = match operation {
             Operation::Turn { .. } => TURN_ACK_TIMEOUT,
-            Operation::Interrupt(_) => Duration::from_millis(1500),
+            Operation::Interrupt { .. } => Duration::from_millis(1500),
             _ => RPC_TIMEOUT,
         };
-        let admission = match &operation {
-            Operation::Turn { admission, .. } => Some(admission.clone()),
-            _ => None,
-        };
+        let admission = operation.admission().cloned();
         let progress = Arc::new(AtomicU8::new(QUEUED));
         let _ticket = Ticket(progress.clone());
         let (result, receiver) = oneshot::channel();
@@ -401,8 +411,9 @@ fn send(
         let _ = result.send(Err(Failure::NotSent("Codex request capacity exceeded")));
         return Ok(());
     }
-    if let Operation::Turn { admission, .. } = &operation
-        && admission.is_expired()
+    if operation
+        .admission()
+        .is_some_and(AdmissionGuard::is_expired)
     {
         let _ = result.send(Err(Failure::Expired));
         return Ok(());
@@ -532,7 +543,7 @@ fn prepare(operation: &Operation, observed: &Observations, id: u64) -> Result<Pr
                 exchange: None,
             })
         }
-        Operation::Interrupt(turn_id) => {
+        Operation::Interrupt { turn_id, .. } => {
             if observed.snapshot.active_turn.as_ref() != Some(turn_id)
                 || !matches!(
                     observed.snapshot.state,
