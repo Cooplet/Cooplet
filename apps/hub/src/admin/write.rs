@@ -549,6 +549,7 @@ pub(crate) async fn revoke_node(
                     },
                 )?);
             }
+            crate::threads::pause_node_pending(tx, &hub_id, &node_id, now, &mut events)?;
         }
         let resource_id = node_id.to_string();
         let mut commit = AdminCommit::new(

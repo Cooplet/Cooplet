@@ -405,6 +405,61 @@ async fn slow_create_expiry_after_discovery_does_not_open_a_native_session() -> 
 }
 
 #[tokio::test]
+async fn managed_launch_expiry_survives_the_adapter_error_boundary_and_rollback() -> TestResult {
+    let fixture = Fixture::start().await?;
+    let path = fixture._dir.0.join("managed-started");
+    let (entered, release) = fixture.adapter.hold_managed_launch(path.clone());
+    let pending = fixture.start_command(
+        BridgeCommand::CreateAgent {
+            client_kind: Some("mock".into()),
+            template_id: None,
+            name: Some("managed-receiver".into()),
+            workspace_dir: None,
+            overrides: None,
+        },
+        SLOW_BUDGET,
+        relay_client("http://127.0.0.1:1")?,
+    )?;
+    timeout(WAIT, entered).await??;
+    assert_eq!(fixture.adapter.open_calls(), 1);
+    assert_eq!(
+        fixture.operation_state(&pending.id).await?.as_deref(),
+        Some("in_progress")
+    );
+    fixture.at(SLOW_BUDGET + 1);
+    release
+        .send(())
+        .map_err(|_| "managed launch barrier closed")?;
+    let id = pending.id.clone();
+    let response = pending.finish().await?;
+    assert_eq!(response.op_id, id);
+    assert_eq!(response.outcome, CommandOutcome::Expired);
+    assert!(!path.exists());
+    assert_eq!(
+        fixture.operation_state(&id).await?.as_deref(),
+        Some("failed")
+    );
+    assert_eq!(
+        fixture.roster_receipt(id).await?.outcome,
+        CommandOutcome::Expired
+    );
+    let rolled_back = fixture
+        .state
+        .reads
+        .read(move |db| {
+            Ok(db.query_row(
+                "SELECT state = 'stopped' AND runtime_pid IS NULL
+             FROM participants WHERE name = 'managed-receiver'",
+                [],
+                |row| row.get::<_, bool>(0),
+            )?)
+        })
+        .await?;
+    assert!(rolled_back);
+    fixture.stop().await
+}
+
+#[tokio::test]
 async fn timely_native_submit_accepts_and_persists_its_late_ack() -> TestResult {
     let fixture = Fixture::start().await?;
     let receiver = fixture.agent().await?;

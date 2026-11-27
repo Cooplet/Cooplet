@@ -13,7 +13,8 @@ use cooplet_protocol::{
 };
 use futures_util::future::BoxFuture;
 use tokio::sync::{
-    OwnedRwLockWriteGuard, OwnedSemaphorePermit, RwLock, Semaphore, mpsc, oneshot, watch,
+    OwnedRwLockReadGuard, OwnedRwLockWriteGuard, OwnedSemaphorePermit, RwLock, Semaphore, mpsc,
+    oneshot, watch,
 };
 
 use crate::error::HubError;
@@ -193,11 +194,12 @@ impl LiveBridge {
         }
     }
 
-    fn reserve_slot(&self, node_id: &NodeId, thread: bool) -> Result<Reserved, ReserveError> {
-        let registry = self.lock();
-        let active = registry
-            .ready_session(node_id)
-            .ok_or(ReserveError::Offline)?;
+    fn reserve_slot(
+        &self,
+        active: &ActiveSession,
+        authority: Option<OwnedRwLockReadGuard<()>>,
+    ) -> Result<Reserved, ReserveError> {
+        let thread = authority.is_some();
         let slots = if thread {
             &active.threads
         } else {
@@ -213,7 +215,38 @@ impl LiveBridge {
             outbound: active.outbound.clone(),
             cancel: thread.then(|| active.cancelled_threads.clone()),
             clock: self.inner.clock.clone(),
+            authority,
         })
+    }
+
+    async fn reserve_thread_in_session(&self, node_id: &NodeId) -> Result<Reserved, ReserveError> {
+        let (authority, identity, mut closed) = {
+            let registry = self.lock();
+            let (entry, active) = registry
+                .registered_ready(node_id)
+                .ok_or(ReserveError::Offline)?;
+            (
+                entry.authority.clone(),
+                active.identity,
+                active.close.subscribe(),
+            )
+        };
+        // A rebinding or revoke denies immediate writes, but may roll back.
+        // Keep the scheduler's original trigger until this authority is
+        // available again. Exit when this particular session closes.
+        let guard = tokio::select! {
+            biased;
+            _ = closed.wait_for(Option::is_some) => return Err(ReserveError::Offline),
+            guard = authority.read_owned() => guard,
+        };
+        let registry = self.lock();
+        let (_, active) = registry
+            .registered_ready(node_id)
+            .ok_or(ReserveError::Offline)?;
+        if active.identity != identity {
+            return Err(ReserveError::Offline);
+        }
+        self.reserve_slot(active, Some(guard))
     }
 
     pub(super) fn ready(&self, key: &SessionKey) -> bool {
@@ -269,11 +302,21 @@ impl BridgeRegistry for LiveBridge {
     }
 
     fn reserve(&self, node_id: &NodeId) -> Result<Box<dyn CommandPermit>, ReserveError> {
-        Ok(Box::new(self.reserve_slot(node_id, false)?))
+        let registry = self.lock();
+        let active = registry
+            .ready_session(node_id)
+            .ok_or(ReserveError::Offline)?;
+        Ok(Box::new(self.reserve_slot(active, None)?))
     }
 
-    fn reserve_thread(&self, node_id: &NodeId) -> Result<Box<dyn ThreadPermit>, ReserveError> {
-        Ok(Box::new(self.reserve_slot(node_id, true)?))
+    fn reserve_thread<'a>(
+        &'a self,
+        node_id: &'a NodeId,
+    ) -> BoxFuture<'a, Result<Box<dyn ThreadPermit>, ReserveError>> {
+        Box::pin(async move {
+            let reserved = self.reserve_thread_in_session(node_id).await?;
+            Ok(Box::new(reserved) as Box<dyn ThreadPermit>)
+        })
     }
 
     fn disconnect_revoked(&self, node_id: &NodeId) {
@@ -308,14 +351,18 @@ impl BridgeRegistry for LiveBridge {
 
 impl Registry {
     fn ready_session(&self, node_id: &NodeId) -> Option<&ActiveSession> {
+        let (entry, active) = self.registered_ready(node_id)?;
+        let _authority = entry.authority.try_read().ok()?;
+        Some(active)
+    }
+
+    fn registered_ready(&self, node_id: &NodeId) -> Option<(&Entry, &ActiveSession)> {
         if !self.open {
             return None;
         }
-        self.nodes
-            .get(node_id)
-            .filter(|entry| !entry.revoked && entry.authority.try_read().is_ok())
-            .and_then(|entry| entry.session.as_ref())
-            .filter(|active| active.ready)
+        let entry = self.nodes.get(node_id).filter(|entry| !entry.revoked)?;
+        let active = entry.session.as_ref().filter(|active| active.ready)?;
+        Some((entry, active))
     }
 }
 
@@ -443,6 +490,7 @@ struct Reserved {
     outbound: mpsc::Sender<Outbound>,
     cancel: Option<watch::Sender<()>>,
     clock: Arc<dyn MonoClock>,
+    authority: Option<OwnedRwLockReadGuard<()>>,
 }
 
 impl CommandPermit for Reserved {
@@ -469,14 +517,17 @@ impl ThreadPermit for Reserved {
     }
 
     fn submit(
-        self: Box<Self>,
+        mut self: Box<Self>,
         request: ThreadDeliverPayload,
     ) -> BoxFuture<'static, Result<ThreadAckPayload, SubmitError>> {
+        let Some(authority) = self.authority.take() else {
+            return Box::pin(std::future::ready(Err(SubmitError::Unavailable)));
+        };
         let deadline = self
             .clock
             .deadline_after(Duration::from_millis(request.admission_budget_ms));
         Box::pin(send(self, request, deadline, |request| {
-            Outbound::Thread(Box::new(request))
+            Outbound::Thread(Box::new(request), authority)
         }))
     }
 }
@@ -528,7 +579,10 @@ impl Drop for CancelWaiter {
 
 pub(super) enum Outbound {
     Command(Box<Request<CommandResPayload, CommandReqPayload>>),
-    Thread(Box<Request<ThreadAckPayload, ThreadDeliverPayload>>),
+    Thread(
+        Box<Request<ThreadAckPayload, ThreadDeliverPayload>>,
+        OwnedRwLockReadGuard<()>,
+    ),
 }
 
 pub(super) struct Request<T, P> {
@@ -679,14 +733,14 @@ mod tests {
         ));
         let mut threads = Vec::new();
         for _ in 0..THREAD_SLOTS {
-            if let Ok(permit) = bridge.reserve_thread(&node_id) {
+            if let Ok(permit) = bridge.reserve_thread(&node_id).await {
                 assert_eq!(permit.epoch(), 7);
                 threads.push(permit);
             }
         }
         assert_eq!(threads.len(), THREAD_SLOTS as usize);
         assert!(matches!(
-            bridge.reserve_thread(&node_id),
+            bridge.reserve_thread(&node_id).await,
             Err(ReserveError::RateLimited)
         ));
         drop(commands.pop());
@@ -698,7 +752,7 @@ mod tests {
             Err(ReserveError::Offline)
         ));
         assert!(matches!(
-            bridge.reserve_thread(&node_id),
+            bridge.reserve_thread(&node_id).await,
             Err(ReserveError::Offline)
         ));
         drop(admission);
@@ -725,6 +779,7 @@ mod tests {
         }));
         let permit = bridge
             .reserve_thread(&node_id)
+            .await
             .map_err(|_| "could not reserve a thread slot")?;
         let mut submit = permit.submit(ThreadDeliverPayload {
             delivery_generation: 0,
@@ -743,7 +798,9 @@ mod tests {
             std::task::Poll::Ready(())
         })
         .await;
-        let Outbound::Thread(request) = incoming.recv().await.ok_or("no queued delivery")? else {
+        let Outbound::Thread(request, _authority) =
+            incoming.recv().await.ok_or("no queued delivery")?
+        else {
             return Err("unexpected queued command".into());
         };
         assert!(!request.reply.is_cancelled());

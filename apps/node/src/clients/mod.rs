@@ -141,6 +141,8 @@ pub struct SpawnedManagedProcess {
 pub enum SpawnManagedError {
     #[error("The managed process was already spawned for this open")]
     AlreadySpawned,
+    #[error("Admission expired before launching the managed process")]
+    AdmissionExpired,
     #[error("Could not spawn the managed process: {0}")]
     SpawnFailed(String),
     #[error("The managed process could not be verified clean: {0}")]
@@ -436,6 +438,25 @@ pub trait ClientAdapter: Send + Sync {
         handle: &'a SessionHandle,
         decision: ApprovalDecision,
     ) -> BoxFuture<'a, ApprovalRespondOutcome>;
+
+    /// Admit a delegated approval immediately before the first possible native
+    /// write. Return `None` only when expiry prevented that write. An operation
+    /// that may have written must report its outcome even after expiry.
+    /// Adapters that queue a response override this method and carry the guard
+    /// to the task that owns the writer.
+    fn respond_approval_with_admission<'a>(
+        &'a self,
+        handle: &'a SessionHandle,
+        decision: ApprovalDecision,
+        admission: &'a AdmissionGuard,
+    ) -> BoxFuture<'a, Option<ApprovalRespondOutcome>> {
+        Box::pin(async move {
+            if admission.is_expired() {
+                return None;
+            }
+            Some(self.respond_approval(handle, decision).await)
+        })
+    }
 
     fn cancel_or_stop<'a>(
         &'a self,

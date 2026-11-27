@@ -571,11 +571,11 @@ impl Socket {
     }
 
     async fn forward(&mut self, pending: &mut Pending, request: Outbound) -> SessionResult<()> {
-        let Ok(_authorized) = self.authority.clone().try_read_owned() else {
-            return Ok(());
-        };
         match request {
             Outbound::Command(request) => {
+                let Ok(_authorized) = self.authority.clone().try_read_owned() else {
+                    return Ok(());
+                };
                 let mut request = *request;
                 let id = request.payload.op_id.clone();
                 if pending.commands.contains_key(&id) {
@@ -599,7 +599,7 @@ impl Socket {
                     Awaiting::new(self.clock.as_ref(), granted, (), request.reply),
                 );
             }
-            Outbound::Thread(request) => {
+            Outbound::Thread(request, _authorized) => {
                 let mut request = *request;
                 if request.reply.is_cancelled() {
                     return Ok(());

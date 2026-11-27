@@ -690,6 +690,97 @@ async fn separate_native_approval_ids_and_unknown_application_do_not_allow_a_rep
     Ok(())
 }
 
+#[tokio::test]
+async fn delegated_approval_rechecks_admission_at_the_backpressured_socket() -> Test {
+    use std::{
+        future::{Future, poll_fn},
+        pin::Pin,
+        sync::{
+            Arc,
+            atomic::{AtomicU64, Ordering},
+        },
+        task::Poll,
+    };
+
+    use cooplet_platform::{MonoClock, MonoInstant};
+
+    #[derive(Default)]
+    struct Clock(AtomicU64);
+
+    impl MonoClock for Clock {
+        fn now(&self) -> MonoInstant {
+            MonoInstant::from_millis(self.0.load(Ordering::SeqCst))
+        }
+    }
+
+    async fn is_pending<F: Future>(mut future: Pin<&mut F>) -> bool {
+        poll_fn(|cx| Poll::Ready(future.as_mut().poll(cx).is_pending())).await
+    }
+
+    let (mut peer, handle, mut events) = live(None, true).await?;
+    let adapter = CodexAdapter::new(None);
+    peer.begin("t").await?;
+    peer.callback(
+        json!(81),
+        "item/commandExecution/requestApproval",
+        json!({}),
+    )
+    .await?;
+    let decision = ApprovalDecision {
+        approval_id: approval(&mut events).await?,
+        action: ApprovalAction::Approve,
+    };
+    let session = &handle
+        .downcast_ref::<Live>()
+        .ok_or("missing live fixture")?
+        .session;
+    let flood = session.rpc(
+        "fixture/backpressure",
+        json!({"payload":"x".repeat(2 * 1024 * 1024)}),
+    );
+    tokio::pin!(flood);
+    assert!(is_pending(flood.as_mut()).await);
+    // Let the writer start the frame, then leave the peer unread while the approval queues.
+    timeout(LIMIT, peer.0.get_ref().readable()).await??;
+
+    let clock = Arc::new(Clock::default());
+    let admission = AdmissionGuard::with_clock(Duration::from_secs(5), clock.clone());
+    let approval = adapter.respond_approval_with_admission(&handle, decision.clone(), &admission);
+    tokio::pin!(approval);
+    assert!(is_pending(approval.as_mut()).await);
+    clock.0.store(5_001, Ordering::SeqCst);
+    let request = peer.recv().await?;
+    assert_eq!(request["method"], "fixture/backpressure");
+    peer.ack(&request, Value::Null).await?;
+    assert!(flood.await.is_ok());
+    assert!(timeout(LIMIT, approval).await?.is_none());
+
+    let (fence, checked) = tokio::join!(session.rpc("fixture/fence", json!({})), async {
+        let request = peer.recv().await?;
+        assert_eq!(request["method"], "fixture/fence");
+        peer.ack(&request, Value::Null).await
+    });
+    checked?;
+    assert!(fence.is_ok());
+
+    // The unsent approval is still current. An admitted write stays uncertain
+    // when the deadline expires before its result is observed by the caller.
+    let admission = AdmissionGuard::with_clock(Duration::from_secs(5), clock.clone());
+    let approval = adapter.respond_approval_with_admission(&handle, decision, &admission);
+    tokio::pin!(approval);
+    assert!(is_pending(approval.as_mut()).await);
+    let packet = peer.recv().await?;
+    assert_eq!(packet["id"], 81);
+    assert!(packet["result"].is_object());
+    clock.0.store(11_000, Ordering::SeqCst);
+    assert!(admission.is_expired());
+    assert!(matches!(
+        approval.await,
+        Some(ApprovalRespondOutcome::Unknown(_))
+    ));
+    Ok(())
+}
+
 #[path = "../../../tests/common/codex_backend.rs"]
 mod codex_backend;
 

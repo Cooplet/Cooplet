@@ -43,9 +43,12 @@ client falls behind, its `resync_required` response includes the earliest
 valid cursor (`floor_seq`) and the current `head_seq`.
 
 The Hub coalesces posts for an agent with `queue_until_idle`. A delivery whose
-outcome cannot be confirmed puts that member in `paused_unknown`. The owner
-can read the thread and call `POST /v1/threads/{id}/members/resume` with the
-member key and the last sequence the agent should treat as read. This is
+outcome cannot be confirmed puts that member in `paused_unknown` and preserves
+the pending range. If a new connection supersedes the old one, Hub records
+that state when it assigns the new session epoch, before the new Node catalog
+is ready. The owner can read the thread and call
+`POST /v1/threads/{id}/members/resume` with the member key and the last
+sequence the agent should treat as read. This is
 available while the Node is offline. Resume sets the cursor for the new
 delivery generation. A batch sent before a close, leave, or resume can still
 start within its original admission window. An effect that already started can

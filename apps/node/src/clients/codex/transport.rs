@@ -117,7 +117,10 @@ pub(super) enum Operation {
         schema: Option<Value>,
         admission: AdmissionGuard,
     },
-    Approval(ApprovalDecision),
+    Approval {
+        decision: ApprovalDecision,
+        admission: Option<AdmissionGuard>,
+    },
     Interrupt {
         turn_id: String,
         admission: AdmissionGuard,
@@ -128,6 +131,7 @@ impl Operation {
     fn admission(&self) -> Option<&AdmissionGuard> {
         match self {
             Self::Turn { admission, .. } | Self::Interrupt { admission, .. } => Some(admission),
+            Self::Approval { admission, .. } => admission.as_ref(),
             _ => None,
         }
     }
@@ -446,7 +450,7 @@ fn send(
             };
             observed.begin_submit(input, schema.is_some());
         }
-        Operation::Approval(_) => {
+        Operation::Approval { .. } => {
             observed.approvals.consume_current();
             // A response is a JSON-RPC result, with no acknowledgement for the answering client.
             let _ = result.send(Err(Failure::Uncertain(
@@ -524,7 +528,13 @@ fn prepare(operation: &Operation, observed: &Observations, id: u64) -> Result<Pr
             }
             Ok(rpc("turn/start", params, Exchange::Turn))
         }
-        Operation::Approval(decision) => {
+        Operation::Approval {
+            decision,
+            admission,
+        } => {
+            if admission.as_ref().is_some_and(AdmissionGuard::is_expired) {
+                return Err(Failure::Expired);
+            }
             let callback = observed
                 .approvals
                 .current()

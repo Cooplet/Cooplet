@@ -58,7 +58,7 @@ pub(crate) async fn post(
         let board = store::board(ctx.tx, &id, ctx.now)?;
         store::require_open(&board)?;
         let post = compose_post(ctx, &board, author, body)?;
-        store_post(ctx, &id, &post, op_id)?;
+        store_post(ctx, &board, &post, op_id)?;
         ctx.posted_seq = Some(post.seq);
         let receipt = ThreadPostReceipt {
             post_id: post.post_id.clone(),
@@ -264,11 +264,13 @@ fn body_mention_tokens(body: &str) -> impl Iterator<Item = &str> {
 
 fn store_post(
     ctx: &Mutation<'_>,
-    id: &ThreadId,
+    board: &ThreadSummary,
     post: &ThreadPostWire,
     op_id: &OperationId,
 ) -> Result<(), HubError> {
+    let id = &board.thread_id;
     let expiry = post.created_at_ms.saturating_add(RETENTION_MS);
+    let mentions = serde_json::to_string(&post.mentions)?;
     attach_blobs(ctx, id, post, expiry)?;
     ctx.tx.execute(
         "INSERT INTO thread_posts(thread_id,seq,post_id,author_actor_id,author_kind,author_handle,
@@ -277,14 +279,51 @@ fn store_post(
          VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15)",
         params![id.as_str(), post.seq, post.post_id.as_str(), post.author_actor_id, post.author_kind.as_str(),
             post.author_handle, post.in_reply_to_post_id.as_ref().map(MessageId::as_str), post.body,
-            serde_json::to_string(&post.mentions)?, serde_json::to_string(&post.attachments)?,
+            mentions, serde_json::to_string(&post.attachments)?,
             post.question.as_ref().map(serde_json::to_string).transpose()?,
             post.answer.as_ref().map(serde_json::to_string).transpose()?,
             op_id.as_str(), post.created_at_ms, expiry],
     )?;
+    if expiry > ctx.now {
+        defer_direct_wakes(ctx, board, post, &mentions)?;
+    }
     ctx.tx.execute(
         "UPDATE threads SET head_seq=?1, updated_at_ms=?2 WHERE thread_id=?3",
         params![post.seq, post.created_at_ms, id.as_str()],
+    )?;
+    Ok(())
+}
+
+fn defer_direct_wakes(
+    ctx: &Mutation<'_>,
+    board: &ThreadSummary,
+    post: &ThreadPostWire,
+    mentions: &str,
+) -> rusqlite::Result<()> {
+    // When explicit recovery will defer this direct wake, record it with
+    // the post. Its lifetime can outlast the posts that first armed recovery.
+    ctx.tx.execute(
+        "UPDATE thread_members AS m SET resume_through_seq=?2
+         WHERE m.thread_id=?1 AND m.state='active' AND m.delivery_mode='direct_now'
+           AND m.resume_through_seq<?2 AND m.pending_delivery_id IS NULL
+           AND m.role!='observer' AND m.wake_policy!='muted' AND m.member_key!=?3
+           AND (m.wake_policy='all' OR EXISTS(
+               SELECT 1 FROM json_each(?4) WHERE value IN ('all',m.member_key)
+           ))
+           AND EXISTS(
+               SELECT 1 FROM nodes n JOIN node_participants p USING(node_id)
+               WHERE n.node_id=m.node_id AND n.status='online' AND n.revoked_at_ms IS NULL
+                 AND p.participant_id=m.participant_id AND p.synced_epoch=n.session_epoch AND p.kind='agent'
+           )
+           AND EXISTS(
+               SELECT 1 FROM thread_posts prior
+               WHERE prior.thread_id=m.thread_id AND prior.seq>MAX(?5,m.confirmed_seq)
+                 AND prior.seq<=m.resume_through_seq AND prior.author_actor_id!=m.member_key
+                 AND (m.wake_policy='all' OR EXISTS(
+                     SELECT 1 FROM json_each(prior.mentions_json) WHERE value IN ('all',m.member_key)
+                 ))
+           )",
+        params![board.thread_id.as_str(), post.seq, post.author_actor_id, mentions, board.floor_seq],
     )?;
     Ok(())
 }

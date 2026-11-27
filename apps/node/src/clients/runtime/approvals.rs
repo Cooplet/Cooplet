@@ -379,16 +379,22 @@ async fn send_approval(
             return None;
         }
         started.store(true, Ordering::Relaxed);
-        Some(
-            tokio::time::timeout(
-                APPROVAL_TIMEOUT,
-                live.adapter.respond_approval(&live.handle, decision),
-            )
-            .await
-            .unwrap_or_else(|_| {
-                ApprovalRespondOutcome::Unknown("approval acknowledgment timed out".into())
-            }),
-        )
+        tokio::time::timeout(APPROVAL_TIMEOUT, async {
+            match admission {
+                Some(guard) => {
+                    live.adapter
+                        .respond_approval_with_admission(&live.handle, decision, guard)
+                        .await
+                }
+                None => Some(live.adapter.respond_approval(&live.handle, decision).await),
+            }
+        })
+        .await
+        .unwrap_or_else(|_| {
+            Some(ApprovalRespondOutcome::Unknown(
+                "approval acknowledgment timed out".into(),
+            ))
+        })
     };
     tokio::select! {
         biased;

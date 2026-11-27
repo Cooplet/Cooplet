@@ -267,6 +267,7 @@ async fn allocate_epoch(
                     },
                 )?);
             }
+            crate::threads::pause_node_pending(tx, &hub_id, &key.node_id, now, &mut events)?;
             if deadline.is_expired() || shutdown.has_changed().unwrap_or(true) {
                 return Err(handshake_expired().into());
             }

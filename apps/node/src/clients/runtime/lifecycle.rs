@@ -533,7 +533,11 @@ impl AgentService {
             },
             None => SessionOpenMode::Create,
         };
-        let spawner = Arc::new(OpeningSpawner::new(self.clone(), key.clone()));
+        let spawner = Arc::new(OpeningSpawner::new(
+            self.clone(),
+            key.clone(),
+            admission.cloned(),
+        ));
         let request = SessionOpenRequest {
             preparation: preparation.clone(),
             participant_id: key.0.clone(),
@@ -567,7 +571,10 @@ impl AgentService {
             .await;
         // A detached spawn may still be publishing its process identity.
         // Rollback needs ownership settled before it checks for the child.
-        spawner.seal().await;
+        let launch_expired = spawner.seal().await;
+        if launch_expired && result.is_err() {
+            return Err(admission_expired());
+        }
         let opened = result?;
         opened.native_key.validate(&plan.client_kind)?;
         if let Some(previous) = &plan.previous

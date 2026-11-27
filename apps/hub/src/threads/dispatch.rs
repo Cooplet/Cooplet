@@ -206,10 +206,13 @@ impl Sweep {
         mode: Mode,
         staged_revision: u64,
     ) -> Attempt {
-        if state.shutdown.has_changed().unwrap_or(true) {
-            return Attempt::Offline;
-        }
-        let permit = match state.bridge.reserve_thread(node_id) {
+        let mut shutdown = state.shutdown.clone();
+        let reserved = tokio::select! {
+            biased;
+            _ = shutdown.changed() => return Attempt::Offline,
+            reserved = state.bridge.reserve_thread(node_id) => reserved,
+        };
+        let permit = match reserved {
             Ok(permit) => permit,
             Err(ReserveError::Offline) => return Attempt::Offline,
             Err(ReserveError::RateLimited) => return Attempt::Saturated,
@@ -724,6 +727,23 @@ pub(crate) fn recover_pending(
     pause_pending(tx, hub_id, None, now, notices)
 }
 
+pub(crate) fn pause_node_pending(
+    tx: &Transaction<'_>,
+    hub_id: &HubId,
+    node_id: &NodeId,
+    now: i64,
+    notices: &mut Vec<EventNotice>,
+) -> rusqlite::Result<()> {
+    let previous = notices.len();
+    pause_pending(tx, hub_id, Some(node_id), now, notices)?;
+    if notices.len() > previous
+        && let Some(last) = notices.last()
+    {
+        events::advance_head(tx, last.seq)?;
+    }
+    Ok(())
+}
+
 fn pause_pending(
     tx: &Transaction<'_>,
     hub_id: &HubId,
@@ -731,11 +751,15 @@ fn pause_pending(
     now: i64,
     notices: &mut Vec<EventNotice>,
 ) -> rusqlite::Result<()> {
-    let mut statement = tx.prepare_cached(
+    let mut statement = tx.prepare_cached(if node_id.is_some() {
         "UPDATE thread_members SET state='paused_unknown',resume_through_seq=NULL
-          WHERE state='active' AND pending_delivery_id IS NOT NULL AND (?1 IS NULL OR node_id=?1)
-          RETURNING thread_id,member_key",
-    )?;
+         WHERE node_id=?1 AND state='active' AND pending_delivery_id IS NOT NULL
+         RETURNING thread_id,member_key"
+    } else {
+        "UPDATE thread_members SET state='paused_unknown',resume_through_seq=NULL
+         WHERE ?1 IS NULL AND state='active' AND pending_delivery_id IS NOT NULL
+         RETURNING thread_id,member_key"
+    })?;
     let keys = statement
         .query_map([node_id.map(NodeId::as_str)], |row| {
             Ok((parse_col::<ThreadId>(row, 0)?, row.get::<_, String>(1)?))

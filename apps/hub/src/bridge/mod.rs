@@ -55,8 +55,11 @@ pub(crate) trait ThreadPermit: Send {
 pub(crate) trait BridgeRegistry: Send + Sync {
     fn reserve(&self, node_id: &NodeId) -> Result<Box<dyn CommandPermit>, ReserveError>;
 
-    fn reserve_thread(&self, _node_id: &NodeId) -> Result<Box<dyn ThreadPermit>, ReserveError> {
-        Err(ReserveError::Offline)
+    fn reserve_thread<'a>(
+        &'a self,
+        _node_id: &'a NodeId,
+    ) -> BoxFuture<'a, Result<Box<dyn ThreadPermit>, ReserveError>> {
+        Box::pin(std::future::ready(Err(ReserveError::Offline)))
     }
 
     fn live(&self) -> Option<&LiveBridge> {

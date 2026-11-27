@@ -4,8 +4,8 @@ use cooplet_protocol::{
     ApprovalWaitKind, BRIDGE_ERROR_HEADER, BRIDGE_SUBPROTOCOL, BridgeFrame, BridgePayload,
     ErrorCode, HelloAckPayload, HubId, MemberView, ParticipantId, ParticipantKind,
     ParticipantState, ParticipantWire, RosterReadyPayload, RosterSyncPayload, TemplateSummary,
-    ThreadAckPayload, ThreadDeliverPayload, ThreadDeliveryOutcome, ThreadMembersResponse,
-    ThreadSummary,
+    ThreadAckPayload, ThreadDeliverPayload, ThreadDeliveryOutcome, ThreadMemberState,
+    ThreadMembersResponse, ThreadSummary,
 };
 use futures_util::{SinkExt, StreamExt};
 use http::{HeaderValue, Request, StatusCode, header};
@@ -123,6 +123,25 @@ fn roster() -> RosterSyncPayload {
         unresolved_thread_fences: Vec::new(),
         resolved_op_receipts: Vec::new(),
     }
+}
+
+fn agent_roster(participant_id: ParticipantId) -> RosterSyncPayload {
+    let mut initial = roster();
+    initial.participants.push(ParticipantWire {
+        participant_id,
+        kind: ParticipantKind::Agent,
+        name: "coordinator".into(),
+        client_kind: Some("mock".into()),
+        workspace_dir: None,
+        state: ParticipantState::Idle,
+        capabilities: json!({}),
+        wait_kind: None,
+        approval_id: None,
+        action_hint: None,
+        summary: None,
+        can_respond_remotely: None,
+    });
+    initial
 }
 
 async fn ready(socket: &mut Socket, epoch: u64, roster: &RosterSyncPayload) -> TestResult {
@@ -308,21 +327,7 @@ async fn resume_skips_previously_sent_posts_and_ignores_the_old_ack() -> TestRes
     let enrolled = enroll(&hub, "Worker", "bridge-resume-epoch").await?;
     let (mut socket, epoch) = open(&hub, &enrolled).await?;
     let participant = ParticipantId::generate()?;
-    let mut initial = roster();
-    initial.participants.push(ParticipantWire {
-        participant_id: participant.clone(),
-        kind: ParticipantKind::Agent,
-        name: "coordinator".into(),
-        client_kind: Some("mock".into()),
-        workspace_dir: None,
-        state: ParticipantState::Idle,
-        capabilities: json!({}),
-        wait_kind: None,
-        approval_id: None,
-        action_hint: None,
-        summary: None,
-        can_respond_remotely: None,
-    });
+    let initial = agent_roster(participant.clone());
     ready(&mut socket, epoch, &initial).await?;
     let admin = hub.admin()?;
     let member = format!("{}/{participant}", enrolled.node_id);
@@ -427,5 +432,100 @@ async fn bridge_closes_binary_and_oversized_frames() -> TestResult {
     let text = "x".repeat(cooplet_protocol::MAX_WS_FRAME_BYTES + 1);
     oversized.send(Message::Text(text.into())).await?;
     close_code(&mut oversized, 1009, "bridge_frame_too_large").await?;
+    Ok(())
+}
+
+#[tokio::test]
+async fn an_unready_replacement_or_revoke_pauses_the_old_unacknowledged_range() -> TestResult {
+    let hub = Hub::start().await?;
+    let admin = hub.admin()?;
+    for revoke in [false, true] {
+        let mode = if revoke { "revoked" } else { "replaced" };
+        let enrolled = enroll(&hub, "Worker", &format!("enroll-{mode}")).await?;
+        let (mut old, epoch) = open(&hub, &enrolled).await?;
+        let participant = ParticipantId::generate()?;
+        ready(&mut old, epoch, &agent_roster(participant.clone())).await?;
+        let member = format!("{}/{participant}", enrolled.node_id);
+        let board: ThreadSummary = admin
+            .post_json(
+                "/v1/threads",
+                &json!({
+                    "title":"Recover an interrupted range",
+                    "members":[{"member_key":member,"handle":"coordinator"}],
+                }),
+                Some(&format!("thread-{mode}")),
+            )
+            .await?;
+        let prefix = format!("/v1/threads/{}", board.thread_id);
+        let _: Value = admin
+            .post_json(
+                &format!("{prefix}/posts"),
+                &json!({"body":"@coordinator interrupted range"}),
+                Some(&format!("post-{mode}")),
+            )
+            .await?;
+        let delivery: ThreadDeliverPayload = frame(&mut old).await?.decode_payload()?;
+
+        if revoke {
+            let revoked: Value = admin
+                .post_json(
+                    &format!("/v1/nodes/{}/revoke", enrolled.node_id),
+                    &json!({}),
+                    Some("revoke-live-range"),
+                )
+                .await?;
+            assert_eq!(revoked["revoked"], true);
+            close_code(&mut old, 4003, "node_revoked").await?;
+            assert_eq!(summary(&hub, &enrolled).await?["status"], "revoked");
+        } else {
+            let (mut replacement, next_epoch) = open(&hub, &enrolled).await?;
+            assert_eq!(next_epoch, epoch + 1);
+            close_code(&mut old, 4001, "superseded_by_new_epoch").await?;
+            replacement.send(Message::Close(None)).await?;
+            let closed = timeout(DEADLINE, replacement.next())
+                .await?
+                .ok_or("replacement did not echo close")??;
+            assert!(matches!(closed, Message::Close(_)));
+            drop(replacement);
+            let item = summary(&hub, &enrolled).await?;
+            assert_eq!(item["status"], "offline");
+            assert_eq!(item["session_epoch"], next_epoch);
+        }
+
+        let members: ThreadMembersResponse =
+            admin.get_json(&format!("{prefix}/members"), &[]).await?;
+        let current = members
+            .items
+            .iter()
+            .find(|view| view.member_key == member)
+            .ok_or("thread member disappeared after its session ended")?;
+        assert_eq!(current.state, ThreadMemberState::PausedUnknown);
+        assert_eq!(current.confirmed_seq, 0);
+        let pending = current
+            .pending
+            .as_ref()
+            .ok_or("interrupted range was discarded")?;
+        assert_eq!(pending.delivery_id, delivery.delivery_id);
+        assert_eq!(
+            (pending.from_seq, pending.to_seq),
+            (delivery.from_seq, delivery.to_seq)
+        );
+        if !revoke {
+            let resumed: MemberView = admin
+                .post_json(
+                    &format!("{prefix}/members/resume"),
+                    &json!({"member_key":member,"after_seq":delivery.to_seq}),
+                    Some("resume-while-replacement-offline"),
+                )
+                .await?;
+            assert_eq!(resumed.state, ThreadMemberState::Active);
+            assert_eq!(
+                resumed.delivery_generation,
+                delivery.delivery_generation + 1
+            );
+            assert_eq!(resumed.confirmed_seq, delivery.to_seq);
+            assert!(resumed.pending.is_none());
+        }
+    }
     Ok(())
 }

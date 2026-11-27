@@ -165,7 +165,7 @@ CREATE TABLE thread_members (
                         CHECK (state IN ('active','paused_unknown','left')),
     delivery_generation INTEGER NOT NULL DEFAULT 0 CHECK (delivery_generation >= 0),
     confirmed_seq       INTEGER NOT NULL DEFAULT 0,
-    -- The head observed at explicit resume, while a direct member awaits one recovery delivery.
+    -- The head at explicit resume, extended by relevant direct wakes deferred into recovery.
     resume_through_seq  INTEGER,
     pending_delivery_id TEXT,
     pending_from_seq    INTEGER,

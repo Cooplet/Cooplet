@@ -3,7 +3,7 @@ use std::{
     error::Error,
     fs,
     path::PathBuf,
-    sync::atomic::{AtomicBool, Ordering},
+    sync::atomic::{AtomicBool, AtomicI64, Ordering},
 };
 
 use cooplet_platform::PrivateFs;
@@ -141,6 +141,7 @@ fn queue_coalesces_once_idle_and_cannot_accept_an_old_generation_ack() -> TestRe
 }
 
 const TEST_EPOCH: u64 = 5;
+const TEST_NOW: i64 = 1_800_000_000_000;
 const STEP_TIMEOUT: Duration = Duration::from_secs(2);
 
 struct AttemptOnWire {
@@ -184,18 +185,23 @@ impl BridgeRegistry for ControlledBridge {
         Err(ReserveError::Offline)
     }
 
-    fn reserve_thread(&self, _: &NodeId) -> Result<Box<dyn ThreadPermit>, ReserveError> {
-        if !self.online.load(Ordering::Acquire) {
-            return Err(ReserveError::Offline);
-        }
-        if let Ok(slot) = self.free_slot.clone().try_acquire_owned() {
-            return Ok(Box::new(ControlledPermit {
-                slot,
-                sent: self.sent.clone(),
-            }));
-        }
-        let _ = self.saturated.send(());
-        Err(ReserveError::RateLimited)
+    fn reserve_thread<'a>(
+        &'a self,
+        _: &'a NodeId,
+    ) -> BoxFuture<'a, Result<Box<dyn ThreadPermit>, ReserveError>> {
+        Box::pin(async move {
+            if !self.online.load(Ordering::Acquire) {
+                return Err(ReserveError::Offline);
+            }
+            if let Ok(slot) = self.free_slot.clone().try_acquire_owned() {
+                return Ok(Box::new(ControlledPermit {
+                    slot,
+                    sent: self.sent.clone(),
+                }) as Box<dyn ThreadPermit>);
+            }
+            let _ = self.saturated.send(());
+            Err(ReserveError::RateLimited)
+        })
     }
 
     fn disconnect_revoked(&self, _: &NodeId) {
@@ -241,6 +247,7 @@ struct Fixture {
     engine: StorageEngine,
     shutdown: watch::Sender<()>,
     state: AppState,
+    wall: Arc<AtomicI64>,
     admin: AuthenticatedCaller,
     bridge: Arc<ControlledBridge>,
     attempts: mpsc::UnboundedReceiver<AttemptOnWire>,
@@ -280,7 +287,9 @@ impl Fixture {
             signal,
             DEFAULT_MAX_BLOB_BYTES,
         )?;
-        state.wall_clock = Arc::new(|| 1_800_000_000_000);
+        let wall = Arc::new(AtomicI64::new(TEST_NOW));
+        let injected = wall.clone();
+        state.wall_clock = Arc::new(move || injected.load(Ordering::Relaxed));
         let admin = auth::authenticate(
             &state.reads,
             &state.master,
@@ -309,6 +318,7 @@ impl Fixture {
             scratch,
             engine: storage.engine,
             state,
+            wall,
             admin,
             shutdown,
             bridge,
@@ -343,6 +353,17 @@ impl Fixture {
 
     fn member_key(&self) -> String {
         format!("{}/{}", self.node, self.worker)
+    }
+
+    async fn resume_through(&self, thread: &ThreadId) -> TestResult<Option<u64>> {
+        let thread = thread.clone();
+        let key = self.member_key();
+        Ok(self.state.reads.read(move |db| {
+            Ok(db.query_row(
+                "SELECT resume_through_seq FROM thread_members WHERE thread_id=?1 AND member_key=?2",
+                params![thread.as_str(), key], |row| row.get(0),
+            )?)
+        }).await?)
     }
 
     async fn post(
@@ -543,12 +564,76 @@ async fn offline_direct_resume_delivers_once_after_idle_and_preserves_normal_dir
     fixture.set_worker(ParticipantState::Idle).await?;
     fixture.settle().await?;
 
-    let has_resume = fixture.state.reads.read(move |db| {
-        Ok(db.query_row(
-            "SELECT resume_through_seq IS NOT NULL FROM thread_members WHERE thread_id=?1 AND member_key=?2",
-            params![board.as_str(), key], |row| row.get::<_, bool>(0),
-        )?)
-    }).await?;
-    assert!(!has_resume);
+    assert_eq!(fixture.resume_through(&board).await?, None);
+    fixture.close().await
+}
+
+#[tokio::test]
+async fn deferred_direct_wake_survives_expiry_of_the_original_recovery_range() -> TestResult {
+    let mut fixture = Fixture::new(true).await?;
+    let thread = fixture.board(DeliveryMode::DirectNow).await?;
+    let first = fixture
+        .post(&thread, "expiry-recovery-first", "@worker first")
+        .await?;
+    fixture
+        .attempt()
+        .await?
+        .complete(ThreadDeliveryOutcome::Unknown)?;
+    fixture.settle().await?;
+
+    let expiry = first.created_at_ms + threads::RETENTION_MS;
+    fixture.wall.store(expiry - 1, Ordering::Relaxed);
+    let resumed = threads::resume(
+        &fixture.state,
+        &fixture.admin,
+        thread.clone(),
+        "expiry-recovery-resume",
+        ThreadMemberResumeRequest {
+            member_key: Some(fixture.member_key()),
+            after_seq: 0,
+        },
+    )
+    .await?;
+    assert_eq!(resumed.delivery_generation, 1);
+    assert_eq!(fixture.resume_through(&thread).await?, Some(1));
+
+    fixture
+        .post(&thread, "expiry-recovery-context", "More context")
+        .await?;
+    fixture.settle().await?;
+    assert_eq!(fixture.resume_through(&thread).await?, Some(1));
+    let deferred = fixture
+        .post(&thread, "expiry-recovery-deferred", "@worker new request")
+        .await?;
+    fixture.settle().await?;
+    assert_eq!(fixture.resume_through(&thread).await?, Some(deferred.seq));
+
+    fixture.wall.store(expiry + 1, Ordering::Relaxed);
+    assert_eq!(
+        threads::get(&fixture.state, &fixture.admin, thread.clone())
+            .await?
+            .floor_seq,
+        1
+    );
+    fixture.set_worker(ParticipantState::Idle).await?;
+    let recovered = fixture.attempt().await?;
+    assert_eq!(
+        (recovered.payload.from_seq, recovered.payload.to_seq),
+        (1, deferred.seq)
+    );
+    assert_eq!(recovered.payload.delivery_generation, 1);
+    assert!(recovered.payload.truncated_earlier);
+    assert_eq!(
+        recovered
+            .payload
+            .posts
+            .iter()
+            .map(|post| post.seq)
+            .collect::<Vec<_>>(),
+        vec![2, 3]
+    );
+    recovered.complete(ThreadDeliveryOutcome::Delivered)?;
+    fixture.settle().await?;
+    assert_eq!(fixture.resume_through(&thread).await?, None);
     fixture.close().await
 }

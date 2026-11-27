@@ -1,7 +1,8 @@
 use std::{collections::hash_map::Entry, process::Command, sync::Arc, time::Duration};
 
 use cooplet_platform::{
-    PendingCleanup, PlatformError, ProcessHandle, ProcessIdentity, SpawnError, TerminateOutcome,
+    AdmissionGuard, PendingCleanup, PlatformError, ProcessHandle, ProcessIdentity, SpawnError,
+    TerminateOutcome,
 };
 use cooplet_storage::WriteOutcome;
 use futures_util::future::BoxFuture;
@@ -42,20 +43,38 @@ impl ManagedProcess {
 pub(super) struct OpeningSpawner {
     service: AgentService,
     key: SessionKey,
-    used: Arc<Mutex<bool>>,
+    state: Arc<Mutex<OpeningState>>,
+    admission: Option<AdmissionGuard>,
+}
+
+enum OpeningState {
+    Available,
+    Sealed,
+    AdmissionExpired,
 }
 
 impl OpeningSpawner {
-    pub(super) fn new(service: AgentService, key: SessionKey) -> Self {
+    pub(super) fn new(
+        service: AgentService,
+        key: SessionKey,
+        admission: Option<AdmissionGuard>,
+    ) -> Self {
         Self {
             service,
             key,
-            used: Arc::new(Mutex::new(false)),
+            state: Arc::new(Mutex::new(OpeningState::Available)),
+            admission,
         }
     }
 
-    pub(super) async fn seal(&self) {
-        *self.used.lock().await = true;
+    /// Wait for the current launch attempt and prevent another. The result
+    /// records expiry proven by the worker at the process creation boundary.
+    pub(super) async fn seal(&self) -> bool {
+        let mut state = self.state.lock().await;
+        if matches!(*state, OpeningState::Available) {
+            *state = OpeningState::Sealed;
+        }
+        matches!(*state, OpeningState::AdmissionExpired)
     }
 }
 
@@ -65,16 +84,20 @@ impl ManagedProcessSpawner for OpeningSpawner {
         command: Command,
     ) -> BoxFuture<'_, Result<SpawnedManagedProcess, SpawnManagedError>> {
         Box::pin(async move {
-            let mut used = self.used.clone().lock_owned().await;
-            if *used {
+            let mut state = self.state.clone().lock_owned().await;
+            if !matches!(*state, OpeningState::Available) {
                 return Err(SpawnManagedError::AlreadySpawned);
             }
-            *used = true;
+            *state = OpeningState::Sealed;
             let service = self.service.clone();
             let key = self.key.clone();
+            let admission = self.admission.clone();
             tokio::spawn(async move {
-                let _seal = used;
-                spawn_owned(service, key, command).await
+                let result = spawn_owned(service, key, command, admission).await;
+                if matches!(&result, Err(SpawnManagedError::AdmissionExpired)) {
+                    *state = OpeningState::AdmissionExpired;
+                }
+                result
             })
             .await
             .map_err(|error| SpawnManagedError::PersistenceFailed(error.to_string()))?
@@ -86,11 +109,16 @@ async fn spawn_owned(
     service: AgentService,
     key: SessionKey,
     mut command: Command,
+    admission: Option<AdmissionGuard>,
 ) -> Result<SpawnedManagedProcess, SpawnManagedError> {
-    let result =
-        tokio::task::spawn_blocking(move || ProcessHandle::spawn_isolated_group(&mut command))
-            .await
-            .map_err(|error| SpawnManagedError::SpawnFailed(error.to_string()))?;
+    let result = tokio::task::spawn_blocking(move || {
+        if admission.as_ref().is_some_and(AdmissionGuard::is_expired) {
+            return Err(SpawnManagedError::AdmissionExpired);
+        }
+        Ok(ProcessHandle::spawn_isolated_group(&mut command))
+    })
+    .await
+    .map_err(|error| SpawnManagedError::SpawnFailed(error.to_string()))??;
     let mut handle = match result {
         Ok(handle) => handle,
         Err(SpawnError::CleanupPending { source, cleanup }) => {
@@ -465,6 +493,78 @@ mod tests {
         })
     }
 
+    #[test]
+    fn blocking_pool_delay_cannot_admit_a_managed_process_after_the_deadline() -> TestResult {
+        use std::{
+            future::{Future, poll_fn},
+            sync::atomic::{AtomicU64, Ordering},
+            task::Poll,
+        };
+
+        use cooplet_platform::{MonoClock, MonoInstant};
+        use tokio::{runtime::Builder, sync::oneshot, time::timeout};
+
+        #[derive(Default)]
+        struct Clock(AtomicU64);
+
+        impl MonoClock for Clock {
+            fn now(&self) -> MonoInstant {
+                MonoInstant::from_millis(self.0.load(Ordering::SeqCst))
+            }
+        }
+
+        Builder::new_current_thread()
+            .enable_all()
+            .max_blocking_threads(1)
+            .build()?
+            .block_on(async {
+                let fixture = fixture().await?;
+                let clock = Arc::new(Clock::default());
+                let admission = AdmissionGuard::with_clock(Duration::from_secs(30), clock.clone());
+                let (entered, occupied) = oneshot::channel();
+                let (release, blocked) = oneshot::channel();
+                let blocker = tokio::task::spawn_blocking(move || {
+                    let _ = entered.send(());
+                    let _ = blocked.blocking_recv();
+                });
+                timeout(Duration::from_secs(5), occupied).await??;
+                let path = fixture._dir.0.join("process-started");
+                let mut command = Command::new("sh");
+                command
+                    .args(["-c", "printf started > \"$1\"; exec sleep 5", "sh"])
+                    .arg(&path);
+                let key = (fixture.agent.clone(), 1);
+                let launch = spawn_owned(
+                    fixture.service.clone(),
+                    key.clone(),
+                    command,
+                    Some(admission),
+                );
+                tokio::pin!(launch);
+                // The first poll submits spawn_blocking, behind the occupied worker.
+                assert!(poll_fn(|cx| Poll::Ready(launch.as_mut().poll(cx).is_pending())).await);
+                clock.0.store(30_001, Ordering::SeqCst);
+                release.send(()).map_err(|_| "blocking worker closed")?;
+                blocker.await?;
+                assert!(matches!(
+                    launch.await,
+                    Err(SpawnManagedError::AdmissionExpired)
+                ));
+                assert!(!path.exists());
+                assert!(!fixture.service.has_owned_process(&key));
+                assert!(
+                    fixture
+                        .service
+                        .participant_row(&fixture.agent)
+                        .await?
+                        .identity
+                        .is_none()
+                );
+                fixture.engine.shutdown().await?;
+                Ok(())
+            })
+    }
+
     #[tokio::test]
     async fn process_group_is_owned_only_once_and_identity_is_durable_before_return() -> TestResult
     {
@@ -472,7 +572,7 @@ mod tests {
         let service = &fixture.service;
         let id = &fixture.agent;
         let key = (id.clone(), 1);
-        let spawner = OpeningSpawner::new(service.clone(), key.clone());
+        let spawner = OpeningSpawner::new(service.clone(), key.clone(), None);
         let mut command = Command::new("sh");
         command.args(["-c", "sleep 60 & wait"]);
         let spawned = spawner.spawn(command).await?;
@@ -499,7 +599,7 @@ mod tests {
         let fixture = fixture().await?;
         let service = &fixture.service;
         let key = (fixture.agent.clone(), 1);
-        let spawner = OpeningSpawner::new(service.clone(), key.clone());
+        let spawner = OpeningSpawner::new(service.clone(), key.clone(), None);
         let mut command = Command::new("sh");
         command.args(["-c", "read -r input"]).stdin(Stdio::piped());
         let mut spawned = spawner.spawn(command).await?;

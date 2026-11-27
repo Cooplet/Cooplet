@@ -462,6 +462,8 @@ async fn failed_open_does_not_interrupt_an_inflight_command(
         turn = required_submit(adapter, "command concurrent with failed open") => turn?,
         response = &mut existing => return Err(io::Error::other(format!("Command returned before adapter intake: {:?}", response??)).into()),
     };
+    let acknowledgement = turn.admit()?;
+    let late_ack = tokio::time::Instant::now() + Duration::from_secs(6);
     adapter.fail_next_open();
     let rejected = hub
         .admin
@@ -484,10 +486,12 @@ async fn failed_open_does_not_interrupt_an_inflight_command(
     })
     .await?;
     assert_eq!(online_epoch(&hub.admin, node).await?, epoch);
+    // Cross the native admission deadline while its accepted effect waits for an ACK.
+    tokio::time::sleep_until(late_ack).await;
     assert!(!existing.is_finished());
-    turn.finish(SubmitOutcome::Accepted {
-        native_turn_id: None,
-    })?;
+    acknowledgement
+        .send(SubmitOutcome::Accepted { native_turn_id: None })
+        .map_err(|_| io::Error::other("the admitted command no longer accepted its acknowledgement"))?;
     assert_eq!(existing.await??["delivery_state"], "delivered");
     Ok(())
 }
