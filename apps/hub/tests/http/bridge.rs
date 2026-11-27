@@ -529,3 +529,26 @@ async fn an_unready_replacement_or_revoke_pauses_the_old_unacknowledged_range() 
     }
     Ok(())
 }
+
+#[tokio::test]
+async fn shutdown_reports_a_failed_disconnect_commit() -> TestResult {
+    let mut hub = Hub::start().await?;
+    let enrolled = enroll(&hub, "Disconnect", "disconnect-commit").await?;
+    let (mut socket, epoch) = open(&hub, &enrolled).await?;
+    ready(&mut socket, epoch, &roster()).await?;
+    let db = rusqlite::Connection::open(hub.database_path())?;
+    db.execute_batch(
+        "CREATE TRIGGER fail_disconnect BEFORE INSERT ON events WHEN NEW.kind='node.disconnected'
+         BEGIN SELECT RAISE(ABORT,'simulated disconnect failure'); END;",
+    )?;
+
+    let status = hub.stop().await?;
+    assert!(!status.success());
+    let recorded: String = db.query_row(
+        "SELECT status FROM nodes WHERE node_id=?1",
+        [enrolled.node_id.as_str()],
+        |row| row.get(0),
+    )?;
+    assert_eq!(recorded, "online");
+    Ok(())
+}

@@ -21,7 +21,10 @@ use std::{
 
 use cooplet_protocol::ErrorCode;
 use cooplet_storage::{BlobDiskStore, DbActor, ReadPool, StorageEngine};
-use tokio::{sync::watch, task::JoinHandle};
+use tokio::{
+    sync::{Semaphore, watch},
+    task::JoinHandle,
+};
 
 use crate::{
     auth::RevocationWatch, bridge::BridgeRegistry, credentials::Master, error::HubError,
@@ -82,24 +85,26 @@ impl AppState {
 }
 
 #[derive(Clone)]
-pub(crate) struct BackgroundWrites(watch::Sender<WriteTasks>);
+pub(crate) struct BackgroundWrites {
+    tasks: watch::Sender<WriteTasks>,
+    writes: Arc<Semaphore>,
+}
 
 struct WriteTasks {
     open: bool,
     active: usize,
-    limit: usize,
 }
 
 impl BackgroundWrites {
     pub(crate) fn new(limit: usize) -> Self {
-        Self(
-            watch::channel(WriteTasks {
+        Self {
+            tasks: watch::channel(WriteTasks {
                 open: true,
                 active: 0,
-                limit: limit.max(1),
             })
             .0,
-        )
+            writes: Arc::new(Semaphore::new(limit.max(1))),
+        }
     }
 
     /// Own writes whose commit or post-commit notification must outlive the HTTP caller.
@@ -108,13 +113,26 @@ impl BackgroundWrites {
         F: Future + Send + 'static,
         F::Output: Send + 'static,
     {
-        let mut closed = false;
-        let accepted = self.0.send_if_modified(|tasks| {
+        let permit = self.writes.clone().try_acquire_owned().map_err(|_| {
+            HubError::new(
+                ErrorCode::Overloaded,
+                "Too many background writes are in progress.",
+            )
+        })?;
+        self.spawn_tracked(async move {
+            let _permit = permit;
+            task.await
+        })
+    }
+
+    /// Track work with its own admission bound, such as one thread dispatcher per online Node.
+    pub(crate) fn spawn_tracked<F>(&self, task: F) -> Result<JoinHandle<F::Output>, HubError>
+    where
+        F: Future + Send + 'static,
+        F::Output: Send + 'static,
+    {
+        let accepted = self.tasks.send_if_modified(|tasks| {
             if !tasks.open {
-                closed = true;
-                return false;
-            }
-            if tasks.active >= tasks.limit {
                 return false;
             }
             tasks.active += 1;
@@ -123,14 +141,10 @@ impl BackgroundWrites {
         if !accepted {
             return Err(HubError::new(
                 ErrorCode::Overloaded,
-                if closed {
-                    "The Hub is shutting down."
-                } else {
-                    "Too many background writes are in progress."
-                },
+                "The Hub is shutting down.",
             ));
         }
-        let active = ActiveWrite(self.0.clone());
+        let active = ActiveWrite(self.tasks.clone());
         Ok(tokio::spawn(async move {
             let _active = active;
             task.await
@@ -138,11 +152,15 @@ impl BackgroundWrites {
     }
 
     pub(crate) fn close(&self) {
-        self.0.send_modify(|tasks| tasks.open = false);
+        self.tasks.send_modify(|tasks| tasks.open = false);
     }
 
     pub(crate) async fn drain(&self) {
-        let _ = self.0.subscribe().wait_for(|tasks| tasks.active == 0).await;
+        let _ = self
+            .tasks
+            .subscribe()
+            .wait_for(|tasks| tasks.active == 0)
+            .await;
     }
 }
 

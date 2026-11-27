@@ -350,7 +350,7 @@ pub(crate) async fn leave(
             return Err(store::conflict("The last owner cannot leave while other members remain.", "last_owner"));
         }
         ctx.tx.execute(
-            "UPDATE thread_members SET state='left',left_at_ms=?1,resume_through_seq=NULL
+            "UPDATE thread_members SET state='left',left_at_ms=?1,resume_through_seq=NULL,last_wake_seq=0
              WHERE thread_id=?2 AND member_key=?3",
             params![ctx.now, id.as_str(), key],
         )?;

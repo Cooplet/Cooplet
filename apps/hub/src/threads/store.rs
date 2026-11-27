@@ -250,7 +250,6 @@ pub(super) struct Mutation<'a> {
     pub(super) now: i64,
     hub_id: &'a HubId,
     events: Vec<EventNotice>,
-    pub(super) posted_seq: Option<u64>,
 }
 
 impl Mutation<'_> {
@@ -341,7 +340,6 @@ where
                         now,
                         hub_id: &hub_id,
                         events: Vec::new(),
-                        posted_seq: None,
                     };
                     let (thread_id, data) = apply(&mut ctx, &operation_id)?;
                     let receipt = serde_json::to_string(&data).map_err(HubError::from)?;
@@ -362,19 +360,19 @@ where
                         events::advance_head(tx, last.seq)?;
                     }
                     Ok::<_, WriteError<HubError>>(WriteOutcome::with_events(
-                        (data, Some((thread_id, ctx.posted_seq))),
+                        (data, Some(thread_id)),
                         ctx.events,
                     ))
                 })
                 .await;
             match result {
                 Ok((data, changed)) => {
-                    if let Some((thread_id, posted_seq)) = changed {
+                    if let Some(thread_id) = changed {
                         if operation.invalidates_acl() {
                             invalidate_acl(&state);
                         }
                         if matches!(operation.kind, "thread.post" | "thread.member.resume") {
-                            super::dispatch::wake_thread(&state, thread_id, posted_seq).await;
+                            super::dispatch::wake_thread(&state, thread_id).await;
                         }
                     }
                     Ok(data)
@@ -388,24 +386,14 @@ where
                     let thread_id = operation.thread_id.clone();
                     let kind = operation.kind;
                     let replay = verified_read(&state, &caller, move |tx, caller, now| {
-                        let data = operation.replay(tx, caller, now)?;
-                        let posted_seq = if data.is_some() && kind == "thread.post" {
-                            tx.query_row(
-                            "SELECT p.seq FROM thread_posts p JOIN operations o USING(operation_id)
-                             WHERE o.actor_id=?1 AND o.operation_key=?2",
-                            params![caller.actor_id(), operation.key], |row| row.get(0),
-                        ).optional()?
-                        } else {
-                            None
-                        };
-                        Ok(data.map(|value| (value, posted_seq)))
+                        operation.replay(tx, caller, now)
                     })
                     .await?;
-                    if let Some((data, posted_seq)) = replay {
+                    if let Some(data) = replay {
                         if let Some(thread_id) = thread_id
                             && matches!(kind, "thread.post" | "thread.member.resume")
                         {
-                            super::dispatch::wake_thread(&state, thread_id, posted_seq).await;
+                            super::dispatch::wake_thread(&state, thread_id).await;
                         }
                         return Ok(data);
                     }
@@ -441,7 +429,6 @@ where
                 now,
                 hub_id: &hub_id,
                 events: Vec::new(),
-                posted_seq: None,
             };
             let value = apply(&mut ctx)?;
             if let Some(last) = ctx.events.last() {

@@ -213,16 +213,13 @@ impl LiveBridge {
     async fn reserve_thread_in_session(
         &self,
         node_id: &NodeId,
-        direct_epoch: Option<u64>,
+        wait_for_slot: bool,
     ) -> Result<Reserved, ReserveError> {
         let (authority, slots, identity, mut closed) = {
             let registry = self.lock();
             let (entry, active) = registry
                 .registered_ready(node_id)
                 .ok_or(ReserveError::Offline)?;
-            if direct_epoch.is_some_and(|epoch| epoch != active.identity.epoch) {
-                return Err(ReserveError::Offline);
-            }
             (
                 entry.authority.clone(),
                 active.threads.clone(),
@@ -230,7 +227,7 @@ impl LiveBridge {
                 active.close.subscribe(),
             )
         };
-        let permit = if direct_epoch.is_some() {
+        let permit = if wait_for_slot {
             tokio::select! {
                 biased;
                 _ = closed.wait_for(Option::is_some) => return Err(ReserveError::Offline),
@@ -327,11 +324,11 @@ impl BridgeRegistry for LiveBridge {
     fn reserve_thread<'a>(
         &'a self,
         node_id: &'a NodeId,
-        direct_epoch: Option<u64>,
+        wait_for_slot: bool,
     ) -> BoxFuture<'a, Result<Box<dyn ThreadPermit>, ReserveError>> {
         Box::pin(async move {
             let reserved = self
-                .reserve_thread_in_session(node_id, direct_epoch)
+                .reserve_thread_in_session(node_id, wait_for_slot)
                 .await?;
             Ok(Box::new(reserved) as Box<dyn ThreadPermit>)
         })
@@ -751,14 +748,14 @@ mod tests {
         ));
         let mut threads = Vec::new();
         for _ in 0..THREAD_SLOTS {
-            if let Ok(permit) = bridge.reserve_thread(&node_id, None).await {
+            if let Ok(permit) = bridge.reserve_thread(&node_id, false).await {
                 assert_eq!(permit.epoch(), 7);
                 threads.push(permit);
             }
         }
         assert_eq!(threads.len(), THREAD_SLOTS as usize);
         assert!(matches!(
-            bridge.reserve_thread(&node_id, None).await,
+            bridge.reserve_thread(&node_id, false).await,
             Err(ReserveError::RateLimited)
         ));
         drop(commands.pop());
@@ -771,7 +768,7 @@ mod tests {
             .threads
             .clone();
         let _occupied = slots.try_acquire_many_owned(THREAD_SLOTS)?;
-        let mut direct = bridge.reserve_thread(&node_id, Some(7));
+        let mut direct = bridge.reserve_thread(&node_id, true);
         std::future::poll_fn(|cx| {
             assert!(direct.as_mut().poll(cx).is_pending());
             std::task::Poll::Ready(())
@@ -787,7 +784,7 @@ mod tests {
             Err(ReserveError::Offline)
         ));
         assert!(matches!(
-            bridge.reserve_thread(&node_id, None).await,
+            bridge.reserve_thread(&node_id, false).await,
             Err(ReserveError::Offline)
         ));
         drop(admission);
@@ -813,7 +810,7 @@ mod tests {
             epoch: 7,
         }));
         let permit = bridge
-            .reserve_thread(&node_id, None)
+            .reserve_thread(&node_id, false)
             .await
             .map_err(|_| "could not reserve a thread slot")?;
         let mut submit = permit.submit(ThreadDeliverPayload {

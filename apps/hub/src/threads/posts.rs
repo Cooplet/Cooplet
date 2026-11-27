@@ -59,7 +59,6 @@ pub(crate) async fn post(
         store::require_open(&board)?;
         let post = compose_post(ctx, &board, author, body)?;
         store_post(ctx, &id, &post, op_id)?;
-        ctx.posted_seq = Some(post.seq);
         let receipt = ThreadPostReceipt {
             post_id: post.post_id.clone(),
             seq: post.seq,
@@ -300,13 +299,16 @@ fn record_wakes(
     mentions: &str,
 ) -> rusqlite::Result<()> {
     // Record queue eligibility with the post, including while the Node is offline.
-    // A direct member only retains wakes during an explicit recovery.
+    // Each ordinary direct wake belongs to the current online session. Keep
+    // the earliest unfinished one; the intervening posts are already durable.
     ctx.tx.execute(
         "UPDATE thread_members AS m SET
-           last_wake_seq=CASE WHEN m.delivery_mode='queue_until_idle' THEN ?2 ELSE last_wake_seq END,
+           last_wake_seq=CASE WHEN m.delivery_mode='queue_until_idle' THEN ?2
+               WHEN m.resume_through_seq IS NULL AND m.last_wake_seq=0 THEN ?2 ELSE last_wake_seq END,
            resume_through_seq=CASE WHEN m.resume_through_seq IS NOT NULL THEN ?2 END
          WHERE m.thread_id=?1 AND m.state='active' AND m.node_id IS NOT NULL
-           AND (m.delivery_mode='queue_until_idle' OR m.resume_through_seq IS NOT NULL)
+           AND (m.delivery_mode='queue_until_idle' OR m.resume_through_seq IS NOT NULL
+                OR EXISTS(SELECT 1 FROM nodes WHERE node_id=m.node_id AND status='online' AND revoked_at_ms IS NULL))
            AND m.role!='observer' AND m.wake_policy!='muted' AND m.member_key!=?3
            AND (m.wake_policy='all' OR ?5 OR m.member_key IN (SELECT value FROM json_each(?4)))",
         params![
@@ -420,13 +422,35 @@ pub(super) fn last_relevant_seq(
     head: u64,
     member: &MemberView,
 ) -> rusqlite::Result<Option<u64>> {
+    relevant_seq(db, id, since, head, member, "DESC")
+}
+
+pub(super) fn first_relevant_seq(
+    db: &Connection,
+    id: &ThreadId,
+    since: u64,
+    head: u64,
+    member: &MemberView,
+) -> rusqlite::Result<Option<u64>> {
+    relevant_seq(db, id, since, head, member, "ASC")
+}
+
+fn relevant_seq(
+    db: &Connection,
+    id: &ThreadId,
+    since: u64,
+    head: u64,
+    member: &MemberView,
+    order: &str,
+) -> rusqlite::Result<Option<u64>> {
     if member.wake_policy == ThreadWakePolicy::Muted {
         return Ok(None);
     }
-    db.query_row(
+    db.prepare_cached(&format!(
         "SELECT seq FROM thread_posts WHERE thread_id=?1 AND seq>?2 AND seq<=?3 AND author_actor_id!=?4
          AND (?5='all' OR EXISTS(SELECT 1 FROM json_each(mentions_json) WHERE value IN ('all',?4)))
-         ORDER BY seq DESC LIMIT 1",
+         ORDER BY seq {order} LIMIT 1"
+    ))?.query_row(
         params![id.as_str(), since, head, member.member_key, member.wake_policy.as_str()],
         |row| row.get(0),
     ).optional()
@@ -457,7 +481,8 @@ pub(crate) async fn wait(
                 let relevant = last_relevant_seq(ctx.tx, &id, body.since_seq, head_seq, &member)?;
                 ctx.tx.execute(
                     "UPDATE thread_members SET confirmed_seq=MAX(confirmed_seq,?1),wake_policy=?2,
-                     last_wake_seq=CASE WHEN delivery_mode='queue_until_idle' THEN ?5 ELSE 0 END,
+                     last_wake_seq=CASE WHEN delivery_mode='queue_until_idle' THEN ?5
+                         WHEN ?1>=?6 THEN 0 ELSE last_wake_seq END,
                      resume_through_seq=CASE WHEN resume_through_seq<=?1 THEN NULL ELSE resume_through_seq END
                      WHERE thread_id=?3 AND member_key=?4",
                     params![
@@ -465,7 +490,8 @@ pub(crate) async fn wait(
                         member.wake_policy.as_str(),
                         id.as_str(),
                         member.member_key,
-                        relevant.unwrap_or(0)
+                        relevant.unwrap_or(0),
+                        head_seq
                     ],
                 )?;
                 if body.wake_policy.is_some() {
@@ -503,7 +529,7 @@ pub(crate) async fn wait(
                 Ok(out)
             })
             .await?;
-            super::dispatch::wake_thread(&state_copy, thread_id, None).await;
+            super::dispatch::wake_thread(&state_copy, thread_id).await;
             Ok(response)
         })?
         .await

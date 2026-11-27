@@ -75,6 +75,8 @@ CREATE TABLE node_participants (
                         )),
     capabilities_json   TEXT    NOT NULL DEFAULT '{}',
     approval_json       TEXT,
+    -- An idle-scheduled delivery owns this gate until its ACK or a fresh Idle.
+    idle_delivery_id    TEXT,
     synced_epoch        INTEGER NOT NULL,
     updated_at_ms       INTEGER NOT NULL,
     PRIMARY KEY (node_id, participant_id)
@@ -166,7 +168,7 @@ CREATE TABLE thread_members (
                         CHECK (state IN ('active','paused_unknown','left')),
     delivery_generation INTEGER NOT NULL DEFAULT 0 CHECK (delivery_generation >= 0),
     confirmed_seq       INTEGER NOT NULL DEFAULT 0,
-    -- Latest post that can wake this queued member; eligibility also requires a live cursor.
+    -- Latest relevant queued post, or earliest unattempted direct post in this session.
     last_wake_seq       INTEGER NOT NULL DEFAULT 0 CHECK (last_wake_seq >= 0),
     -- The head at explicit resume, extended by relevant direct wakes deferred into recovery.
     resume_through_seq  INTEGER,

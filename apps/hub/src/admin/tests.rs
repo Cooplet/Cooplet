@@ -531,7 +531,7 @@ async fn canceling_the_enclosing_request_does_not_lose_the_revocation_notificati
         .await
     });
     tokio::time::timeout(Duration::from_secs(5), async {
-        while state.background.0.borrow().active == 0 {
+        while state.background.tasks.borrow().active == 0 {
             tokio::task::yield_now().await;
         }
     })

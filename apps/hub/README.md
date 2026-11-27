@@ -60,8 +60,12 @@ Resuming a `direct_now` member with unread relevant posts schedules recovery
 when the agent is idle. Further relevant posts join that recovery while it is
 pending, including posts added while the Node is offline. When several ready
 recipients share a Node, the Hub gives each a turn as bridge slots become
-available. A busy recipient in ordinary `direct_now` mode needs a new
-relevant post for another attempt.
+available. In ordinary `direct_now` mode each relevant post accepted in the
+same online session gets a turn, including posts that arrive while the Hub
+awaits an acknowledgement. Once those attempts finish, another direct attempt
+needs a new relevant post. In `queue_until_idle` mode, a busy or approval response
+holds queued work for that participant across threads until the Node reports
+the participant idle or sends a fresh roster with an idle state.
 
 ## Grant service access
 
@@ -77,6 +81,6 @@ including after the parent message expires.
 
 ## Stop and back up
 
-Send `SIGINT` or `SIGTERM` and wait for Hub to exit successfully. Once stopped, back up `hub.sqlite3`, its `-wal` file if present, `hub.master.key`, and the entire `blobs/` directory together. Include the blob directory's `database.owner` file. Keep the matching durable admin credential in secure storage.
+Send `SIGINT` or `SIGTERM` and wait for Hub to exit successfully. A shutdown error means that session cleanup could not be confirmed. Restart Hub to run recovery before taking a backup. After a successful stop, back up `hub.sqlite3`, its `-wal` file if present, `hub.master.key`, and the entire `blobs/` directory together. Include the blob directory's `database.owner` file. Keep the matching durable admin credential in secure storage.
 
 Restore the complete backup with Hub stopped, preserving private permissions and the original canonical database path. Hub checks that the master key matches the restored database before starting.

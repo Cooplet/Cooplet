@@ -368,6 +368,22 @@ async fn run(args: RunArgs) -> CliResult<()> {
             socket.local_addr()?
         )?;
         serve(socket, state, limits, shutdown, signals).await?;
+        // A session can finish even if its final status transaction failed.
+        let online: bool = engine
+            .reads()
+            .read(|db| {
+                Ok(db.query_row(
+                    "SELECT EXISTS(SELECT 1 FROM nodes WHERE status='online')",
+                    [],
+                    |row| row.get(0),
+                )?)
+            })
+            .await?;
+        if online {
+            return Err(
+                io::Error::other("Hub shutdown could not confirm all nodes offline").into(),
+            );
+        }
         Ok::<(), Box<dyn Error + Send + Sync>>(())
     }
     .await;

@@ -214,6 +214,9 @@ pub(super) async fn worker(
                 require_session(tx, &key)?;
                 let now = wall_clock();
                 let (idle, event) = apply_event(tx, &hub_id, &key, now, event)?;
+                if let Some(participant) = &idle {
+                    crate::threads::participant_idle(tx, &key.node_id, participant)?;
+                }
                 if cancelled.borrow().is_some() {
                     return Err(
                         HubError::new(ErrorCode::BridgeUnavailable, "The bridge closed.").into(),
@@ -226,8 +229,8 @@ pub(super) async fn worker(
             })
             .await?;
         applied.send_replace(seq);
-        if let Some(participant_id) = idle {
-            crate::threads::wake_participant(&state, &wake_node, &participant_id);
+        if idle.is_some() {
+            crate::threads::wake(&state, &wake_node);
         }
     }
 }
@@ -295,7 +298,9 @@ fn apply_event(
                 Some(EventKind::ParticipantCreated)
             };
             let Some(kind) = change_kind else {
-                return Ok((None, None));
+                let idle = (participant.state == ParticipantState::Idle)
+                    .then_some(participant.participant_id);
+                return Ok((idle, None));
             };
             let mut data = serde_json::to_value(&participant)?;
             data["intake_state"] = json!(participant.state.intake_state());
@@ -328,7 +333,10 @@ fn apply_event(
             };
             let encoded = approval.encode(state)?;
             let Some(kind) = changed_state(&previous, state, &encoded) else {
-                return Ok((None, None));
+                return Ok((
+                    (state == ParticipantState::Idle).then_some(participant_id),
+                    None,
+                ));
             };
             tx.execute(
                 "UPDATE node_participants SET state = ?1, approval_json = ?2, updated_at_ms = ?3
