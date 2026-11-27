@@ -26,7 +26,7 @@ impl InboundDuringWrite {
     pub(super) fn consume(
         &mut self,
         incoming: ReceivedFrame,
-        on_notification: impl FnOnce(&str, &Value, std::time::Instant) -> Result<(), Fault>,
+        on_notification: impl FnOnce(&str, &Value, Option<std::time::Instant>) -> Result<(), Fault>,
     ) -> Result<(), Fault> {
         match incoming.frame {
             Frame::Request { method, .. } if method == "session/request_permission" => {
@@ -38,15 +38,18 @@ impl InboundDuringWrite {
                 }
                 self.unsupported.push(id);
             }
-            Frame::Notification { method, params } if self.reply.is_none() => {
-                on_notification(&method, &params, incoming.read_at)?;
+            Frame::Notification { method, params } => {
+                // Keep routing diagnostics active after a terminal response,
+                // while excluding subsequent chunks from the completed turn.
+                let turn_read_at = self.reply.is_none().then_some(incoming.read_at);
+                on_notification(&method, &params, turn_read_at)?;
             }
             Frame::Response { id, reply }
                 if id.as_u64() == Some(self.id) && self.reply.is_none() =>
             {
                 self.reply = Some(reply);
             }
-            Frame::Notification { .. } | Frame::Response { .. } => {}
+            Frame::Response { .. } => {}
         }
         Ok(())
     }
@@ -56,5 +59,46 @@ impl InboundDuringWrite {
             wire.reject_request(id).await?;
         }
         Ok(self.reply)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+    use std::time::Instant;
+
+    #[test]
+    fn notifications_after_an_early_reply_are_still_classified() -> Result<(), Fault> {
+        let mut inbox = InboundDuringWrite::new(1);
+        let read_at = Instant::now();
+        inbox.consume(
+            ReceivedFrame {
+                frame: Frame::Response {
+                    id: json!(1),
+                    reply: Ok(json!({})),
+                },
+                read_at,
+            },
+            |_, _, _| Err(Fault::InvalidFrame),
+        )?;
+        let mut observed = false;
+        inbox.consume(
+            ReceivedFrame {
+                frame: Frame::Notification {
+                    method: "fixture/extension".into(),
+                    params: Value::Null,
+                },
+                read_at,
+            },
+            |method, _, turn_read_at| {
+                assert_eq!(method, "fixture/extension");
+                assert!(turn_read_at.is_none());
+                observed = true;
+                Ok(())
+            },
+        )?;
+        assert!(observed);
+        Ok(())
     }
 }

@@ -285,9 +285,19 @@ async fn finished(
     answer: &str,
 ) -> TestResult {
     let completion = event(session, first_sequence).await?;
-    assert!(matches!(completion, AdapterEventKind::TurnCompleted {
-        status, operation_key: Some(operation_key), text, native_turn_id: None, structured: None,
-    } if status == expected && operation_key == key && text == answer));
+    let AdapterEventKind::TurnCompleted {
+        status,
+        operation_key,
+        text,
+        native_turn_id: None,
+        structured: None,
+    } = completion
+    else {
+        return Err(format!("Expected an Agy turn completion, got {completion:?}").into());
+    };
+    assert_eq!(status, expected);
+    assert_eq!(operation_key.as_deref(), Some(key));
+    assert_eq!(text, answer);
     assert!(matches!(
         event(session, first_sequence + 1).await?,
         AdapterEventKind::StateChanged(ParticipantRuntimeState::Idle)
@@ -730,11 +740,20 @@ fn content_nonce(text: &str) -> TestResult<&str> {
 #[tokio::test]
 async fn cancel_is_idempotent_and_keeps_the_session_usable() -> TestResult {
     let tree = Tree::new()?;
+    tree.set("open-mode", "idle-update")?;
     let adapter = AgyAdapter::new(tree.config());
     let owner = Arc::new(Spawner::new(tree.0.clone()));
     let mut session = adapter
         .create_or_resume(open_request(&tree, owner.clone(), SessionOpenMode::Create)?)
         .await?;
+    // Confirm that the idle chunk has been read before opening a turn window.
+    tree.release()?;
+    tree.wait_for(
+        |frame| frame["id"] == "idle-barrier" && frame["error"]["code"] == -32601,
+        1,
+    )
+    .await?;
+    tree.reset_release()?;
     let handle = session.handle.clone();
     assert!(matches!(
         adapter

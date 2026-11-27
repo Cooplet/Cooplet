@@ -117,7 +117,13 @@ fn acp_worker() -> TestResult {
                     transport.text(SESSION_ID, "agent_message_chunk", "historical output")?;
                     transport.reply(id, json!({}))?;
                 }
-                transport.text(SESSION_ID, "agent_message_chunk", "idle-output")?;
+                if transport.mode("open-mode")? == "idle-update" {
+                    transport.wait_for_release()?;
+                    transport.text(SESSION_ID, "agent_message_chunk", "idle-output")?;
+                    transport.send(&json!({
+                        "jsonrpc":"2.0", "id":"idle-barrier", "method":"fixture/barrier"
+                    }))?;
+                }
 
                 let prompt_mode = transport.mode("prompt-mode")?;
                 duplex_next = prompt_mode == "duplex";
@@ -232,6 +238,7 @@ fn acp_worker() -> TestResult {
                     },
                 )?;
             }
+            None if frame["id"] == "idle-barrier" && frame["error"]["code"] == -32601 => {}
             None if frame["id"] == "duplex-request" && frame["error"]["code"] == -32601 => {
                 transport.record(&json!({"duplex_reply":true}))?;
             }

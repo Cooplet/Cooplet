@@ -71,21 +71,19 @@ impl Session {
                 _ = &mut stopping => None,
                 fault = actor.run(&mut wire, &mut requests) => Some(fault),
             };
-            requests.close();
-            while let Ok(request) = requests.try_recv() {
-                request.transport_closed();
-            }
-            drop(requests);
-            // A fault must keep its pipes open until submit exits. An
-            // explicit stop can take over as long as we still own the wire.
-            if fault.is_some() {
-                tokio::select! {
-                    biased;
-                    _ = &mut stopping => fault = None,
-                    () = active_submits.closed() => {}
+            let close_pipes = async {
+                // A fault keeps its pipes open until submit exits. An explicit
+                // stop releases them even if a command still holds a queue permit.
+                if fault.is_some() {
+                    tokio::select! {
+                        biased;
+                        _ = &mut stopping => fault = None,
+                        () = active_submits.closed() => {}
+                    }
                 }
-            }
-            drop(wire);
+                drop(wire);
+            };
+            tokio::join!(biased; reject_queued_commands(requests), close_pipes);
             // Even an explicit stop releases the event stream after submit.
             active_submits.closed().await;
             actor.finish(fault).await;
@@ -118,6 +116,9 @@ impl Session {
     }
 
     pub(super) async fn submit(&self, request: SubmitTurnRequest) -> SubmitOutcome {
+        // Cover queue admission too: shutdown can race a reserved slot before
+        // the command reaches the actor.
+        let _active_submit = self.submitters.subscribe();
         let closed = closed_submit;
         if self.is_closed() {
             return closed();
@@ -137,9 +138,6 @@ impl Session {
             }
         };
         let (reply, outcome) = oneshot::channel();
-        // Keep transport teardown behind every submitted call until its caller
-        // observes the outcome or drops the future.
-        let _active_submit = self.submitters.subscribe();
         // The writer separately checks whether this particular caller has left.
         let (_submit_scope, exit) = watch::channel(());
         place.send(Command::Submit {
@@ -209,6 +207,13 @@ impl Command {
                 let _ = reply.send(StopOutcome::AlreadyGone);
             }
         }
+    }
+}
+
+async fn reject_queued_commands(mut requests: mpsc::Receiver<Command>) {
+    requests.close();
+    while let Some(request) = requests.recv().await {
+        request.transport_closed();
     }
 }
 
@@ -430,7 +435,7 @@ impl Actor {
                 return Ok(Some(reply));
             }
             Frame::Notification { method, params } => {
-                self.notification(&method, &params, received.read_at)?;
+                self.notification(&method, &params, Some(received.read_at))?;
             }
             Frame::Response { .. } => {}
         }
@@ -441,7 +446,7 @@ impl Actor {
         &mut self,
         method: &str,
         params: &Value,
-        read_at: std::time::Instant,
+        turn_read_at: Option<std::time::Instant>,
     ) -> Result<(), Fault> {
         if method != "session/update" || params["sessionId"] != self.session_id {
             if !self.warned_unexpected_notification {
@@ -450,7 +455,7 @@ impl Actor {
             }
             return Ok(());
         }
-        let Some(turn) = &mut self.turn else {
+        let (Some(turn), Some(read_at)) = (&mut self.turn, turn_read_at) else {
             return Ok(());
         };
         let update = &params["update"];
@@ -584,5 +589,31 @@ impl Actor {
 fn send_outcome(reply: &mut Option<oneshot::Sender<SubmitOutcome>>, outcome: SubmitOutcome) {
     if let Some(reply) = reply.take() {
         let _ = reply.send(outcome);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn shutdown_replies_to_a_command_with_an_outstanding_queue_permit()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let (commands, requests) = mpsc::channel(1);
+        let permit = commands.reserve().await?;
+        let (reply, result) = oneshot::channel();
+        tokio::join!(reject_queued_commands(requests), async {
+            commands.closed().await;
+            permit.send(Command::Cancel {
+                prompt_id: 1,
+                reply,
+            });
+        });
+        drop(commands);
+        assert!(matches!(
+            timeout(Duration::from_secs(1), result).await?,
+            Ok(StopOutcome::AlreadyGone)
+        ));
+        Ok(())
     }
 }
