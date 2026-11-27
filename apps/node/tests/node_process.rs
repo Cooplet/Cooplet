@@ -17,7 +17,9 @@ use cooplet_node::{
     http::openapi_json,
     now_ms,
 };
-use cooplet_protocol::{ErrorCode, MessageId, ParticipantId, PrincipalKind, RequestId};
+use cooplet_protocol::{
+    ErrorCode, MessageId, ParticipantId, PrincipalKind, RequestId, validate_idempotency_key,
+};
 use cooplet_storage::WriteOutcome;
 use rusqlite::params;
 use serde_json::{Value, json};
@@ -130,6 +132,62 @@ fn command(state: &Path, args: &[&str]) -> TestResult<std::process::Output> {
         String::from_utf8_lossy(&output.stderr)
     );
     Ok(output)
+}
+
+#[tokio::test]
+async fn delegated_cli_exposes_generated_key_when_the_hub_is_offline() -> TestResult {
+    let directory = TestDirectory::new()?;
+    let state = directory.state();
+    let (mut daemon, _) = run_process(&state).await?;
+    let source = directory.0.join("relay.txt");
+    fs::write(&source, "test upload")?;
+    let source = source.to_str().ok_or("Expected a UTF-8 test path")?;
+    let qualified_recipient = "node_00000000000000000000000000/part_00000000000000000000000000";
+    let run = |args: &[&str]| {
+        Command::new(COOPLET)
+            .arg("--state-dir")
+            .arg(&state)
+            .args(args)
+            .output()
+    };
+
+    for mut args in [
+        vec!["thread", "create", "--title", "Offline thread"],
+        vec![
+            "message",
+            "send",
+            "--to",
+            qualified_recipient,
+            "--body",
+            "Offline message",
+        ],
+        vec!["blob", "put", source, "--target", "hub"],
+    ] {
+        let first = run(&args)?;
+        assert!(!first.status.success());
+        assert!(first.stdout.is_empty());
+        let stderr = std::str::from_utf8(&first.stderr)?;
+        let mut lines = stderr.lines();
+        let key = lines
+            .next()
+            .and_then(|line| line.strip_prefix("idempotency_key="))
+            .ok_or("The first stderr line must report the retry key")?;
+        validate_idempotency_key(key)?;
+        assert!(lines.any(|line| line.contains("502")), "{stderr}");
+
+        args.extend(["--operation-key", key]);
+        let retry = run(&args)?;
+        assert!(!retry.status.success());
+        let stderr = std::str::from_utf8(&retry.stderr)?;
+        assert!(stderr.contains("502"), "{stderr}");
+        assert!(!stderr.contains("idempotency_key="), "{stderr}");
+    }
+
+    let local = command(&state, &["blob", "put", source])?;
+    assert!(!std::str::from_utf8(&local.stderr)?.contains("idempotency_key="));
+    command(&state, &["node", "stop"])?;
+    assert!(daemon.wait().await?.success());
+    Ok(())
 }
 
 #[tokio::test]
@@ -715,6 +773,27 @@ async fn http_rejections_use_problems_and_auth_reads_leave_wal_unchanged() -> Te
             "POST /v1/messages",
             "Idempotency-Key: positional\r\n",
             "[1]",
+            "400",
+            "invalid_request",
+        ),
+        (
+            "POST /v1/threads/thr_00000000000000000000000000/close",
+            "Idempotency-Key: empty-close\r\n",
+            "",
+            "502",
+            "bridge_unavailable",
+        ),
+        (
+            "POST /v1/threads/thr_00000000000000000000000000/close",
+            "Idempotency-Key: object-close\r\n",
+            "{}",
+            "502",
+            "bridge_unavailable",
+        ),
+        (
+            "POST /v1/threads/thr_00000000000000000000000000/wait",
+            "",
+            r#"{"since_seq":0,"wake_policy":"muted"}"#,
             "400",
             "invalid_request",
         ),

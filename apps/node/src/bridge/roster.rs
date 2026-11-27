@@ -1,4 +1,7 @@
-use std::path::{Path, PathBuf};
+use std::{
+    collections::HashSet,
+    path::{Path, PathBuf},
+};
 
 use cooplet_protocol::{
     BridgeFrame, BridgePayload, CommandOutcome, CommandResPayload, ErrorCode, HelloAckPayload,
@@ -20,7 +23,7 @@ use crate::{
 
 use super::{HubConnection, execution};
 
-const MAX_PARTICIPANTS: usize = 4096;
+pub(super) const MAX_PARTICIPANTS: usize = 4096;
 
 const PARTICIPANT_COLUMNS: &str = "participant_id, kind, name, client_kind, workspace_dir,
     state, capabilities_json, CASE WHEN state = 'awaiting_approval'
@@ -28,6 +31,7 @@ const PARTICIPANT_COLUMNS: &str = "participant_id, kind, name, client_kind, work
 
 pub(super) struct Snapshot {
     pub(super) cursor: u64,
+    pub(super) participants: HashSet<ParticipantId>,
     pub(super) frames: Vec<String>,
 }
 
@@ -60,19 +64,20 @@ fn build_snapshot(
 ) -> Result<Snapshot> {
     let tx = conn.unchecked_transaction()?;
     let cursor = head(&tx)?;
+    let mut participants = HashSet::new();
     let mut builder = Builder::new(epoch)?;
     {
         let mut statement = tx.prepare(&format!(
             "SELECT {PARTICIPANT_COLUMNS} FROM participants ORDER BY participant_id LIMIT ?1"
         ))?;
         let mut rows = statement.query([MAX_PARTICIPANTS + 1])?;
-        let mut count = 0;
         while let Some(row) = rows.next()? {
-            count += 1;
-            if count > MAX_PARTICIPANTS {
+            if participants.len() == MAX_PARTICIPANTS {
                 return Err(roster_limit());
             }
-            builder.push(RequiredEntry::Participant(participant_row(row)?))?;
+            let participant = participant_row(row)?;
+            participants.insert(participant.participant_id.clone());
+            builder.push(RequiredEntry::Participant(participant))?;
         }
     }
     for template in templates {
@@ -84,6 +89,7 @@ fn build_snapshot(
     }
     Ok(Snapshot {
         cursor,
+        participants,
         frames: builder.finish()?,
     })
 }

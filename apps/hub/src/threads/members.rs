@@ -15,7 +15,7 @@ use crate::{
 };
 
 use super::{
-    close_board,
+    close_board, posts,
     store::{self, Mutation, Operation},
 };
 
@@ -227,7 +227,8 @@ pub(super) fn add(
         let disputed = existing.pending.is_some();
         ctx.tx.execute(
             "UPDATE thread_members SET node_id=?1, role=?2, wake_policy=?3, delivery_mode=?4, state=?5,
-             confirmed_seq=?6, joined_at_ms=?7, left_at_ms=NULL WHERE thread_id=?8 AND member_key=?9",
+             confirmed_seq=?6, resume_through_seq=NULL, joined_at_ms=?7, left_at_ms=NULL
+             WHERE thread_id=?8 AND member_key=?9",
             params![address.node_id.as_ref().map(NodeId::as_str), role.as_str(), wake.as_str(), mode.as_str(),
                 if disputed { "paused_unknown" } else { "active" },
                 if disputed { existing.confirmed_seq } else { head }, ctx.now,
@@ -355,7 +356,8 @@ pub(crate) async fn leave(
             return Err(store::conflict("The last owner cannot leave while other members remain.", "last_owner"));
         }
         ctx.tx.execute(
-            "UPDATE thread_members SET state='left',left_at_ms=?1 WHERE thread_id=?2 AND member_key=?3",
+            "UPDATE thread_members SET state='left',left_at_ms=?1,resume_through_seq=NULL
+             WHERE thread_id=?2 AND member_key=?3",
             params![ctx.now, id.as_str(), key],
         )?;
         let saved = member(ctx.tx, &id, key)?.ok_or_else(store::not_found)?;
@@ -391,10 +393,20 @@ pub(crate) async fn resume(
         let generation = existing.delivery_generation.checked_add(1)
             .filter(|seq| i64::try_from(*seq).is_ok())
             .ok_or_else(|| HubError::internal("Thread delivery generation overflow."))?;
+        let resume_through = if existing.delivery_mode == DeliveryMode::DirectNow
+            && existing.node_id.is_some()
+            && existing.role != ThreadRole::Observer
+            && posts::last_relevant_seq(ctx.tx, &id, body.after_seq, board.head_seq, &existing)?.is_some()
+        {
+            Some(board.head_seq)
+        } else {
+            None
+        };
         ctx.tx.execute(
             "UPDATE thread_members SET state='active',delivery_generation=?1,confirmed_seq=?2,
-             pending_delivery_id=NULL,pending_from_seq=NULL,pending_to_seq=NULL WHERE thread_id=?3 AND member_key=?4",
-            params![generation, body.after_seq, id.as_str(), key],
+             pending_delivery_id=NULL,pending_from_seq=NULL,pending_to_seq=NULL,resume_through_seq=?3
+             WHERE thread_id=?4 AND member_key=?5",
+            params![generation, body.after_seq, resume_through, id.as_str(), key],
         )?;
         let saved = member(ctx.tx, &id, key)?.ok_or_else(store::not_found)?;
         ctx.event(&id, EventKind::ThreadMemberUpdated, &event_data(&id, &saved))?;

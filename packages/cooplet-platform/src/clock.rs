@@ -25,6 +25,12 @@ impl MonoInstant {
         self.0.is_some()
     }
 
+    /// Compare deadlines from the same clock. An invalid instant must expire
+    /// before a valid deadline.
+    pub fn is_earlier_than(self, other: Self) -> bool {
+        self.0 < other.0
+    }
+
     pub fn as_millis(self) -> Option<u64> {
         self.0
             .and_then(|nanos| u64::try_from(nanos / 1_000_000).ok())

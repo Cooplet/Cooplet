@@ -770,6 +770,10 @@ where
     T: Serialize + DeserializeOwned + Send + 'static,
     F: FnOnce(&Transaction<'_>, i64) -> Result<AdminCommit<T>, HubError> + Send + 'static,
 {
+    let _transition = match (&operation.notify, state.bridge.live()) {
+        (Notify::Node(node_id), Some(bridge)) => Some(bridge.transition(node_id).await),
+        _ => None,
+    };
     let actor_id = caller.actor_id().to_owned();
     let write_actor = actor_id.clone();
     let write_operation = operation.clone();

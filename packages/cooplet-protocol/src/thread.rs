@@ -1,6 +1,10 @@
 //! Public thread requests and views, shared by the Hub and its Node proxy.
 
 use serde_json::Value;
+use utoipa::openapi::{
+    ObjectBuilder, RefOr,
+    schema::{Schema, SchemaType, Type},
+};
 
 use crate::{
     AnswerPayload, AttachmentRef, DeliveryMode, MessageId, NodeId, OperationId, QuestionPayload,
@@ -27,6 +31,22 @@ crate::wire::wire_string_enum! {
         MentionsOnly => "mentions_only",
         All => "all",
         Muted => "muted",
+    }
+}
+
+crate::wire::wire_string_enum! {
+    pub enum ThreadWaitPolicy {
+        MentionsOnly => "mentions_only",
+        All => "all",
+    }
+}
+
+impl From<ThreadWaitPolicy> for ThreadWakePolicy {
+    fn from(value: ThreadWaitPolicy) -> Self {
+        match value {
+            ThreadWaitPolicy::MentionsOnly => Self::MentionsOnly,
+            ThreadWaitPolicy::All => Self::All,
+        }
     }
 }
 
@@ -62,6 +82,7 @@ crate::wire::wire_object! {
 }
 
 crate::wire::wire_object! {
+    #[derive(Default)]
     #[serde(deny_unknown_fields)]
     pub struct ThreadCloseRequest {}
 }
@@ -97,10 +118,24 @@ crate::wire::wire_object! {
 crate::wire::wire_object! {
     #[serde(deny_unknown_fields)]
     pub struct ThreadPinSetRequest {
+        #[schema(schema_with = non_null_json_schema)]
         pub value_json: Value,
         pub post_id: Option<MessageId>,
         pub expected_version: Option<u64>,
-    }
+    } schema_fields
+}
+
+fn non_null_json_schema() -> RefOr<Schema> {
+    ObjectBuilder::new()
+        .schema_type(SchemaType::Array(vec![
+            Type::Object,
+            Type::Array,
+            Type::String,
+            Type::Number,
+            Type::Boolean,
+        ]))
+        .description(Some("The non-null JSON value to store."))
+        .into()
 }
 
 crate::wire::wire_object! {
@@ -116,7 +151,7 @@ crate::wire::wire_object! {
     #[serde(deny_unknown_fields)]
     pub struct ThreadWaitRequest {
         pub since_seq: u64,
-        pub wake_policy: Option<ThreadWakePolicy>,
+        pub wake_policy: Option<ThreadWaitPolicy>,
     }
 }
 

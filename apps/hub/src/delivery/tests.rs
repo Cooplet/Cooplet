@@ -121,7 +121,7 @@ impl Fixture {
         self.state.db.write_sqlite(move |tx| {
             tx.execute(
                 "INSERT INTO nodes (node_id, display_name, owner_principal_id, credential_hmac, status, enrolled_at_ms)
-                 VALUES (?1, 'Test node', ?2, ?1, 'offline', ?3)",
+                 VALUES (?1, 'Test node', ?2, ?1, 'online', ?3)",
                 rusqlite::params![node.as_str(), owner, now_ms()],
             )?;
             tx.execute(
@@ -242,6 +242,7 @@ struct FakeBridge {
 
 struct FakeState {
     reserves: AtomicUsize,
+    session_epoch: AtomicU64,
     submits: AtomicUsize,
     permits: AtomicUsize,
     response: Mutex<(CommandOutcome, Option<ProblemDetails>)>,
@@ -261,6 +262,7 @@ impl FakeBridge {
         Arc::new(Self {
             shared: Arc::new(FakeState {
                 reserves: AtomicUsize::new(0),
+                session_epoch: AtomicU64::new(0),
                 submits: AtomicUsize::new(0),
                 permits: AtomicUsize::new(0),
                 response: Mutex::new((CommandOutcome::Delivered, None)),
@@ -319,7 +321,7 @@ impl FakeBridge {
     }
 }
 
-struct FakePermit(Arc<FakeState>);
+struct FakePermit(Arc<FakeState>, CommandSession);
 
 impl Drop for FakePermit {
     fn drop(&mut self) {
@@ -328,6 +330,10 @@ impl Drop for FakePermit {
 }
 
 impl CommandPermit for FakePermit {
+    fn session(&self) -> CommandSession {
+        self.1
+    }
+
     fn submit(
         self: Box<Self>,
         payload: CommandReqPayload,
@@ -389,7 +395,13 @@ impl BridgeRegistry for FakeBridge {
             return Err(ReserveError::RateLimited);
         }
         self.shared.reserved.notify_one();
-        Ok(Box::new(FakePermit(self.shared.clone())))
+        Ok(Box::new(FakePermit(
+            self.shared.clone(),
+            CommandSession {
+                generation: 1,
+                epoch: self.shared.session_epoch.load(Ordering::SeqCst),
+            },
+        )))
     }
 
     fn disconnect_revoked(&self, _node: &NodeId) {}
@@ -878,7 +890,18 @@ async fn recovering_an_unacknowledged_acceptance_never_starts_bridge_delivery() 
     let key = "lost-acceptance-ack";
     let request = prepare_message(&f.admin, key, direct(&node, &participant)?)?;
     assert!(matches!(
-        accept_request(&f.state, request.clone(), Some(node.clone())).await?,
+        accept_request(
+            &f.state,
+            request.clone(),
+            Some((
+                node.clone(),
+                CommandSession {
+                    generation: 1,
+                    epoch: 0
+                }
+            )),
+        )
+        .await?,
         Accepted::Dispatch(_)
     ));
 
@@ -1531,6 +1554,7 @@ async fn reply_and_receipt_identity_are_node_qualified() -> TestResult {
         Ok(WriteOutcome::new(()))
     }).await?;
 
+    bridge.shared.session_epoch.store(7, Ordering::SeqCst);
     let actor = |node: NodeId, participant: ParticipantId| {
         crate::storage::sql::read_tx(&f.state.reads, move |db| {
             crate::auth::attest_node_participant(db, &node, &participant, Some((1, 7)))
@@ -2133,6 +2157,39 @@ async fn service_principal_cannot_hijack_human_question_and_bridge_preserves_pro
     assert_eq!(status, StatusCode::CREATED);
     assert_eq!(valid_reply.in_reply_to, Some(service_msg.message_id));
 
+    f.close().await?;
+    Ok(())
+}
+
+#[tokio::test]
+async fn stale_destination_reservation_cannot_accept_a_command() -> TestResult {
+    let bridge = FakeBridge::new();
+    let f = Fixture::new(bridge.clone()).await?;
+    let node = NodeId::generate()?;
+    let recipient = ParticipantId::generate()?;
+    f.node(&node, &recipient, "agent").await?;
+    let replaced = node.clone();
+    f.state
+        .db
+        .write_sqlite(move |tx| {
+            tx.execute(
+                "UPDATE nodes SET session_epoch = 2 WHERE node_id = ?1",
+                [replaced.as_str()],
+            )?;
+            Ok(WriteOutcome::new(()))
+        })
+        .await?;
+
+    let key = "fenced-command-reservation";
+    result_code(
+        send_message(&f.state, &f.admin, key, direct(&node, &recipient)?).await,
+        ErrorCode::BridgeUnavailable,
+    )?;
+    assert_eq!(bridge.shared.submits.load(Ordering::SeqCst), 0);
+    bridge.shared.session_epoch.store(2, Ordering::SeqCst);
+    let (_, receipt) = send_message(&f.state, &f.admin, key, direct(&node, &recipient)?).await?;
+    assert_eq!(receipt.delivery_state, DeliveryState::Delivered);
+    assert_eq!(bridge.shared.submits.load(Ordering::SeqCst), 1);
     f.close().await?;
     Ok(())
 }

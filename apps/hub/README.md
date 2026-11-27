@@ -46,7 +46,11 @@ The Hub coalesces posts for an agent with `queue_until_idle`. A delivery whose
 outcome cannot be confirmed puts that member in `paused_unknown`. The owner
 can read the thread and call `POST /v1/threads/{id}/members/resume` with the
 member key and the last sequence the agent should treat as read. This is
-available while the Node is offline. For the end-to-end CLI sequence, see the
+available while the Node is offline. Resume sets the cursor for the new
+delivery generation. A batch sent before a close, leave, or resume can still
+start within its original admission window. An effect that already started can
+finish later. An acknowledgement from an earlier generation cannot advance the
+new cursor. For the end-to-end CLI sequence, see the
 [two-Node walkthrough](../node/README.md#share-a-thread-across-two-nodes).
 
 ## Grant service access

@@ -776,6 +776,7 @@ async fn thread_acl_change_discards_initial_frames_at_the_retained_event_floor()
     use crate::threads;
     use cooplet_protocol::{
         ThreadCreateRequest, ThreadMemberJoinRequest, ThreadMemberLeaveRequest, ThreadRole,
+        ThreadWaitRequest,
     };
 
     let fixture = Fixture::new().await?;
@@ -798,6 +799,17 @@ async fn thread_acl_change_discards_initial_frames_at_the_retained_event_floor()
         },
     )
     .await?;
+    let denied = threads::wait(
+        &fixture.state,
+        &service,
+        board.thread_id.clone(),
+        ThreadWaitRequest {
+            since_seq: u64::MAX,
+            wake_policy: None,
+        },
+    )
+    .await;
+    assert!(denied.is_err_and(|error| error.problem().code == ErrorCode::Forbidden));
     fixture
         .state
         .db

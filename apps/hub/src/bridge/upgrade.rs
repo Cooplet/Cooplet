@@ -132,6 +132,7 @@ async fn upgrade(
     // Own allocation through its commit. If a client disappears while receiving
     // 101, the old session still learns that its durable epoch has been fenced.
     let write_state = state.clone();
+    let write_bridge = bridge.clone();
     let deadline = budget.0.clone();
     let key = SessionKey {
         node_id: node_id.clone(),
@@ -139,6 +140,10 @@ async fn upgrade(
         epoch: 0,
     };
     let allocation = state.background.spawn(async move {
+        let _transition = write_bridge.transition(&key.node_id).await;
+        if deadline.is_expired() {
+            return Err(handshake_expired());
+        }
         let epoch = match allocate_epoch(&write_state, deadline, caller, &key).await {
             Ok(epoch) => epoch,
             Err(error) => {

@@ -19,6 +19,13 @@ use crate::{
     operations::{ADMISSION_EXPIRED, DelegatedOperation, admission_expired, bound_problem},
 };
 
+#[cfg(test)]
+#[path = "../../../tests/common/mock_adapter.rs"]
+mod mock_adapter;
+#[cfg(test)]
+#[path = "commands_timing_tests.rs"]
+mod timing_tests;
+
 pub(in crate::bridge) async fn command(
     state: &NodeState,
     hub_id: &HubId,

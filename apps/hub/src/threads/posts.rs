@@ -418,21 +418,17 @@ pub(crate) async fn wait(
             let thread_id = id.clone();
             let response = store::update(&state_copy, &caller, move |ctx| {
                 store::require_read(ctx.tx, ctx.caller, &id, ctx.now)?;
+                let mut member = members::require_contributor(ctx, &id, false)?;
                 let board = store::board(ctx.tx, &id, ctx.now)?;
                 store::require_open(&board)?;
                 store::validate_cursor(&board, body.since_seq)?;
-                let mut member = members::require_contributor(ctx, &id, false)?;
-                if let Some(policy) = body.wake_policy {
-                    if policy == ThreadWakePolicy::Muted {
-                        return Err(HubError::invalid(
-                            "Wait accepts mentions_only or all as wake policy.",
-                        ));
-                    }
+                if let Some(policy) = body.wake_policy.map(ThreadWakePolicy::from) {
                     member.wake_policy = policy;
                 }
                 ctx.tx.execute(
-                    "UPDATE thread_members SET confirmed_seq=MAX(confirmed_seq,?1),wake_policy=?2
-                 WHERE thread_id=?3 AND member_key=?4",
+                    "UPDATE thread_members SET confirmed_seq=MAX(confirmed_seq,?1),wake_policy=?2,
+                     resume_through_seq=CASE WHEN resume_through_seq<=?1 THEN NULL ELSE resume_through_seq END
+                     WHERE thread_id=?3 AND member_key=?4",
                     params![
                         body.since_seq,
                         member.wake_policy.as_str(),

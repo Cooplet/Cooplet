@@ -1,5 +1,5 @@
 use std::{
-    collections::{HashMap, HashSet},
+    collections::HashMap,
     sync::{Arc, Mutex, MutexGuard},
     time::Duration,
 };
@@ -33,10 +33,41 @@ const RETRIES: usize = 6;
 #[derive(Clone, Default)]
 pub(crate) struct Dispatch(Arc<Mutex<HashMap<NodeId, watch::Sender<Wake>>>>);
 
-#[derive(Clone, Copy, Default)]
+#[derive(Default)]
 struct Wake {
     revision: u64,
-    idle_revision: u64,
+    last_idle_revision: u64,
+    roster_revision: u64,
+    participant_idle: HashMap<ParticipantId, u64>,
+}
+
+impl Wake {
+    fn advance(&mut self, trigger: WakeTrigger<'_>) {
+        self.revision = self.revision.saturating_add(1);
+        match trigger {
+            WakeTrigger::Work => return,
+            WakeTrigger::Roster => self.roster_revision = self.revision,
+            WakeTrigger::Idle(participant) => {
+                self.participant_idle
+                    .insert(participant.clone(), self.revision);
+            }
+        }
+        self.last_idle_revision = self.revision;
+    }
+
+    fn newer_idle(&self, participant: &ParticipantId, staged_revision: u64) -> bool {
+        self.roster_revision > staged_revision
+            || self
+                .participant_idle
+                .get(participant)
+                .is_some_and(|revision| *revision > staged_revision)
+    }
+}
+
+enum WakeTrigger<'a> {
+    Work,
+    Roster,
+    Idle(&'a ParticipantId),
 }
 
 impl Dispatch {
@@ -48,18 +79,17 @@ impl Dispatch {
 }
 
 pub(crate) fn wake(state: &AppState, node_id: &NodeId) {
-    signal(state, node_id, true);
+    signal(state, node_id, WakeTrigger::Roster);
 }
 
-fn signal(state: &AppState, node_id: &NodeId, projected_idle: bool) {
+pub(crate) fn wake_participant(state: &AppState, node_id: &NodeId, participant_id: &ParticipantId) {
+    signal(state, node_id, WakeTrigger::Idle(participant_id));
+}
+
+fn signal(state: &AppState, node_id: &NodeId, trigger: WakeTrigger<'_>) {
     let mut nodes = state.thread_dispatch.lock();
     if let Some(wake) = nodes.get(node_id) {
-        wake.send_modify(|wake| {
-            wake.revision = wake.revision.wrapping_add(1);
-            if projected_idle {
-                wake.idle_revision = wake.idle_revision.wrapping_add(1);
-            }
-        });
+        wake.send_modify(|wake| wake.advance(trigger));
         return;
     }
     let (send, receive) = watch::channel(Wake::default());
@@ -73,10 +103,11 @@ pub(super) async fn wake_thread(state: &AppState, thread_id: ThreadId, direct_se
     let id = thread_id.clone();
     let nodes = read_tx(&state.reads, move |db| {
         let mut stmt = db.prepare_cached(
-            "SELECT m.node_id, m.delivery_mode FROM thread_members m JOIN nodes n USING(node_id)
+            "SELECT m.node_id, m.delivery_mode, MAX(m.resume_through_seq IS NOT NULL)
+             FROM thread_members m JOIN nodes n USING(node_id)
              WHERE m.thread_id=?1 AND m.state='active' AND m.node_id IS NOT NULL
                AND m.role!='observer' AND m.wake_policy!='muted' AND n.status='online'
-               AND (m.delivery_mode='queue_until_idle' OR ?2 IS NOT NULL)
+               AND (m.delivery_mode='queue_until_idle' OR m.resume_through_seq IS NOT NULL OR ?2 IS NOT NULL)
              GROUP BY m.node_id, m.delivery_mode",
         )?;
         Ok(stmt
@@ -84,6 +115,7 @@ pub(super) async fn wake_thread(state: &AppState, thread_id: ThreadId, direct_se
                 Ok((
                     parse_col::<NodeId>(row, 0)?,
                     parse_col::<DeliveryMode>(row, 1)?,
+                    row.get::<_, bool>(2)?,
                 ))
             })?
             .collect::<rusqlite::Result<Vec<_>>>()?)
@@ -91,17 +123,16 @@ pub(super) async fn wake_thread(state: &AppState, thread_id: ThreadId, direct_se
     .await;
     match nodes {
         Ok(nodes) => {
-            for (node_id, mode) in nodes {
-                match (mode, direct_seq) {
-                    (DeliveryMode::DirectNow, Some(seq)) => {
-                        let state_copy = state.clone();
-                        let thread_id = thread_id.clone();
-                        let _ = state.background.spawn(async move {
-                            drive_direct(state_copy, node_id, thread_id, seq).await;
-                        });
-                    }
-                    (DeliveryMode::QueueUntilIdle, _) => signal(state, &node_id, false),
-                    _ => {}
+            for (node_id, mode, has_resume) in nodes {
+                if mode == DeliveryMode::QueueUntilIdle || has_resume {
+                    signal(state, &node_id, WakeTrigger::Work);
+                }
+                if let (DeliveryMode::DirectNow, Some(seq)) = (mode, direct_seq) {
+                    let state_copy = state.clone();
+                    let thread_id = thread_id.clone();
+                    let _ = state.background.spawn(async move {
+                        drive_direct(state_copy, node_id, thread_id, seq).await;
+                    });
                 }
             }
         }
@@ -119,14 +150,14 @@ struct Candidate {
 
 #[derive(Clone)]
 enum Mode {
-    Queue,
+    Idle,
     Direct { thread_id: ThreadId, post_seq: u64 },
 }
 
 impl Mode {
     fn as_str(&self) -> &'static str {
         match self {
-            Self::Queue => "queue_until_idle",
+            Self::Idle => "queue_until_idle",
             Self::Direct { .. } => "direct_now",
         }
     }
@@ -149,20 +180,32 @@ enum Completion {
 
 struct Sweep {
     cursor: Option<Candidate>,
-    suppressed: HashSet<Candidate>,
-    pending: JoinSet<(Candidate, Completion)>,
+    suppressed: HashMap<Candidate, u64>,
+    pending: JoinSet<FinishedAttempt>,
+}
+
+struct FinishedAttempt {
+    candidate: Candidate,
+    staged_revision: u64,
+    outcome: Completion,
 }
 
 impl Sweep {
     fn new() -> Self {
         Self {
             cursor: None,
-            suppressed: HashSet::new(),
+            suppressed: HashMap::new(),
             pending: JoinSet::new(),
         }
     }
 
-    async fn start(&mut self, state: &AppState, node_id: &NodeId, mode: Mode) -> Attempt {
+    async fn start(
+        &mut self,
+        state: &AppState,
+        node_id: &NodeId,
+        mode: Mode,
+        staged_revision: u64,
+    ) -> Attempt {
         if state.shutdown.has_changed().unwrap_or(true) {
             return Attempt::Offline;
         }
@@ -225,14 +268,18 @@ impl Sweep {
         let state = state.clone();
         let node_id = node_id.clone();
         self.pending.spawn(async move {
-            let completion = deliver(&state, &node_id, permit, payload, acl).await;
-            (output, completion)
+            let outcome = deliver(&state, &node_id, permit, payload, acl).await;
+            FinishedAttempt {
+                candidate: output,
+                staged_revision,
+                outcome,
+            }
         });
         self.cursor = Some(candidate);
         Attempt::Started
     }
 
-    async fn next(&mut self) -> Option<(Candidate, Completion)> {
+    async fn next(&mut self) -> Option<FinishedAttempt> {
         while let Some(result) = self.pending.join_next().await {
             match result {
                 Ok(completion) => return Some(completion),
@@ -249,36 +296,42 @@ async fn drive_direct(state: AppState, node_id: NodeId, thread_id: ThreadId, pos
         thread_id,
         post_seq,
     };
-    while let Attempt::Started = sweep.start(&state, &node_id, mode.clone()).await {}
+    while let Attempt::Started = sweep.start(&state, &node_id, mode.clone(), 0).await {}
     while sweep.next().await.is_some() {}
-    signal(&state, &node_id, false);
+    signal(&state, &node_id, WakeTrigger::Work);
 }
 
 async fn drive_queue(state: AppState, node_id: NodeId, mut wake: watch::Receiver<Wake>) {
     let mut sweep = Sweep::new();
-    let mut observed = *wake.borrow_and_update();
+    let mut observed = 0;
+    let mut observed_idle = 0;
     let mut scan = true;
     let mut retry = false;
     let mut follow_up = false;
     let mut retries = 0;
     loop {
-        let current = *wake.borrow_and_update();
-        if observed.revision != current.revision {
-            if observed.idle_revision != current.idle_revision {
-                sweep.suppressed.clear();
-                retries = 0;
-            }
-            observed = current;
-            if scan {
-                // Finish this keyset sweep before considering new work on earlier keys.
-                follow_up = true;
-            } else {
-                sweep.cursor = None;
-                scan = true;
+        {
+            let current = wake.borrow_and_update();
+            if observed != current.revision {
+                if observed_idle != current.last_idle_revision {
+                    observed_idle = current.last_idle_revision;
+                    sweep.suppressed.retain(|candidate, staged_revision| {
+                        !current.newer_idle(&candidate.member_id, *staged_revision)
+                    });
+                    retries = 0;
+                }
+                observed = current.revision;
+                if scan {
+                    // Finish this keyset sweep before considering new work on earlier keys.
+                    follow_up = true;
+                } else {
+                    sweep.cursor = None;
+                    scan = true;
+                }
             }
         }
         if scan {
-            match sweep.start(&state, &node_id, Mode::Queue).await {
+            match sweep.start(&state, &node_id, Mode::Idle, observed).await {
                 Attempt::Started => continue,
                 Attempt::NoCandidate | Attempt::Offline | Attempt::Saturated => scan = false,
                 Attempt::Retry => {
@@ -293,10 +346,17 @@ async fn drive_queue(state: AppState, node_id: NodeId, mut wake: watch::Receiver
                     if change.is_err() { return; }
                     continue;
                 },
-                completion = sweep.next() => if let Some((candidate, outcome)) = completion {
+                completion = sweep.next() => if let Some(FinishedAttempt {candidate, staged_revision, outcome}) = completion {
                     match outcome {
                         Completion::Delivered => follow_up = true,
-                        Completion::WaitForIdle => { sweep.suppressed.insert(candidate); }
+                        Completion::WaitForIdle => {
+                            // A projected Idle can commit before the preceding Busy ACK arrives.
+                            if wake.borrow().newer_idle(&candidate.member_id, staged_revision) {
+                                follow_up = true;
+                            } else {
+                                sweep.suppressed.insert(candidate, staged_revision);
+                            }
+                        }
                         Completion::Transient => retry = true,
                         Completion::Ignore => {}
                     }
@@ -332,7 +392,7 @@ async fn drive_queue(state: AppState, node_id: NodeId, mut wake: watch::Receiver
             }
         }
         let mut nodes = state.thread_dispatch.lock();
-        if wake.borrow().revision == observed.revision {
+        if wake.borrow().revision == observed {
             nodes.remove(&node_id);
             return;
         }
@@ -345,22 +405,25 @@ fn stage(
     (epoch, now): (u64, i64),
     mode: &Mode,
     cursor: Option<&Candidate>,
-    suppressed: &HashSet<Candidate>,
+    suppressed: &HashMap<Candidate, u64>,
     delivery_id: OperationId,
 ) -> Result<Option<ThreadDeliverPayload>, HubError> {
     let only_thread = match mode {
-        Mode::Queue => None,
+        Mode::Idle => None,
         Mode::Direct { thread_id, .. } => Some(thread_id.as_str()),
     };
     let mut candidates = tx.prepare_cached(
-        "SELECT m.participant_id,m.thread_id,m.member_key
+        "SELECT m.participant_id,m.thread_id,m.member_key,m.resume_through_seq
          FROM thread_members m JOIN nodes n USING(node_id)
          JOIN node_participants p ON p.node_id=m.node_id AND p.participant_id=m.participant_id
          JOIN threads t USING(thread_id)
          WHERE m.node_id=?1 AND n.session_epoch=?2 AND n.status='online' AND n.revoked_at_ms IS NULL
            AND t.status='open' AND m.state='active' AND m.pending_delivery_id IS NULL AND m.role!='observer'
-           AND m.wake_policy!='muted' AND m.confirmed_seq<t.head_seq AND m.delivery_mode=?3
-           AND p.synced_epoch=?2 AND p.kind='agent' AND (?3='direct_now' OR p.state='idle')
+           AND m.wake_policy!='muted' AND m.confirmed_seq<t.head_seq
+           AND p.synced_epoch=?2 AND p.kind='agent'
+           AND ((?3='direct_now' AND m.delivery_mode='direct_now')
+                OR (?3='queue_until_idle' AND p.state='idle'
+                    AND (m.delivery_mode='queue_until_idle' OR m.resume_through_seq IS NOT NULL)))
            AND (?4 IS NULL OR m.thread_id=?4) AND (m.participant_id,m.thread_id)>(?5,?6)
          ORDER BY m.participant_id,m.thread_id",
     )?;
@@ -377,19 +440,40 @@ fn stage(
             member_id: parse_col(row, 0)?,
             thread_id: parse_col(row, 1)?,
         };
-        if suppressed.contains(&candidate) {
+        if suppressed.contains_key(&candidate) {
             continue;
         }
         let key: String = row.get(2)?;
+        let resume_through: Option<u64> = row.get(3)?;
         let member =
             members::member(tx, &candidate.thread_id, &key)?.ok_or_else(store::not_found)?;
         let board = store::board(tx, &candidate.thread_id, now)?;
         let floor = member.confirmed_seq.max(board.floor_seq);
-        let relevant = match mode {
-            Mode::Queue => {
-                posts::last_relevant_seq(tx, &candidate.thread_id, floor, board.head_seq, &member)?
+        let recovery_ready = if let Some(through) = resume_through {
+            let relevant = floor < through
+                && posts::last_relevant_seq(tx, &candidate.thread_id, floor, through, &member)?
+                    .is_some();
+            if !relevant {
+                tx.execute(
+                    "UPDATE thread_members SET resume_through_seq=NULL WHERE thread_id=?1 AND member_key=?2",
+                    params![candidate.thread_id.as_str(), key],
+                )?;
             }
-            Mode::Direct { post_seq, .. } if *post_seq > floor && *post_seq <= board.head_seq => {
+            relevant
+        } else {
+            false
+        };
+        let through = match mode {
+            Mode::Idle if member.delivery_mode == DeliveryMode::DirectNow => {
+                recovery_ready.then_some(board.head_seq)
+            }
+            Mode::Idle => {
+                posts::last_relevant_seq(tx, &candidate.thread_id, floor, board.head_seq, &member)?
+                    .map(|_| board.head_seq)
+            }
+            Mode::Direct { post_seq, .. }
+                if !recovery_ready && *post_seq > floor && *post_seq <= board.head_seq =>
+            {
                 posts::last_relevant_seq(
                     tx,
                     &candidate.thread_id,
@@ -400,7 +484,7 @@ fn stage(
             }
             Mode::Direct { .. } => None,
         };
-        if let Some(through) = relevant {
+        if let Some(through) = through {
             let payload = materialize(tx, candidate, &member, floor, through, delivery_id)?;
             tx.execute(
                 "UPDATE thread_members SET pending_delivery_id=?1,pending_from_seq=?2,pending_to_seq=?3
@@ -599,18 +683,20 @@ fn finish(
 ) -> rusqlite::Result<WriteOutcome<bool>> {
     let delivered = outcome == ThreadDeliveryOutcome::Delivered;
     let unknown = outcome == ThreadDeliveryOutcome::Unknown;
+    let rejected = outcome == ThreadDeliveryOutcome::Rejected;
     let changed = tx.execute(
         "UPDATE thread_members SET state=CASE WHEN ?1 THEN 'paused_unknown' ELSE state END,
            confirmed_seq=CASE WHEN ?2 THEN MAX(confirmed_seq,?3) ELSE confirmed_seq END,
            pending_delivery_id=CASE WHEN ?1 THEN pending_delivery_id ELSE NULL END,
            pending_from_seq=CASE WHEN ?1 THEN pending_from_seq ELSE NULL END,
-           pending_to_seq=CASE WHEN ?1 THEN pending_to_seq ELSE NULL END
+           pending_to_seq=CASE WHEN ?1 THEN pending_to_seq ELSE NULL END,
+           resume_through_seq=CASE WHEN ?1 OR ?2 OR ?10 THEN NULL ELSE resume_through_seq END
          WHERE thread_id=?4 AND member_key=?5 AND node_id=?6 AND state='active' AND delivery_generation=?7
            AND pending_delivery_id=?8 AND pending_to_seq=?3
            AND EXISTS(SELECT 1 FROM nodes WHERE node_id=?6 AND session_epoch=?9)",
         params![unknown, delivered, delivery.to_seq, delivery.candidate.thread_id.as_str(),
             delivery.member_key, delivery.node_id.as_str(), delivery.generation,
-            delivery.delivery_id.as_str(), delivery.epoch],
+            delivery.delivery_id.as_str(), delivery.epoch, rejected],
     )?;
     let mut notices = Vec::new();
     if changed != 0 {
@@ -646,7 +732,7 @@ fn pause_pending(
     notices: &mut Vec<EventNotice>,
 ) -> rusqlite::Result<()> {
     let mut statement = tx.prepare_cached(
-        "UPDATE thread_members SET state='paused_unknown'
+        "UPDATE thread_members SET state='paused_unknown',resume_through_seq=NULL
           WHERE state='active' AND pending_delivery_id IS NOT NULL AND (?1 IS NULL OR node_id=?1)
           RETURNING thread_id,member_key",
     )?;
@@ -673,7 +759,7 @@ pub(crate) fn reconcile_fences(
     for report in reports {
         let key = format!("{node_id}/{}", report.participant_id);
         let changed = tx.execute(
-            "UPDATE thread_members SET state='paused_unknown'
+            "UPDATE thread_members SET state='paused_unknown',resume_through_seq=NULL
              WHERE thread_id=?1 AND member_key=?2 AND node_id=?3 AND delivery_generation=?4 AND state='active'",
             params![report.thread_id.as_str(), key, node_id.as_str(), report.delivery_generation],
         )?;
@@ -716,126 +802,4 @@ fn member_event(
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-    use cooplet_protocol::UserId;
-    use rusqlite::Connection;
-
-    type TestResult = Result<(), Box<dyn std::error::Error>>;
-
-    #[test]
-    fn queue_coalesces_once_idle_and_cannot_accept_an_old_generation_ack() -> TestResult {
-        let mut db = Connection::open_in_memory()?;
-        db.execute_batch(include_str!("../storage/v1.sql"))?;
-        let node = NodeId::generate()?;
-        let hub = HubId::generate()?;
-        let owner = UserId::generate()?;
-        let participant = ParticipantId::generate()?;
-        let thread = ThreadId::generate()?;
-        let key = format!("{node}/{participant}");
-        let tx = db.transaction()?;
-        tx.execute(
-            "INSERT INTO hub_meta VALUES(1,?1,'Hub','fingerprint',0,0,1,1)",
-            [hub.as_str()],
-        )?;
-        tx.execute(
-            "INSERT INTO principals(principal_id,kind,username,display_name,created_at_ms,updated_at_ms)
-             VALUES(?1,'human_admin','owner','Owner',1,1)", [owner.as_str()],
-        )?;
-        tx.execute(
-            "INSERT INTO nodes(node_id,display_name,owner_principal_id,credential_hmac,session_epoch,status,enrolled_at_ms)
-             VALUES(?1,'Worker',?2,'credential',5,'online',1)", params![node.as_str(), owner.as_str()],
-        )?;
-        tx.execute(
-            "INSERT INTO node_participants(node_id,participant_id,kind,name,state,synced_epoch,updated_at_ms)
-             VALUES(?1,?2,'agent','Worker','working',5,1)", params![node.as_str(), participant.as_str()],
-        )?;
-        tx.execute(
-            "INSERT INTO threads(thread_id,title,created_by_actor_id,status,head_seq,created_at_ms,updated_at_ms)
-             VALUES(?1,'Dispatch',?2,'open',5,1,5)", params![thread.as_str(), owner.as_str()],
-        )?;
-        tx.execute(
-            "INSERT INTO thread_members(thread_id,member_key,participant_id,node_id,handle,role,wake_policy,joined_at_ms)
-             VALUES(?1,?2,?3,?4,'worker','member','mentions_only',1)",
-            params![thread.as_str(), key, participant.as_str(), node.as_str()],
-        )?;
-        let worker_mention = serde_json::to_string(&[&key])?;
-        for seq in 1..=5 {
-            let mentions = if matches!(seq, 1 | 4) {
-                worker_mention.as_str()
-            } else {
-                "[]"
-            };
-            tx.execute(
-                "INSERT INTO thread_posts(thread_id,seq,post_id,author_actor_id,author_kind,author_handle,
-                   body,mentions_json,created_at_ms,expires_at_ms)
-                 VALUES(?1,?2,?3,?4,'human','owner','post',?5,?2,100)",
-                params![thread.as_str(), seq, cooplet_protocol::MessageId::generate()?.as_str(), owner.as_str(), mentions],
-            )?;
-        }
-        let attempt = || {
-            stage(
-                &tx,
-                &node,
-                (5, 50),
-                &Mode::Queue,
-                None,
-                &HashSet::new(),
-                OperationId::generate()?,
-            )
-        };
-        assert!(attempt()?.is_none());
-        tx.execute("UPDATE node_participants SET state='idle'", [])?;
-        let payload = attempt()?.ok_or("no delivery after idle")?;
-        assert_eq!(
-            (payload.from_seq, payload.to_seq, payload.posts.len()),
-            (1, 4, 4)
-        );
-        assert!(attempt()?.is_none());
-        let delivery = Delivery::from_payload(&node, 5, &payload);
-        assert!(
-            !finish(
-                &tx,
-                &hub,
-                &Delivery {
-                    epoch: 4,
-                    ..delivery.clone()
-                },
-                ThreadDeliveryOutcome::Delivered,
-                51
-            )?
-            .value
-        );
-        assert!(finish(&tx, &hub, &delivery, ThreadDeliveryOutcome::Unknown, 51)?.value);
-
-        tx.execute(
-            "UPDATE thread_members SET state='active',delivery_generation=1,confirmed_seq=4,
-             pending_delivery_id=NULL,pending_from_seq=NULL,pending_to_seq=NULL",
-            [],
-        )?;
-        assert!(!finish(&tx, &hub, &delivery, ThreadDeliveryOutcome::Delivered, 52)?.value);
-        reconcile_fences(
-            &tx,
-            &hub,
-            &node,
-            &[ThreadFenceReport {
-                thread_id: thread.clone(),
-                participant_id: participant.clone(),
-                delivery_generation: 0,
-                highest_dispatched_seq: 4,
-                last_delivery_id: Some(payload.delivery_id),
-                last_from_seq: Some(1),
-            }],
-            52,
-            &mut Vec::new(),
-        )?;
-        assert_eq!(
-            members::member(&tx, &thread, &key)?
-                .ok_or("member absent")?
-                .state,
-            cooplet_protocol::ThreadMemberState::Active
-        );
-        assert!(attempt()?.is_none());
-        Ok(())
-    }
-}
+mod tests;

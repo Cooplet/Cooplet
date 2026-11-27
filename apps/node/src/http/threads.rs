@@ -12,7 +12,7 @@ use http::{HeaderMap, StatusCode};
 use crate::error::Result;
 
 use super::{
-    Caller, Json, NodeState, Path, Query,
+    Caller, Json, NodeState, OptionalJson, Path, Query,
     bridge::{rpc, unexpected_result},
     extract::required_key,
 };
@@ -89,7 +89,10 @@ pub(super) async fn get(
 
 #[utoipa::path(
     post, path = "/v1/threads/{thread_id}/close", security(("bearer" = [])),
-    request_body = ThreadCloseRequest,
+    request_body(
+        content = Option<ThreadCloseRequest>,
+        description = "Optional empty JSON object. Omit the body or send {}."
+    ),
     params(("thread_id" = ThreadId, Path), ("Idempotency-Key" = String, Header)),
     responses(
         (status = 200, description = "Success", body = ThreadSummary),
@@ -102,7 +105,7 @@ pub(super) async fn close(
     Caller(caller): Caller,
     Path(thread_id): Path<ThreadId>,
     headers: HeaderMap,
-    Json(_): Json<ThreadCloseRequest>,
+    OptionalJson(_): OptionalJson<ThreadCloseRequest>,
 ) -> ThreadResponse<ThreadSummary> {
     let operation = NodeRpcOperation::ThreadClose {
         thread_id,

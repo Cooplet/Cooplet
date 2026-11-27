@@ -22,7 +22,7 @@ use cooplet_protocol::{
 };
 use cooplet_storage::{StorageError, WriteFailure, WriteOutcome};
 use http::StatusCode;
-use rusqlite::{Connection, Transaction};
+use rusqlite::{Connection, Transaction, params};
 use serde::{Deserialize, Serialize};
 use tokio::{
     sync::{oneshot, watch},
@@ -32,7 +32,7 @@ use tokio::{
 use crate::{
     AppState,
     auth::{AuthenticatedCaller, reverify_caller_tx},
-    bridge::{CommandPermit, ReserveError, SubmitError},
+    bridge::{CommandPermit, CommandSession, ReserveError, SubmitError},
     error::HubError,
     now_ms,
     storage::sql::read_verified_tx_with_clock,
@@ -728,10 +728,10 @@ async fn deliver_owned(
             "The Hub is shutting down.",
         ));
     }
-    let reserved_node = reservation
+    let reserved = reservation
         .as_ref()
-        .map(|reservation| reservation.node.clone());
-    match accept_request(state, request.clone(), reserved_node).await {
+        .map(|reservation| (reservation.node.clone(), reservation.permit.session()));
+    match accept_request(state, request.clone(), reserved).await {
         Ok(Accepted::Done(reply)) => Ok(reply),
         Ok(Accepted::Dispatch(target)) => {
             let response = match reservation {
@@ -755,7 +755,7 @@ async fn deliver_owned(
 async fn accept_request(
     state: &AppState,
     request: Arc<Request>,
-    reserved_node: Option<NodeId>,
+    reserved: Option<(NodeId, CommandSession)>,
 ) -> Result<Accepted, WriteFailure<HubError>> {
     let hub_id = state.meta.hub_id.clone();
     let wall_clock = state.wall_clock.clone();
@@ -767,7 +767,19 @@ async fn accept_request(
                 return Ok(WriteOutcome::new(Accepted::Done(reply)));
             }
             let target = request.preflight(tx, now)?;
-            let can_dispatch = target.notify.is_some() && target.notify == reserved_node;
+            let can_dispatch = if let Some((node, session)) = &reserved
+                && target.notify.as_ref() == Some(node)
+            {
+                tx.query_row(
+                    "SELECT EXISTS(SELECT 1 FROM nodes
+                         WHERE node_id = ?1 AND generation = ?2 AND session_epoch = ?3
+                           AND revoked_at_ms IS NULL AND status = 'online')",
+                    params![node.as_str(), session.generation, session.epoch],
+                    |row| row.get::<_, bool>(0),
+                )?
+            } else {
+                false
+            };
             if !can_dispatch && !request.is_answer() && request.action.target_node().is_some() {
                 return Err(reserve_error(ReserveError::Offline).into());
             }

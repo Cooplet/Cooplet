@@ -2879,6 +2879,7 @@
           }
         ],
         "requestBody": {
+          "description": "Optional empty JSON object. Omit the body or send {}.",
           "content": {
             "application/json": {
               "schema": {
@@ -2886,7 +2887,7 @@
               }
             }
           },
-          "required": true
+          "required": false
         },
         "responses": {
           "200": {
@@ -6077,7 +6078,16 @@
               }
             ]
           },
-          "value_json": {}
+          "value_json": {
+            "type": [
+              "object",
+              "array",
+              "string",
+              "number",
+              "boolean"
+            ],
+            "description": "The non-null JSON value to store."
+          }
         },
         "additionalProperties": false
       },
@@ -6407,6 +6417,13 @@
         },
         "additionalProperties": false
       },
+      "ThreadWaitPolicy": {
+        "type": "string",
+        "enum": [
+          "mentions_only",
+          "all"
+        ]
+      },
       "ThreadWaitRequest": {
         "type": "object",
         "required": [
@@ -6424,7 +6441,7 @@
                 "type": "null"
               },
               {
-                "$ref": "#/components/schemas/ThreadWakePolicy"
+                "$ref": "#/components/schemas/ThreadWaitPolicy"
               }
             ]
           }

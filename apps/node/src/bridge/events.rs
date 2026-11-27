@@ -1,4 +1,4 @@
-use std::sync::Arc;
+use std::{collections::HashSet, io, sync::Arc};
 
 use cooplet_protocol::{
     ApprovalWaitKind, EventEnvelope, EventKind, NodeEventPayload, NodeId, ParticipantId,
@@ -11,7 +11,7 @@ use tokio::sync::{broadcast, mpsc};
 
 use crate::{error::Result, http::events::events_query_sql, storage::read_event};
 
-use super::roster::{bad_data, lookup_participant};
+use super::roster::{MAX_PARTICIPANTS, bad_data, lookup_participant};
 
 const PAGE_ROWS: usize = 32;
 const FORWARDED: &[EventKind] = &[
@@ -37,12 +37,16 @@ pub(super) async fn pump(
     local_id: NodeId,
     mut notices: broadcast::Receiver<EventNotice>,
     mut cursor: u64,
+    participants: HashSet<ParticipantId>,
     outbox: mpsc::Sender<Batch>,
 ) -> Result<()> {
     let kinds: Vec<_> = FORWARDED.iter().map(|kind| kind.as_str()).collect();
     let sql = Arc::new(events_query_sql(kinds.len()));
     let mut initial_head = None;
-    let mut last_approval = None;
+    let mut projection = Projection {
+        participants,
+        last_approval: None,
+    };
     let mut first = true;
     loop {
         let page = reads
@@ -58,12 +62,12 @@ pub(super) async fn pump(
                         &kinds,
                         cursor,
                         initial_head,
-                        last_approval,
+                        projection,
                     )
                 }
             })
             .await?;
-        last_approval = page.last_approval;
+        projection = page.projection;
         let head = *initial_head.get_or_insert(page.head);
         let allowed = page.through >= head;
         if (first || page.through > cursor)
@@ -103,6 +107,11 @@ struct Page {
     through: u64,
     head: u64,
     events: Vec<NodeEventPayload>,
+    projection: Projection,
+}
+
+struct Projection {
+    participants: HashSet<ParticipantId>,
     last_approval: Option<LastApproval>,
 }
 
@@ -120,7 +129,7 @@ fn read_page(
     kinds: &[&str],
     cursor: u64,
     initial_head: Option<u64>,
-    mut last_approval: Option<LastApproval>,
+    mut projection: Projection,
 ) -> std::result::Result<Page, StorageError> {
     let tx = conn.unchecked_transaction()?;
     let (floor, head): (u64, u64) = tx.query_row(
@@ -148,7 +157,7 @@ fn read_page(
         let event = read_event(row, local_id)?;
         latest = event.seq;
         scanned += 1;
-        if let Some(event) = project(&tx, event, &mut last_approval)? {
+        if let Some(event) = project(&tx, event, &mut projection)? {
             events.push(event);
         }
     }
@@ -156,14 +165,14 @@ fn read_page(
         through: if scanned < PAGE_ROWS { cut } else { latest },
         head,
         events,
-        last_approval,
+        projection,
     })
 }
 
 fn project(
     conn: &Connection,
     event: EventEnvelope,
-    last_approval: &mut Option<LastApproval>,
+    projection: &mut Projection,
 ) -> rusqlite::Result<Option<NodeEventPayload>> {
     match event.kind {
         EventKind::ParticipantCreated
@@ -171,7 +180,7 @@ fn project(
         | EventKind::ParticipantAwaitingApproval
         | EventKind::ParticipantStopped => {
             let state = ParticipantChange::deserialize(&event.payload).map_err(bad_data)?;
-            let previous = last_approval.take();
+            let previous = projection.last_approval.take();
             let duplicate = event.kind == EventKind::ParticipantAwaitingApproval
                 && previous.as_ref().is_some_and(|previous| {
                     previous.seq.checked_add(1) == Some(event.seq)
@@ -187,18 +196,31 @@ fn project(
                     EventKind::ParticipantCreated | EventKind::ParticipantStateChanged
                 )
             {
-                *last_approval = Some(LastApproval {
+                projection.last_approval = Some(LastApproval {
                     seq: event.seq,
                     actor: state.participant_id.clone(),
                     fields: state.approval.clone(),
                 });
             }
-            if event.kind == EventKind::ParticipantCreated
+            let known = projection.participants.contains(&state.participant_id);
+            // A new participant can have a durable starting row whose first
+            // public transition is a failed open. Declare it before sending
+            // state-only updates, even if the first state is already terminal.
+            if !known
+                || event.kind == EventKind::ParticipantCreated
                 || state.reason.as_deref() == Some("resumed")
             {
+                if !known && projection.participants.len() == MAX_PARTICIPANTS {
+                    return Err(bad_data(io::Error::other(
+                        "The bridge participant limit was reached",
+                    )));
+                }
                 let mut participant = lookup_participant(conn, &state.participant_id)?
                     .ok_or(rusqlite::Error::QueryReturnedNoRows)?;
                 state.apply_to(&mut participant);
+                projection
+                    .participants
+                    .insert(participant.participant_id.clone());
                 return Ok(Some(NodeEventPayload::ParticipantDeclared { participant }));
             }
             Ok(Some(NodeEventPayload::ParticipantStateChanged {
@@ -212,7 +234,7 @@ fn project(
             }))
         }
         other => {
-            *last_approval = None;
+            projection.last_approval = None;
             let (kind, fields): (&str, &[&str]) = match other {
                 EventKind::WorkflowRunStarted => {
                     ("workflow_run_started", &["run_id", "workflow_name"])
@@ -276,4 +298,108 @@ struct ApprovalFields {
     action_hint: Option<String>,
     summary: Option<String>,
     can_respond_remotely: Option<bool>,
+}
+
+#[cfg(test)]
+mod tests {
+    use cooplet_protocol::{AggregateType, EventId, SourceKind};
+    use rusqlite::params;
+    use serde_json::json;
+
+    use super::*;
+
+    #[test]
+    fn first_failed_open_is_declared_without_losing_event_history()
+    -> std::result::Result<(), Box<dyn std::error::Error>> {
+        let connection = Connection::open_in_memory()?;
+        connection.execute_batch(crate::storage::MIGRATIONS[0].sql)?;
+        let local_id = NodeId::generate()?;
+        let new_participant = ParticipantId::generate()?;
+        let known_participant = ParticipantId::generate()?;
+        for id in [&new_participant, &known_participant] {
+            connection.execute(
+                "INSERT INTO participants (participant_id, kind, name, client_kind, state,
+                    created_at_ms, updated_at_ms, capabilities_json)
+                 VALUES (?1, 'agent', ?2, 'test', 'idle', 1, 3, '{\"supports_resume\":true}')",
+                params![id.as_str(), format!("latest-{id}")],
+            )?;
+        }
+        let mut projection = Projection {
+            participants: HashSet::from([known_participant.clone()]),
+            last_approval: None,
+        };
+        let event = |seq, actor: &ParticipantId, kind, state, name, reason| {
+            Ok::<_, cooplet_protocol::IdError>(EventEnvelope {
+                seq,
+                event_id: EventId::generate()?,
+                source_kind: SourceKind::Node,
+                source_id: local_id.clone().into(),
+                kind,
+                aggregate_type: AggregateType::Participant,
+                aggregate_id: actor.to_string(),
+                actor_id: None,
+                created_at_ms: seq as i64,
+                payload: json!({
+                    "participant_id": actor,
+                    "state": state,
+                    "name": name,
+                    "reason": reason,
+                }),
+            })
+        };
+        let stopped = event(
+            1,
+            &new_participant,
+            EventKind::ParticipantStopped,
+            ParticipantState::Stopped,
+            "first-name",
+            "native_open_failed",
+        )?;
+        let Some(NodeEventPayload::ParticipantDeclared { participant }) =
+            project(&connection, stopped, &mut projection)?
+        else {
+            return Err(
+                io::Error::other("the first failed open did not declare the participant").into(),
+            );
+        };
+        assert_eq!(participant.participant_id, new_participant);
+        assert_eq!(participant.state, ParticipantState::Stopped);
+        assert_eq!(participant.name, "first-name");
+        assert_eq!(participant.client_kind.as_deref(), Some("test"));
+        assert_eq!(participant.capabilities["supports_resume"], true);
+        assert_eq!(projection.participants.len(), 2);
+
+        let stopped_known = event(
+            2,
+            &known_participant,
+            EventKind::ParticipantStopped,
+            ParticipantState::Stopped,
+            "known-name",
+            "native_open_failed",
+        )?;
+        assert!(matches!(
+            project(&connection, stopped_known, &mut projection)?,
+            Some(NodeEventPayload::ParticipantStateChanged {
+                participant_id, state: ParticipantState::Stopped, ..
+            }) if participant_id == known_participant
+        ));
+
+        let renamed = event(
+            3,
+            &new_participant,
+            EventKind::ParticipantStateChanged,
+            ParticipantState::Idle,
+            "new-name",
+            "resumed",
+        )?;
+        assert!(matches!(
+            project(&connection, renamed, &mut projection)?,
+            Some(NodeEventPayload::ParticipantDeclared { participant })
+                if participant.participant_id == new_participant
+                    && participant.state == ParticipantState::Idle
+                    && participant.name == "new-name"
+        ));
+        assert_eq!(projection.participants.len(), 2);
+        Ok(())
+    }
 }

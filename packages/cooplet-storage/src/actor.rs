@@ -158,9 +158,33 @@ impl DbActor {
         E: Send + 'static,
         F: FnOnce(&Transaction<'_>) -> Result<WriteOutcome<T>, WriteError<E>> + Send + 'static,
     {
+        self.write_with_admission(write, false).await
+    }
+
+    /// Wait for writer capacity in a bounded lifecycle task. Cancellation
+    /// stops waiting before enqueue and preserves actor ownership after enqueue.
+    pub async fn write_wait<T, E, F>(&self, write: F) -> Result<T, WriteFailure<E>>
+    where
+        T: Send + 'static,
+        E: Send + 'static,
+        F: FnOnce(&Transaction<'_>) -> Result<WriteOutcome<T>, WriteError<E>> + Send + 'static,
+    {
+        self.write_with_admission(write, true).await
+    }
+
+    async fn write_with_admission<T, E, F>(
+        &self,
+        write: F,
+        wait: bool,
+    ) -> Result<T, WriteFailure<E>>
+    where
+        T: Send + 'static,
+        E: Send + 'static,
+        F: FnOnce(&Transaction<'_>) -> Result<WriteOutcome<T>, WriteError<E>> + Send + 'static,
+    {
         let (reply, result) = oneshot::channel();
         let events = self.events.clone();
-        self.submit(Job::Write(Box::new(move |conn, lock| {
+        let job = Job::Write(Box::new(move |conn, lock| {
             let result = (|| {
                 lock.verify_path().map_err(StorageError::from)?;
                 let tx = conn
@@ -196,7 +220,12 @@ impl DbActor {
                 Ok(value)
             })();
             let _ = reply.send(result);
-        })))?;
+        }));
+        if wait {
+            self.submit_wait(job).await?;
+        } else {
+            self.submit(job)?;
+        }
         result
             .await
             .map_err(|_| StorageError::WriteOutcomeUnknown)?
@@ -224,17 +253,8 @@ impl DbActor {
     }
 
     pub(crate) async fn barrier(&self) -> Result<(), StorageError> {
-        let sender = self
-            .inbox
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .clone()
-            .ok_or(StorageError::Closed)?;
         let (reply, result) = oneshot::channel();
-        sender
-            .send(Job::Barrier(reply))
-            .await
-            .map_err(|_| StorageError::Closed)?;
+        self.submit_wait(Job::Barrier(reply)).await?;
         result.await.map_err(|_| StorageError::WriteOutcomeUnknown)
     }
 
@@ -255,5 +275,15 @@ impl DbActor {
             mpsc::error::TrySendError::Full(_) => StorageError::Overloaded,
             mpsc::error::TrySendError::Closed(_) => StorageError::Closed,
         })
+    }
+
+    async fn submit_wait(&self, job: Job) -> Result<(), StorageError> {
+        let sender = self
+            .inbox
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone()
+            .ok_or(StorageError::Closed)?;
+        sender.send(job).await.map_err(|_| StorageError::Closed)
     }
 }

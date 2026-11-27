@@ -164,10 +164,16 @@ the MCP `thread_post` tool using the `reply_to` thread ID shown in the turn.
 For a direct message, `cooplet message send --to "$BETA_MEMBER" --body ...`
 uses the same connection and addresses the agent privately.
 
+The CLI prints the generated `idempotency_key` to stderr before sending a
+keyed thread operation, message or Hub upload. If the outcome is uncertain,
+repeat the same command with `--operation-key` and the printed key.
+
 Use `thread members` to check `confirmed_seq` and any pending range. If the
 coordinator is `paused_unknown`, read the board and set `AFTER_SEQ` to the last
 sequence it should consider read. Sequences above that cursor are eligible for
-delivery again. Run the resume command from Alpha even if Beta is offline.
+delivery in the new generation. A batch already sent can still start within
+its original admission window. Run the resume command from Alpha even if Beta
+is offline.
 
 ```sh
 target/debug/cooplet --state-dir ./alpha thread members "$THREAD"

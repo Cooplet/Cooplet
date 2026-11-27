@@ -2,8 +2,10 @@ use std::time::Duration;
 
 use cooplet_protocol::{
     ApprovalWaitKind, BRIDGE_ERROR_HEADER, BRIDGE_SUBPROTOCOL, BridgeFrame, BridgePayload,
-    ErrorCode, HelloAckPayload, HubId, ParticipantId, ParticipantKind, ParticipantState,
-    ParticipantWire, RosterReadyPayload, RosterSyncPayload, TemplateSummary,
+    ErrorCode, HelloAckPayload, HubId, MemberView, ParticipantId, ParticipantKind,
+    ParticipantState, ParticipantWire, RosterReadyPayload, RosterSyncPayload, TemplateSummary,
+    ThreadAckPayload, ThreadDeliverPayload, ThreadDeliveryOutcome, ThreadMembersResponse,
+    ThreadSummary,
 };
 use futures_util::{SinkExt, StreamExt};
 use http::{HeaderValue, Request, StatusCode, header};
@@ -285,6 +287,129 @@ async fn bridge_snapshot_is_atomic_and_same_node_replacement_reuses_capacity() -
     let node = summary(&hub, &first).await?;
     assert_eq!(node["templates"][0]["template_id"], "review");
     assert_eq!(node["status"], "offline");
+    Ok(())
+}
+
+fn thread_ack(delivery: ThreadDeliverPayload) -> ThreadAckPayload {
+    ThreadAckPayload {
+        delivery_generation: delivery.delivery_generation,
+        delivery_id: delivery.delivery_id,
+        thread_id: delivery.thread_id,
+        member_id: delivery.member_id,
+        acked_seq: delivery.to_seq,
+        outcome: ThreadDeliveryOutcome::Delivered,
+        detail: None,
+    }
+}
+
+#[tokio::test]
+async fn resume_skips_previously_sent_posts_and_ignores_the_old_ack() -> TestResult {
+    let hub = Hub::start().await?;
+    let enrolled = enroll(&hub, "Worker", "bridge-resume-epoch").await?;
+    let (mut socket, epoch) = open(&hub, &enrolled).await?;
+    let participant = ParticipantId::generate()?;
+    let mut initial = roster();
+    initial.participants.push(ParticipantWire {
+        participant_id: participant.clone(),
+        kind: ParticipantKind::Agent,
+        name: "coordinator".into(),
+        client_kind: Some("mock".into()),
+        workspace_dir: None,
+        state: ParticipantState::Idle,
+        capabilities: json!({}),
+        wait_kind: None,
+        approval_id: None,
+        action_hint: None,
+        summary: None,
+        can_respond_remotely: None,
+    });
+    ready(&mut socket, epoch, &initial).await?;
+    let admin = hub.admin()?;
+    let member = format!("{}/{participant}", enrolled.node_id);
+    let join = json!({"member_key":member,"handle":"coordinator"});
+    let board: ThreadSummary = admin
+        .post_json(
+            "/v1/threads",
+            &json!({
+                "title":"Visible on the wire", "members":[join],
+            }),
+            Some("old-range-thread"),
+        )
+        .await?;
+    let posts = format!("/v1/threads/{}/posts", board.thread_id);
+    let members = format!("/v1/threads/{}/members", board.thread_id);
+    let _: Value = admin
+        .post_json(
+            &posts,
+            &json!({"body":"@coordinator old range"}),
+            Some("old-range-post"),
+        )
+        .await?;
+    let old: ThreadDeliverPayload = frame(&mut socket).await?.decode_payload()?;
+    assert_eq!(
+        (old.delivery_generation, old.from_seq, old.to_seq),
+        (0, 1, 1)
+    );
+
+    let left: MemberView = admin
+        .post_json(
+            &format!("{members}/leave"),
+            &json!({"member_key":member}),
+            Some("old-range-leave"),
+        )
+        .await?;
+    assert_eq!(
+        left.pending
+            .ok_or("leave lost the unresolved range")?
+            .delivery_id,
+        old.delivery_id
+    );
+    let joined: Value = admin
+        .post_json(&format!("{members}/join"), &join, Some("old-range-join"))
+        .await?;
+    assert_eq!(joined["state"], "paused_unknown");
+    let resumed: MemberView = admin
+        .post_json(
+            &format!("{members}/resume"),
+            &json!({"member_key":member,"after_seq":old.to_seq}),
+            Some("old-range-skip"),
+        )
+        .await?;
+    assert_eq!(resumed.delivery_generation, 1);
+    assert_eq!(resumed.confirmed_seq, 1);
+    assert!(resumed.pending.is_none());
+
+    let _: Value = admin
+        .post_json(
+            &posts,
+            &json!({"body":"@coordinator new range"}),
+            Some("new-range-post"),
+        )
+        .await?;
+    let new: ThreadDeliverPayload = frame(&mut socket).await?.decode_payload()?;
+    assert_eq!(
+        (new.delivery_generation, new.from_seq, new.to_seq),
+        (1, 2, 2)
+    );
+    send(&mut socket, epoch, &thread_ack(old)).await?;
+    send(&mut socket, epoch, &thread_ack(new)).await?;
+    timeout(DEADLINE, async {
+        loop {
+            let page: ThreadMembersResponse = admin.get_json(&members, &[]).await?;
+            let view = page
+                .items
+                .iter()
+                .find(|view| view.member_key == member)
+                .ok_or("member disappeared after resume")?;
+            if view.confirmed_seq == 2 {
+                assert_eq!(view.delivery_generation, 1);
+                assert!(view.pending.is_none());
+                return Ok::<_, Box<dyn std::error::Error + Send + Sync>>(());
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await??;
     Ok(())
 }
 

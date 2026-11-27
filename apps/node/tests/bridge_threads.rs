@@ -17,9 +17,12 @@ use std::{
     time::Duration,
 };
 
-use cooplet_client::{ClientError, CoopletClient};
+use cooplet_client::{ClientError, CoopletClient, EventsQuery};
 use cooplet_node::clients::{AdapterEventKind, ParticipantRuntimeState, SubmitOutcome, TurnInput};
-use cooplet_protocol::{AttachmentRef, AuthorKind, ErrorCode, MessageId, NodeId, ParticipantId};
+use cooplet_protocol::{
+    ApprovalWait, ApprovalWaitKind, AttachmentRef, AuthorKind, ErrorCode, EventKind, MessageId,
+    NodeId, ParticipantId,
+};
 use serde_json::{Value, json};
 use tokio::time::{sleep, timeout};
 
@@ -161,18 +164,17 @@ async fn enrolled_nodes_share_a_thread_and_reply_over_the_same_bridge() -> TestR
 
     let source = a.workspace_dir.join(FILE_NAME);
     fs::write(&source, FILE_BYTES)?;
-    let mut upload = node_cli(&a.state_dir);
-    upload.args(["blob", "put"]).arg(&source).args([
-        "--target",
-        "hub",
-        "--mime-type",
-        "text/plain",
-    ]);
-    let upload = cli_json(upload).await?;
+    let (failed, upload) = mcp_call(
+        a_session.credential.clone(),
+        "blob_put",
+        json!({"path":FILE_NAME,"target":"hub","operation_key":"agent-attachment"}),
+    )
+    .await?;
+    assert!(!failed, "MCP blob relay failed: {upload}");
     let attachment: AttachmentRef = serde_json::from_value(upload)?;
     assert_eq!(attachment.name, FILE_NAME);
     assert_eq!(attachment.size_bytes, FILE_BYTES.len() as u64);
-    let operator_post = json!({"body":"Artifact available", "mentions":["coordinator"], "attachments":[attachment]});
+    let operator_post = json!({"body":"Coordination note", "mentions":["coordinator"]});
     let human_post = json!({"body":"@coordinator review the decision"});
     let service_post = json!({"body":"@coordinator the checks passed"});
     let agent_post = mcp_call(
@@ -180,6 +182,7 @@ async fn enrolled_nodes_share_a_thread_and_reply_over_the_same_bridge() -> TestR
         "thread_post",
         json!({
             "thread_id":thread, "body":"@coordinator I agree", "operation_key":"agent-post",
+            "attachments":[attachment],
         }),
     );
     let (operator_saved, human_saved, service_saved, agent_saved) = tokio::try_join!(
@@ -290,6 +293,14 @@ async fn enrolled_nodes_share_a_thread_and_reply_over_the_same_bridge() -> TestR
     assert_eq!(linked["in_reply_to"], outgoing.as_str());
     exercise_hub_native_reply(&hub, &reporter, &b_session, &b_mock, &b_enrollment.node_id).await?;
     exercise_board_api(&hub, &a, &a_session, &thread, &posts).await?;
+    failed_open_does_not_interrupt_an_inflight_command(
+        &hub,
+        &b_session,
+        &b_mock,
+        &b_enrollment.node_id,
+    )
+    .await?;
+    exercise_approval_redaction(&hub, &reporter, &b_session, &b_enrollment.node_id).await?;
 
     // Signal the Hub while both WebSockets are registered, before stopping either Node.
     hub.stop().await?;
@@ -425,6 +436,150 @@ async fn exercise_hub_native_reply(
         assert_eq!(reply["delivery_state"], "delivered");
     }
     Ok(())
+}
+
+async fn failed_open_does_not_interrupt_an_inflight_command(
+    hub: &BridgeHub,
+    destination: &MockSession,
+    adapter: &MockAdapter,
+    node: &NodeId,
+) -> TestResult {
+    finish_live_turn(&hub.admin, node, destination).await?;
+    let epoch = online_epoch(&hub.admin, node).await?;
+    let recipient = &destination.target.participant_id;
+    let body = json!({"target_node_id":node,"target_participant_id":recipient,"body":"Keep this command in flight"});
+    let admin = hub.admin.clone();
+    let mut existing = tokio::spawn(async move {
+        post(
+            &admin,
+            "/v1/messages",
+            &body,
+            "in-flight-during-failed-open",
+        )
+        .await
+    });
+    let turn = tokio::select! {
+        turn = required_submit(adapter, "command concurrent with failed open") => turn?,
+        response = &mut existing => return Err(io::Error::other(format!("Command returned before adapter intake: {:?}", response??)).into()),
+    };
+    adapter.fail_next_open();
+    let rejected = hub
+        .admin
+        .post_json::<_, Value>(
+            "/v1/agents",
+            &json!({"target_node_id":node,"client_kind":"mock","name":"failed-after-roster"}),
+            Some("failed-bridged-open"),
+        )
+        .await;
+    problem(rejected, ErrorCode::BridgeUnavailable, 502)?;
+    wait_for(async || {
+        let catalog: Value = hub
+            .admin
+            .get_json("/v1/participants", &[("node_id", node.to_string())])
+            .await?;
+        Ok(items(&catalog)?
+            .iter()
+            .any(|row| row["name"] == "failed-after-roster" && row["state"] == "stopped")
+            .then_some(()))
+    })
+    .await?;
+    assert_eq!(online_epoch(&hub.admin, node).await?, epoch);
+    assert!(!existing.is_finished());
+    turn.finish(SubmitOutcome::Accepted {
+        native_turn_id: None,
+    })?;
+    assert_eq!(existing.await??["delivery_state"], "delivered");
+    Ok(())
+}
+
+async fn exercise_approval_redaction(
+    hub: &BridgeHub,
+    reporter: &CoopletClient,
+    session: &MockSession,
+    node: &NodeId,
+) -> TestResult {
+    let participant = &session.target.participant_id;
+    let mut cursor = hub
+        .admin
+        .list_events(&EventsQuery::default())
+        .await?
+        .latest_seq;
+    let mut previous = None;
+    for approval in ["initial approval", "replacement approval"] {
+        session
+            .emit(AdapterEventKind::ApprovalRequested(ApprovalWait {
+                approval_id: Some(approval.into()),
+                kind: ApprovalWaitKind::Permission,
+                summary: Some(approval.into()),
+                can_respond_remotely: true,
+                action_hint: Some("Review the requested permission".into()),
+            }))
+            .await?;
+        let admin_row = wait_for(async || {
+            let catalog: Value = hub
+                .admin
+                .get_json("/v1/participants", &[("node_id", node.to_string())])
+                .await?;
+            Ok(items(&catalog)?
+                .iter()
+                .find(|row| {
+                    row["participant_id"] == participant.as_str() && row["summary"] == approval
+                })
+                .cloned())
+        })
+        .await?;
+        let id = field(&admin_row, "approval_id")?;
+        assert_ne!(previous.as_deref(), Some(id));
+        previous = Some(id.to_owned());
+        assert_eq!(admin_row["can_respond_remotely"], true);
+
+        let catalog: Value = reporter
+            .get_json("/v1/participants", &[("node_id", node.to_string())])
+            .await?;
+        let redacted = items(&catalog)?
+            .iter()
+            .find(|row| row["participant_id"] == participant.as_str())
+            .ok_or("catalog omitted the awaiting participant")?;
+        assert_redacted_approval(redacted, approval);
+
+        let query = EventsQuery {
+            after: cursor,
+            kinds: vec![EventKind::ParticipantAwaitingApproval],
+            ..EventsQuery::default()
+        };
+        let events = reporter.list_events(&query).await?;
+        let event = events
+            .items
+            .iter()
+            .find(|event| {
+                event.payload["participant_id"] == participant.as_str()
+                    && event.payload["summary"] == approval
+            })
+            .ok_or("missing live redacted approval event")?;
+        assert_redacted_approval(&event.payload, approval);
+        let admin_events = hub.admin.list_events(&query).await?;
+        assert!(
+            admin_events
+                .items
+                .iter()
+                .any(|event| event.payload["approval_id"] == id)
+        );
+        cursor = events.next_seq;
+    }
+    let rejected = reporter.post_json::<_, Value>(
+        "/v1/messages", &json!({"target_node_id":node,"target_participant_id":participant,"body":"Waiting for input"}),
+        Some("reporter-blocked-by-approval"),
+    ).await;
+    let error = problem(rejected, ErrorCode::AwaitingApproval, 409)?;
+    assert_redacted_approval(&json!(error.extensions), "replacement approval");
+    Ok(())
+}
+
+fn assert_redacted_approval(payload: &Value, summary: &str) {
+    assert!(payload.get("approval_id").is_none());
+    assert_eq!(payload["can_respond_remotely"], false);
+    assert_eq!(payload["wait_kind"], "permission");
+    assert_eq!(payload["summary"], summary);
 }
 
 async fn exercise_board_api(
@@ -669,12 +824,17 @@ async fn wait_for<T>(mut check: impl AsyncFnMut() -> TestResult<Option<T>>) -> T
 }
 
 async fn online(client: &CoopletClient, id: &NodeId) -> TestResult {
+    online_epoch(client, id).await?;
+    Ok(())
+}
+
+async fn online_epoch(client: &CoopletClient, id: &NodeId) -> TestResult<u64> {
     wait_for(async || {
         let nodes: Value = client.get_json("/v1/nodes", &[]).await?;
         Ok(items(&nodes)?
             .iter()
-            .any(|node| node["node_id"] == id.as_str() && node["status"] == "online")
-            .then_some(()))
+            .find(|node| node["node_id"] == id.as_str() && node["status"] == "online")
+            .and_then(|node| node["session_epoch"].as_u64()))
     })
     .await
 }

@@ -2,7 +2,7 @@
   "schemaVersion": 2,
   "version": "0.6.0",
   "releaseIdentity": "1e3a61daf9a5a1527dd049d9f04f84a42ec22aaba783b66d16cbc95af285914c",
-  "generation": "ba8d817b-2375-417c-b1bb-d524d0b7214f",
+  "generation": "f48a4695-14f1-4ac3-8778-8b35b0466e51",
   "packageMode": "registry",
   "managed": {
     ".devkit/compose.apps.yaml": {
@@ -278,14 +278,14 @@
   },
   "cargoResolution": {
     "version": 1,
-    "lock": "7e468e33e471acc945d42a634df08414626facb2e2179108ac8f038e39d95c8d",
+    "lock": "624921b31c6f3214292a0afc7897c86d3f6cc68f116a15a4b19685eede2d25e9",
     "inputs": {
-      "digest": "ae5154f8cd18dd41cc0a94fc03b4f49a605f1f95189ee6738c3a63e77935c668",
+      "digest": "cb40f4e3c716b00f82b7d14c64cf029fda44ddd2e45b43a8ee528faf709c166d",
       "policy": "14aa8b966c1a23c5aad3907a629843c093c9b3ec1f628b499a8298e3bc9af92f",
       "members": {
         "apps/history": "b67497c3e853a9347fb09296b4de2efdd73447c93915913fd1105bed27fe10fe",
         "apps/hub": "3153003b114e76ef2388afe8830f0bc628f1034181ef3717b3b75a418d988995",
-        "apps/node": "d28cbc367fbf2c930776996029ee069f2b1b97ff665d81f7c6b7d9d3f77e8a65",
+        "apps/node": "4aea3e7ddc41b88bd75a6744ac4f34a324e7f1989c42b35ba0000c98b7fab6a3",
         "apps/telegram": "52de4c63305a12e49bd6bca6ce1db4413a47c0c2a63b50e7d200a4e40327532e",
         "packages/cooplet-client": "650e7e07c95e905faafabc0a2471b6ba693ba218946a44a645dde96a9166863b",
         "packages/cooplet-platform": "30d6f391e221db62e536f8bcc3fb56bac94cc099cc1d7a1ddcad9e1976867cd1",

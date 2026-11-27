@@ -1,5 +1,5 @@
 use std::{
-    collections::{HashMap, VecDeque},
+    collections::{HashMap, HashSet, VecDeque},
     future::{Future, ready},
     path::Path,
     sync::Arc,
@@ -177,14 +177,7 @@ pub(super) async fn run(
     let (ready, exit) = attempt.serve(&mut io, connect_deadline, stop).await;
     bridge.session.send_replace(None);
     if let Some(code) = exit.close() {
-        let _ = tokio::time::timeout(
-            CLOSE_TIMEOUT,
-            io.socket.send(Message::Close(Some(CloseFrame {
-                code,
-                reason: exit.reason().into(),
-            }))),
-        )
-        .await;
+        io.close(code, exit.reason()).await;
     }
     (ready, exit)
 }
@@ -209,7 +202,7 @@ impl Attempt<'_> {
         let notices = self.state.db.subscribe();
         let max_commands = (hello.max_inflight_commands as usize).min(MAX_COMMANDS);
         let max_threads = (hello.max_inflight_threads as usize).min(MAX_THREAD_DELIVERIES);
-        let cursor = match self
+        let (cursor, participants) = match self
             .sync_roster(io, epoch, hello, roster_deadline, stop)
             .await
         {
@@ -221,7 +214,9 @@ impl Attempt<'_> {
         let reads = self.state.reads.clone();
         let local_id = self.state.info.node_id.clone();
         self.bridge.spawn_worker(async move {
-            if let Err(error) = events::pump(reads, local_id, notices, cursor, event_tx).await {
+            if let Err(error) =
+                events::pump(reads, local_id, notices, cursor, participants, event_tx).await
+            {
                 tracing::warn!(code = %error.code(), "Could not forward Node events");
             }
         });
@@ -261,7 +256,7 @@ impl Attempt<'_> {
         hello: HelloAckPayload,
         deadline: MonoInstant,
         stop: &watch::Receiver<bool>,
-    ) -> SessionResult<u64> {
+    ) -> SessionResult<(u64, HashSet<ParticipantId>)> {
         let capture = roster::capture(&self.state.reads, self.workspace, self.hub, epoch, hello);
         let roster = tokio::select! {
             roster = capture => roster.map_err(|error| {
@@ -295,7 +290,11 @@ impl Attempt<'_> {
                 }
                 () = ready(()) => {
                     if let Some(frame) = frames.pop_front() {
-                        io.send(Message::Text(frame.into()), deadline, Exit::RosterTimeout, stop).await?;
+                        io.send(
+                            Message::Text(frame.into()),
+                            Some((deadline, Exit::RosterTimeout)),
+                            stop,
+                        ).await?;
                     }
                 }
             }
@@ -304,7 +303,7 @@ impl Attempt<'_> {
         let ready = io.next_app(deadline, Exit::RosterTimeout, stop).await?;
         check_epoch(&ready, epoch)?;
         decode::<RosterReadyPayload>(&ready)?;
-        Ok(roster.cursor)
+        Ok((roster.cursor, roster.participants))
     }
 
     async fn online(
@@ -363,8 +362,11 @@ impl Attempt<'_> {
                 if let Some(mut request) = online.requests.take_ready(ready_cursor)
                     && request.mark_sent(&*self.bridge.clock)
                 {
-                    let deadline = io.earlier_timeout(SEND_TIMEOUT, request.deadline());
-                    io.send(Message::Text(request.take_frame().into()), deadline, Exit::SendTimeout, stop).await?;
+                    io.send(
+                        Message::Text(request.take_frame().into()),
+                        Some((request.deadline(), Exit::SendTimeout)),
+                        stop,
+                    ).await?;
                     online.requests.sent(request);
                 }
             }
@@ -775,19 +777,12 @@ impl Wire {
             }
             Message::Ping(_) => {
                 // Tungstenite queues the RFC 6455 Pong while reading a Ping.
-                within(
-                    &*self.clock,
-                    self.clock.deadline_after(SEND_TIMEOUT),
-                    Exit::SendTimeout,
-                    stop,
-                    async { self.socket.flush().await.map_err(ws_error) },
-                )
-                .await?;
+                self.flush(SEND_TIMEOUT, stop).await?;
                 Ok(None)
             }
             Message::Close(close) => {
                 // Send the automatically queued close reply before dropping the stream.
-                let _ = tokio::time::timeout(CLOSE_TIMEOUT, self.socket.flush()).await;
+                let _ = self.flush(CLOSE_TIMEOUT, stop).await;
                 if close.is_some_and(|close| u16::from(close.code) == 4003) {
                     Err(Exit::Revoked)
                 } else {
@@ -803,46 +798,75 @@ impl Wire {
             return Err(Exit::PongTimeout);
         }
         let bytes = self.heartbeat.serial.to_be_bytes();
-        self.send_online(Message::Ping(bytes.to_vec().into()), stop)
-            .await?;
-        self.heartbeat.wait_for_pong(&*self.clock, bytes);
-        Ok(())
+        self.heartbeat.start_ping(&*self.clock, bytes);
+        self.send(Message::Ping(bytes.to_vec().into()), None, stop)
+            .await
     }
 
     async fn send(
         &mut self,
         message: Message,
-        deadline: MonoInstant,
-        on_timeout: Exit,
+        limit: Option<(MonoInstant, Exit)>,
         stop: &watch::Receiver<bool>,
     ) -> SessionResult<()> {
+        let (deadline, on_timeout) = self.write_deadline(SEND_TIMEOUT, limit);
         within(&*self.clock, deadline, on_timeout, stop, async {
             self.socket.send(message).await.map_err(ws_error)
         })
         .await
     }
 
-    fn earlier_timeout(&self, local: Duration, deadline: MonoInstant) -> MonoInstant {
-        let remaining = self.clock.remaining_ms(deadline).unwrap_or(0);
-        if remaining <= local.as_millis() as u64 {
-            deadline
-        } else {
-            self.clock.deadline_after(local)
-        }
-    }
-
-    async fn send_online(
+    async fn flush(
         &mut self,
-        message: Message,
+        timeout: Duration,
         stop: &watch::Receiver<bool>,
     ) -> SessionResult<()> {
-        self.send(
-            message,
-            self.clock.deadline_after(SEND_TIMEOUT),
-            Exit::SendTimeout,
-            stop,
-        )
+        let (deadline, on_timeout) = self.write_deadline(timeout, None);
+        within(&*self.clock, deadline, on_timeout, stop, async {
+            self.socket.flush().await.map_err(ws_error)
+        })
         .await
+    }
+
+    // Cancel a stalled write when the next Ping is due, or when its expected
+    // Pong has expired. A partially written frame cannot be interrupted and
+    // resumed later without continuing its socket write.
+    fn write_deadline(
+        &self,
+        timeout: Duration,
+        limit: Option<(MonoInstant, Exit)>,
+    ) -> (MonoInstant, Exit) {
+        let heartbeat = self.heartbeat.deadline();
+        let local = self.clock.deadline_after(timeout);
+        let mut bound = if local.is_earlier_than(heartbeat) {
+            (local, Exit::SendTimeout)
+        } else {
+            let on_timeout = if self.heartbeat.awaiting.is_some() {
+                Exit::PongTimeout
+            } else {
+                Exit::SendTimeout
+            };
+            (heartbeat, on_timeout)
+        };
+        if let Some(limit) = limit
+            && limit.0.is_earlier_than(bound.0)
+        {
+            bound = limit;
+        }
+        bound
+    }
+
+    async fn close(&mut self, code: CloseCode, reason: &'static str) {
+        let (deadline, _) = self.write_deadline(CLOSE_TIMEOUT, None);
+        let message = Message::Close(Some(CloseFrame {
+            code,
+            reason: reason.into(),
+        }));
+        tokio::select! {
+            biased;
+            () = wait_deadline(&*self.clock, Some(deadline)) => {},
+            _ = self.socket.send(message) => {},
+        }
     }
 
     async fn send_payload(
@@ -853,7 +877,7 @@ impl Wire {
     ) -> SessionResult<()> {
         let bytes = BridgeFrame::encode_json(epoch, payload).map_err(|_| Exit::Protocol)?;
         let text = String::from_utf8(bytes).map_err(|_| Exit::Protocol)?;
-        self.send_online(Message::Text(text.into()), stop).await
+        self.send(Message::Text(text.into()), None, stop).await
     }
 }
 
@@ -877,7 +901,7 @@ impl Heartbeat {
             .map_or(self.next_ping, |(_, deadline)| deadline)
     }
 
-    fn wait_for_pong(&mut self, clock: &dyn MonoClock, payload: [u8; 8]) {
+    fn start_ping(&mut self, clock: &dyn MonoClock, payload: [u8; 8]) {
         self.awaiting = Some((payload, clock.deadline_after(PONG_TIMEOUT)));
         self.next_ping = clock.deadline_after(PING_INTERVAL);
         self.serial = self.serial.wrapping_add(1);
@@ -929,7 +953,14 @@ async fn within<T>(
 
 #[cfg(test)]
 mod tests {
-    use std::sync::atomic::{AtomicU64, Ordering};
+    use std::{
+        future::poll_fn,
+        pin::{Pin, pin},
+        sync::atomic::{AtomicU64, Ordering},
+        task::Poll,
+    };
+
+    use tokio::io::AsyncReadExt;
 
     use super::*;
 
@@ -955,7 +986,7 @@ mod tests {
         assert_eq!(clock.remaining_ms(heartbeat.deadline()), Some(15_000));
         clock.at(15_000);
         let challenge = 9_u64.to_be_bytes();
-        heartbeat.wait_for_pong(&clock, challenge);
+        heartbeat.start_ping(&clock, challenge);
         assert_eq!(clock.remaining_ms(heartbeat.deadline()), Some(10_000));
 
         clock.at(24_999);
@@ -965,7 +996,7 @@ mod tests {
         assert_eq!(clock.remaining_ms(heartbeat.deadline()), Some(5_001));
 
         clock.at(30_000);
-        heartbeat.wait_for_pong(&clock, challenge);
+        heartbeat.start_ping(&clock, challenge);
         clock.at(40_000);
         assert!(matches!(
             heartbeat.pong(&clock, &challenge),
@@ -999,6 +1030,93 @@ mod tests {
             );
             assert!(result.is_err_and(|failure| failure.reason() == expired.reason()));
         }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn blocked_application_write_cannot_cross_heartbeat_deadline() {
+        for waiting_for_pong in [false, true] {
+            let clock = Arc::new(Clock::default());
+            let (mut wire, _peer) = blocked_wire(&clock).await;
+            let (until, reason) = if waiting_for_pong {
+                wire.heartbeat.start_ping(&*clock, [0; 8]);
+                (10_000, Exit::PongTimeout)
+            } else {
+                (15_000, Exit::SendTimeout)
+            };
+            clock.at(until - 1);
+            let (_stopping, stop) = watch::channel(false);
+            let mut write =
+                pin!(wire.send(Message::Text("blocked".repeat(10).into()), None, &stop,));
+            assert!(poll_once(write.as_mut()).await.is_pending());
+            clock.at(until);
+            tokio::time::advance(Duration::from_millis(1)).await;
+            assert!(matches!(
+                poll_once(write.as_mut()).await,
+                Poll::Ready(Err(failure)) if failure.reason() == reason.reason()
+            ));
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn blocked_websocket_flush_cannot_extend_pong_deadline()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let clock = Arc::new(Clock::default());
+        let (mut wire, _peer) = blocked_wire(&clock).await;
+        wire.heartbeat.start_ping(&*clock, [0; 8]);
+        wire.socket
+            .feed(Message::Text("buffered".repeat(10).into()))
+            .await?;
+        clock.at(9_999);
+        let (_stopping, stop) = watch::channel(false);
+        let mut flush = pin!(wire.flush(SEND_TIMEOUT, &stop));
+        assert!(poll_once(flush.as_mut()).await.is_pending());
+        clock.at(10_000);
+        tokio::time::advance(Duration::from_millis(1)).await;
+        assert!(matches!(
+            poll_once(flush.as_mut()).await,
+            Poll::Ready(Err(Exit::PongTimeout))
+        ));
+        Ok(())
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn time_waiting_to_write_ping_consumes_its_pong_budget()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let clock = Arc::new(Clock::default());
+        let (mut wire, mut peer) = blocked_wire(&clock).await;
+        clock.at(15_000);
+        let (_stopping, stop) = watch::channel(false);
+        {
+            let mut sending = pin!(wire.heartbeat(&stop));
+            assert!(poll_once(sending.as_mut()).await.is_pending());
+
+            clock.at(23_000);
+            tokio::time::advance(Duration::from_secs(8)).await;
+            let mut prefix = [0; 8];
+            let mut read = pin!(peer.read_exact(&mut prefix));
+            assert!(matches!(poll_once(read.as_mut()).await, Poll::Ready(Ok(8))));
+            assert!(matches!(
+                poll_once(sending.as_mut()).await,
+                Poll::Ready(Ok(()))
+            ));
+        }
+        assert_eq!(clock.remaining_ms(wire.heartbeat.deadline()), Some(2_000));
+        Ok(())
+    }
+
+    async fn poll_once<F: Future>(mut future: Pin<&mut F>) -> Poll<F::Output> {
+        poll_fn(|context| Poll::Ready(future.as_mut().poll(context))).await
+    }
+
+    async fn blocked_wire(clock: &Arc<Clock>) -> (Wire, tokio::io::DuplexStream) {
+        let (transport, peer) = tokio::io::duplex(8);
+        let socket = WebSocketStream::from_raw_socket(
+            Box::new(transport) as Box<dyn WebSocketIo>,
+            tokio_tungstenite::tungstenite::protocol::Role::Client,
+            None,
+        )
+        .await;
+        (Wire::new(socket, clock.clone()), peer)
     }
 
     #[test]

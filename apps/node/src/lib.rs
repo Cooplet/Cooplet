@@ -1,5 +1,8 @@
 //! Autonomous Cooplet Node.
 
+#[cfg(test)]
+extern crate self as cooplet_node;
+
 pub mod auth;
 pub mod bridge;
 pub mod clients;

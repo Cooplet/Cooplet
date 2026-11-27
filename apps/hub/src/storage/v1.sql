@@ -165,6 +165,8 @@ CREATE TABLE thread_members (
                         CHECK (state IN ('active','paused_unknown','left')),
     delivery_generation INTEGER NOT NULL DEFAULT 0 CHECK (delivery_generation >= 0),
     confirmed_seq       INTEGER NOT NULL DEFAULT 0,
+    -- The head observed at explicit resume, while a direct member awaits one recovery delivery.
+    resume_through_seq  INTEGER,
     pending_delivery_id TEXT,
     pending_from_seq    INTEGER,
     pending_to_seq      INTEGER,
@@ -173,6 +175,7 @@ CREATE TABLE thread_members (
     CHECK ((pending_delivery_id IS NULL AND pending_from_seq IS NULL AND pending_to_seq IS NULL)
         OR (pending_delivery_id IS NOT NULL AND pending_from_seq IS NOT NULL AND pending_to_seq IS NOT NULL
             AND pending_from_seq >= 1 AND pending_to_seq >= pending_from_seq)),
+    CHECK (resume_through_seq IS NULL OR (resume_through_seq > confirmed_seq AND delivery_mode = 'direct_now' AND state = 'active')),
     PRIMARY KEY (thread_id, member_key),
     UNIQUE (thread_id, handle)
 );

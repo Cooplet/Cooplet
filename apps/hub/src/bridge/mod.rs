@@ -29,10 +29,18 @@ pub(crate) enum SubmitError {
 
 /// A reservation owns one slot for a specific session until dropped or completed.
 pub(crate) trait CommandPermit: Send {
+    fn session(&self) -> CommandSession;
+
     fn submit(
         self: Box<Self>,
         request: CommandReqPayload,
     ) -> BoxFuture<'static, Result<CommandResPayload, SubmitError>>;
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(crate) struct CommandSession {
+    pub(crate) generation: u64,
+    pub(crate) epoch: u64,
 }
 
 pub(crate) trait ThreadPermit: Send {

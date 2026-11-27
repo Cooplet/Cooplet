@@ -1,14 +1,16 @@
+use std::path::Path;
+
 use clap::Subcommand;
-use cooplet_client::{CoopletClient, api_path};
+use cooplet_client::api_path;
 use cooplet_protocol::{
     AnswerPayload, AttachmentRef, DeliveryMode, MessageId, QuestionPayload, ThreadCloseRequest,
     ThreadCreateRequest, ThreadId, ThreadMemberJoinRequest, ThreadMemberLeaveRequest,
     ThreadMemberResumeRequest, ThreadPinSetRequest, ThreadPostRequest, ThreadRole, ThreadStatus,
-    ThreadWaitRequest, ThreadWakePolicy,
+    ThreadWaitPolicy, ThreadWaitRequest, ThreadWakePolicy,
 };
 use serde_json::Value;
 
-use super::{CliResult, json_arg, operation_key_or_generate, print_json};
+use super::{CliResult, delegated_operation_key, json_arg, operator_for_delegation, print_json};
 
 #[derive(Subcommand)]
 pub(super) enum ThreadCommand {
@@ -93,7 +95,7 @@ pub(super) enum ThreadCommand {
         #[arg(long)]
         since_seq: u64,
         #[arg(long)]
-        wake_policy: Option<ThreadWakePolicy>,
+        wake_policy: Option<ThreadWaitPolicy>,
     },
     /// List the thread's members
     Members {
@@ -138,7 +140,7 @@ pub(super) enum ThreadCommand {
     },
 }
 
-pub(super) async fn run(client: &CoopletClient, command: ThreadCommand) -> CliResult {
+pub(super) async fn run(state_dir: &Path, command: ThreadCommand) -> CliResult {
     use ThreadCommand::*;
 
     let result: Value = match command {
@@ -155,7 +157,7 @@ pub(super) async fn run(client: &CoopletClient, command: ThreadCommand) -> CliRe
                 creator_handle,
                 members,
             };
-            post(client, "/v1/threads", &body, operation_key).await?
+            post(state_dir, "/v1/threads", &body, operation_key).await?
         }
         List {
             limit,
@@ -167,10 +169,14 @@ pub(super) async fn run(client: &CoopletClient, command: ThreadCommand) -> CliRe
                 ("after", as_param(after)),
                 ("status", as_param(status)),
             ]);
-            client.get_json("/v1/threads", &query).await?
+            operator_for_delegation(state_dir)
+                .await?
+                .get_json("/v1/threads", &query)
+                .await?
         }
         Get { thread_id } => {
-            client
+            operator_for_delegation(state_dir)
+                .await?
                 .get_json(&api_path(&["threads", thread_id.as_str()])?, &[])
                 .await?
         }
@@ -179,7 +185,7 @@ pub(super) async fn run(client: &CoopletClient, command: ThreadCommand) -> CliRe
             operation_key,
         } => {
             let path = api_path(&["threads", thread_id.as_str(), "close"])?;
-            post(client, &path, &ThreadCloseRequest {}, operation_key).await?
+            post(state_dir, &path, &ThreadCloseRequest {}, operation_key).await?
         }
         Post {
             thread_id,
@@ -200,7 +206,7 @@ pub(super) async fn run(client: &CoopletClient, command: ThreadCommand) -> CliRe
                 answer,
                 in_reply_to,
             };
-            post(client, &path, &body, operation_key).await?
+            post(state_dir, &path, &body, operation_key).await?
         }
         Read {
             thread_id,
@@ -214,7 +220,10 @@ pub(super) async fn run(client: &CoopletClient, command: ThreadCommand) -> CliRe
                 ("limit", as_param(limit)),
                 ("include_pins", as_param(include_pins.then_some(true))),
             ]);
-            client.get_json(&path, &query).await?
+            operator_for_delegation(state_dir)
+                .await?
+                .get_json(&path, &query)
+                .await?
         }
         Pin {
             thread_id,
@@ -226,7 +235,8 @@ pub(super) async fn run(client: &CoopletClient, command: ThreadCommand) -> CliRe
             operation_key,
         } => {
             let path = api_path(&["threads", thread_id.as_str(), "pins", &pin_key])?;
-            let key = operation_key_or_generate(operation_key)?;
+            let key = delegated_operation_key(operation_key)?;
+            let client = operator_for_delegation(state_dir).await?;
             if delete {
                 let query = params([("expected_version", as_param(expected_version))]);
                 client
@@ -252,7 +262,10 @@ pub(super) async fn run(client: &CoopletClient, command: ThreadCommand) -> CliRe
                 since_seq,
                 wake_policy,
             };
-            client.post_json(&path, &body, None).await?
+            operator_for_delegation(state_dir)
+                .await?
+                .post_json(&path, &body, None)
+                .await?
         }
         Members {
             thread_id,
@@ -261,7 +274,10 @@ pub(super) async fn run(client: &CoopletClient, command: ThreadCommand) -> CliRe
         } => {
             let path = api_path(&["threads", thread_id.as_str(), "members"])?;
             let query = params([("limit", as_param(limit)), ("after", after)]);
-            client.get_json(&path, &query).await?
+            operator_for_delegation(state_dir)
+                .await?
+                .get_json(&path, &query)
+                .await?
         }
         Join {
             thread_id,
@@ -280,7 +296,7 @@ pub(super) async fn run(client: &CoopletClient, command: ThreadCommand) -> CliRe
                 wake_policy,
                 delivery_mode,
             };
-            post(client, &path, &body, operation_key).await?
+            post(state_dir, &path, &body, operation_key).await?
         }
         Leave {
             thread_id,
@@ -289,7 +305,7 @@ pub(super) async fn run(client: &CoopletClient, command: ThreadCommand) -> CliRe
         } => {
             let path = api_path(&["threads", thread_id.as_str(), "members", "leave"])?;
             post(
-                client,
+                state_dir,
                 &path,
                 &ThreadMemberLeaveRequest { member_key },
                 operation_key,
@@ -307,19 +323,20 @@ pub(super) async fn run(client: &CoopletClient, command: ThreadCommand) -> CliRe
                 member_key,
                 after_seq,
             };
-            post(client, &path, &body, operation_key).await?
+            post(state_dir, &path, &body, operation_key).await?
         }
     };
     print_json(&result)
 }
 
 async fn post(
-    client: &CoopletClient,
+    state_dir: &Path,
     path: &str,
     body: &impl serde::Serialize,
     operation_key: Option<String>,
 ) -> CliResult<Value> {
-    let key = operation_key_or_generate(operation_key)?;
+    let key = delegated_operation_key(operation_key)?;
+    let client = operator_for_delegation(state_dir).await?;
     Ok(client.post_json(path, body, Some(&key)).await?)
 }
 

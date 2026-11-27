@@ -14,7 +14,7 @@ use rusqlite::params;
 
 use crate::{AppState, auth::AuthenticatedCaller, error::HubError, storage::sql::json_byte_len};
 
-pub(crate) use dispatch::{Dispatch, reconcile_fences, recover_pending, wake};
+pub(crate) use dispatch::{Dispatch, reconcile_fences, recover_pending, wake, wake_participant};
 pub(crate) use members::{join, leave, list_members, resume};
 pub(crate) use posts::{delete_pin, post, read, set_pin, wait};
 pub(crate) use store::can_access_thread_scope;

@@ -266,10 +266,7 @@ async fn run_local(command: TopCommand, dir: &Path) -> CliResult {
             Ok(())
         }
         TopCommand::Blob { command } => run_blob(command, dir).await,
-        TopCommand::Thread { command } => {
-            let client = operator_for_delegation(dir).await?;
-            threads::run(&client, command).await
-        }
+        TopCommand::Thread { command } => threads::run(dir, command).await,
         TopCommand::Message { command } => run_message(command, dir).await,
         TopCommand::Openapi => Err(io::Error::other("Unexpected local command").into()),
     }
@@ -428,8 +425,8 @@ async fn run_message(command: MessageCommand, dir: &Path) -> CliResult {
         ttl_ms: queue_ttl_ms,
         operation_key,
     } = command;
+    let key = delegated_operation_key(operation_key)?;
     let client = operator_for_delegation(dir).await?;
-    let key = operation_key_or_generate(operation_key)?;
     let receipt: SendMessageResponse = client
         .post_json(
             "/v1/messages",
@@ -631,9 +628,12 @@ async fn run_blob(command: BlobCommand, dir: &Path) -> CliResult {
             operation_key,
             target,
         } => {
-            let client = match target {
-                BlobTarget::Local => operator(dir).await?,
-                BlobTarget::Hub => operator_for_delegation(dir).await?,
+            let (client, operation_key) = match target {
+                BlobTarget::Local => (operator(dir).await?, operation_key),
+                BlobTarget::Hub => {
+                    let key = delegated_operation_key(operation_key)?;
+                    (operator_for_delegation(dir).await?, Some(key))
+                }
             };
             let name = match name {
                 Some(value) => value,
@@ -729,6 +729,15 @@ fn operation_key_or_generate(key: Option<String>) -> CliResult<String> {
         None => RequestId::generate()?.to_string(),
     };
     validate_idempotency_key(&key)?;
+    Ok(key)
+}
+
+fn delegated_operation_key(key: Option<String>) -> CliResult<String> {
+    let generated = key.is_none();
+    let key = operation_key_or_generate(key)?;
+    if generated {
+        writeln!(io::stderr().lock(), "idempotency_key={key}")?;
+    }
     Ok(key)
 }
 

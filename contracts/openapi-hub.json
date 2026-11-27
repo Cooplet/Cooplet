@@ -1649,7 +1649,16 @@
               }
             ]
           },
-          "value_json": {}
+          "value_json": {
+            "description": "The non-null JSON value to store.",
+            "type": [
+              "object",
+              "array",
+              "string",
+              "number",
+              "boolean"
+            ]
+          }
         },
         "required": [
           "value_json"
@@ -1982,6 +1991,13 @@
         ],
         "type": "object"
       },
+      "ThreadWaitPolicy": {
+        "enum": [
+          "mentions_only",
+          "all"
+        ],
+        "type": "string"
+      },
       "ThreadWaitRequest": {
         "additionalProperties": false,
         "properties": {
@@ -1996,7 +2012,7 @@
                 "type": "null"
               },
               {
-                "$ref": "#/components/schemas/ThreadWakePolicy"
+                "$ref": "#/components/schemas/ThreadWaitPolicy"
               }
             ]
           }

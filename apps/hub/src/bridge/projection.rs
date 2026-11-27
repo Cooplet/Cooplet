@@ -137,7 +137,7 @@ pub(super) async fn mark_offline(state: &AppState, key: SessionKey) -> Result<()
     let wall_clock = state.wall_clock.clone();
     Ok(state
         .db
-        .write(move |tx| {
+        .write_wait(move |tx| {
             let now = wall_clock();
             let changed = tx.execute(
                 "UPDATE nodes SET status = 'offline' WHERE node_id = ?1 AND generation = ?2
@@ -226,8 +226,8 @@ pub(super) async fn worker(
             })
             .await?;
         applied.send_replace(seq);
-        if idle {
-            crate::threads::wake(&state, &wake_node);
+        if let Some(participant_id) = idle {
+            crate::threads::wake_participant(&state, &wake_node, &participant_id);
         }
     }
 }
@@ -267,7 +267,7 @@ fn apply_event(
     key: &SessionKey,
     now: i64,
     event: NodeEventPayload,
-) -> Result<(bool, Option<EventNotice>), HubError> {
+) -> Result<(Option<ParticipantId>, Option<EventNotice>), HubError> {
     let (kind, aggregate_type, aggregate_id, data, idle) = match event {
         NodeEventPayload::ParticipantDeclared { participant } => {
             let previous = previous_participant(tx, key, &participant.participant_id)?;
@@ -295,7 +295,7 @@ fn apply_event(
                 Some(EventKind::ParticipantCreated)
             };
             let Some(kind) = change_kind else {
-                return Ok((false, None));
+                return Ok((None, None));
             };
             let mut data = serde_json::to_value(&participant)?;
             data["intake_state"] = json!(participant.state.intake_state());
@@ -304,7 +304,7 @@ fn apply_event(
                 AggregateType::Participant,
                 participant.participant_id.to_string(),
                 data,
-                participant.state == ParticipantState::Idle,
+                (participant.state == ParticipantState::Idle).then_some(participant.participant_id),
             )
         }
         NodeEventPayload::ParticipantStateChanged {
@@ -328,7 +328,7 @@ fn apply_event(
             };
             let encoded = approval.encode(state)?;
             let Some(kind) = changed_state(&previous, state, &encoded) else {
-                return Ok((false, None));
+                return Ok((None, None));
             };
             tx.execute(
                 "UPDATE node_participants SET state = ?1, approval_json = ?2, updated_at_ms = ?3
@@ -352,7 +352,7 @@ fn apply_event(
                 AggregateType::Participant,
                 participant_id.to_string(),
                 data,
-                state == ParticipantState::Idle,
+                (state == ParticipantState::Idle).then_some(participant_id),
             )
         }
         event => {
@@ -383,7 +383,7 @@ fn apply_event(
                 AggregateType::WorkflowRun,
                 run_id.to_string(),
                 data,
-                false,
+                None,
             )
         }
     };

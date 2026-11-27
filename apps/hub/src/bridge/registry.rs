@@ -12,11 +12,15 @@ use cooplet_protocol::{
     CommandReqPayload, CommandResPayload, ErrorCode, NodeId, ThreadAckPayload, ThreadDeliverPayload,
 };
 use futures_util::future::BoxFuture;
-use tokio::sync::{OwnedSemaphorePermit, Semaphore, mpsc, oneshot, watch};
+use tokio::sync::{
+    OwnedRwLockWriteGuard, OwnedSemaphorePermit, RwLock, Semaphore, mpsc, oneshot, watch,
+};
 
 use crate::error::HubError;
 
-use super::{BridgeRegistry, CommandPermit, ReserveError, SubmitError, ThreadPermit};
+use super::{
+    BridgeRegistry, CommandPermit, CommandSession, ReserveError, SubmitError, ThreadPermit,
+};
 
 pub(super) const COMMAND_SLOTS: u32 = 32;
 pub(super) const THREAD_SLOTS: u32 = 16;
@@ -37,6 +41,7 @@ struct Inner {
 struct Registry {
     open: bool,
     nodes: HashMap<NodeId, Entry>,
+    active_nodes: usize,
 }
 
 #[derive(Default)]
@@ -46,13 +51,15 @@ struct Entry {
     high_water_epoch: u64,
     allocated_epoch: u64,
     attempts: usize,
+    transitions: usize,
+    authority: Arc<RwLock<()>>,
     transient_revision: u64,
     revoked: bool,
     session: Option<ActiveSession>,
 }
 
 struct ActiveSession {
-    epoch: u64,
+    identity: CommandSession,
     ready: bool,
     close: watch::Sender<Option<CloseReason>>,
     outbound: mpsc::Sender<Outbound>,
@@ -95,6 +102,15 @@ pub(super) struct SessionKey {
     pub(super) epoch: u64,
 }
 
+impl SessionKey {
+    pub(super) fn identity(&self) -> CommandSession {
+        CommandSession {
+            generation: self.generation,
+            epoch: self.epoch,
+        }
+    }
+}
+
 impl LiveBridge {
     pub(crate) fn new(capacity: usize, clock: Arc<dyn MonoClock>) -> Self {
         Self {
@@ -102,6 +118,7 @@ impl LiveBridge {
                 registry: Mutex::new(Registry {
                     open: true,
                     nodes: HashMap::new(),
+                    active_nodes: 0,
                 }),
                 tasks: watch::channel(0).0,
                 capacity,
@@ -123,10 +140,11 @@ impl LiveBridge {
 
     pub(super) fn admit(&self, node_id: NodeId) -> Result<Admission, HubError> {
         let mut registry = self.lock();
-        if !registry.open
-            || (!registry.nodes.contains_key(&node_id)
-                && registry.nodes.len() >= self.inner.capacity)
-        {
+        let already_counted = registry
+            .nodes
+            .get(&node_id)
+            .is_some_and(|entry| entry.attempts != 0);
+        if !registry.open || (!already_counted && registry.active_nodes >= self.inner.capacity) {
             return Err(HubError::new(
                 ErrorCode::Overloaded,
                 "The Hub cannot admit another bridge.",
@@ -140,13 +158,39 @@ impl LiveBridge {
             ));
         }
         entry.attempts += 1;
+        let authority = entry.authority.clone();
+        let transient_revision = entry.transient_revision;
+        if !already_counted {
+            registry.active_nodes += 1;
+        }
         self.inner.tasks.send_modify(|count| *count += 1);
         Ok(Admission {
             bridge: self.clone(),
             node_id,
-            transient_revision: entry.transient_revision,
+            authority,
+            transient_revision,
             registered_epoch: None,
         })
+    }
+
+    /// Serialize durable changes to a node's bridge identity with application
+    /// writes. Keep the guard through publication of the new registry state.
+    pub(crate) async fn transition(&self, node_id: &NodeId) -> AuthorityTransition {
+        let authority = {
+            let mut registry = self.lock();
+            let entry = registry.nodes.entry(node_id.clone()).or_default();
+            entry.transitions += 1;
+            entry.authority.clone()
+        };
+        let reference = TransitionRef {
+            bridge: self.clone(),
+            node_id: node_id.clone(),
+        };
+        let exclusive = authority.write_owned().await;
+        AuthorityTransition {
+            _exclusive: exclusive,
+            _reference: reference,
+        }
     }
 
     fn reserve_slot(&self, node_id: &NodeId, thread: bool) -> Result<Reserved, ReserveError> {
@@ -165,7 +209,7 @@ impl LiveBridge {
             .map_err(|_| ReserveError::RateLimited)?;
         Ok(Reserved {
             permit,
-            epoch: active.epoch,
+            identity: active.identity,
             outbound: active.outbound.clone(),
             cancel: thread.then(|| active.cancelled_threads.clone()),
             clock: self.inner.clock.clone(),
@@ -182,7 +226,7 @@ impl LiveBridge {
             .get_mut(&key.node_id)
             .filter(|entry| !entry.revoked)
             .and_then(|entry| entry.session.as_mut())
-            .filter(|active| active.epoch == key.epoch)
+            .filter(|active| active.identity == key.identity())
         else {
             return false;
         };
@@ -196,7 +240,7 @@ impl LiveBridge {
             .nodes
             .get_mut(&key.node_id)
             .and_then(|entry| entry.session.as_mut())
-            .filter(|active| active.epoch == key.epoch)
+            .filter(|active| active.identity == key.identity())
         {
             active.ready = false;
         }
@@ -269,7 +313,7 @@ impl Registry {
         }
         self.nodes
             .get(node_id)
-            .filter(|entry| !entry.revoked)
+            .filter(|entry| !entry.revoked && entry.authority.try_read().is_ok())
             .and_then(|entry| entry.session.as_ref())
             .filter(|active| active.ready)
     }
@@ -278,11 +322,16 @@ impl Registry {
 pub(super) struct Admission {
     bridge: LiveBridge,
     node_id: NodeId,
+    authority: Arc<RwLock<()>>,
     transient_revision: u64,
     registered_epoch: Option<u64>,
 }
 
 impl Admission {
+    pub(super) fn authority(&self) -> Arc<RwLock<()>> {
+        self.authority.clone()
+    }
+
     /// The database has fenced the old epoch even if the HTTP connection
     /// fails before completing its upgrade.
     pub(super) fn claim(&self, epoch: u64) {
@@ -293,7 +342,7 @@ impl Admission {
             if entry
                 .session
                 .as_ref()
-                .is_some_and(|session| session.epoch < epoch)
+                .is_some_and(|session| session.identity.epoch < epoch)
                 && let Some(active) = entry.session.take()
             {
                 active.close.send_replace(Some(CloseReason::Replaced));
@@ -303,7 +352,7 @@ impl Admission {
 
     pub(super) fn register(
         &mut self,
-        epoch: u64,
+        identity: CommandSession,
         close: watch::Sender<Option<CloseReason>>,
         outbound: mpsc::Sender<Outbound>,
         cancelled_threads: watch::Sender<()>,
@@ -322,13 +371,13 @@ impl Admission {
         if entry.transient_revision != self.transient_revision {
             return Err(CloseReason::Retry);
         }
-        if epoch < entry.allocated_epoch || epoch <= entry.high_water_epoch {
+        if identity.epoch < entry.allocated_epoch || identity.epoch <= entry.high_water_epoch {
             return Err(CloseReason::Replaced);
         }
-        entry.high_water_epoch = epoch;
-        self.registered_epoch = Some(epoch);
+        entry.high_water_epoch = identity.epoch;
+        self.registered_epoch = Some(identity.epoch);
         if let Some(previous) = entry.session.replace(ActiveSession {
-            epoch,
+            identity,
             ready: false,
             close,
             outbound,
@@ -349,28 +398,58 @@ impl Drop for Admission {
             if entry
                 .session
                 .as_ref()
-                .is_some_and(|session| self.registered_epoch == Some(session.epoch))
+                .is_some_and(|session| self.registered_epoch == Some(session.identity.epoch))
             {
                 entry.session = None;
             }
             entry.attempts -= 1;
             if entry.attempts == 0 {
-                registry.nodes.remove(&self.node_id);
+                let remove = entry.transitions == 0;
+                registry.active_nodes -= 1;
+                if remove {
+                    registry.nodes.remove(&self.node_id);
+                }
             }
         }
         self.bridge.inner.tasks.send_modify(|count| *count -= 1);
     }
 }
 
+pub(crate) struct AuthorityTransition {
+    _exclusive: OwnedRwLockWriteGuard<()>,
+    _reference: TransitionRef,
+}
+
+struct TransitionRef {
+    bridge: LiveBridge,
+    node_id: NodeId,
+}
+
+impl Drop for TransitionRef {
+    fn drop(&mut self) {
+        let mut registry = self.bridge.lock();
+        if let Some(entry) = registry.nodes.get_mut(&self.node_id) {
+            entry.transitions -= 1;
+            if entry.transitions == 0 && entry.attempts == 0 {
+                registry.nodes.remove(&self.node_id);
+            }
+        }
+    }
+}
+
 struct Reserved {
     permit: OwnedSemaphorePermit,
-    epoch: u64,
+    identity: CommandSession,
     outbound: mpsc::Sender<Outbound>,
     cancel: Option<watch::Sender<()>>,
     clock: Arc<dyn MonoClock>,
 }
 
 impl CommandPermit for Reserved {
+    fn session(&self) -> CommandSession {
+        self.identity
+    }
+
     fn submit(
         self: Box<Self>,
         request: CommandReqPayload,
@@ -386,7 +465,7 @@ impl CommandPermit for Reserved {
 
 impl ThreadPermit for Reserved {
     fn epoch(&self) -> u64 {
-        self.epoch
+        self.identity.epoch
     }
 
     fn submit(
@@ -503,6 +582,13 @@ mod tests {
 
     use super::*;
 
+    fn session(epoch: u64) -> CommandSession {
+        CommandSession {
+            generation: 1,
+            epoch,
+        }
+    }
+
     #[tokio::test]
     async fn delayed_upgrade_cannot_displace_higher_epoch_or_survive_revocation()
     -> Result<(), Box<dyn std::error::Error>> {
@@ -516,7 +602,7 @@ mod tests {
         let (outbound_late, _received_late) = mpsc::channel(SESSION_QUEUE);
         let (cancel, _) = watch::channel(());
         assert_eq!(
-            late.register(2, close_late, outbound_late, cancel.clone()),
+            late.register(session(2), close_late, outbound_late, cancel.clone()),
             Ok(())
         );
         assert!(!bridge.is_online(&node_id));
@@ -529,7 +615,7 @@ mod tests {
         let (close_early, _) = watch::channel(None);
         let (outbound_early, _) = mpsc::channel(SESSION_QUEUE);
         assert_eq!(
-            early.register(1, close_early, outbound_early, cancel.clone()),
+            early.register(session(1), close_early, outbound_early, cancel.clone()),
             Err(CloseReason::Replaced)
         );
         drop(early);
@@ -541,7 +627,7 @@ mod tests {
         let (close_racing, _) = watch::channel(None);
         let (outbound_racing, _) = mpsc::channel(SESSION_QUEUE);
         assert_eq!(
-            racing.register(3, close_racing, outbound_racing, cancel),
+            racing.register(session(3), close_racing, outbound_racing, cancel),
             Err(CloseReason::Revoked)
         );
         assert_eq!(*closed_late.borrow(), Some(CloseReason::Revoked));
@@ -566,7 +652,10 @@ mod tests {
         let (close, closed) = watch::channel(None);
         let (outbound, _incoming) = mpsc::channel(SESSION_QUEUE);
         let (cancel, _) = watch::channel(());
-        assert_eq!(admission.register(7, close, outbound, cancel), Ok(()));
+        assert_eq!(
+            admission.register(session(7), close, outbound, cancel),
+            Ok(())
+        );
         assert!(matches!(
             bridge.reserve(&node_id),
             Err(ReserveError::Offline)
@@ -627,7 +716,7 @@ mod tests {
         let (outbound, mut incoming) = mpsc::channel(SESSION_QUEUE);
         let (cancel, mut cancelled) = watch::channel(());
         admission
-            .register(7, close, outbound, cancel)
+            .register(session(7), close, outbound, cancel)
             .map_err(|_| "could not register test bridge")?;
         assert!(bridge.ready(&SessionKey {
             node_id: node_id.clone(),

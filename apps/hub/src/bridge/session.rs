@@ -1,5 +1,5 @@
 use std::{
-    collections::{HashMap, HashSet},
+    collections::{HashMap, HashSet, VecDeque},
     future::{Future, pending},
     sync::Arc,
     time::Duration,
@@ -16,11 +16,14 @@ use cooplet_protocol::{
 };
 use futures_util::SinkExt;
 use tokio::{
-    sync::{OwnedSemaphorePermit, mpsc, watch},
+    sync::{OwnedSemaphorePermit, RwLock, mpsc, watch},
     task::{JoinHandle, JoinSet},
     time,
 };
 use tokio_tungstenite::tungstenite;
+
+#[cfg(test)]
+mod timing_tests;
 
 use crate::{AppState, delivery, error::HubError, threads};
 
@@ -54,11 +57,12 @@ pub(super) async fn run(
     let mut session = Socket {
         io: socket,
         close,
+        authority: admission.authority(),
         clock: bridge.clock().clone(),
         heartbeat: Heartbeat::new(bridge.clock().as_ref()),
         epoch: key.epoch,
     };
-    let registered = admission.register(key.epoch, close_tx.clone(), outbound, cancelled_tx);
+    let registered = admission.register(key.identity(), close_tx.clone(), outbound, cancelled_tx);
     drop(handshake);
     if let Err(reason) = registered {
         session.send_close(reason).await;
@@ -82,6 +86,7 @@ pub(super) async fn run(
     if let Err(Exit::Close(reason)) = result {
         session.send_close(reason).await;
     }
+    drop(session);
     if let Err(error) = projection::mark_offline(&state, key.clone()).await {
         tracing::warn!(node_id = %key.node_id, %error, "Bridge disconnect could not update the node catalog");
     }
@@ -110,6 +115,7 @@ impl From<ProtocolError> for Exit {
 struct Socket {
     io: WebSocket,
     close: watch::Receiver<Option<CloseReason>>,
+    authority: Arc<RwLock<()>>,
     clock: Arc<dyn MonoClock>,
     heartbeat: Heartbeat,
     epoch: u64,
@@ -123,14 +129,10 @@ struct Frame {
 impl Socket {
     async fn synchronize(&mut self, state: &AppState, key: &SessionKey) -> SessionResult<()> {
         let initial = self.clock.deadline_after(ROSTER_TIMEOUT);
-        let pending = bounded(
-            &mut self.close,
-            self.clock.as_ref(),
-            initial,
-            delivery::pending_op_ids(state, &key.node_id),
-        )
-        .await?
-        .map_err(|error| projection_error(key, error))?;
+        let pending = self
+            .wait_controls(initial, delivery::pending_op_ids(state, &key.node_id))
+            .await?
+            .map_err(|error| projection_error(key, error))?;
         let hello = HelloAckPayload {
             hub_id: state.meta.hub_id.clone(),
             node_id: key.node_id.clone(),
@@ -138,7 +140,8 @@ impl Socket {
             max_inflight_threads: THREAD_SLOTS,
             pending_op_ids: pending.clone(),
         };
-        self.send(encode(self.epoch, &hello)?, initial).await?;
+        self.send_handshake(encode(self.epoch, &hello)?, initial)
+            .await?;
 
         let clock = self.clock.clone();
         let deadline = clock.deadline_after(ROSTER_TIMEOUT);
@@ -150,12 +153,12 @@ impl Socket {
                 reason = closed(&mut self.close) => return Err(Exit::Close(reason)),
                 () = until(clock.as_ref(), Some(deadline)) => return Err(Exit::Close(CloseReason::Retry)),
                 () = until(clock.as_ref(), Some(self.heartbeat.deadline())) => {
-                    self.heartbeat_tick().await?;
+                    self.heartbeat_tick(Some(deadline)).await?;
                     continue;
                 }
                 packet = self.io.recv() => packet,
             };
-            let Some(Frame { frame, bytes }) = self.read(packet).await? else {
+            let Some(Frame { frame, bytes }) = self.read(packet, Some(deadline)).await? else {
                 continue;
             };
             let chunk: RosterSyncPayload = frame.decode_payload()?;
@@ -171,25 +174,55 @@ impl Socket {
         tokio::pin!(commit);
         // The actor owns a transaction once queued. Expire the guard and wait
         // for its result before attempting to clean up that same durable epoch.
-        let commit_result = tokio::select! {
-            biased;
-            reason = closed(&mut self.close) => {
+        let commit_result = match self.wait_controls(deadline, commit.as_mut()).await {
+            Ok(result) => result,
+            Err(error) => {
                 guard.expire();
-                self.send_close(reason).await;
+                if let Exit::Close(reason) = error {
+                    self.send_close(reason).await;
+                }
                 let _ = commit.await;
                 return Err(Exit::Peer);
             }
-            () = until(clock.as_ref(), Some(deadline)) => {
-                guard.expire();
-                self.send_close(CloseReason::Retry).await;
-                let _ = commit.await;
-                return Err(Exit::Peer);
-            }
-            result = &mut commit => result,
         };
         commit_result.map_err(|error| roster_error(key, error))?;
-        self.send(encode(self.epoch, &RosterReadyPayload {})?, deadline)
+        self.send_handshake(encode(self.epoch, &RosterReadyPayload {})?, deadline)
             .await
+    }
+
+    async fn wait_controls<T>(
+        &mut self,
+        deadline: MonoInstant,
+        future: impl Future<Output = T>,
+    ) -> SessionResult<T> {
+        let clock = self.clock.clone();
+        tokio::pin!(future);
+        loop {
+            let incoming = tokio::select! {
+                biased;
+                reason = closed(&mut self.close) => return Err(Exit::Close(reason)),
+                () = until(clock.as_ref(), Some(deadline)) => return Err(Exit::Close(CloseReason::Retry)),
+                () = until(clock.as_ref(), Some(self.heartbeat.deadline())) => {
+                    self.heartbeat_tick(Some(deadline)).await?;
+                    continue;
+                }
+                result = &mut future => return Ok(result),
+                incoming = self.io.recv() => incoming,
+            };
+            if self.read(incoming, Some(deadline)).await?.is_some() {
+                return Err(Exit::Close(CloseReason::InvalidFrame));
+            }
+        }
+    }
+
+    async fn send_handshake(
+        &mut self,
+        message: Message,
+        deadline: MonoInstant,
+    ) -> SessionResult<()> {
+        let authority = self.authority.clone();
+        let _authorized = self.wait_controls(deadline, authority.read_owned()).await?;
+        self.send_application(message, deadline).await
     }
 
     async fn run_ready(
@@ -218,6 +251,7 @@ impl Socket {
             accepted_events: 0,
             rpc: JoinSet::new(),
             requests: HashSet::new(),
+            responses: VecDeque::new(),
             pending: Pending::default(),
         };
         let (result, worker_finished) = loop {
@@ -264,6 +298,7 @@ impl Socket {
         worker: &mut JoinHandle<Result<(), HubError>>,
     ) -> Result<(), (Exit, bool)> {
         let clock = self.clock.clone();
+        let authority = self.authority.clone();
         let next_ack = ready.pending.deadline(clock.as_ref());
         let result = tokio::select! {
             reason = closed(&mut self.close) => Err(Exit::Close(reason)),
@@ -273,7 +308,7 @@ impl Socket {
                 }
                 return Err((Exit::Close(CloseReason::Retry), true));
             }
-            () = until(clock.as_ref(), Some(self.heartbeat.deadline())) => self.heartbeat_tick().await,
+            () = until(clock.as_ref(), Some(self.heartbeat.deadline())) => self.heartbeat_tick(None).await,
             () = until(clock.as_ref(), next_ack) => {
                 ready.pending.expire(clock.as_ref());
                 Ok(())
@@ -292,10 +327,18 @@ impl Socket {
             },
             result = ready.rpc.join_next(), if !ready.rpc.is_empty() => match result {
                 Some(Ok(response)) => {
-                    ready.requests.remove(&response.request_id);
-                    self.send_response(response).await
+                    ready.responses.push_back(response);
+                    Ok(())
                 }
                 _ => Err(Exit::Close(CloseReason::Retry)),
+            },
+            _authorized = authority.read_owned(), if !ready.responses.is_empty() => {
+                if let Some(response) = ready.responses.pop_front() {
+                    ready.requests.remove(&response.request_id);
+                    self.send_response(response).await
+                } else {
+                    Ok(())
+                }
             },
         };
         result.map_err(|error| (error, false))
@@ -308,7 +351,7 @@ impl Socket {
         ready: &mut Ready,
         packet: Option<Result<Message, axum::Error>>,
     ) -> SessionResult<()> {
-        let Some(Frame { frame, .. }) = self.read(packet).await? else {
+        let Some(Frame { frame, .. }) = self.read(packet, None).await? else {
             return Ok(());
         };
         match frame.kind {
@@ -343,13 +386,15 @@ impl Socket {
             }
             FrameKind::NodeRequest => {
                 let req: NodeRequestPayload = frame.decode_payload()?;
-                if ready.rpc.len() >= REVERSE_SLOTS {
-                    self.send_response(problem_response(
-                        req.request_id,
-                        ErrorCode::RateLimited,
-                        "The node has no free reverse request slots.",
-                    ))
-                    .await?;
+                if ready.requests.len() >= REVERSE_SLOTS {
+                    if let Ok(_authorized) = self.authority.clone().try_read_owned() {
+                        self.send_response(problem_response(
+                            req.request_id,
+                            ErrorCode::RateLimited,
+                            "The node has no free reverse request slots.",
+                        ))
+                        .await?;
+                    }
                 } else if !ready.requests.insert(req.request_id.clone()) {
                     return Err(Exit::Close(CloseReason::InvalidFrame));
                 } else {
@@ -388,6 +433,7 @@ impl Socket {
     async fn read(
         &mut self,
         packet: Option<Result<Message, axum::Error>>,
+        deadline: Option<MonoInstant>,
     ) -> SessionResult<Option<Frame>> {
         let message = match packet {
             Some(Ok(message)) => message,
@@ -422,7 +468,9 @@ impl Socket {
             }
             Message::Ping(_) => {
                 // Tungstenite queues the RFC Pong automatically.
-                let deadline = self.clock.deadline_after(WRITE_TIMEOUT);
+                let deadline = deadline.unwrap_or_else(|| self.clock.deadline_after(WRITE_TIMEOUT));
+                self.ensure_heartbeat(deadline).await?;
+                let deadline = self.write_deadline(deadline);
                 bounded(
                     &mut self.close,
                     self.clock.as_ref(),
@@ -440,13 +488,46 @@ impl Socket {
         }
     }
 
-    async fn heartbeat_tick(&mut self) -> SessionResult<()> {
+    async fn heartbeat_tick(&mut self, deadline: Option<MonoInstant>) -> SessionResult<()> {
         if self.heartbeat.pong.is_some() {
             return Err(Exit::Close(CloseReason::Retry));
         }
         let payload = self.heartbeat.ping(self.clock.as_ref());
-        self.send(Message::Ping(payload), self.heartbeat.deadline())
-            .await
+        let limit = self.heartbeat.deadline();
+        let deadline = deadline.map_or(limit, |deadline| self.earlier(limit, deadline));
+        self.send(Message::Ping(payload), deadline).await
+    }
+
+    async fn ensure_heartbeat(&mut self, deadline: MonoInstant) -> SessionResult<()> {
+        if self.clock.is_expired(self.heartbeat.deadline()) {
+            self.heartbeat_tick(Some(deadline)).await?;
+        }
+        Ok(())
+    }
+
+    fn earlier(&self, left: MonoInstant, right: MonoInstant) -> MonoInstant {
+        if self.clock.remaining_ms(left).unwrap_or(0) <= self.clock.remaining_ms(right).unwrap_or(0)
+        {
+            left
+        } else {
+            right
+        }
+    }
+
+    fn write_deadline(&self, deadline: MonoInstant) -> MonoInstant {
+        self.earlier(
+            self.earlier(deadline, self.heartbeat.deadline()),
+            self.clock.deadline_after(WRITE_TIMEOUT),
+        )
+    }
+
+    async fn send_application(
+        &mut self,
+        message: Message,
+        deadline: MonoInstant,
+    ) -> SessionResult<()> {
+        self.ensure_heartbeat(deadline).await?;
+        self.send(message, self.write_deadline(deadline)).await
     }
 
     async fn send(&mut self, message: Message, deadline: MonoInstant) -> SessionResult<()> {
@@ -486,10 +567,13 @@ impl Socket {
                 ),
             )?,
         };
-        self.send(encoded, deadline).await
+        self.send_application(encoded, deadline).await
     }
 
     async fn forward(&mut self, pending: &mut Pending, request: Outbound) -> SessionResult<()> {
+        let Ok(_authorized) = self.authority.clone().try_read_owned() else {
+            return Ok(());
+        };
         match request {
             Outbound::Command(request) => {
                 let mut request = *request;
@@ -563,14 +647,11 @@ impl Socket {
         deadline: MonoInstant,
         reply: &mut Reply<T>,
     ) -> SessionResult<bool> {
-        let Some(remaining) = self.clock.remaining_ms(deadline) else {
+        if self.clock.is_expired(deadline) {
             return Ok(false);
-        };
-        let deadline = if Duration::from_millis(remaining) > WRITE_TIMEOUT {
-            self.clock.deadline_after(WRITE_TIMEOUT)
-        } else {
-            deadline
-        };
+        }
+        self.ensure_heartbeat(deadline).await?;
+        let deadline = self.write_deadline(deadline);
         let mut started = false;
         let write = async {
             if reply.is_cancelled() {
@@ -673,6 +754,7 @@ struct Ready {
     applied: watch::Receiver<u64>,
     accepted_events: u64,
     requests: HashSet<OperationId>,
+    responses: VecDeque<NodeResponsePayload>,
     rpc: JoinSet<NodeResponsePayload>,
     pending: Pending,
 }
