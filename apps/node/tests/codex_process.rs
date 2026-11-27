@@ -99,8 +99,11 @@ impl Fixture {
         Ok((daemon, client))
     }
 
-    fn cli(&self, mode: &str, args: &[&str]) -> Test<Value> {
-        let output = self.command(mode)?.args(args).output()?;
+    fn doctor(&self, mode: &str) -> Test<Value> {
+        let output = self.command(mode)?
+            .env("PATH", &self.root)
+            .args(["node", "doctor"])
+            .output()?;
         assert!(
             output.status.success(),
             "{}",
@@ -198,7 +201,7 @@ async fn cli_runs_codex_with_mcp_and_resumes_the_same_thread_in_a_new_group() ->
     fs::rename(fixture.root.join("codex"), fixture.root.join("dispatcher"))?;
     std::os::unix::fs::symlink("dispatcher", fixture.root.join("codex"))?;
     let (daemon, client) = fixture.start("ok").await?;
-    let doctor = fixture.cli("ok", &["node", "doctor"])?;
+    let doctor = fixture.doctor("ok")?;
     let codex = adapter_report(&doctor, "codex")?;
     assert_eq!(codex["available"], true);
     assert_eq!(codex["version"], "codex-fixture/99.0.0");
@@ -369,7 +372,7 @@ async fn invalid_codex_peer_home_mcp_and_paths_fail_closed() -> Test {
 async fn doctor_rejects_missing_flags_and_bounds_a_hung_probe() -> Test {
     let fixture = Fixture::new()?;
     let (_daemon, _client) = fixture.start("ok").await?;
-    let no_schema = fixture.cli("no-schema", &["node", "doctor"])?;
+    let no_schema = fixture.doctor("no-schema")?;
     let codex = adapter_report(&no_schema, "codex")?;
     assert_eq!(codex["available"], true);
     assert_eq!(codex["capabilities"]["supports_structured_output"], false);
@@ -378,7 +381,7 @@ async fn doctor_rejects_missing_flags_and_bounds_a_hung_probe() -> Test {
         ("probe-timeout", "stdio initialize"),
     ] {
         let start = std::time::Instant::now();
-        let report = fixture.cli(mode, &["node", "doctor"])?;
+        let report = fixture.doctor(mode)?;
         let codex = adapter_report(&report, "codex")?;
         assert_eq!(codex["available"], false);
         assert!(
@@ -403,12 +406,7 @@ async fn doctor_skips_an_inaccessible_path_candidate_and_open_rechecks_the_execu
         0o601
     };
     fs::set_permissions(denied.join("codex"), fs::Permissions::from_mode(mode))?;
-    let path = env::var_os("PATH").ok_or_else(|| io::Error::other("PATH unavailable"))?;
-    let path = env::join_paths(
-        [denied, fixture.root.clone()]
-            .into_iter()
-            .chain(env::split_paths(&path)),
-    )?;
+    let path = env::join_paths([denied, fixture.root.clone()])?;
     let report = fixture
         .command("ok")?
         .env_remove("COOPLET_CODEX_BIN")
