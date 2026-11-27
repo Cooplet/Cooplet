@@ -1,6 +1,7 @@
 //! Managed Antigravity CLI sessions over ACP v1 stdio.
 
 mod acp_wire;
+mod inbound;
 mod open;
 mod session;
 mod settings;
@@ -77,15 +78,19 @@ impl AgyAdapter {
     }
 
     async fn discovery(&self) -> DiscoveryReport {
+        let binary = self.binary();
         let mut report = DiscoveryReport {
             client_kind: KIND.into(),
             available: false,
-            binary_path: self.binary(),
+            binary_path: binary
+                .as_ref()
+                .filter(|path| path.to_str().is_some())
+                .cloned(),
             version: None,
             capabilities: AdapterCapabilities::default(),
             detail: None,
         };
-        let Some(binary) = &report.binary_path else {
+        let Some(binary) = &binary else {
             report.detail = Some("Agy executable was not found".into());
             return report;
         };

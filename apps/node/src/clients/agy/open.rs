@@ -5,7 +5,9 @@ use serde_json::{Value, json};
 
 use super::{
     acp_wire::{Fault, Frame, Wire, WriteFailure},
-    failure, invalid,
+    failure,
+    inbound::InboundDuringWrite,
+    invalid,
 };
 use crate::{
     clients::EffectiveAgentOptions,
@@ -204,23 +206,40 @@ impl Stage {
 
 async fn rpc(wire: &mut Wire, method: &str, params: Value, stage: Stage) -> Result<Value> {
     let (id, request) = wire.request(method, params);
-    wire.send(request, None)
+    let mut inbox = InboundDuringWrite::new(id);
+    let (written, read_fault) = match wire.begin_write(request, None) {
+        Ok(pending) => {
+            wire.pump_write(pending, |frame| inbox.consume(frame, |_, _| Ok(())))
+                .await
+        }
+        Err(failure) => (Err(failure), None),
+    };
+    written.map_err(|error| match error {
+        WriteFailure::Encode => {
+            failure(ErrorCode::InternalError, "Could not encode Agy ACP request")
+        }
+        WriteFailure::FrameLimit => invalid("Agy ACP setup request exceeded the size limit"),
+        WriteFailure::Expired | WriteFailure::Unwritten => {
+            let code = if matches!(stage, Stage::Configure) {
+                ErrorCode::DeliveryUnknown
+            } else {
+                ErrorCode::Overloaded
+            };
+            failure(code, "Agy ACP setup request did not reach the child")
+        }
+        WriteFailure::Unknown => stage.lost(read_fault.unwrap_or(Fault::WriteUnconfirmed).detail()),
+    })?;
+    if let Some(fault) = read_fault {
+        return Err(stage.lost(fault.detail()));
+    }
+    if let Some(reply) = inbox
+        .finish(wire)
         .await
-        .map_err(|error| match error {
-            WriteFailure::Encode => {
-                failure(ErrorCode::InternalError, "Could not encode Agy ACP request")
-            }
-            WriteFailure::FrameLimit => invalid("Agy ACP setup request exceeded the size limit"),
-            WriteFailure::Expired | WriteFailure::Unwritten => {
-                let code = if matches!(stage, Stage::Configure) {
-                    ErrorCode::DeliveryUnknown
-                } else {
-                    ErrorCode::Overloaded
-                };
-                failure(code, "Agy ACP setup request did not reach the child")
-            }
-            WriteFailure::Unknown => stage.lost(Fault::WriteUnconfirmed.detail()),
-        })?;
+        .map_err(|fault| stage.lost(fault.detail()))?
+    {
+        return reply.map_err(|code| stage.rejected(code));
+    }
+
     tokio::time::timeout(SESSION_RPC_TIMEOUT, async {
         loop {
             match wire

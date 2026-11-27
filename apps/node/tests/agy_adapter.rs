@@ -740,6 +740,7 @@ async fn cancel_is_idempotent_and_keeps_the_session_usable() -> TestResult {
         ("cancel", TurnFinishStatus::Cancelled),
         ("end-on-cancel", TurnFinishStatus::Completed),
         ("cancel-timeout", TurnFinishStatus::Cancelled),
+        ("cancel-on-retry", TurnFinishStatus::Cancelled),
     ]
     .into_iter()
     .enumerate()
@@ -776,7 +777,7 @@ async fn cancel_is_idempotent_and_keeps_the_session_usable() -> TestResult {
         } else {
             assert!(matches!(outcome, StopOutcome::Unknown(_)));
         }
-        if mode == "cancel-timeout" {
+        if matches!(mode, "cancel-timeout" | "cancel-on-retry") {
             assert!(before.elapsed() >= Duration::from_secs(2));
             assert!(matches!(
                 adapter
@@ -785,7 +786,16 @@ async fn cancel_is_idempotent_and_keeps_the_session_usable() -> TestResult {
                     .state,
                 ParticipantRuntimeState::Working
             ));
-            tree.release()?;
+            if mode == "cancel-on-retry" {
+                assert!(matches!(
+                    adapter
+                        .cancel_or_stop(&handle, StopMode::CancelTurn)
+                        .await?,
+                    StopOutcome::TurnCancelled
+                ));
+            } else {
+                tree.release()?;
+            }
         }
         finished(&mut session, seq + 1, "turn", status, "").await?;
     }
@@ -797,13 +807,13 @@ async fn cancel_is_idempotent_and_keeps_the_session_usable() -> TestResult {
         SubmitOutcome::Accepted { .. }
     ));
     assert!(matches!(
-        event(&mut session, 10).await?,
+        event(&mut session, 13).await?,
         AdapterEventKind::StateChanged(ParticipantRuntimeState::Working)
     ));
-    finished(&mut session, 11, "turn", TurnFinishStatus::Completed, "").await?;
-    assert_eq!(tree.frames("session/cancel")?.len(), 3);
+    finished(&mut session, 14, "turn", TurnFinishStatus::Completed, "").await?;
+    assert_eq!(tree.frames("session/cancel")?.len(), 5);
     assert_eq!(tree.frames("session/new")?.len(), 1);
-    assert_eq!(tree.frames("session/prompt")?.len(), 4);
+    assert_eq!(tree.frames("session/prompt")?.len(), 5);
     Ok(())
 }
 
@@ -902,15 +912,22 @@ async fn post_ack_fault_waits_for_submit_exit_before_emitting_unknown() -> TestR
             AdapterEventKind::StateChanged(ParticipantRuntimeState::Working)
         ));
         tree.release()?;
+        let identity = handle
+            .persisted()
+            .process_identity
+            .as_ref()
+            .ok_or("Missing process identity")?;
         if mode == "after-ack-eof" {
-            let identity = handle
-                .persisted()
-                .process_identity
-                .as_ref()
-                .ok_or("Missing process identity")?;
             eventually(|| Ok((identity.probe()? == ProcessProbe::Exited).then_some(()))).await?;
         } else {
-            tree.wait_for(|item| item["stdin_eof"] == true, 1).await?;
+            tree.wait_for(|item| item["fault_sent"] == true, 1).await?;
+            let early_eof = tokio::time::timeout(
+                Duration::from_millis(200),
+                tree.wait_for(|item| item["stdin_eof"] == true, 1),
+            )
+            .await;
+            assert!(early_eof.is_err());
+            assert_eq!(identity.probe()?, ProcessProbe::Running);
         }
         assert!(matches!(
             session.events.try_recv(),
@@ -1211,6 +1228,35 @@ async fn http_delivery_receipt_survives_working_and_post_ack_failure() -> TestRe
     assert_eq!(replay["message_id"], delivered["message_id"]);
     assert_eq!(replay["delivery_state"], "delivered");
     assert_eq!(tree.frames("session/prompt")?.len(), 2);
+    server.shutdown().await?;
+    Ok(())
+}
+
+#[tokio::test]
+async fn large_open_and_prompt_complete_while_agy_writes_to_stdout() -> TestResult {
+    let tree = Tree::new()?;
+    tree.set("open-mode", "duplex")?;
+    tree.mode("duplex")?;
+    let template = tree.workspace().join(".cooplet/agents/duplex");
+    fs::create_dir_all(&template)?;
+    fs::write(
+        template.join("agent.json"),
+        r#"{"schema":1,"client":"agy"}"#,
+    )?;
+    let large_text = "x".repeat(256 * 1024);
+    fs::write(template.join("instructions.md"), &large_text)?;
+
+    let server = Server::new(&tree, tree.config()).await?;
+    let id = server
+        .create(&json!({"template_id":"duplex", "name":"duplex"}))
+        .await?;
+    let delivered = server.message(&id, &large_text, "duplex-turn").await?;
+    assert_eq!(delivered["delivery_state"], "delivered");
+    server.state(&id, "idle", Some("ready")).await?;
+    assert_eq!(tree.frames("session/new")?.len(), 1);
+    assert_eq!(tree.frames("session/prompt")?.len(), 1);
+    tree.wait_for(|item| item["duplex_reply"] == true, 1)
+        .await?;
     server.shutdown().await?;
     Ok(())
 }

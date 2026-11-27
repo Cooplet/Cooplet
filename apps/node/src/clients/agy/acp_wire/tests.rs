@@ -75,7 +75,7 @@ fn writer_distinguishes_prewrite_rejection_from_partial_frame() {
             bytes: Vec::new(),
         };
         assert_eq!(
-            write_frame(&mut writer, b"sample\n", None, &closed),
+            write_frame(&mut writer, b"sample\n", None, &closed, &OnceLock::new()),
             Err(expected)
         );
         assert_eq!(writer.bytes, &b"sample\n"[..allowance]);
@@ -91,7 +91,8 @@ fn writer_distinguishes_prewrite_rejection_from_partial_frame() {
                 guard: AdmissionGuard::new(Duration::ZERO),
                 submitting: submitting.clone(),
             }),
-            &closed
+            &closed,
+            &OnceLock::new(),
         ),
         Err(WriteFailure::Expired)
     );
@@ -104,7 +105,8 @@ fn writer_distinguishes_prewrite_rejection_from_partial_frame() {
                 guard: AdmissionGuard::new(Duration::from_secs(10)),
                 submitting,
             }),
-            &closed
+            &closed,
+            &OnceLock::new(),
         ),
         Err(WriteFailure::Expired)
     );

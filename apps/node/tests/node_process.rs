@@ -140,7 +140,10 @@ fn agy_report(diagnosis: &Value) -> TestResult<&Value> {
 
 #[tokio::test]
 async fn doctor_and_run_use_the_registered_agy_adapter() -> TestResult {
-    use std::os::unix::fs::PermissionsExt;
+    use std::{
+        ffi::OsStr,
+        os::unix::{ffi::OsStrExt, fs::PermissionsExt},
+    };
 
     let directory = TestDirectory::new()?;
     let state = directory.state();
@@ -206,6 +209,20 @@ fi
         .get_json(&format!("/v1/participants/{id}"), &[])
         .await?;
     assert_eq!(participant["state"], "idle");
+
+    let raw = directory.0.join(OsStr::from_bytes(b"bin-\xff"));
+    fs::create_dir(&raw)?;
+    fs::rename(&binary, raw.join("agy"))?;
+    let output = Command::new(COOPLET)
+        .args(["node", "doctor", "--state-dir"])
+        .arg(&state)
+        .env("PATH", &raw)
+        .output()?;
+    assert!(output.status.success());
+    let report: Value = serde_json::from_slice(&output.stdout)?;
+    assert_eq!(agy_report(&report)?["available"], true);
+    assert_eq!(agy_report(&report)?["binary_path"], Value::Null);
+
     command(&state, &["node", "stop"])?;
     assert!(daemon.wait().await?.success());
     Ok(())

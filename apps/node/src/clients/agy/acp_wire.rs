@@ -2,7 +2,7 @@ use std::{
     io::{self, BufRead, BufReader, Write},
     process::{ChildStderr, ChildStdin, ChildStdout},
     sync::{
-        Arc,
+        Arc, OnceLock,
         atomic::{AtomicBool, Ordering},
     },
     thread,
@@ -39,6 +39,7 @@ pub(super) enum Fault {
     EventReceiverClosed,
     WriteUnconfirmed,
     PromptUnconfirmed,
+    TooManyRequests,
 }
 
 impl Fault {
@@ -52,6 +53,7 @@ impl Fault {
             Self::EventReceiverClosed => "Agy session event receiver closed",
             Self::WriteUnconfirmed => "Agy ACP write did not finish",
             Self::PromptUnconfirmed => "Agy ACP prompt outcome is unconfirmed",
+            Self::TooManyRequests => "Agy sent too many ACP requests during a write",
         }
     }
 }
@@ -73,12 +75,19 @@ pub(super) struct Admission {
 struct WriteFrame {
     bytes: Vec<u8>,
     admission: Option<Admission>,
-    result: oneshot::Sender<Result<Instant, WriteFailure>>,
+    started: Arc<OnceLock<Instant>>,
+    result: oneshot::Sender<Result<(), WriteFailure>>,
+}
+
+pub(super) struct PendingWrite {
+    pub started: Arc<OnceLock<Instant>>,
+    result: oneshot::Receiver<Result<(), WriteFailure>>,
 }
 
 pub(super) struct Wire {
     writer: mpsc::Sender<WriteFrame>,
     reader: mpsc::Receiver<Result<ReceivedFrame, Fault>>,
+    _keep_faulted_stdout_open: mpsc::Sender<()>,
     closed: Arc<AtomicBool>,
     next_id: u64,
 }
@@ -91,10 +100,12 @@ impl Wire {
     ) -> io::Result<Self> {
         let (writer, writes) = mpsc::channel(1);
         let (frames, reader) = mpsc::channel(4);
+        let (keep_stdout, release_stdout) = mpsc::channel(1);
         let closed = Arc::new(AtomicBool::new(false));
         let wire = Self {
             writer,
             reader,
+            _keep_faulted_stdout_open: keep_stdout,
             closed: closed.clone(),
             next_id: 1,
         };
@@ -103,7 +114,7 @@ impl Wire {
             .spawn(move || run_writer(stdin, writes, &closed))?;
         thread::Builder::new()
             .name("agy-acp-stdout".into())
-            .spawn(move || run_reader(stdout, &frames))?;
+            .spawn(move || run_reader(stdout, &frames, release_stdout))?;
         if let Some(mut stderr) = stderr {
             thread::Builder::new()
                 .name("agy-acp-stderr".into())
@@ -127,29 +138,68 @@ impl Wire {
         )
     }
 
-    pub(super) async fn send(
+    pub(super) fn begin_write(
         &self,
         value: Value,
         admission: Option<Admission>,
-    ) -> Result<Instant, WriteFailure> {
+    ) -> Result<PendingWrite, WriteFailure> {
         let mut bytes = serde_json::to_vec(&value).map_err(|_| WriteFailure::Encode)?;
         if bytes.len() > MAX_FRAME_BYTES {
             return Err(WriteFailure::FrameLimit);
         }
         bytes.push(b'\n');
         let (result, written) = oneshot::channel();
+        let started = Arc::new(OnceLock::new());
         self.writer
             .try_send(WriteFrame {
                 bytes,
                 admission,
+                started: started.clone(),
                 result,
             })
             .map_err(|_| WriteFailure::Unwritten)?;
-        // Once queued, only the writer can prove that the first byte was prevented.
-        match tokio::time::timeout(WRITE_TIMEOUT, written).await {
+        Ok(PendingWrite {
+            started,
+            result: written,
+        })
+    }
+
+    pub(super) async fn send_control(&self, value: Value) -> Result<(), WriteFailure> {
+        let pending = self.begin_write(value, None)?;
+        Self::finish_write(pending, &self.closed).await
+    }
+
+    /// A peer can write to stdout while reading the request on stdin. Drain
+    /// inbound frames during the write so neither side waits on a full pipe.
+    pub(super) async fn pump_write(
+        &mut self,
+        pending: PendingWrite,
+        mut consume: impl FnMut(ReceivedFrame) -> Result<(), Fault>,
+    ) -> (Result<(), WriteFailure>, Option<Fault>) {
+        let closed = self.closed.clone();
+        let written = Self::finish_write(pending, &closed);
+        tokio::pin!(written);
+        loop {
+            tokio::select! {
+                biased;
+                result = &mut written => return (result, None),
+                incoming = self.recv() => {
+                    if let Err(fault) = incoming.and_then(&mut consume) {
+                        // Fence further writes, then let the writer classify
+                        // whether any bytes of this frame crossed the pipe.
+                        closed.store(true, Ordering::Release);
+                        return (written.await, Some(fault));
+                    }
+                }
+            }
+        }
+    }
+
+    async fn finish_write(pending: PendingWrite, closed: &AtomicBool) -> Result<(), WriteFailure> {
+        match tokio::time::timeout(WRITE_TIMEOUT, pending.result).await {
             Ok(Ok(outcome)) => outcome,
             _ => {
-                self.closed.store(true, Ordering::Release);
+                closed.store(true, Ordering::Release);
                 Err(WriteFailure::Unknown)
             }
         }
@@ -165,9 +215,8 @@ impl Wire {
             "id": id,
             "error": {"code": -32601, "message": "Method not found"}
         });
-        self.send(response, None)
+        self.send_control(response)
             .await
-            .map(|_| ())
             .map_err(|_| Fault::WriteUnconfirmed)
     }
 }
@@ -180,20 +229,26 @@ impl Drop for Wire {
 
 fn run_writer(mut stdin: ChildStdin, mut writes: mpsc::Receiver<WriteFrame>, closed: &AtomicBool) {
     while let Some(frame) = writes.blocking_recv() {
-        if closed.load(Ordering::Acquire) {
-            break;
-        }
-        let outcome = write_frame(&mut stdin, &frame.bytes, frame.admission, closed);
+        let outcome = write_frame(
+            &mut stdin,
+            &frame.bytes,
+            frame.admission,
+            closed,
+            &frame.started,
+        );
         let unusable = matches!(
             outcome,
             Err(WriteFailure::Unknown | WriteFailure::Unwritten)
         );
         if unusable {
-            drop(stdin);
-            let _ = frame.result.send(outcome);
-            return;
+            closed.store(true, Ordering::Release);
         }
         let _ = frame.result.send(outcome);
+        if unusable {
+            // Hold stdin until actor teardown, with no further writes.
+            while writes.blocking_recv().is_some() {}
+            break;
+        }
     }
 }
 
@@ -202,17 +257,16 @@ fn write_frame(
     bytes: &[u8],
     admission: Option<Admission>,
     closed: &AtomicBool,
-) -> Result<Instant, WriteFailure> {
+    started: &OnceLock<Instant>,
+) -> Result<(), WriteFailure> {
     let abandoned = || {
         admission
             .as_ref()
             .is_some_and(|admission| admission.submitting.has_changed().is_err())
     };
-    let mut started = Instant::now();
     let mut remaining = bytes;
     while !remaining.is_empty() {
         if remaining.len() == bytes.len() {
-            started = Instant::now();
             if closed.load(Ordering::Acquire) {
                 return Err(WriteFailure::Unwritten);
             }
@@ -223,6 +277,7 @@ fn write_frame(
             {
                 return Err(WriteFailure::Expired);
             }
+            started.get_or_init(Instant::now);
         } else if closed.load(Ordering::Acquire) || abandoned() {
             return Err(WriteFailure::Unknown);
         }
@@ -238,7 +293,7 @@ fn write_frame(
         && !abandoned()
         && writer.flush().is_ok()
     {
-        Ok(started)
+        Ok(())
     } else if remaining.len() == bytes.len() {
         Err(WriteFailure::Unwritten)
     } else {
@@ -246,7 +301,11 @@ fn write_frame(
     }
 }
 
-fn run_reader(stdout: ChildStdout, frames: &mpsc::Sender<Result<ReceivedFrame, Fault>>) {
+fn run_reader(
+    stdout: ChildStdout,
+    frames: &mpsc::Sender<Result<ReceivedFrame, Fault>>,
+    mut release_stdout: mpsc::Receiver<()>,
+) {
     let mut reader = BufReader::new(stdout);
     let mut bytes = Vec::new();
     loop {
@@ -256,7 +315,13 @@ fn run_reader(stdout: ChildStdout, frames: &mpsc::Sender<Result<ReceivedFrame, F
             parse_frame(&bytes).map(|frame| ReceivedFrame { frame, read_at })
         });
         let failed = frame.is_err();
-        if frames.blocking_send(frame).is_err() || failed {
+        if frames.blocking_send(frame).is_err() {
+            break;
+        }
+        if failed {
+            // Keep the descriptor open until the actor is ready to close.
+            // Closing it early can make the peer exit via a broken pipe.
+            let _ = release_stdout.blocking_recv();
             break;
         }
     }

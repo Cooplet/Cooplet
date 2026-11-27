@@ -1,6 +1,6 @@
 use std::{
     sync::{
-        Arc,
+        Arc, OnceLock,
         atomic::{AtomicBool, Ordering},
     },
     time::Duration,
@@ -12,7 +12,10 @@ use tokio::{
     time::{Instant, sleep_until, timeout},
 };
 
-use super::acp_wire::{Admission, Fault, Frame, ReceivedFrame, Reply, Wire, WriteFailure};
+use super::{
+    acp_wire::{Admission, Fault, Frame, ReceivedFrame, Reply, Wire, WriteFailure},
+    inbound::InboundDuringWrite,
+};
 use crate::clients::{
     AdapterEvent, AdapterEventKind, ParticipantRuntimeState, StopOutcome, SubmitOutcome,
     SubmitTurnRequest, TurnFinishStatus,
@@ -55,11 +58,12 @@ impl Session {
                 _ = stop.wait_for(|stopped| *stopped) => None,
                 fault = actor.run(&mut wire, &mut requests) => Some(fault),
             };
-            drop(wire);
             requests.close();
             while let Ok(request) = requests.try_recv() {
                 request.transport_closed();
             }
+            actor.await_submit_exit().await;
+            drop(wire);
             actor.finish(fault).await;
         });
         (
@@ -186,7 +190,7 @@ struct Actor {
 
 struct Turn {
     id: u64,
-    first_write: std::time::Instant,
+    first_write: Arc<OnceLock<std::time::Instant>>,
     operation_key: String,
     text: String,
     cancellation: Option<oneshot::Sender<StopOutcome>>,
@@ -278,57 +282,68 @@ impl Actor {
         // another submit from a different direct adapter caller.
         self.await_submit_exit().await;
         self.submit_exit = Some(exit.clone());
-        let first_write = match wire
-            .send(
-                frame,
-                Some(Admission {
-                    guard: request.admission,
-                    submitting: exit,
-                }),
-            )
-            .await
-        {
-            Ok(first_write) => first_write,
-            Err(failure) => {
-                let outcome = match failure {
-                    WriteFailure::Expired => SubmitOutcome::Expired,
-                    WriteFailure::Encode | WriteFailure::FrameLimit => {
-                        SubmitOutcome::Unavailable("Could not frame Agy turn input".into())
-                    }
-                    WriteFailure::Unwritten => SubmitOutcome::Unavailable(
-                        "Agy ACP pipe closed before the first write".into(),
-                    ),
-                    WriteFailure::Unknown => return Err(Fault::WriteUnconfirmed),
-                };
-                send_outcome(reply, outcome);
-                return if failure == WriteFailure::Unwritten {
-                    Err(Fault::Closed)
-                } else {
-                    Ok(())
-                };
+        let mut inbox = InboundDuringWrite::new(id);
+        let (written, read_fault) = match wire.begin_write(
+            frame,
+            Some(Admission {
+                guard: request.admission,
+                submitting: exit,
+            }),
+        ) {
+            Ok(pending) => {
+                self.turn = Some(Turn {
+                    id,
+                    first_write: pending.started.clone(),
+                    operation_key: request.operation_key,
+                    text: String::new(),
+                    cancellation: None,
+                });
+                wire.pump_write(pending, |frame| {
+                    inbox.consume(frame, |params, read_at| self.update(&params, read_at))
+                })
+                .await
             }
+            Err(failure) => (Err(failure), None),
         };
-        self.turn = Some(Turn {
-            id,
-            first_write,
-            operation_key: request.operation_key,
-            text: String::new(),
-            cancellation: None,
-        });
+        if let Err(failure) = written {
+            self.turn = None;
+            let outcome = match failure {
+                WriteFailure::Expired => SubmitOutcome::Expired,
+                WriteFailure::Encode | WriteFailure::FrameLimit => {
+                    SubmitOutcome::Unavailable("Could not frame Agy turn input".into())
+                }
+                WriteFailure::Unwritten => {
+                    SubmitOutcome::Unavailable("Agy ACP pipe closed before the first write".into())
+                }
+                WriteFailure::Unknown => {
+                    return Err(read_fault.unwrap_or(Fault::WriteUnconfirmed));
+                }
+            };
+            send_outcome(reply, outcome);
+            return match read_fault {
+                Some(fault) => Err(fault),
+                None if failure == WriteFailure::Unwritten => Err(Fault::Closed),
+                None => Ok(()),
+            };
+        }
+        if let Some(fault) = read_fault {
+            return Err(fault);
+        }
 
         let deadline = Instant::now() + self.fail_fast_window;
-        let terminal = loop {
+        let mut terminal = inbox.finish(wire).await?;
+        while terminal.is_none() {
             // A reply already read at the deadline takes priority. Check the
             // deadline again after every nonterminal frame to bound this window.
-            let completion = tokio::select! {
+            terminal = tokio::select! {
                 biased;
                 frame = wire.recv() => self.receive(wire, frame?).await?,
-                _ = sleep_until(deadline) => break None,
+                _ = sleep_until(deadline) => break,
             };
-            if completion.is_some() || Instant::now() >= deadline {
-                break completion;
+            if Instant::now() >= deadline {
+                break;
             }
-        };
+        }
         if let Some(Err(code)) = terminal {
             tracing::warn!(rpc_code = code, "Agy rejected a prompt during handoff");
             if matches!(code, -32602 | -32000) {
@@ -352,6 +367,9 @@ impl Actor {
                 native_turn_id: None,
             },
         );
+        // Node's process monitor can disconnect once either pipe is closed.
+        // Let the submit future return before handling any following fault.
+        self.await_submit_exit().await;
         Ok(())
     }
 
@@ -391,7 +409,10 @@ impl Actor {
         let update = &params["update"];
         let content = &update["content"];
         // A line already read while idle can still be queued behind the write.
-        if read_at >= turn.first_write
+        if turn
+            .first_write
+            .get()
+            .is_some_and(|started| read_at >= *started)
             && update["sessionUpdate"] == "agent_message_chunk"
             && content["type"] == "text"
             && let Some(text) = content["text"].as_str()
@@ -455,27 +476,23 @@ impl Actor {
             let _ = reply.send(StopOutcome::TurnCancelled);
             return Ok(());
         };
-        if let Some(pending) = &mut turn.cancellation {
-            if pending.is_closed() {
-                *pending = reply;
-            } else {
-                let _ = reply.send(StopOutcome::Unknown(
-                    "Agy turn cancellation is already pending".into(),
-                ));
-            }
+        if turn
+            .cancellation
+            .as_ref()
+            .is_some_and(|pending| !pending.is_closed())
+        {
+            let _ = reply.send(StopOutcome::Unknown(
+                "Agy turn cancellation is already pending".into(),
+            ));
             return Ok(());
         }
         turn.cancellation = Some(reply);
-        wire.send(
-            json!({
-                "jsonrpc": "2.0",
-                "method": "session/cancel",
-                "params": {"sessionId": self.session_id}
-            }),
-            None,
-        )
+        wire.send_control(json!({
+            "jsonrpc": "2.0",
+            "method": "session/cancel",
+            "params": {"sessionId": self.session_id}
+        }))
         .await
-        .map(|_| ())
         .map_err(|_| Fault::WriteUnconfirmed)
     }
 
@@ -503,8 +520,9 @@ impl Actor {
     }
 
     async fn finish(&mut self, fault: Option<Result<(), Fault>>) {
-        self.await_submit_exit().await;
-        if let Some(Err(fault)) = fault {
+        if let Some(Err(fault)) = fault
+            && !matches!(fault, Fault::EventReceiverClosed)
+        {
             tracing::warn!(reason = fault.detail(), "Agy ACP session lost");
             let _ = self
                 .change_state(ParticipantRuntimeState::Unknown {

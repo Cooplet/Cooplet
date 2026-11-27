@@ -1,7 +1,7 @@
 use std::{
     env,
     fs::{self, File, OpenOptions},
-    io::{self, BufRead, BufReader, Write},
+    io::{self, BufRead, BufReader, Read, Write},
     path::{Path, PathBuf},
     process::{Command, Stdio},
     thread,
@@ -42,10 +42,34 @@ fn acp_worker() -> TestResult {
     let stdin = io::stdin();
     let mut input = stdin.lock();
     let mut prompt = None;
+    let mut duplex_next = false;
+    let mut cancel_count = 0;
     let mut model = "default".to_owned();
     let mut effort = "standard".to_owned();
     loop {
-        let frame = match receive(&mut input)? {
+        let received = if std::mem::take(&mut duplex_next) {
+            let mut prefix = [0_u8; 256];
+            input.read_exact(&mut prefix)?;
+            if transport.mcp.is_object() {
+                transport.send(&json!({
+                    "jsonrpc":"2.0", "id":"duplex-request",
+                    "method":"fs/read_text_file", "params":{}
+                }))?;
+            }
+            let title = "x".repeat(32 * 1024);
+            for _ in 0..12 {
+                transport.update(
+                    SESSION_ID,
+                    json!({
+                        "sessionUpdate":"session_info_update", "title":title
+                    }),
+                )?;
+            }
+            receive(&mut io::Cursor::new(prefix).chain(&mut input))?
+        } else {
+            receive(&mut input)?
+        };
+        let frame = match received {
             Some(value) => value,
             None => {
                 transport.record(&json!({"stdin_eof": true}))?;
@@ -76,6 +100,7 @@ fn acp_worker() -> TestResult {
                         "agentCapabilities": caps
                     }),
                 )?;
+                duplex_next = managed && transport.mode("open-mode")? == "duplex";
             }
             Some("session/new" | "session/resume" | "session/load") => {
                 transport.mcp = frame["params"]["mcpServers"][0].clone();
@@ -94,9 +119,11 @@ fn acp_worker() -> TestResult {
                 }
                 transport.text(SESSION_ID, "agent_message_chunk", "idle-output")?;
 
-                if transport.mode("prompt-mode")? == "partial" {
+                let prompt_mode = transport.mode("prompt-mode")?;
+                duplex_next = prompt_mode == "duplex";
+                if prompt_mode == "partial" {
                     let mut prefix = [0_u8; 256];
-                    std::io::Read::read_exact(&mut input, &mut prefix)?;
+                    input.read_exact(&mut prefix)?;
                     transport.record(&json!({"partial_prompt": true}))?;
                     return Ok(());
                 }
@@ -122,7 +149,8 @@ fn acp_worker() -> TestResult {
                         transport.wait_for_release()?;
                         transport.terminal(id, "end_turn")?;
                     }
-                    "cancel" | "end-on-cancel" | "cancel-timeout" => {
+                    "cancel" | "end-on-cancel" | "cancel-timeout" | "cancel-on-retry" => {
+                        cancel_count = 0;
                         prompt = Some((id.clone(), mode));
                     }
                     "reject" => transport.error(id, -32602)?,
@@ -140,6 +168,7 @@ fn acp_worker() -> TestResult {
                         transport.send(&json!({
                             "jsonrpc":"2.0","id":id,"method":"session/request_permission","params":{}
                         }))?;
+                        transport.record(&json!({"fault_sent":true}))?;
                     }
                     "text-limit" => {
                         transport.wait_for_release()?;
@@ -147,12 +176,14 @@ fn acp_worker() -> TestResult {
                         transport.text(SESSION_ID, "agent_message_chunk", &text)?;
                         transport.text(SESSION_ID, "agent_message_chunk", &text)?;
                         transport.text(SESSION_ID, "agent_message_chunk", "overflow")?;
+                        transport.record(&json!({"fault_sent":true}))?;
                     }
                     "frame-limit" => {
                         transport.wait_for_release()?;
                         transport
                             .output
                             .write_all(&vec![b'x'; 4 * 1024 * 1024 + 1])?;
+                        transport.record(&json!({"fault_sent":true}))?;
                     }
                     "after-ack-rpc-error" => {
                         transport.wait_for_release()?;
@@ -180,6 +211,14 @@ fn acp_worker() -> TestResult {
                 }
             }
             Some("session/cancel") => {
+                cancel_count += 1;
+                if cancel_count == 1
+                    && prompt
+                        .as_ref()
+                        .is_some_and(|(_, mode)| mode == "cancel-on-retry")
+                {
+                    continue;
+                }
                 let (id, mode) = prompt.take().ok_or("Cancel sent without a prompt")?;
                 if mode == "cancel-timeout" {
                     transport.wait_for_release()?;
@@ -192,6 +231,9 @@ fn acp_worker() -> TestResult {
                         "cancelled"
                     },
                 )?;
+            }
+            None if frame["id"] == "duplex-request" && frame["error"]["code"] == -32601 => {
+                transport.record(&json!({"duplex_reply":true}))?;
             }
             _ => return Err("Unexpected request from Cooplet".into()),
         }
