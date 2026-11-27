@@ -326,6 +326,8 @@ async fn retry_errors_and_cancel_use_the_current_turn_and_native_settlement() ->
         peer.assistant("error", "partial from first run").await?;
         peer.frame(json!({"type":"agent_end","willRetry":true}))
             .await?;
+        peer.frame(json!({"type":"auto_retry_start","attempt":1}))
+            .await?;
         Ok::<_, Box<dyn Error + Send + Sync>>(())
     };
     let (outcome, proof) = tokio::join!(submit, native);
@@ -379,7 +381,10 @@ async fn retry_errors_and_cancel_use_the_current_turn_and_native_settlement() ->
         async {
             let (command, _) = peer.command().await?;
             peer.ack(&command, "started").await?;
-            peer.begin(&command).await
+            peer.start().await?;
+            // A native Pi input hook can modify the payload after it accepts
+            // the exact RPC prompt.
+            peer.user(&json!("repeat with native suffix")).await
         }
     );
     proof?;
@@ -680,5 +685,86 @@ async fn native_busy_releases_intake_when_external_work_settles_on_either_side_o
         )
         .await?;
     }
+    Ok(())
+}
+
+#[tokio::test]
+async fn unresolved_overlapping_native_runs_close_without_completion_or_idle() -> TestResult {
+    for external_first in [true, false] {
+        let (session, mut events, mut peer) = fixture()?;
+        let admission = AdmissionGuard::new(WAIT);
+        let (outcome, proof) = tokio::join!(
+            session.submit("managed".into(), "managed input", &admission),
+            async {
+                let (command, _) = peer.command().await?;
+                if external_first {
+                    peer.start().await?;
+                    peer.user(&json!("external input")).await?;
+                    peer.assistant("stop", "external assistant").await?;
+                    peer.frame(json!({"type":"agent_end","willRetry":false}))
+                        .await?;
+                }
+                peer.ack(&command, "started").await?;
+                if !external_first {
+                    peer.begin(&command).await?;
+                    peer.assistant("stop", "managed assistant").await?;
+                    peer.frame(json!({"type":"agent_end","willRetry":false}))
+                        .await?;
+                }
+                Ok::<_, Box<dyn Error + Send + Sync>>(())
+            }
+        );
+        proof?;
+        assert!(matches!(outcome, SubmitOutcome::Accepted { .. }));
+        assert!(matches!(
+            next(&mut events).await?.kind,
+            AdapterEventKind::StateChanged(ParticipantRuntimeState::Working)
+        ));
+        // The second run starts while the first one's extension delays its settle.
+        let user = if external_first {
+            "managed input"
+        } else {
+            "external input"
+        };
+        let frames = [
+            json!({"type":"agent_start"}),
+            json!({"type":"message_start","message":{"role":"user","content":user}}),
+            json!({"type":"agent_settled","aborted":false}),
+        ];
+        let mut bytes = Vec::new();
+        for frame in frames {
+            serde_json::to_writer(&mut bytes, &frame)?;
+            bytes.push(b'\n');
+        }
+        peer.output.write_all(&bytes).await?;
+        assert!(timeout(WAIT, events.recv()).await?.is_none());
+        assert!(matches!(
+            session.state().runtime_state(),
+            ParticipantRuntimeState::Unknown { .. }
+        ));
+        assert!(matches!(
+            session
+                .submit("no-replay".into(), "later", &admission)
+                .await,
+            SubmitOutcome::Unavailable(_)
+        ));
+    }
+    Ok(())
+}
+
+#[tokio::test]
+async fn overlapping_background_runs_close_even_without_a_node_turn() -> TestResult {
+    let (session, mut events, mut peer) = fixture()?;
+    peer.start().await?;
+    assert!(matches!(
+        next(&mut events).await?.kind,
+        AdapterEventKind::StateChanged(ParticipantRuntimeState::Working)
+    ));
+    peer.start().await?;
+    assert!(timeout(WAIT, events.recv()).await?.is_none());
+    assert!(matches!(
+        session.state().runtime_state(),
+        ParticipantRuntimeState::Unknown { .. }
+    ));
     Ok(())
 }

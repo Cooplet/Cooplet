@@ -8,6 +8,36 @@ use super::rpc::{Reply, State};
 
 pub(super) const NATIVE_BUSY_ERROR: &str = "Agent is already processing. Specify streamingBehavior ('steer' or 'followUp') to queue the message.";
 
+pub(super) enum NativeActivity {
+    Idle,
+    BusyBeforeStart,
+    Running { retry: bool },
+}
+
+impl NativeActivity {
+    pub(super) fn is_busy(&self) -> bool {
+        !matches!(self, Self::Idle)
+    }
+
+    fn observe(&mut self, kind: &str, frame: &Value) -> bool {
+        match kind {
+            // A callback can delay an earlier run's settlement until another
+            // run starts. Untagged events cannot establish ownership then.
+            "agent_start" if matches!(self, Self::Running { retry: false }) => return false,
+            "agent_start" => *self = Self::Running { retry: false },
+            "agent_settled" => *self = Self::Idle,
+            "auto_retry_start" | "auto_retry_end" | "compaction_end" => {
+                if let Self::Running { retry } = self {
+                    *retry = kind == "auto_retry_start"
+                        || (kind == "compaction_end" && frame["willRetry"] == true);
+                }
+            }
+            _ => {}
+        }
+        true
+    }
+}
+
 pub(super) struct Turn {
     pub(super) id: String,
     pub(super) wrote: bool,
@@ -15,10 +45,18 @@ pub(super) struct Turn {
     pub(super) cancel: Option<oneshot::Sender<TurnFinishStatus>>,
     operation_key: String,
     input: [u8; 32],
-    saw_input: bool,
+    run: NativeRun,
+    saw_managed_user: bool,
     saw_native_settle: bool,
     assistant: Option<TurnResult>,
     finished: Option<TurnResult>,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum NativeRun {
+    Waiting,
+    Unclaimed { conflicting: bool },
+    Managed,
 }
 
 struct TurnResult {
@@ -35,63 +73,107 @@ impl Turn {
             cancel: None,
             operation_key,
             input: Sha256::digest(message.as_bytes()).into(),
-            saw_input: false,
+            run: NativeRun::Waiting,
+            saw_managed_user: false,
             saw_native_settle: false,
             assistant: None,
             finished: None,
         }
     }
 
-    fn observe(&mut self, kind: &str, frame: &Value) {
+    /// Returns false when the native stream no longer identifies the managed run.
+    fn observe(&mut self, kind: &str, frame: &Value) -> bool {
         if !self.wrote || self.finished.is_some() {
-            return;
+            return true;
         }
         match kind {
-            // AgentSession can retry or continue without emitting the input a second time.
-            "agent_start" => self.assistant = None,
-            "message_start" if !self.saw_input && frame["message"]["role"] == "user" => {
-                self.saw_input =
-                    user_input_digest(&frame["message"]["content"]) == Some(self.input);
+            "agent_start" => return self.begin(),
+            "message_start" if frame["message"]["role"] == "user" => {
+                return self.observe_user(&frame["message"]["content"]);
             }
-            "message_end" if self.saw_input && frame["message"]["role"] == "assistant" => {
+            "message_end"
+                if self.run == NativeRun::Managed && frame["message"]["role"] == "assistant" =>
+            {
                 self.assistant = Some(final_assistant(&frame["message"]));
             }
             "agent_settled" => {
                 self.saw_native_settle = true;
-                // Pi extensions can start and finish their own run during prompt preflight.
-                // Only a run that echoed our input can complete the operation before its ACK.
-                if self.saw_input || self.accepted {
-                    let aborted = frame.get("aborted");
-                    self.finished = Some(match aborted {
-                        Some(Value::Bool(true)) => TurnResult {
-                            status: TurnFinishStatus::Cancelled,
-                            text: String::new(),
-                        },
-                        // Older Pi reports cancellation only via the current assistant stop reason.
-                        None | Some(Value::Bool(false)) => {
-                            self.assistant.take().unwrap_or_else(failed)
-                        }
-                        _ => failed(),
-                    });
+                match self.run {
+                    NativeRun::Managed => self.finish(frame),
+                    NativeRun::Waiting if self.accepted => self.finish(frame),
+                    NativeRun::Unclaimed { .. } if self.accepted => return false,
+                    _ => self.run = NativeRun::Waiting,
                 }
             }
             _ => {}
         }
+        true
+    }
+
+    fn begin(&mut self) -> bool {
+        self.run = match self.run {
+            NativeRun::Waiting if self.accepted => NativeRun::Managed,
+            NativeRun::Waiting => NativeRun::Unclaimed { conflicting: false },
+            NativeRun::Unclaimed { .. } if !self.accepted => {
+                NativeRun::Unclaimed { conflicting: true }
+            }
+            NativeRun::Managed => NativeRun::Managed,
+            _ => return false,
+        };
+        self.assistant = None;
+        true
+    }
+
+    fn observe_user(&mut self, content: &Value) -> bool {
+        // A started ACK followed by an unambiguous new run identifies that
+        // run even if a trusted Pi input hook transformed the user text.
+        if self.run == NativeRun::Managed && !self.saw_managed_user {
+            self.saw_managed_user = true;
+            return true;
+        }
+        let matches = user_input_digest(content) == Some(self.input);
+        match self.run {
+            NativeRun::Managed => matches,
+            NativeRun::Unclaimed { conflicting: true } if matches => false,
+            _ => {
+                self.run = if matches {
+                    self.saw_managed_user = true;
+                    NativeRun::Managed
+                } else {
+                    NativeRun::Unclaimed { conflicting: true }
+                };
+                true
+            }
+        }
+    }
+
+    fn finish(&mut self, frame: &Value) {
+        self.finished = Some(match frame.get("aborted") {
+            Some(Value::Bool(true)) => TurnResult {
+                status: TurnFinishStatus::Cancelled,
+                text: String::new(),
+            },
+            // Older Pi reports cancellation only via the current assistant stop reason.
+            None | Some(Value::Bool(false)) => self.assistant.take().unwrap_or_else(failed),
+            _ => failed(),
+        });
     }
 }
 
 impl State {
     pub(super) fn handle_turn_event(&mut self, kind: &str, frame: &Value) {
-        let was_busy = self.native_busy;
-        match kind {
-            "agent_start" => self.native_busy = true,
-            "agent_settled" => self.native_busy = false,
-            _ => {}
+        let was_busy = self.native_activity.is_busy();
+        if !self.native_activity.observe(kind, frame) {
+            self.close_ambiguous_stream();
+            return;
         }
         if let Some(turn) = self.turn.as_mut().filter(|turn| turn.wrote) {
-            turn.observe(kind, frame);
-            self.emit_finished();
-        } else if was_busy != self.native_busy {
+            if turn.observe(kind, frame) {
+                self.emit_finished();
+            } else {
+                self.close_ambiguous_stream();
+            }
+        } else if was_busy != self.native_activity.is_busy() {
             self.emit_native_state();
         }
     }
@@ -100,10 +182,15 @@ impl State {
         let Some(turn) = self.turn.as_mut().filter(|turn| turn.id == id) else {
             return SubmitOutcome::Unknown("Pi disconnected during intake".into());
         };
-        if !reply.success && !turn.saw_input && reply.error.as_deref() == Some(NATIVE_BUSY_ERROR) {
+        if !reply.success
+            && turn.run != NativeRun::Managed
+            && reply.error.as_deref() == Some(NATIVE_BUSY_ERROR)
+        {
             // Releasing the Node slot on Busy requires an Idle event even if it
             // already arrived on the native stream while the ACK was pending.
-            self.native_busy = self.native_busy || !turn.saw_native_settle;
+            if !turn.saw_native_settle && !self.native_activity.is_busy() {
+                self.native_activity = NativeActivity::BusyBeforeStart;
+            }
             self.turn = None;
             self.emit_native_state();
             return SubmitOutcome::Busy;
@@ -143,7 +230,7 @@ impl State {
     }
 
     fn emit_native_state(&mut self) {
-        let state = if self.native_busy {
+        let state = if self.native_activity.is_busy() {
             ParticipantRuntimeState::Working
         } else {
             ParticipantRuntimeState::Idle
@@ -151,12 +238,19 @@ impl State {
         self.emit(AdapterEventKind::StateChanged(state));
     }
 
+    fn close_ambiguous_stream(&mut self) {
+        tracing::warn!("Could not correlate overlapping native Pi runs");
+        self.close();
+    }
+
     pub(super) fn runtime_state(&self) -> ParticipantRuntimeState {
         if self.is_closed() {
             ParticipantRuntimeState::Unknown {
                 reason: "pi_rpc_closed".into(),
             }
-        } else if self.native_busy || self.turn.as_ref().is_some_and(|turn| turn.wrote) {
+        } else if self.native_activity.is_busy()
+            || self.turn.as_ref().is_some_and(|turn| turn.wrote)
+        {
             ParticipantRuntimeState::Working
         } else {
             ParticipantRuntimeState::Idle
@@ -164,7 +258,7 @@ impl State {
     }
 
     pub(super) fn idle(&self) -> bool {
-        !self.is_closed() && !self.native_busy && self.turn.is_none()
+        !self.is_closed() && !self.native_activity.is_busy() && self.turn.is_none()
     }
 }
 

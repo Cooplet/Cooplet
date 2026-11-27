@@ -2,7 +2,7 @@ use std::{
     error::Error,
     fs, io,
     io::{BufRead, BufReader, Write},
-    os::unix::fs::PermissionsExt as _,
+    os::unix::{ffi::OsStrExt as _, fs::PermissionsExt as _},
     path::{Path, PathBuf},
     process::{Child, ChildStdout, Command, Stdio},
     time::Duration,
@@ -133,7 +133,7 @@ fn command(state: &Path, args: &[&str]) -> TestResult<std::process::Output> {
 
 #[tokio::test]
 async fn startup_announces_the_exact_operator_path_for_non_utf8_state() -> TestResult {
-    use std::{ffi::OsStr, os::unix::ffi::OsStrExt};
+    use std::ffi::OsStr;
 
     let directory = TestDirectory::new()?;
     let raw = directory.0.join(OsStr::from_bytes(b"state-\xff"));
@@ -180,7 +180,9 @@ async fn foreground_cli_restarts_with_same_identity_and_replays_stop_without_sto
         serde_json::from_slice::<Value>(&command(&state, &["node", "status"])?.stdout)?["status"],
         "ok"
     );
-    let client_path = directory.0.join("client-binaries");
+    let client_path = directory
+        .0
+        .join(std::ffi::OsStr::from_bytes(b"client-binaries-\xff"));
     fs::create_dir(&client_path)?;
     let diagnose = || -> TestResult<Value> {
         let output = Command::new(COOPLET)
@@ -224,9 +226,9 @@ esac
     let installed = pi_report(&diagnose()?);
     assert_eq!(installed["available"], true);
     assert_eq!(installed["version"], "9.0.0");
+    assert_eq!(installed["binary_path"], pi.display().to_string());
     assert_eq!(installed["capabilities"]["supports_resume"], true);
     assert_eq!(installed["capabilities"]["supports_tui_attach"], false);
-    use std::os::unix::ffi::OsStrExt;
     let workspace = directory
         .0
         .join(std::ffi::OsStr::from_bytes(b"separate-workspace-\xff"));

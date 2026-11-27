@@ -85,6 +85,10 @@ A delivered receipt confirms Pi intake. Pi saves the assistant turn in its
 native history. To send a reply through Cooplet, the participant calls the
 Cooplet MCP `send_message` tool.
 
+If a Pi extension starts overlapping native runs and Pi's events cannot
+identify their completion, Node marks the participant unknown. Stop and
+resume the participant to reopen the conversation.
+
 Run `python3 apps/node/tests/pi_live.py` after building Node to exercise the
 production registry, native Pi and participant MCP against a local model
 fixture. The test accepts `--pi PATH` and `--cooplet PATH`.

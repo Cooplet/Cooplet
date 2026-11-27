@@ -19,7 +19,7 @@ use crate::clients::{
     TurnFinishStatus,
 };
 
-use super::turn::Turn;
+use super::turn::{NativeActivity, Turn};
 
 const COMMAND_TIMEOUT: Duration = Duration::from_secs(15);
 const MAX_RECORD_BYTES: usize = 16 * 1024 * 1024;
@@ -42,7 +42,7 @@ pub(super) struct State {
     next_command: u64,
     event_seq: u64,
     pub(super) turn: Option<Turn>,
-    pub(super) native_busy: bool,
+    pub(super) native_activity: NativeActivity,
     ready: bool,
 }
 
@@ -100,7 +100,7 @@ impl Session {
                 next_command: 0,
                 event_seq: 0,
                 turn: None,
-                native_busy: false,
+                native_activity: NativeActivity::Idle,
                 ready: false,
             }),
             input: AsyncMutex::new(Some(input)),
@@ -391,7 +391,9 @@ impl Transfer<'_> {
                 if admission.is_some_and(AdmissionGuard::is_expired) {
                     return Err(CommandError::Expired);
                 }
-                if state.native_busy && state.turn.as_ref().is_some_and(|turn| turn.id == self.id) {
+                if state.native_activity.is_busy()
+                    && state.turn.as_ref().is_some_and(|turn| turn.id == self.id)
+                {
                     return Err(CommandError::Busy);
                 }
                 let result = pipe.try_write(bytes);

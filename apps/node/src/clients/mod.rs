@@ -21,7 +21,7 @@ pub use turn_input::*;
 use std::{
     any::Any,
     collections::BTreeMap,
-    path::PathBuf,
+    path::{Path, PathBuf},
     process::{ChildStderr, ChildStdin, ChildStdout, Command},
     str::FromStr,
     sync::Arc,
@@ -30,7 +30,7 @@ use std::{
 use cooplet_platform::{AdmissionGuard, ProcessIdentity};
 use cooplet_protocol::{ErrorCode, MessageId, ParticipantId, ParticipantState};
 use futures_util::future::BoxFuture;
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Serialize, Serializer};
 use serde_json::Value;
 use tokio::sync::mpsc;
 use utoipa::ToSchema;
@@ -83,10 +83,20 @@ pub struct AdapterConfig {
 pub struct DiscoveryReport {
     pub client_kind: String,
     pub available: bool,
+    #[serde(serialize_with = "serialize_display_path")]
     pub binary_path: Option<PathBuf>,
     pub version: Option<String>,
     pub capabilities: AdapterCapabilities,
     pub detail: Option<String>,
+}
+
+fn serialize_display_path<S: Serializer>(
+    path: &Option<PathBuf>,
+    serializer: S,
+) -> std::result::Result<S::Ok, S::Error> {
+    path.as_deref()
+        .map(Path::to_string_lossy)
+        .serialize(serializer)
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
