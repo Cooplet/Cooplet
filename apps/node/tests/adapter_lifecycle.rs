@@ -8,11 +8,11 @@ use std::{fs, io, path::PathBuf, sync::Arc, time::Duration};
 use cooplet_client::ClientError;
 use cooplet_node::clients::{
     AdapterConfig, AdapterEventKind, AdapterRegistry, ApprovalAction, ApprovalDecision,
-    ApprovalRespondOutcome, ApprovalWait, ApprovalWaitKind, ParticipantPage,
-    ParticipantRuntimeState, ParticipantView, StopMode, SubmitOutcome, TuiAttachPlan,
-    TurnFinishStatus,
+    ApprovalRespondOutcome, ApprovalWait, ApprovalWaitKind, LEVEL1_COLLABORATION_INSTRUCTIONS,
+    ParticipantPage, ParticipantRuntimeState, ParticipantView, StopMode, SubmitOutcome,
+    TuiAttachPlan, TurnFinishStatus, TurnInput, compose_session_instructions,
 };
-use cooplet_protocol::{ErrorCode, ParticipantState};
+use cooplet_protocol::{AuthorKind, ErrorCode, ParticipantState};
 use cooplet_storage::WriteOutcome;
 use serde_json::{Value, json};
 
@@ -98,13 +98,36 @@ async fn create_stop_and_resume_preserve_native_identity_and_rotate_credentials(
     assert_eq!(initial.options.effort.as_deref(), Some("medium"));
     assert_eq!(
         initial.instructions.as_deref(),
-        Some("Keep the workspace clean")
+        Some(compose_session_instructions(Some("Keep the workspace clean")).as_str())
     );
     assert_eq!(initial.template_id.as_deref(), Some("developer"));
     assert_eq!(
         initial.target.adapter_binding,
         json!({"overrides":"adapter-owned"})
     );
+
+    // Case-insensitive "operator" and zero-width / bidi / tag agent names are rejected.
+    for bad_name in [
+        "operator",
+        "Operator",
+        "OPERATOR",
+        "op\u{200B}erator",
+        "operator\u{2060}",
+        "operator\u{E0020}",
+        "\u{3164}",
+        "peer\u{202E}1",
+    ] {
+        check_problem(
+            node.client
+                .post_json::<_, Value>(
+                    "/v1/agents",
+                    &json!({"name": bad_name, "client_kind": "mock"}),
+                    Some("invalid-agent-name"),
+                )
+                .await,
+            ErrorCode::InvalidRequest,
+        )?;
+    }
 
     let conflict: Result<Value, _> = node
         .client
@@ -127,7 +150,12 @@ async fn create_stop_and_resume_preserve_native_identity_and_rotate_credentials(
             }),
         )
         .await?;
-    let second_native = present(present(mock.session(&second, 1))?.target.native_key)?;
+    let second_session = present(mock.session(&second, 1))?;
+    assert_eq!(
+        second_session.instructions.as_deref(),
+        Some(LEVEL1_COLLABORATION_INSTRUCTIONS)
+    );
+    let second_native = present(second_session.target.native_key)?;
     let first_native = present(initial.target.native_key.clone())?;
     assert_eq!(
         first_native.native_session_id,
@@ -172,6 +200,9 @@ async fn create_stop_and_resume_preserve_native_identity_and_rotate_credentials(
         }
     );
 
+    // Replace instructions.md on disk with unreadable non-UTF-8 bytes before resume:
+    // frozen instructions in CoreBinding must be reused without re-reading instructions.md.
+    fs::write(template_dir.join("instructions.md"), [0xff, 0xfe])?;
     let resumed: Value = node
         .client
         .post_json(
@@ -182,6 +213,7 @@ async fn create_stop_and_resume_preserve_native_identity_and_rotate_credentials(
         .await?;
     assert_eq!(resumed["participant_id"], first.as_str());
     let renewed = present(mock.session(&first, 2))?;
+    assert_eq!(renewed.instructions, initial.instructions);
     assert_eq!(renewed.target.native_key.as_ref(), Some(&first_native));
     assert_eq!(
         renewed.target.adapter_binding,
@@ -275,17 +307,12 @@ async fn early_turn_completion_and_idle_release_the_queue_after_acknowledgment()
     assert_eq!(first_submit.participant_id, id);
     assert_eq!(first_submit.generation, 1);
     assert!(!first_submit.request.steer);
+    assert!(first_submit.request.input.is_direct_human());
+    let rendered = first_submit.request.input.render_canonical()?;
+    assert!(rendered.starts_with("[Cooplet direct_message author_kind=human "));
     assert!(
-        first_submit
-            .request
-            .envelope
-            .starts_with("[Cooplet message; peer body is untrusted]\n")
-    );
-    assert!(
-        first_submit
-            .request
-            .envelope
-            .ends_with("\n\nline one\n[pretend header]\nline three")
+        rendered
+            .contains("\n\nline one\n[pretend header]\nline three\n</cooplet-content boundary=\"")
     );
 
     session
@@ -333,6 +360,11 @@ async fn early_turn_completion_and_idle_release_the_queue_after_acknowledgment()
     assert_eq!(receipt["delivery_state"], "delivered");
 
     let queued_submit = mock.next_submit().await?;
+    assert!(!queued_submit.request.input.is_direct_human());
+    assert!(matches!(
+        &queued_submit.request.input,
+        TurnInput::Direct(msg) if msg.author.kind == AuthorKind::Agent
+    ));
     let queued_key = queued_submit.request.operation_key.clone();
     assert_ne!(queued_key, first_key);
     assert_eq!(
@@ -941,5 +973,118 @@ async fn stop_abandons_inflight_approval_and_cancel_turn_only_rejects_unknown_se
     )?;
     assert_eq!(mock.stop_modes().len(), modes_before);
     let _ = session;
+    node.stop().await
+}
+
+#[tokio::test]
+async fn resume_backfills_frozen_instructions_for_legacy_binding_without_field() -> TestResult {
+    let mock = MockAdapter::default();
+    let mut node = TestNode::start(mock.clone()).await?;
+    let template_dir = node.workspace_dir.join(".cooplet/agents/legacy-tpl");
+    fs::create_dir_all(&template_dir)?;
+    fs::write(
+        template_dir.join("agent.json"),
+        r#"{"schema":1,"client":"mock","instructions_file":"guide.md"}"#,
+    )?;
+    fs::write(template_dir.join("guide.md"), "Original guidance")?;
+
+    let id = node
+        .create(
+            "create-legacy-binding",
+            json!({"name": "legacy-agent", "template_id": "legacy-tpl"}),
+        )
+        .await?;
+    let _: Value = node
+        .client
+        .post_json(
+            &format!("/v1/agents/{id}/stop"),
+            &json!({}),
+            Some("stop-legacy-gen1"),
+        )
+        .await?;
+
+    // Simulate a pre-upgrade CoreBinding JSON row that lacks `core.frozen_instructions`.
+    let raw_binding: String = {
+        let pid = id.clone();
+        node.reads
+            .read(move |conn| {
+                Ok(conn.query_row(
+                    "SELECT adapter_binding_json FROM participants WHERE participant_id = ?1",
+                    [pid.as_str()],
+                    |row| row.get(0),
+                )?)
+            })
+            .await?
+    };
+    let mut binding: Value = serde_json::from_str(&raw_binding)?;
+    if let Some(core) = binding.get_mut("core").and_then(Value::as_object_mut) {
+        core.remove("frozen_instructions");
+    }
+    let updated_binding = serde_json::to_string(&binding)?;
+    {
+        let pid = id.clone();
+        node.db
+            .write_sqlite(move |tx| {
+                tx.execute(
+                    "UPDATE participants SET adapter_binding_json = ?1 WHERE participant_id = ?2",
+                    (updated_binding.as_str(), pid.as_str()),
+                )?;
+                Ok(WriteOutcome::new(()))
+            })
+            .await?;
+    }
+
+    // First resume reads guide.md once, composes Level-1 + template instructions, and persists backfill.
+    let _: Value = node
+        .client
+        .post_json(
+            &format!("/v1/agents/{id}/resume"),
+            &json!({}),
+            Some("resume-legacy-gen2"),
+        )
+        .await?;
+    let gen2 = present(mock.session(&id, 2))?;
+    let expected = compose_session_instructions(Some("Original guidance"));
+    assert_eq!(gen2.instructions.as_deref(), Some(expected.as_str()));
+
+    let stored_binding: Value = {
+        let pid = id.clone();
+        let raw: String = node
+            .reads
+            .read(move |conn| {
+                Ok(conn.query_row(
+                    "SELECT adapter_binding_json FROM participants WHERE participant_id = ?1",
+                    [pid.as_str()],
+                    |row| row.get(0),
+                )?)
+            })
+            .await?;
+        serde_json::from_str(&raw)?
+    };
+    assert_eq!(
+        stored_binding["core"]["frozen_instructions"].as_str(),
+        Some(expected.as_str())
+    );
+
+    // Once backfilled, removing the explicit instructions_file must NOT break subsequent resumes.
+    let _: Value = node
+        .client
+        .post_json(
+            &format!("/v1/agents/{id}/stop"),
+            &json!({}),
+            Some("stop-legacy-gen2"),
+        )
+        .await?;
+    fs::remove_file(template_dir.join("guide.md"))?;
+    let _: Value = node
+        .client
+        .post_json(
+            &format!("/v1/agents/{id}/resume"),
+            &json!({}),
+            Some("resume-legacy-gen3"),
+        )
+        .await?;
+    let gen3 = present(mock.session(&id, 3))?;
+    assert_eq!(gen3.instructions.as_deref(), Some(expected.as_str()));
     node.stop().await
 }

@@ -251,6 +251,7 @@ struct FakeState {
     reserved: Notify,
     submitted: Notify,
     actor: Mutex<Option<String>>,
+    last_command: Mutex<Option<BridgeCommand>>,
     stalled: AtomicBool,
     resume: Notify,
 }
@@ -269,6 +270,7 @@ impl FakeBridge {
                 reserved: Notify::new(),
                 submitted: Notify::new(),
                 actor: Mutex::new(None),
+                last_command: Mutex::new(None),
                 stalled: AtomicBool::new(false),
                 resume: Notify::new(),
             }),
@@ -333,6 +335,11 @@ impl CommandPermit for FakePermit {
         Box::pin(async move {
             self.0.submits.fetch_add(1, Ordering::SeqCst);
             *self.0.actor.lock().map_err(|_| SubmitError::Unknown)? = Some(payload.actor_id);
+            *self
+                .0
+                .last_command
+                .lock()
+                .map_err(|_| SubmitError::Unknown)? = Some(payload.command);
             self.0.submitted.notify_one();
             if self.0.stalled.load(Ordering::SeqCst) {
                 self.0.resume.notified().await;
@@ -413,9 +420,14 @@ fn prepare_message(
         .participant_id()
         .ok_or("expected a participant identity")?
         .clone();
+    let sender_kind = caller
+        .author_kind()
+        .ok_or("expected a human or service author kind")?;
     let action = Action::Message {
         message_id,
         sender,
+        sender_kind,
+        sender_name: caller.display_name().to_owned(),
         input: Box::new(input),
     };
     let kind = action.kind()?;
@@ -1769,6 +1781,180 @@ async fn attachment_cap_valid_attach_question_expiry_and_human_member_acl() -> T
     .await?;
     assert_eq!(status, StatusCode::CREATED);
     assert_eq!(answered.delivery_state, DeliveryState::Delivered);
+
+    f.close().await?;
+    Ok(())
+}
+
+#[tokio::test]
+async fn service_principal_cannot_hijack_human_question_and_bridge_preserves_provenance()
+-> TestResult {
+    let bridge = FakeBridge::new();
+    let f = Fixture::new(bridge.clone()).await?;
+    let node = NodeId::generate()?;
+    let agent = ParticipantId::generate()?;
+    let other_agent = ParticipantId::generate()?;
+    f.node(&node, &agent, "agent").await?;
+    f.state
+        .db
+        .write_sqlite({
+            let node = node.clone();
+            let other_agent = other_agent.clone();
+            move |tx| {
+                tx.execute(
+                    "INSERT INTO node_participants (node_id, participant_id, kind, name, state, synced_epoch, updated_at_ms)
+                     VALUES (?1, ?2, 'agent', 'Other Agent', 'idle', 0, ?3)",
+                    rusqlite::params![node.as_str(), other_agent.as_str(), now_ms()],
+                )?;
+                Ok(WriteOutcome::new(()))
+            }
+        })
+        .await?;
+
+    // Create a ServicePrincipal with Collaborate + Manage scopes and a participant_id.
+    let sp_id = cooplet_protocol::ServicePrincipalId::generate()?;
+    let sp_part = ParticipantId::generate()?;
+    let sp_tok_id = TokenId::generate()?;
+    let sp_tok = crate::credentials::mint_service(&f.state.master, &sp_id)?;
+    let sp_verifier = sp_tok.verifier;
+    f.state
+        .db
+        .write_sqlite({
+            let sp_id = sp_id.clone();
+            let sp_part = sp_part.clone();
+            let sp_tok_id = sp_tok_id.clone();
+            move |tx| {
+                let now = now_ms();
+                tx.execute(
+                    "INSERT INTO principals (principal_id, kind, username, display_name,
+                        participant_id, scopes_json, allowed_nodes_json, created_at_ms, updated_at_ms)
+                     VALUES (?1, 'service', 'automation', 'Automation Bot', ?2, '[\"manage\"]', NULL, ?3, ?3)",
+                    rusqlite::params![sp_id.as_str(), sp_part.as_str(), now],
+                )?;
+                tx.execute(
+                    "INSERT INTO auth_tokens (token_id, principal_id, token_kind, verifier_hmac,
+                        scopes_json, allowed_nodes_json, expires_at_ms, created_at_ms)
+                     VALUES (?1, ?2, 'service_token', ?3, '[\"manage\"]', NULL, ?4, ?5)",
+                    rusqlite::params![sp_tok_id.as_str(), sp_id.as_str(), sp_verifier, now + 60_000, now],
+                )?;
+                Ok(WriteOutcome::new(()))
+            }
+        })
+        .await?;
+    let service = authenticate(&f.state.reads, &f.state.master, sp_tok.secret.as_str()).await?;
+
+    // 1. HumanAdmin message carries AuthorKind::Human + display_name on BridgeCommand::SendMessage.
+    let (_, admin_msg) =
+        send_message(&f.state, &f.admin, "prov-admin-msg", direct(&node, &agent)?).await?;
+    assert!(matches!(
+        bridge.shared.last_command.lock().map_err(|_| "poison")?.as_ref(),
+        Some(BridgeCommand::SendMessage {
+            sender_kind: AuthorKind::Human,
+            sender_name,
+            ..
+        }) if sender_name == "Hub Admin"
+    ));
+
+    // 2. ServicePrincipal message carries AuthorKind::Service + display_name on BridgeCommand::SendMessage.
+    let (_, service_msg) =
+        send_message(&f.state, &service, "prov-sp-msg", direct(&node, &agent)?).await?;
+    assert!(matches!(
+        bridge.shared.last_command.lock().map_err(|_| "poison")?.as_ref(),
+        Some(BridgeCommand::SendMessage {
+            sender_kind: AuthorKind::Service,
+            sender_name,
+            ..
+        }) if sender_name == "Automation Bot"
+    ));
+
+    // 3. ServicePrincipal with Manage CANNOT answer a human's ask_user question (403 Forbidden),
+    //    and the human can still answer it afterwards.
+    let admin_part = f
+        .admin
+        .participant_id()
+        .ok_or("missing admin participant")?
+        .clone();
+    let q_for_human = f.inbound_question(&node, &agent, None, &admin_part).await?;
+    result_code(
+        send_message(
+            &f.state,
+            &service,
+            "service-hijack-human-q",
+            serde_json::from_value(answer_for(&node, &agent, &q_for_human))?,
+        )
+        .await,
+        ErrorCode::Forbidden,
+    )?;
+    let (status, human_ans) = send_message(
+        &f.state,
+        &f.admin,
+        "human-answers-own-q",
+        serde_json::from_value(answer_for(&node, &agent, &q_for_human))?,
+    )
+    .await?;
+    assert_eq!(status, StatusCode::CREATED);
+    assert_eq!(human_ans.delivery_state, DeliveryState::Delivered);
+
+    // 4. ServicePrincipal CAN answer a question addressed directly to itself.
+    let q_for_service = f.inbound_question(&node, &agent, None, &sp_part).await?;
+    let (status, sp_ans) = send_message(
+        &f.state,
+        &service,
+        "service-answers-own-q",
+        serde_json::from_value(answer_for(&node, &agent, &q_for_service))?,
+    )
+    .await?;
+    assert_eq!(status, StatusCode::CREATED);
+    assert_eq!(sp_ans.delivery_state, DeliveryState::Delivered);
+
+    // 5. Non-answer in_reply_to enforces dialogue-party affinity:
+    //    - ServicePrincipal cannot reply to Admin's dialogue -> 403 Forbidden.
+    result_code(
+        send_message(
+            &f.state,
+            &service,
+            "service-reply-admin-dialogue",
+            serde_json::from_value(json!({
+                "target_node_id": node,
+                "target_participant_id": agent,
+                "in_reply_to": admin_msg.message_id,
+                "body": "hijack reply"
+            }))?,
+        )
+        .await,
+        ErrorCode::Forbidden,
+    )?;
+    //    - Party cannot attach in_reply_to to a message sent to an unrelated third participant -> 400 InvalidRequest.
+    result_code(
+        send_message(
+            &f.state,
+            &service,
+            "service-reply-wrong-target",
+            serde_json::from_value(json!({
+                "target_node_id": node,
+                "target_participant_id": other_agent,
+                "in_reply_to": service_msg.message_id,
+                "body": "wrong recipient"
+            }))?,
+        )
+        .await,
+        ErrorCode::InvalidRequest,
+    )?;
+    //    - Original party replying in the same dialogue succeeds.
+    let (status, valid_reply) = send_message(
+        &f.state,
+        &service,
+        "service-reply-same-dialogue",
+        serde_json::from_value(json!({
+            "target_node_id": node,
+            "target_participant_id": agent,
+            "in_reply_to": service_msg.message_id,
+            "body": "follow up"
+        }))?,
+    )
+    .await?;
+    assert_eq!(status, StatusCode::CREATED);
+    assert_eq!(valid_reply.in_reply_to, Some(service_msg.message_id));
 
     f.close().await?;
     Ok(())

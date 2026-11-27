@@ -104,7 +104,11 @@ struct Manifest {
 }
 
 pub fn load_template(workspace_dir: &Path, template_id: &str) -> Result<AgentTemplate> {
-    load_with_config(workspace_dir, template_id, user_config_dir)
+    load_with_config_mode(workspace_dir, template_id, user_config_dir, true)
+}
+
+pub fn load_template_options(workspace_dir: &Path, template_id: &str) -> Result<AgentTemplate> {
+    load_with_config_mode(workspace_dir, template_id, user_config_dir, false)
 }
 
 pub fn list_templates(workspace_dir: &Path) -> Result<Vec<TemplateSummary>> {
@@ -115,10 +119,20 @@ fn user_config_dir() -> Option<PathBuf> {
     xdg_dir("XDG_CONFIG_HOME", ".config").ok()
 }
 
+#[cfg(test)]
 fn load_with_config(
     workspace_dir: &Path,
     template_id: &str,
     user_config: impl FnOnce() -> Option<PathBuf>,
+) -> Result<AgentTemplate> {
+    load_with_config_mode(workspace_dir, template_id, user_config, true)
+}
+
+fn load_with_config_mode(
+    workspace_dir: &Path,
+    template_id: &str,
+    user_config: impl FnOnce() -> Option<PathBuf>,
+    load_instructions: bool,
 ) -> Result<AgentTemplate> {
     if !valid_template_id(template_id) {
         return Err(
@@ -129,14 +143,14 @@ fn load_with_config(
 
     let workspace = workspace_root(workspace_dir)?;
     if let Some(root) = template_root(&workspace, [".cooplet", "agents"])?
-        && let Some(template) = load_in_root(&workspace, &root, template_id)?
+        && let Some(template) = load_in_root(&workspace, &root, template_id, load_instructions)?
     {
         return Ok(template);
     }
 
     if let Some(config) = config_root(user_config())?
         && let Some(root) = template_root(&config, ["cooplet", "agents"])?
-        && let Some(template) = load_in_root(&config, &root, template_id)?
+        && let Some(template) = load_in_root(&config, &root, template_id, load_instructions)?
     {
         return Ok(template);
     }
@@ -220,7 +234,12 @@ fn valid_template_id(id: &str) -> bool {
             .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'_' | b'-'))
 }
 
-fn load_in_root(base: &Path, search_root: &Path, id: &str) -> Result<Option<AgentTemplate>> {
+fn load_in_root(
+    base: &Path,
+    search_root: &Path,
+    id: &str,
+    load_instructions: bool,
+) -> Result<Option<AgentTemplate>> {
     let Some(dir) = existing_canonical(&search_root.join(id), Some(base))? else {
         return Ok(None);
     };
@@ -251,7 +270,11 @@ fn load_in_root(base: &Path, search_root: &Path, id: &str) -> Result<Option<Agen
             "expected schema 1 and a nonempty client kind",
         ));
     }
-    let instructions = read_instructions(base, &dir, manifest.instructions_file.as_deref())?;
+    let instructions = if load_instructions {
+        read_instructions(base, &dir, manifest.instructions_file.as_deref())?
+    } else {
+        None
+    };
     Ok(Some(AgentTemplate {
         client: manifest.client,
         title: manifest.title,
@@ -339,7 +362,7 @@ fn list_in_root(
             templates.insert(id, None);
             continue;
         }
-        let Some(template) = load_in_root(base, root, &id)? else {
+        let Some(template) = load_in_root(base, root, &id, true)? else {
             continue;
         };
         templates.insert(

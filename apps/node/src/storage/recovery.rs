@@ -136,7 +136,7 @@ fn recover_delivery(tx: &Transaction<'_>, now: i64) -> rusqlite::Result<Vec<Even
         [now],
     )?;
     tx.execute(
-        "UPDATE intake_queue SET state = 'unknown', resolved_at_ms = ?1 WHERE state = 'dispatched'",
+        "UPDATE intake_queue SET state = 'unknown', resolved_at_ms = ?1, payload_envelope = '' WHERE state = 'dispatched'",
         [now],
     )?;
     events.extend(expire_queued(tx, now, -1)?);

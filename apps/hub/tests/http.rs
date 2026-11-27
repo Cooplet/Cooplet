@@ -448,6 +448,29 @@ async fn scoped_service_access_and_stream_lifecycle() -> TestResult {
     assert!(who.participant_id.is_some());
     assert_eq!(who.name, "Orchestrateur d’équipe");
 
+    // Bidi override and zero-width characters are rejected on principal display names.
+    for bad_name in [
+        "Spoof\u{202E}Admin",
+        "Spoof\u{200B}Admin",
+        "Line\u{2028}Break",
+    ] {
+        expect_problem(
+            admin
+                .post_json::<_, Value>(
+                    "/v1/principals",
+                    &json!({
+                        "kind": "human_member",
+                        "username": "badname_user",
+                        "display_name": bad_name,
+                        "scopes": ["read"],
+                    }),
+                    Some("bad-display-name"),
+                )
+                .await,
+            ErrorCode::InvalidRequest,
+        )?;
+    }
+
     let nodes: Value = service.get_json("/v1/nodes", &[]).await?;
     assert_eq!(
         nodes["items"].as_array().ok_or("node list missing")?.len(),

@@ -63,6 +63,11 @@ async fn gate_sqlite_hygiene() -> TestResult {
         ]);
         let triggers = tx.query_row("SELECT COUNT(*) FROM sqlite_schema WHERE type = 'trigger'", [], |row| row.get::<_, u32>(0))?;
         assert_eq!(triggers, 0);
+        let thread_posts_cols: Vec<String> = tx
+            .prepare("SELECT name FROM pragma_table_info('thread_posts') ORDER BY cid")?
+            .query_map([], |row| row.get::<_, String>(0))?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        assert!(thread_posts_cols.iter().any(|col| col == "author_kind"));
         let read_pragma = |name| tx.pragma_query_value(None, name, |row| row.get::<_, u32>(0));
         assert_eq!(read_pragma("user_version")?, 1);
         assert_eq!(read_pragma("foreign_keys")?, 1);

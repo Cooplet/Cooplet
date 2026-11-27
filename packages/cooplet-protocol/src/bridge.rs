@@ -6,11 +6,11 @@ use serde::{Serialize, de::DeserializeOwned};
 use serde_json::{Map, Value};
 
 use crate::{
-    AnswerPayload, ApprovalDecision, ApprovalWaitKind, AttachmentRef, DeliveryMode, HubId,
-    MessageId, NodeId, OperationId, ParticipantId, ParticipantKind, ParticipantState,
+    AnswerPayload, ApprovalDecision, ApprovalWaitKind, AttachmentRef, AuthorKind, DeliveryMode,
+    HubId, MessageId, NodeId, OperationId, ParticipantId, ParticipantKind, ParticipantState,
     ProblemDetails, ProtocolError, QuestionPayload, RunId, ThreadId, ValidationError,
     WorkflowLogLevel, WorkflowRunState, WorkflowStepStatus, domain::validate_approval_fields,
-    validate_step_key,
+    validate_actor_handle, validate_actor_id, validate_display_name, validate_step_key,
 };
 
 pub const BRIDGE_PROTOCOL_VERSION: u8 = 1;
@@ -276,9 +276,7 @@ impl BridgePayload for CommandReqPayload {
     const KIND: FrameKind = FrameKind::CommandReq;
 
     fn validate(&self) -> Result<(), ValidationError> {
-        if self.actor_id.trim().is_empty() {
-            return Err(ValidationError("command actor ID"));
-        }
+        validate_actor_id(&self.actor_id).map_err(|_| ValidationError("command actor ID"))?;
         self.command.validate()
     }
 }
@@ -288,6 +286,8 @@ crate::wire::wire_object! {
     pub enum BridgeCommand {
         SendMessage {
             message_id: MessageId,
+            sender_kind: AuthorKind,
+            sender_name: String,
             recipient_id: ParticipantId,
             #[serde(skip_serializing_if = "Option::is_none")]
             in_reply_to: Option<MessageId>,
@@ -339,11 +339,16 @@ impl BridgeCommand {
     pub fn validate(&self) -> Result<(), ValidationError> {
         match self {
             Self::SendMessage {
+                sender_name,
                 attachments,
                 question,
                 answer,
                 ..
-            } => validate_message_extras(attachments, question.as_ref(), answer.as_ref()),
+            } => {
+                validate_display_name(sender_name)
+                    .map_err(|_| ValidationError("message sender name"))?;
+                validate_message_extras(attachments, question.as_ref(), answer.as_ref())
+            }
             Self::RespondApproval { decision, .. } => decision.validate(),
             Self::RunWorkflow {
                 workflow_name,
@@ -441,6 +446,7 @@ crate::wire::wire_object! {
         pub seq: u64,
         pub post_id: MessageId,
         pub author_actor_id: String,
+        pub author_kind: AuthorKind,
         pub author_handle: String,
         #[serde(skip_serializing_if = "Option::is_none")]
         pub in_reply_to_post_id: Option<MessageId>,
@@ -459,12 +465,10 @@ crate::wire::wire_object! {
 
 impl ThreadPostWire {
     pub fn validate(&self) -> Result<(), ValidationError> {
-        if self.author_actor_id.trim().is_empty() {
-            return Err(ValidationError("thread post author actor ID"));
-        }
-        if self.author_handle.trim().is_empty() {
-            return Err(ValidationError("thread post author handle"));
-        }
+        validate_actor_id(&self.author_actor_id)
+            .map_err(|_| ValidationError("thread post author actor ID"))?;
+        validate_actor_handle(&self.author_handle)
+            .map_err(|_| ValidationError("thread post author handle"))?;
         validate_message_extras(
             &self.attachments,
             self.question.as_ref(),

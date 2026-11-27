@@ -962,6 +962,26 @@ mod tests {
 
     type SessionTestResult<T = ()> = Result<T, Box<dyn std::error::Error + Send + Sync>>;
 
+    fn test_turn_input() -> SessionTestResult<crate::clients::TurnInput> {
+        Ok(crate::clients::TurnInput::direct(
+            crate::clients::InboundMessage {
+                message_id: cooplet_protocol::MessageId::from_parts(1, [0; 10])?,
+                author: crate::clients::VerifiedAuthor {
+                    kind: cooplet_protocol::AuthorKind::Human,
+                    actor_id: "part_00000000000000000000000001".into(),
+                    name: "operator".into(),
+                    source_node_id: None,
+                },
+                in_reply_to: None,
+                body: "hi".into(),
+                attachments: Vec::new(),
+                question: None,
+                answer: None,
+                expect_mcp_reply: true,
+            },
+        ))
+    }
+
     fn live_session() -> SessionTestResult<std::sync::Arc<super::LiveSession>> {
         let participant_id = cooplet_protocol::ParticipantId::from_parts(1, [0; 10])?;
         let persisted = crate::clients::PersistedSessionRef {
@@ -1086,7 +1106,7 @@ mod tests {
             .submit(crate::clients::SubmitTurnRequest {
                 operation_key: "op-drop".into(),
                 message_id: None,
-                envelope: "hi".into(),
+                input: test_turn_input()?,
                 output_schema: None,
                 steer: false,
                 admission: cooplet_platform::AdmissionGuard::new(std::time::Duration::from_secs(5)),
@@ -1177,7 +1197,7 @@ mod tests {
             .submit(crate::clients::SubmitTurnRequest {
                 operation_key: "op-approval".into(),
                 message_id: None,
-                envelope: "hi".into(),
+                input: test_turn_input()?,
                 output_schema: None,
                 steer: false,
                 admission: cooplet_platform::AdmissionGuard::new(std::time::Duration::from_secs(5)),
@@ -1208,7 +1228,7 @@ mod tests {
             .submit(crate::clients::SubmitTurnRequest {
                 operation_key: "op-inflight".into(),
                 message_id: None,
-                envelope: "hi".into(),
+                input: test_turn_input()?,
                 output_schema: None,
                 steer: false,
                 admission: cooplet_platform::AdmissionGuard::new(std::time::Duration::from_secs(5)),

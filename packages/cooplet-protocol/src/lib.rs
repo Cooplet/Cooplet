@@ -86,6 +86,84 @@ pub fn is_bidi_or_line_control(ch: char) -> bool {
     )
 }
 
+/// Returns `true` for zero-width or invisible format characters used to spoof names and handles.
+pub fn is_zero_width_or_format(ch: char) -> bool {
+    matches!(
+        ch,
+        '\u{00AD}'
+            | '\u{034F}'
+            | '\u{115F}'..='\u{1160}'
+            | '\u{180E}'
+            | '\u{200B}'..='\u{200D}'
+            | '\u{2060}'..='\u{2064}'
+            | '\u{206A}'..='\u{206F}'
+            | '\u{3164}'
+            | '\u{FEFF}'
+            | '\u{FFA0}'
+            | '\u{FFF9}'..='\u{FFFB}'
+            | '\u{E0000}'..='\u{E007F}'
+    )
+}
+
+/// Returns `true` for control, bidi/line-separator, or zero-width/format characters.
+pub fn is_forbidden_display_char(ch: char) -> bool {
+    ch.is_control() || is_bidi_or_line_control(ch) || is_zero_width_or_format(ch)
+}
+
+/// Validate a non-blank display name (1..=128 UTF-8 bytes, no control, bidi, line-separator,
+/// or zero-width/format characters).
+pub fn validate_display_name(value: &str) -> Result<(), ValidationError> {
+    if value.is_empty()
+        || value.len() > 128
+        || value.trim().is_empty()
+        || value.chars().any(is_forbidden_display_char)
+    {
+        Err(ValidationError("display name"))
+    } else {
+        Ok(())
+    }
+}
+
+/// Validate a possibly empty label (0..=128 UTF-8 bytes, no control, bidi, line-separator,
+/// or zero-width/format characters).
+pub fn validate_label(value: &str) -> Result<(), ValidationError> {
+    if value.len() > 128 || value.chars().any(is_forbidden_display_char) {
+        Err(ValidationError("label"))
+    } else {
+        Ok(())
+    }
+}
+
+/// Validate a non-empty participant/thread handle (1..=128 UTF-8 bytes, no whitespace,
+/// control, bidi, line-separator, or zero-width/format characters).
+pub fn validate_actor_handle(value: &str) -> Result<(), ValidationError> {
+    if value.is_empty()
+        || value.len() > 128
+        || value
+            .chars()
+            .any(|ch| ch.is_whitespace() || is_forbidden_display_char(ch))
+    {
+        Err(ValidationError("actor handle"))
+    } else {
+        Ok(())
+    }
+}
+
+/// Validate a non-empty actor identifier (1..=128 UTF-8 bytes, no whitespace,
+/// control, bidi, line-separator, or zero-width/format characters).
+pub fn validate_actor_id(value: &str) -> Result<(), ValidationError> {
+    if value.is_empty()
+        || value.len() > 128
+        || value
+            .chars()
+            .any(|ch| ch.is_whitespace() || is_forbidden_display_char(ch))
+    {
+        Err(ValidationError("actor ID"))
+    } else {
+        Ok(())
+    }
+}
+
 /// Validate an RFC 9110 concrete media type (`type/subtype` with optional parameters).
 pub fn validate_media_type(value: &str) -> Result<(), ValidationError> {
     if value.is_empty()

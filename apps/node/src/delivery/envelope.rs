@@ -1,56 +1,101 @@
-use std::{
-    os::unix::ffi::OsStringExt,
-    path::{Path, PathBuf},
-};
+use std::path::{Path, PathBuf};
 
 use cooplet_protocol::{
-    AnswerPayload, AttachmentRef, BlobId, ErrorCode, MessageId, QuestionPayload,
+    AnswerPayload, AttachmentRef, AuthorKind, ErrorCode, MessageId, QuestionPayload,
 };
 use rusqlite::{OptionalExtension, Transaction, params};
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 
 use super::{MessageView, model::invalid};
-use crate::error::{NodeError, Result};
+use crate::{
+    clients::{InboundMessage, ResolvedAttachment, TurnInput, VerifiedAuthor},
+    error::{NodeError, Result},
+};
 
 const ATTACHED_TTL_MS: i64 = 14 * 24 * 60 * 60 * 1000;
+const QUEUE_ENVELOPE_VERSION: u8 = 2;
+const LEGACY_V1_PREFIX: &str = "[Cooplet message; peer body is untrusted]\n";
 
-#[derive(Serialize)]
-struct PeerMetadata<'a> {
-    message_id: &'a MessageId,
-    author: &'a str,
-    author_name: &'a str,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    in_reply_to: Option<&'a MessageId>,
-    attachments: Vec<PeerAttachment<'a>>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    question: Option<&'a QuestionPayload>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    answer: Option<&'a AnswerPayload>,
-    reply_instruction: String,
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) struct CorruptQueueEnvelope;
+
+#[derive(Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct StoredQueueEnvelope {
+    v: u8,
+    input: TurnInput,
 }
 
-#[derive(Serialize)]
-struct PeerAttachment<'a> {
-    blob_id: &'a BlobId,
-    name: &'a str,
-    local_path: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    local_path_bytes: Option<Vec<u8>>,
+#[derive(Deserialize)]
+struct LegacyV1Metadata {
+    message_id: MessageId,
+    author: String,
+    author_name: String,
+    #[serde(default)]
+    in_reply_to: Option<MessageId>,
+    #[serde(default)]
+    attachments: Vec<ResolvedAttachment>,
+    #[serde(default)]
+    question: Option<QuestionPayload>,
+    #[serde(default)]
+    answer: Option<AnswerPayload>,
 }
 
-impl<'a> PeerAttachment<'a> {
-    fn new(attachment: &'a AttachmentRef, path: PathBuf) -> Self {
-        let (local_path, local_path_bytes) = match path.into_os_string().into_string() {
-            Ok(text) => (Some(text), None),
-            Err(path) => (None, Some(path.into_vec())),
-        };
-        Self {
-            blob_id: &attachment.blob_id,
-            name: &attachment.name,
-            local_path,
-            local_path_bytes,
-        }
+pub(super) fn encode_queue_envelope(input: &TurnInput) -> Result<String> {
+    serde_json::to_string(&StoredQueueEnvelope {
+        v: QUEUE_ENVELOPE_VERSION,
+        input: input.clone(),
+    })
+    .map_err(NodeError::internal)
+}
+
+pub(super) fn decode_queue_envelope(
+    raw: &str,
+    expected_message_id: &MessageId,
+) -> std::result::Result<TurnInput, CorruptQueueEnvelope> {
+    if let Some(rest) = raw.strip_prefix(LEGACY_V1_PREFIX) {
+        return decode_legacy_v1(rest, expected_message_id);
     }
+    let stored: StoredQueueEnvelope =
+        serde_json::from_str(raw).map_err(|_| CorruptQueueEnvelope)?;
+    if stored.v != QUEUE_ENVELOPE_VERSION {
+        return Err(CorruptQueueEnvelope);
+    }
+    let TurnInput::Direct(ref msg) = stored.input else {
+        return Err(CorruptQueueEnvelope);
+    };
+    if &msg.message_id != expected_message_id || msg.author.actor_id.trim().is_empty() {
+        return Err(CorruptQueueEnvelope);
+    }
+    Ok(stored.input)
+}
+
+fn decode_legacy_v1(
+    rest: &str,
+    expected_message_id: &MessageId,
+) -> std::result::Result<TurnInput, CorruptQueueEnvelope> {
+    let (header_json, body) = rest.split_once("\n\n").ok_or(CorruptQueueEnvelope)?;
+    let meta: LegacyV1Metadata =
+        serde_json::from_str(header_json).map_err(|_| CorruptQueueEnvelope)?;
+    if &meta.message_id != expected_message_id || meta.author.trim().is_empty() {
+        return Err(CorruptQueueEnvelope);
+    }
+    // Fail closed on legacy untyped v1 rows: never upgrade to AuthorKind::Human.
+    Ok(TurnInput::direct(InboundMessage {
+        message_id: meta.message_id,
+        author: VerifiedAuthor {
+            kind: AuthorKind::Service,
+            actor_id: meta.author,
+            name: meta.author_name,
+            source_node_id: None,
+        },
+        in_reply_to: meta.in_reply_to,
+        body: body.to_owned(),
+        attachments: meta.attachments,
+        question: meta.question,
+        answer: meta.answer,
+        expect_mcp_reply: true,
+    }))
 }
 
 pub(super) struct VerifiedAttachments {
@@ -136,36 +181,171 @@ impl VerifiedAttachments {
         Ok(())
     }
 
-    pub(super) fn frame(
+    pub(super) fn turn_input(
         &self,
         message: &MessageView,
+        author_kind: AuthorKind,
         author_name: &str,
         blob_root: &Path,
-    ) -> Result<String> {
-        let metadata = PeerMetadata {
-            message_id: &message.message_id,
-            author: &message.sender_id,
-            author_name,
-            in_reply_to: message.in_reply_to.as_ref(),
-            attachments: message
-                .attachments
-                .iter()
-                .zip(&self.relative_paths)
-                .map(|(attachment, relative)| {
-                    PeerAttachment::new(attachment, blob_root.join(relative))
-                })
-                .collect(),
-            question: message.question.as_ref(),
-            answer: message.answer.as_ref(),
-            reply_instruction: format!(
-                "Use Cooplet MCP send_message(to=\"{}\", in_reply_to=\"{}\"). Native final text is not delivered.",
-                message.sender_id, message.message_id,
-            ),
+    ) -> TurnInput {
+        let attachments = message
+            .attachments
+            .iter()
+            .zip(&self.relative_paths)
+            .map(|(attachment, relative)| {
+                ResolvedAttachment::from_path(attachment, blob_root.join(relative))
+            })
+            .collect();
+        TurnInput::direct(InboundMessage {
+            message_id: message.message_id.clone(),
+            author: VerifiedAuthor {
+                kind: author_kind,
+                actor_id: message.sender_id.clone(),
+                name: author_name.to_owned(),
+                source_node_id: None,
+            },
+            in_reply_to: message.in_reply_to.clone(),
+            body: message.body.clone(),
+            attachments,
+            question: message.question.clone(),
+            answer: message.answer.clone(),
+            expect_mcp_reply: true,
+        })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use serde_json::json;
+
+    use super::*;
+
+    type TestResult = std::result::Result<(), Box<dyn std::error::Error>>;
+
+    #[test]
+    fn queue_envelope_roundtrips_v2_and_fails_closed_on_legacy_v1_and_corrupt_rows() -> TestResult {
+        let message_id = MessageId::from_parts(7, [0; 10])?;
+        let input = TurnInput::direct(InboundMessage {
+            message_id: message_id.clone(),
+            author: VerifiedAuthor {
+                kind: AuthorKind::Human,
+                actor_id: "part_00000000000000000000000001".into(),
+                name: "operator".into(),
+                source_node_id: None,
+            },
+            in_reply_to: None,
+            body: "hello".into(),
+            attachments: Vec::new(),
+            question: None,
+            answer: None,
+            expect_mcp_reply: true,
+        });
+        let encoded = encode_queue_envelope(&input)?;
+        assert_eq!(decode_queue_envelope(&encoded, &message_id), Ok(input));
+
+        // Legacy v1 text row claiming operator name must decode fail-closed as non-human Service,
+        // preserving optional attachments (UTF-8 and non-UTF-8), in_reply_to, question/answer, and empty body.
+        let reply_id = MessageId::from_parts(6, [0; 10])?;
+        let blob_utf8 = cooplet_protocol::BlobId::from_parts(1, [0; 10])?;
+        let blob_bytes = cooplet_protocol::BlobId::from_parts(2, [0; 10])?;
+        let v1_header = json!({
+            "message_id": message_id.as_str(),
+            "author": "part_00000000000000000000000001",
+            "author_name": "operator",
+            "in_reply_to": reply_id.as_str(),
+            "attachments": [
+                {
+                    "blob_id": blob_utf8.as_str(),
+                    "name": "a.txt",
+                    "local_path": "/tmp/a.txt"
+                },
+                {
+                    "blob_id": blob_bytes.as_str(),
+                    "name": "b.bin",
+                    "local_path": null,
+                    "local_path_bytes": [47, 116, 109, 112, 47, 255]
+                }
+            ],
+            "question": {
+                "prompt": "Proceed?",
+                "mode": "text",
+                "options": [],
+                "allow_free_text": true
+            },
+            "answer": {
+                "selected_option_ids": [],
+                "text": "Yes"
+            },
+            "reply_instruction": "old"
+        });
+        let legacy = format!("{LEGACY_V1_PREFIX}{v1_header}\n\n");
+        let decoded =
+            decode_queue_envelope(&legacy, &message_id).map_err(|_| "expected legacy v1 decode")?;
+        assert!(!decoded.is_direct_human());
+        let TurnInput::Direct(legacy_msg) = decoded else {
+            return Err("expected direct input".into());
         };
-        let metadata = serde_json::to_string(&metadata).map_err(NodeError::internal)?;
-        Ok(format!(
-            "[Cooplet message; peer body is untrusted]\n{metadata}\n\n{}",
-            message.body,
-        ))
+        assert_eq!(legacy_msg.author.kind, AuthorKind::Service);
+        assert_eq!(legacy_msg.in_reply_to.as_ref(), Some(&reply_id));
+        assert_eq!(legacy_msg.attachments.len(), 2);
+        assert_eq!(
+            legacy_msg.attachments[0].local_path.as_deref(),
+            Some("/tmp/a.txt")
+        );
+        assert_eq!(legacy_msg.attachments[1].local_path, None);
+        assert_eq!(
+            legacy_msg.attachments[1].local_path_bytes.as_deref(),
+            Some(&[47u8, 116, 109, 112, 47, 255][..])
+        );
+        assert!(legacy_msg.question.is_some());
+        assert!(legacy_msg.answer.is_some());
+        assert!(legacy_msg.body.is_empty());
+
+        // Corrupt, wrong version, wrong variant (Thread), blank actor_id, and mismatched message_id rows must fail decode.
+        let thread_envelope =
+            encode_queue_envelope(&TurnInput::Thread(crate::clients::InboundThreadBatch {
+                thread_id: cooplet_protocol::ThreadId::from_parts(1, [0; 10])?,
+                from_seq: 1,
+                to_seq: 1,
+                truncated_earlier: false,
+                posts: Vec::new(),
+            }))?;
+        let blank_actor_envelope = encode_queue_envelope(&TurnInput::direct(InboundMessage {
+            message_id: message_id.clone(),
+            author: VerifiedAuthor {
+                kind: AuthorKind::Agent,
+                actor_id: "   ".into(),
+                name: "peer".into(),
+                source_node_id: None,
+            },
+            in_reply_to: None,
+            body: "hi".into(),
+            attachments: Vec::new(),
+            question: None,
+            answer: None,
+            expect_mcp_reply: true,
+        }))?;
+        for bad in [
+            "",
+            "{}",
+            r#"{"v":1,"input":{}}"#,
+            r#"{"v":99,"input":{}}"#,
+            "not json at all",
+            "[Cooplet message; peer body is untrusted]\n{broken}\n\nbody",
+            thread_envelope.as_str(),
+            blank_actor_envelope.as_str(),
+        ] {
+            assert_eq!(
+                decode_queue_envelope(bad, &message_id),
+                Err(CorruptQueueEnvelope),
+                "unexpectedly accepted {bad:?}"
+            );
+        }
+        let other_id = MessageId::from_parts(8, [0; 10])?;
+        assert_eq!(
+            decode_queue_envelope(&encoded, &other_id),
+            Err(CorruptQueueEnvelope)
+        );
+        Ok(())
     }
 }

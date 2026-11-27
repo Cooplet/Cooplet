@@ -4,6 +4,7 @@ mod binding;
 mod registry;
 mod runtime;
 mod templates;
+mod turn_input;
 
 pub use binding::*;
 pub use cooplet_protocol::{ApprovalAction, ApprovalDecision, ApprovalWait, ApprovalWaitKind};
@@ -11,7 +12,9 @@ pub use registry::AdapterRegistry;
 pub use runtime::*;
 pub use templates::{
     AgentOverrides, AgentTemplate, EffectiveAgentOptions, list_templates, load_template,
+    load_template_options,
 };
+pub use turn_input::*;
 
 use std::{
     any::Any,
@@ -157,6 +160,8 @@ pub struct SessionOpenRequest {
     pub cred_file_path: PathBuf,
     pub template_id: Option<String>,
     pub effective_options: EffectiveAgentOptions,
+    /// Core-composed collaboration rules plus optional template instructions, frozen at create.
+    /// Adapters must append this to their CLI's native base system prompt and never replace it.
     pub instructions: Option<String>,
     pub spawner: Arc<dyn ManagedProcessSpawner>,
 }
@@ -250,7 +255,7 @@ pub struct SubmitTurnRequest {
     /// Node-wide turn correlation echoed in completion events. For a message this is its ID.
     pub operation_key: String,
     pub message_id: Option<MessageId>,
-    pub envelope: String,
+    pub input: TurnInput,
     pub output_schema: Option<Value>,
     pub steer: bool,
     pub admission: AdmissionGuard,

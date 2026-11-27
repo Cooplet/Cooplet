@@ -7,8 +7,8 @@ use std::{
 use cooplet_client::{BearerToken, ClientConfig, CoopletClient, Destination};
 use cooplet_platform::{PlatformError, PrivateFs, random_bytes};
 use cooplet_protocol::{
-    ErrorCode, InfoResponse, NodeId, ParticipantId, PrincipalKind, ServiceScope, TokenId,
-    WhoamiResponse,
+    AuthorKind, ErrorCode, InfoResponse, NodeId, ParticipantId, ParticipantKind, PrincipalKind,
+    ServiceScope, TokenId, WhoamiResponse,
 };
 use cooplet_storage::ReadPool;
 use hmac::{Hmac, Mac};
@@ -219,6 +219,19 @@ impl Principal {
         self.identity.principal_kind
     }
 
+    pub fn author_kind(&self) -> AuthorKind {
+        match self.kind() {
+            PrincipalKind::Operator | PrincipalKind::HumanAdmin | PrincipalKind::HumanMember => {
+                AuthorKind::Human
+            }
+            PrincipalKind::Participant => AuthorKind::Agent,
+            PrincipalKind::Adapter
+            | PrincipalKind::WorkflowRun
+            | PrincipalKind::Service
+            | PrincipalKind::Node => AuthorKind::Service,
+        }
+    }
+
     pub fn can_read_all(&self) -> bool {
         self.trusted_scope(ServiceScope::Read)
     }
@@ -350,7 +363,7 @@ impl Auth {
         let [participant, operator, adapter, workflow] = digests;
         let mut rows = conn.prepare_cached(
             "SELECT c.token_id, c.participant_id, c.principal_kind, c.actor_id, c.scopes_json,
-                    c.verifier_hmac, COALESCE(p.name, c.actor_id)
+                    c.verifier_hmac, COALESCE(p.name, c.actor_id), p.kind
              FROM participant_credentials c LEFT JOIN participants p USING (participant_id)
              WHERE c.verifier_hmac IN (?1, ?2, ?3, ?4)
                AND c.revoked_at_ms IS NULL AND (c.expires_at_ms IS NULL OR c.expires_at_ms > ?5)",
@@ -370,6 +383,7 @@ impl Auth {
                     let kind: String = row.get(2)?;
                     let scopes: String = row.get(4)?;
                     let digest: String = row.get(5)?;
+                    let participant_kind: Option<String> = row.get(7)?;
                     let identity = WhoamiResponse {
                         actor_id: row.get(3)?,
                         principal_kind: kind.parse().map_err(sql_conversion)?,
@@ -382,19 +396,36 @@ impl Auth {
                         name: row.get(6)?,
                         scopes: serde_json::from_str(&scopes).map_err(sql_conversion)?,
                     };
+                    let participant_kind = participant_kind
+                        .as_deref()
+                        .map(str::parse::<ParticipantKind>)
+                        .transpose()
+                        .map_err(sql_conversion)?;
                     Ok((
                         Principal {
                             identity,
                             token_id: token_id.parse().map_err(sql_conversion)?,
                         },
                         digest,
+                        participant_kind,
                     ))
                 },
             )
             .optional()?;
-        let Some((principal, digest)) = candidate else {
+        let Some((principal, digest, participant_kind)) = candidate else {
             return Ok(None);
         };
+        let participant_kind_matches = match principal.kind() {
+            PrincipalKind::Operator => participant_kind == Some(ParticipantKind::Human),
+            PrincipalKind::Participant => participant_kind == Some(ParticipantKind::Agent),
+            PrincipalKind::Adapter | PrincipalKind::WorkflowRun => {
+                principal.identity.participant_id.is_none() && participant_kind.is_none()
+            }
+            _ => false,
+        };
+        if !participant_kind_matches {
+            return Ok(None);
+        }
         let Some(expected) = unhex(&digest) else {
             return Ok(None);
         };

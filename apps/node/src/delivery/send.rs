@@ -2,7 +2,7 @@ use std::{path::Path, sync::Arc, time::Duration};
 
 use cooplet_platform::AdmissionGuard;
 use cooplet_protocol::{
-    AttachmentRef, DeliveryMode, DeliveryState, ErrorCode, MessageId, ParticipantId,
+    AttachmentRef, AuthorKind, DeliveryMode, DeliveryState, ErrorCode, MessageId, ParticipantId,
     ParticipantKind, ParticipantState,
 };
 use cooplet_storage::{EventNotice, StorageError, WriteError, WriteFailure, WriteOutcome};
@@ -11,7 +11,7 @@ use serde_json::json;
 
 use super::{
     Clock, DeliveryService, MessageView, SendMessageRequest, SendMessageResponse, SubmitFence,
-    envelope::VerifiedAttachments,
+    envelope::{VerifiedAttachments, encode_queue_envelope},
     model::invalid,
     queries::{
         Recipient, check_message_frame_fields, committed_pending_answer, recipient, sql_error,
@@ -23,7 +23,7 @@ use super::{
 use crate::{
     auth::Principal,
     clients::{
-        PendingApprovalRecord, SlotDenial, SubmitOutcome, SubmitSlot, SubmitTurnRequest,
+        PendingApprovalRecord, SlotDenial, SubmitOutcome, SubmitSlot, SubmitTurnRequest, TurnInput,
         apply_submit_outcome,
     },
     error::{NodeError, Result},
@@ -105,6 +105,7 @@ impl DeliveryService {
             message_id: MessageId::generate()?,
             operation: operation.clone(),
             can_read_all: caller.can_read_all(),
+            sender_kind: caller.author_kind(),
             sender_name: caller.identity.name,
             input,
         };
@@ -166,7 +167,7 @@ impl DeliveryService {
                 guard.mark_committed();
                 let slot = slot
                     .ok_or_else(|| NodeError::internal("Direct message lacks an admission slot"))?;
-                self.submit_direct(id, operation, work, slot, admission)
+                self.submit_direct(id, operation, *work, slot, admission)
                     .await
             }
             prepared => {
@@ -337,7 +338,7 @@ impl DeliveryService {
         let DirectWork {
             mut receipt,
             message_id,
-            envelope,
+            input,
             attachments,
             answer,
             prepared_at,
@@ -367,7 +368,7 @@ impl DeliveryService {
                         .submit(SubmitTurnRequest {
                             operation_key: message_id.to_string(),
                             message_id: Some(message_id.clone()),
-                            envelope,
+                            input,
                             output_schema: None,
                             steer: false,
                             admission,
@@ -584,13 +585,13 @@ struct FinishedDirect {
 
 enum Prepared {
     Done(Result<SendMessageResponse>),
-    Direct(DirectWork),
+    Direct(Box<DirectWork>),
 }
 
 struct DirectWork {
     receipt: SendMessageResponse,
     message_id: MessageId,
-    envelope: String,
+    input: TurnInput,
     attachments: Vec<AttachmentRef>,
     answer: bool,
     prepared_at: i64,
@@ -599,6 +600,7 @@ struct DirectWork {
 struct Attempt {
     message_id: MessageId,
     operation: Operation,
+    sender_kind: AuthorKind,
     sender_name: String,
     can_read_all: bool,
     input: SendMessageRequest,
@@ -740,19 +742,23 @@ impl Attempt {
             )?);
         }
         if state == DeliveryState::Accepted {
-            let envelope = attachments.frame(&view, &sender_name, blob_root)?;
+            let input = attachments.turn_input(&view, self.sender_kind, &sender_name, blob_root);
             let work = DirectWork {
                 receipt,
                 message_id: view.message_id,
-                envelope,
+                input,
                 attachments: view.attachments,
                 answer: view.answer.is_some(),
                 prepared_at: now,
             };
-            return Ok(WriteOutcome::with_events(Prepared::Direct(work), events));
+            return Ok(WriteOutcome::with_events(
+                Prepared::Direct(Box::new(work)),
+                events,
+            ));
         }
         if let Some(ttl) = ttl {
-            let envelope = attachments.frame(&view, &sender_name, blob_root)?;
+            let input = attachments.turn_input(&view, self.sender_kind, &sender_name, blob_root);
+            let envelope = encode_queue_envelope(&input)?;
             enqueue(
                 tx,
                 &recipient.id,

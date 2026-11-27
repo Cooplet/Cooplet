@@ -232,10 +232,31 @@ async fn restart_keeps_uncertain_delivery_and_answer_receipts_distinct() -> Test
                 [],
                 |row| Ok((row.get::<_, String>(0)?, row.get::<_, u64>(1)?)),
             )?;
-            Ok((receipts, states, participants, events, fence))
+            let queue_envelopes = conn
+                .prepare("SELECT message_id, state, payload_envelope FROM intake_queue ORDER BY message_id")?
+                .query_map([], |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, String>(2)?,
+                    ))
+                })?
+                .collect::<rusqlite::Result<Vec<_>>>()?;
+            Ok((receipts, states, participants, events, fence, queue_envelopes))
         })
         .await?;
-    let (receipts, states, participants, events, fence) = proof;
+    let (receipts, states, participants, events, fence, queue_envelopes) = proof;
+    assert_eq!(
+        queue_envelopes
+            .iter()
+            .map(|(id, state, env)| (id.as_str(), state.as_str(), env.as_str()))
+            .collect::<Vec<_>>(),
+        [
+            ("dispatched", "unknown", ""),
+            ("expired", "expired", ""),
+            ("queued", "queued", "{}"),
+        ]
+    );
     assert_eq!(
         receipts
             .iter()
