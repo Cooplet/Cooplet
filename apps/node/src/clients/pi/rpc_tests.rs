@@ -3,6 +3,7 @@ use std::{error::Error, os::unix::ffi::OsStringExt as _, path::PathBuf};
 use cooplet_protocol::{
     AttachmentRef, AuthorKind, BlobId, MessageId, NodeId, ParticipantId, ThreadId,
 };
+use futures_util::FutureExt as _;
 use serde_json::json;
 use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
 
@@ -557,7 +558,7 @@ async fn a_blocked_interrupt_never_reaches_pi_after_revocation_or_settlement() -
         let interrupt = AdmissionGuard::new(WAIT);
         let cancel = session.cancel(&interrupt);
         tokio::pin!(cancel);
-        assert!(futures_util::poll!(&mut cancel).is_pending());
+        assert!(cancel.as_mut().now_or_never().is_none());
         if revoke {
             interrupt.expire();
         } else {
