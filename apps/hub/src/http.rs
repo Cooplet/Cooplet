@@ -20,6 +20,7 @@ use handlers::{admin_routes::*, command_routes::*, *};
 
 const JSON_BODY_LIMIT: usize = 64 * 1024;
 const ENROLLMENT_BODY_LIMIT: usize = 16 * 1024;
+pub(crate) const BEARER_CHALLENGE: &str = "Bearer realm=\"cooplet-hub\"";
 
 pub(crate) struct RequestLimits {
     requests: usize,

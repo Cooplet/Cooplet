@@ -307,7 +307,8 @@ async fn replay(
     receipt: PriorUpload,
     body: Body,
 ) -> Result<AttachmentRef, HubError> {
-    if request.name != receipt.attachment.name || request.mime_type != receipt.attachment.mime_type {
+    if request.name != receipt.attachment.name || request.mime_type != receipt.attachment.mime_type
+    {
         return Err(receipt_conflict());
     }
     if let (Some(length), Some(sha256)) = (request.length, request.sha256.as_deref()) {

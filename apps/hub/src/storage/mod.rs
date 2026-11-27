@@ -5,6 +5,7 @@ use std::{
     path::{Path, PathBuf},
     str::FromStr,
     sync::{Arc, Mutex},
+    time::Duration,
 };
 
 use cooplet_platform::{AtomicPublish, PrivateFs, PublishOutcome, random_bytes};
@@ -61,15 +62,34 @@ pub(crate) async fn init(state_dir: &Path, display_name: &str) -> StartupResult<
         return Err(io::Error::other("invalid Hub display name").into());
     }
     let state_dir: PathBuf = state_dir.components().collect();
-    if metadata(&state_dir)?.is_some() {
+    let existing = if metadata(&state_dir)?.is_some() {
         PrivateFs::validate_private_dir(&state_dir)?;
-        if metadata(&state_dir.join(DATABASE))?.is_none_or(|m| m.len() == 0) {
+        let existing = metadata(&state_dir.join(DATABASE))?.is_some_and(|m| m.len() != 0);
+        if !existing {
             check_clean_bootstrap(&state_dir, false)?;
         }
-    }
+        existing
+    } else {
+        false
+    };
     let mut config = StorageConfig::new(state_dir.join(DATABASE));
     config.read_pool_size = 1;
-    let engine = StorageEngine::open(config, &[MIGRATION_V1]).await?;
+    let engine = if existing {
+        // The checked open also starts the maintenance driver. Park its first
+        // tick until this bootstrap command releases the database.
+        config.gc_interval = Duration::MAX;
+        let state_dir = state_dir.clone();
+        StorageEngine::open_existing_managed_checked(
+            config,
+            &[MIGRATION_V1],
+            Arc::new(gc::HubGcHooks::default()),
+            None,
+            move |connection| check_existing_init(connection, &state_dir),
+        )
+        .await?
+    } else {
+        StorageEngine::open(config, &[MIGRATION_V1]).await?
+    };
     let result = initialize_locked(&state_dir, display_name, &engine).await;
     let shutdown = engine.shutdown().await;
     let result = result?;
@@ -82,14 +102,17 @@ async fn initialize_locked(
     display_name: &str,
     engine: &StorageEngine,
 ) -> StartupResult<InitResult> {
-    if let Some((meta, fingerprint)) = engine.reads().read(read_meta).await? {
-        check_master(state_dir, &fingerprint)?;
+    let checked_path = state_dir.to_owned();
+    let existing = engine
+        .reads()
+        .read(move |connection| check_v1_bootstrap(connection, &checked_path))
+        .await?;
+    if let Some(meta) = existing {
         return Ok(InitResult {
             hub_id: meta.hub_id,
             token_path: None,
         });
     }
-    check_clean_bootstrap(state_dir, true)?;
     for name in [MASTER_KEY, ADMIN_TOKEN] {
         PrivateFs::clean_interrupted_writes(state_dir, name)?;
     }
@@ -178,11 +201,10 @@ pub(crate) async fn open(
         Arc::new(gc::HubGcHooks::default()),
         Some(blob_config),
         move |connection| {
-            let version: u32 =
-                connection.pragma_query_value(None, "user_version", |row| row.get(0))?;
-            if version != MIGRATION_V1.version {
+            if user_version(connection)? != MIGRATION_V1.version {
                 return Err(incompatible("expected an initialized Hub schema"));
             }
+            check_v1_schema(connection)?;
             let (meta, fingerprint) =
                 read_meta(connection)?.ok_or_else(|| incompatible("Hub identity is missing"))?;
             let master = check_master(&state_dir, &fingerprint)?;
@@ -207,6 +229,82 @@ pub(crate) async fn open(
         meta,
         master,
     })
+}
+
+fn check_existing_init(connection: &Connection, state_dir: &Path) -> Result<(), StorageError> {
+    match user_version(connection)? {
+        0 => {
+            if !schema_objects(connection)?.is_empty() {
+                return Err(incompatible(
+                    "version 0 Hub database must have an empty schema",
+                ));
+            }
+            check_clean_bootstrap(state_dir, true)
+        }
+        version if version == MIGRATION_V1.version => {
+            check_v1_bootstrap(connection, state_dir).map(|_| ())
+        }
+        _ => Err(incompatible("unsupported Hub schema version")),
+    }
+}
+
+fn check_v1_bootstrap(
+    connection: &Connection,
+    state_dir: &Path,
+) -> Result<Option<HubMeta>, StorageError> {
+    let schema = check_v1_schema(connection)?;
+    if let Some((meta, fingerprint)) = read_meta(connection)? {
+        check_master(state_dir, &fingerprint)?;
+        return Ok(Some(meta));
+    }
+    // Only use names from the trusted migration when probing for retained data.
+    for table in schema.iter().filter(|object| object.kind == "table") {
+        let query = format!("SELECT EXISTS (SELECT 1 FROM \"{}\")", table.name);
+        if connection.query_row(&query, [], |row| row.get::<_, bool>(0))? {
+            return Err(partial_state());
+        }
+    }
+    check_clean_bootstrap(state_dir, true)?;
+    Ok(None)
+}
+
+fn user_version(connection: &Connection) -> rusqlite::Result<u32> {
+    connection.pragma_query_value(None, "user_version", |row| row.get(0))
+}
+
+#[derive(PartialEq, Eq)]
+struct SchemaObject {
+    kind: String,
+    name: String,
+    sql: String,
+}
+
+fn schema_objects(connection: &Connection) -> rusqlite::Result<Vec<SchemaObject>> {
+    let mut statement = connection.prepare(
+        "SELECT type, name, sql FROM main.sqlite_schema
+         WHERE substr(name, 1, 7) <> 'sqlite_' ORDER BY type, name",
+    )?;
+    statement
+        .query_map([], |row| {
+            Ok(SchemaObject {
+                kind: row.get(0)?,
+                name: row.get(1)?,
+                sql: row.get(2)?,
+            })
+        })?
+        .collect()
+}
+
+fn check_v1_schema(connection: &Connection) -> Result<Vec<SchemaObject>, StorageError> {
+    // SQLite normalizes the DDL it stores in sqlite_schema. Build the reference
+    // with the same engine and migration, without modifying the file database.
+    let reference = Connection::open_in_memory()?;
+    reference.execute_batch(MIGRATION_V1.sql)?;
+    let expected = schema_objects(&reference)?;
+    if schema_objects(connection)? != expected {
+        return Err(incompatible("Hub schema does not match migration v1"));
+    }
+    Ok(expected)
 }
 
 fn read_meta(connection: &Connection) -> Result<Option<(HubMeta, String)>, StorageError> {

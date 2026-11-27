@@ -174,6 +174,101 @@ async fn init_rejects_partial_state_before_opening_missing_or_empty_database() -
 }
 
 #[tokio::test]
+async fn init_rejects_foreign_or_populated_uninitialized_databases_without_mutation() -> TestResult
+{
+    for (version, setup, reason) in [
+        (
+            0,
+            "CREATE TABLE ledger (amount INTEGER); INSERT INTO ledger VALUES (42);",
+            "version 0 Hub database must have an empty schema",
+        ),
+        (
+            MIGRATION_V1.version,
+            "INSERT INTO principals (principal_id,kind,username,display_name,created_at_ms,updated_at_ms)
+             VALUES ('retained','human_member','existing','Existing',0,0);",
+            "partial Hub state",
+        ),
+    ] {
+        let scratch = Scratch::new()?;
+        let path = scratch.0.join(DATABASE);
+        let database = existing_database(&path, version)?;
+        database.execute_batch(setup)?;
+        drop(database);
+        let before = fs::read(&path)?;
+        let Err(error) = init(&scratch.0, "Test").await else {
+            return Err(io::Error::other("initialized a populated unowned database").into());
+        };
+        assert!(error.to_string().contains(reason), "{error}");
+        assert!(fs::read(&path)? == before);
+        assert!(!scratch.0.join(MASTER_KEY).exists());
+        assert!(!scratch.0.join(ADMIN_TOKEN).exists());
+        assert!(!scratch.0.join(BLOB_DIR).exists());
+    }
+    Ok(())
+}
+
+#[tokio::test]
+async fn init_can_resume_an_empty_unfinished_migration() -> TestResult {
+    for version in [0, MIGRATION_V1.version] {
+        let scratch = Scratch::new()?;
+        let database = existing_database(&scratch.0.join(DATABASE), version)?;
+        drop(database);
+        let initialized = init(&scratch.0, "Test").await?;
+        assert_eq!(initialized.token_path, Some(scratch.0.join(ADMIN_TOKEN)));
+        let hub = open_default(&scratch.0).await?;
+        assert_eq!(hub.meta.hub_id, initialized.hub_id);
+        hub.engine.shutdown().await?;
+    }
+    Ok(())
+}
+
+#[tokio::test]
+async fn both_opens_reject_v1_with_expected_table_names_but_changed_schema() -> TestResult {
+    let scratch = Scratch::new()?;
+    init(&scratch.0, "Test").await?;
+    let path = scratch.0.join(DATABASE);
+    let database = Connection::open(&path)?;
+    database.execute("ALTER TABLE principals ADD COLUMN extra TEXT", [])?;
+    drop(database);
+    let before = fs::read(&path)?;
+    let master = fs::read(scratch.0.join(MASTER_KEY))?;
+    let token = fs::read(scratch.0.join(ADMIN_TOKEN))?;
+    let Err(error) = init(&scratch.0, "Test").await else {
+        return Err(io::Error::other("accepted an incompatible Hub schema during init").into());
+    };
+    assert!(
+        error
+            .to_string()
+            .contains("schema does not match migration v1")
+    );
+    let Err(error) = open_default(&scratch.0).await else {
+        return Err(io::Error::other("accepted an incompatible Hub schema during run").into());
+    };
+    assert!(
+        error
+            .to_string()
+            .contains("schema does not match migration v1")
+    );
+    assert!(fs::read(&path)? == before);
+    assert!(fs::read(scratch.0.join(MASTER_KEY))? == master);
+    assert!(fs::read(scratch.0.join(ADMIN_TOKEN))? == token);
+    assert!(!scratch.0.join(BLOB_DIR).exists());
+    Ok(())
+}
+
+fn existing_database(path: &Path, version: u32) -> StartupResult<Connection> {
+    let database = Connection::open(path)?;
+    fs::set_permissions(path, Permissions::from_mode(0o600))?;
+    database.pragma_update(None, "auto_vacuum", "INCREMENTAL")?;
+    database.execute_batch("VACUUM")?;
+    if version == MIGRATION_V1.version {
+        database.execute_batch(MIGRATION_V1.sql)?;
+        database.pragma_update(None, "user_version", version)?;
+    }
+    Ok(database)
+}
+
+#[tokio::test]
 async fn run_checks_identity_before_managed_blob_recovery() -> TestResult {
     for initialized in [true, false] {
         let scratch = Scratch::new()?;
@@ -349,6 +444,56 @@ async fn watermarks(hub: &HubStorage) -> Result<(u64, u64, u64), StorageError> {
 }
 
 const DAY: i64 = 86_400_000;
+
+#[test]
+fn blob_event_sql_error_rolls_back_the_blob_and_yields_gc_to_event_pruning() -> TestResult {
+    let mut database = Connection::open_in_memory()?;
+    database.execute_batch(MIGRATION_V1.sql)?;
+    let hub_id = HubId::generate()?;
+    let blob_id = BlobId::generate()?;
+    database.execute(
+        "INSERT INTO hub_meta (id, hub_id, display_name, master_key_fingerprint, events_head_seq,
+                               created_at_ms, updated_at_ms) VALUES (1, ?1, 'Hub', 'key', 1, 0, 0)",
+        [hub_id.as_str()],
+    )?;
+    database.execute(
+        "INSERT INTO blobs (blob_id, sha256, size_bytes, mime_type, original_name, safe_disk_name,
+                            disk_rel_path, owner_actor_id, created_at_ms, expires_at_ms)
+         VALUES (?1, 'sha', 1, 'text/plain', 'file', 'file', 'file', 'owner', 0, 1)",
+        [blob_id.as_str()],
+    )?;
+    database.execute_batch(
+        "INSERT INTO events (seq, event_id, kind, aggregate_type, aggregate_id, payload_json, created_at_ms)
+         VALUES (1, 'old', 'node.status', 'node', 'node', '{}', 0);
+         UPDATE sqlite_sequence SET seq = 9223372036854775807 WHERE name = 'events';",
+    )?;
+
+    let gc = HubGcHooks::default();
+    let failed = {
+        let tx = database.transaction()?;
+        gc.prune_batch(&tx, 14 * DAY, 200)
+    };
+    assert!(
+        matches!(failed, Err(error) if error.sqlite_error_code() == Some(rusqlite::ErrorCode::DiskFull))
+    );
+    let before: (Option<i64>, u64, u64) = database.query_row(
+        "SELECT (SELECT deleted_at_ms FROM blobs), events_pruned_through_seq, (SELECT COUNT(*) FROM events) FROM hub_meta",
+        [],
+        |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+    )?;
+    assert_eq!(before, (None, 0, 1));
+
+    let tx = database.transaction()?;
+    assert!(gc.prune_batch(&tx, 14 * DAY, 200)?.has_more);
+    tx.commit()?;
+    let after: (Option<i64>, u64, u64) = database.query_row(
+        "SELECT (SELECT deleted_at_ms FROM blobs), events_pruned_through_seq, (SELECT COUNT(*) FROM events) FROM hub_meta",
+        [],
+        |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+    )?;
+    assert_eq!(after, (None, 1, 0));
+    Ok(())
+}
 
 #[tokio::test]
 async fn prune_advances_floor_only_for_a_committed_contiguous_prefix() -> TestResult {

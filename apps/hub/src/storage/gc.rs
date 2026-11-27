@@ -44,6 +44,9 @@ impl GcHooks for HubGcHooks {
         let first = self.next_phase.load(Ordering::Relaxed);
         for offset in 0..PHASES {
             let phase = (first + offset) % PHASES;
+            // A failed phase rolls back, but must not block the other phases.
+            self.next_phase
+                .store((phase + 1) % PHASES, Ordering::Relaxed);
             let mut events = Vec::new();
             let changed = match phase {
                 0 => prune_tokens(tx, now_ms, limit)?,
@@ -56,8 +59,6 @@ impl GcHooks for HubGcHooks {
                 _ => prune_events(tx, now_ms, limit.saturating_sub(1))?,
             };
             if changed > 0 {
-                self.next_phase
-                    .store((phase + 1) % PHASES, Ordering::Relaxed);
                 return Ok(GcBatchOutcome {
                     events,
                     has_more: true,

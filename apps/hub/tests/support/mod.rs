@@ -171,11 +171,20 @@ impl Hub {
             .nth(1)
             .ok_or("missing HTTP status")?
             .parse()?;
+        let mut headers = http::HeaderMap::new();
+        for line in header.split("\r\n").skip(1) {
+            let (name, value) = line.split_once(':').ok_or("invalid HTTP response header")?;
+            headers.append(name.parse::<http::HeaderName>()?, value.trim().parse()?);
+        }
         let body = response
             .get(header_end + 4..)
             .ok_or("missing HTTP body")?
             .to_vec();
-        Ok(RawResponse { status, body })
+        Ok(RawResponse {
+            status,
+            body,
+            headers,
+        })
     }
 
     pub async fn stop_gracefully(&mut self) -> TestResult {
@@ -247,6 +256,7 @@ impl Drop for Scratch {
 pub struct RawResponse {
     pub status: u16,
     pub body: Vec<u8>,
+    pub headers: http::HeaderMap,
 }
 
 impl RawResponse {

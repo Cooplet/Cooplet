@@ -3,9 +3,9 @@ use std::sync::Arc;
 use axum::{
     body::Body,
     extract::{Request, State},
-    http::{HeaderMap, HeaderName, Method, header},
+    http::{HeaderMap, HeaderName, HeaderValue, Method, StatusCode, header},
     middleware::Next,
-    response::Response,
+    response::{IntoResponse, Response},
 };
 use cooplet_client::X_COOPLET_HUB;
 use cooplet_protocol::{ErrorCode, HubId};
@@ -14,7 +14,7 @@ use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 
 use crate::{AppState, auth, error::HubError};
 
-use super::{ENROLLMENT_BODY_LIMIT, JSON_BODY_LIMIT, extract::Revocations};
+use super::{BEARER_CHALLENGE, ENROLLMENT_BODY_LIMIT, JSON_BODY_LIMIT, extract::Revocations};
 
 #[derive(Clone, Copy, PartialEq)]
 pub(super) enum Access {
@@ -45,9 +45,21 @@ impl Gate {
 
 pub(super) async fn check_request(
     State(gate): State<Gate>,
-    mut request: Request,
+    request: Request,
     next: Next,
-) -> Result<Response, HubError> {
+) -> Response {
+    let requires_bearer = !matches!(gate.access, Access::Public | Access::Enrollment);
+    let mut response = admit(gate, request, next).await.into_response();
+    if requires_bearer && response.status() == StatusCode::UNAUTHORIZED {
+        response.headers_mut().insert(
+            header::WWW_AUTHENTICATE,
+            HeaderValue::from_static(BEARER_CHALLENGE),
+        );
+    }
+    response
+}
+
+async fn admit(gate: Gate, mut request: Request, next: Next) -> Result<Response, HubError> {
     let permit = gate.permits.try_acquire_owned().map_err(|_| {
         HubError::new(
             ErrorCode::Overloaded,
@@ -128,7 +140,9 @@ fn single_authorization(headers: &HeaderMap) -> Result<Option<&axum::http::Heade
 fn bearer(authorization: Option<&axum::http::HeaderValue>) -> Result<&str, HubError> {
     let token = authorization
         .and_then(|value| value.to_str().ok())
-        .and_then(|value| value.strip_prefix("Bearer "))
+        .and_then(|value| value.split_once(' '))
+        .filter(|(scheme, _)| scheme.eq_ignore_ascii_case("Bearer"))
+        .map(|(_, token)| token.trim_start_matches(' '))
         .filter(|token| !token.is_empty() && token.bytes().all(|byte| byte.is_ascii_graphic()));
     token.ok_or_else(unauthorized)
 }

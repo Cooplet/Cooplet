@@ -55,6 +55,26 @@ async fn bootstrap_enrollment_and_admin_boundary() -> TestResult {
         )
         .await?;
     duplicate.problem(401, ErrorCode::Unauthorized)?;
+    assert_eq!(
+        duplicate
+            .headers
+            .get(http::header::WWW_AUTHENTICATE)
+            .ok_or("missing Bearer challenge")?,
+        "Bearer realm=\"cooplet-hub\"",
+    );
+    let standard_bearer = format!("bearer  {}", hub.secret);
+    let health = hub
+        .raw(
+            "GET",
+            "/v1/health",
+            &[
+                ("X-Cooplet-Hub", hub.id.as_str()),
+                ("Authorization", &standard_bearer),
+            ],
+            &[],
+        )
+        .await?;
+    assert_eq!(health.status, 200);
 
     let original = hub.issue_enrollment_cli("Test Node", "first-enrollment")?;
     let replay: Value = admin

@@ -17,7 +17,7 @@ use utoipa::{
 use crate::{
     error::HubError,
     http::{
-        EmptyJson,
+        BEARER_CHALLENGE, EmptyJson,
         handlers::{self, admin_routes, command_routes},
     },
 };
@@ -93,6 +93,7 @@ impl Modify for HttpConventions {
 
         for (path, item) in &mut document.paths.paths {
             let public = matches!(path.as_str(), "/v1/info" | "/v1/openapi.json");
+            let requires_bearer = !public && path != "/v1/enrollment/token";
             item.parameters.get_or_insert_with(Vec::new).push(
                 ParameterBuilder::new()
                     .name("X-Cooplet-Hub")
@@ -111,7 +112,7 @@ impl Modify for HttpConventions {
                 .into_iter()
                 .flatten()
             {
-                describe_responses(operation, public);
+                describe_responses(operation, public, requires_bearer);
             }
         }
     }
@@ -152,7 +153,7 @@ fn describe_post(operation: &mut Operation, path: &str) {
     }
 }
 
-fn describe_responses(operation: &mut Operation, public: bool) {
+fn describe_responses(operation: &mut Operation, public: bool, requires_bearer: bool) {
     let unauthorized = if public {
         "Duplicate Authorization header."
     } else {
@@ -199,6 +200,16 @@ fn describe_responses(operation: &mut Operation, public: bool) {
                     .enum_values(Some(["no-store"])),
             ),
         );
+        if status == "401" && requires_bearer {
+            response.headers.insert(
+                "WWW-Authenticate".into(),
+                Header::new(
+                    ObjectBuilder::new()
+                        .schema_type(Type::String)
+                        .enum_values(Some([BEARER_CHALLENGE])),
+                ),
+            );
+        }
     }
 }
 

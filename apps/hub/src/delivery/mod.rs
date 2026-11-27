@@ -14,8 +14,9 @@ use cooplet_protocol::{
 };
 use cooplet_storage::{StorageError, WriteFailure, WriteOutcome};
 use http::StatusCode;
-use rusqlite::Connection;
+use rusqlite::{Connection, Transaction};
 use serde::{Deserialize, Serialize};
+use tokio::sync::oneshot;
 
 use crate::{
     AppState,
@@ -32,6 +33,7 @@ pub(crate) use dto::{
 pub(crate) use message::get_message;
 
 const ANSWER_KIND: &str = "answer_question";
+const FINALIZATION_REPLY_TIMEOUT: Duration = Duration::from_secs(2);
 
 pub(crate) async fn send_message(
     state: &AppState,
@@ -191,7 +193,16 @@ async fn control(
     command
         .validate()
         .map_err(|error| HubError::invalid(error.to_string()))?;
-    let reply = execute(state, caller, key, Action::Control { node, command }).await?;
+    let reply = execute(
+        state,
+        caller,
+        key,
+        Action::Control {
+            node,
+            command: Box::new(command),
+        },
+    )
+    .await?;
     match reply.body {
         Reply::Command(receipt) => Ok(receipt),
         Reply::Message(_) => Err(HubError::internal(
@@ -203,7 +214,7 @@ async fn control(
 enum Action {
     Control {
         node: NodeId,
-        command: BridgeCommand,
+        command: Box<BridgeCommand>,
     },
     Message {
         message_id: MessageId,
@@ -258,7 +269,7 @@ impl Action {
         match self {
             Self::Message { input, .. } if input.answer.is_some() => Ok(Kind::Answer),
             Self::Message { .. } => Ok(Kind::Message),
-            Self::Control { command, .. } => match command {
+            Self::Control { command, .. } => match command.as_ref() {
                 BridgeCommand::CreateAgent { .. } => Ok(Kind::CreateAgent),
                 BridgeCommand::StopAgent { .. } => Ok(Kind::StopAgent),
                 BridgeCommand::RespondApproval { .. } => Ok(Kind::RespondApproval),
@@ -280,7 +291,7 @@ impl Action {
         let kind = kind.as_str();
         match self {
             Self::Control { node, command } => {
-                let path_target_id = match command {
+                let path_target_id = match command.as_ref() {
                     BridgeCommand::StopAgent { participant_id, .. }
                     | BridgeCommand::RespondApproval { participant_id, .. } => {
                         Some(participant_id.as_str())
@@ -349,7 +360,7 @@ impl Request {
                     ));
                 }
                 if let BridgeCommand::StopAgent { participant_id, .. }
-                | BridgeCommand::RespondApproval { participant_id, .. } = command
+                | BridgeCommand::RespondApproval { participant_id, .. } = command.as_ref()
                     && participant_kind(db, node, participant_id)? != "agent"
                 {
                     return Err(HubError::invalid(
@@ -370,7 +381,7 @@ impl Request {
         let (actor_id, command, delivery_mode, ttl_ms) = match &self.action {
             Action::Control { command, .. } => (
                 self.caller.actor_id(),
-                command.clone(),
+                command.as_ref().clone(),
                 DeliveryMode::DirectNow,
                 None,
             ),
@@ -413,6 +424,14 @@ impl Request {
                 delivery_state: state,
             }),
         })
+    }
+
+    fn unconfirmed_delivery(&self) -> Result<Success, HubError> {
+        if self.is_answer() {
+            self.message_reply(DeliveryState::Unknown)
+        } else {
+            Err(outcome::unknown(self))
+        }
     }
 }
 
@@ -516,11 +535,23 @@ async fn execute(
     };
 
     let state_for_task = state.clone();
-    state
-        .background
-        .spawn(async move { deliver_owned(&state_for_task, request, reservation).await })?
-        .await
-        .map_err(HubError::internal)?
+    let (sender, response) = oneshot::channel();
+    state.background.spawn(async move {
+        let mut client = ClientReply(Some(sender));
+        let result = deliver_owned(&state_for_task, request, reservation, &mut client).await;
+        client.send(result);
+    })?;
+    response.await.map_err(HubError::internal)?
+}
+
+struct ClientReply(Option<oneshot::Sender<Result<Success, HubError>>>);
+
+impl ClientReply {
+    fn send(&mut self, result: Result<Success, HubError>) {
+        if let Some(sender) = self.0.take() {
+            let _ = sender.send(result);
+        }
+    }
 }
 
 struct Reservation {
@@ -533,10 +564,11 @@ async fn probe(state: &AppState, request: Arc<Request>) -> Result<Probe, HubErro
         .reads
         .read(move |conn| {
             let tx = conn.unchecked_transaction()?;
+            let now = now_ms();
             Ok(
-                journal::replay(&tx, &request).and_then(|reply| match reply {
+                authorized_replay(&tx, &request, now).and_then(|reply| match reply {
                     Some(reply) => Ok(Probe::Replay(reply)),
-                    None => request.preflight(&tx, now_ms()).map(Probe::New),
+                    None => request.preflight(&tx, now).map(Probe::New),
                 }),
             )
         })
@@ -546,8 +578,20 @@ async fn probe(state: &AppState, request: Arc<Request>) -> Result<Probe, HubErro
 async fn replay_only(state: &AppState, request: Arc<Request>) -> Result<Option<Success>, HubError> {
     state
         .reads
-        .read(move |conn| Ok(journal::replay(conn, &request)))
+        .read(move |conn| {
+            let tx = conn.unchecked_transaction()?;
+            Ok(authorized_replay(&tx, &request, now_ms()))
+        })
         .await?
+}
+
+fn authorized_replay(
+    tx: &Transaction<'_>,
+    request: &Request,
+    now: i64,
+) -> Result<Option<Success>, HubError> {
+    reverify_caller_tx(tx, &request.caller, now)?;
+    journal::replay(tx, request)
 }
 
 fn reserve_error(error: ReserveError) -> HubError {
@@ -572,34 +616,59 @@ async fn deliver_owned(
     state: &AppState,
     request: Arc<Request>,
     reservation: Option<Reservation>,
+    client: &mut ClientReply,
 ) -> Result<Success, HubError> {
-    let tx_request = request.clone();
-    let hub_id = state.meta.hub_id.clone();
     let reserved_node = reservation
         .as_ref()
         .map(|reservation| reservation.node.clone());
-    let accepted = state
+    match accept_request(state, request.clone(), reserved_node).await {
+        Ok(Accepted::Done(reply)) => Ok(reply),
+        Ok(Accepted::Dispatch(target)) => {
+            let response = match reservation {
+                Some(reservation) => reservation.permit.submit(request.payload()).await,
+                None => Err(SubmitError::Unknown),
+            };
+            let terminal = outcome::classify(&request, response)?;
+            finish(state, request, target.required_nodes, terminal, client).await
+        }
+        Err(WriteFailure::Storage(
+            StorageError::WriteOutcomeUnknown | StorageError::CommitFailed(_),
+        )) => {
+            // A failed acknowledgement cannot authorize the first bridge send.
+            drop(reservation);
+            recover_acceptance(state, request, client).await
+        }
+        Err(error) => Err(error.into()),
+    }
+}
+
+async fn accept_request(
+    state: &AppState,
+    request: Arc<Request>,
+    reserved_node: Option<NodeId>,
+) -> Result<Accepted, WriteFailure<HubError>> {
+    let hub_id = state.meta.hub_id.clone();
+    state
         .db
         .write(move |tx| {
             let now = now_ms();
-            reverify_caller_tx(tx, &tx_request.caller, now)?;
-            if let Some(reply) = journal::replay(tx, &tx_request)? {
+            if let Some(reply) = authorized_replay(tx, &request, now)? {
                 return Ok(WriteOutcome::new(Accepted::Done(reply)));
             }
-            let target = tx_request.preflight(tx, now)?;
+            let target = request.preflight(tx, now)?;
             let can_dispatch = target.notify.is_some() && target.notify == reserved_node;
-            if !can_dispatch && !tx_request.is_answer() {
+            if !can_dispatch && !request.is_answer() {
                 return Err(reserve_error(ReserveError::Offline).into());
             }
             let local = if can_dispatch {
                 None
-            } else if tx_request.action.target_node().is_some() {
-                Some(tx_request.message_reply(DeliveryState::Unavailable)?)
+            } else if request.action.target_node().is_some() {
+                Some(request.message_reply(DeliveryState::Unavailable)?)
             } else {
-                Some(tx_request.message_reply(DeliveryState::Delivered)?)
+                Some(request.message_reply(DeliveryState::Delivered)?)
             };
-            journal::insert(tx, &tx_request, &target, local.as_ref(), now)?;
-            let events = match &tx_request.action {
+            journal::insert(tx, &request, &target, local.as_ref(), now)?;
+            let events = match &request.action {
                 Action::Message {
                     message_id,
                     sender,
@@ -612,11 +681,11 @@ async fn deliver_owned(
                     message::insert(
                         tx,
                         &hub_id,
-                        &tx_request.caller,
+                        &request.caller,
                         &target,
                         message::NewMessage {
                             id: message_id,
-                            operation_id: &tx_request.id,
+                            operation_id: &request.id,
                             sender,
                             body: input,
                             state: delivery_state,
@@ -634,30 +703,14 @@ async fn deliver_owned(
                 events,
             ))
         })
-        .await;
-
-    match accepted {
-        Ok(Accepted::Done(reply)) => Ok(reply),
-        Ok(Accepted::Dispatch(target)) => {
-            let response = match reservation {
-                Some(reservation) => reservation.permit.submit(request.payload()).await,
-                None => Err(SubmitError::Unknown),
-            };
-            let terminal = outcome::classify(&request, response)?;
-            finish(state, request, target.required_nodes, terminal).await
-        }
-        Err(WriteFailure::Storage(
-            StorageError::WriteOutcomeUnknown | StorageError::CommitFailed(_),
-        )) => {
-            // A failed acknowledgement cannot authorize the first bridge send.
-            drop(reservation);
-            recover_acceptance(state, request).await
-        }
-        Err(error) => Err(error.into()),
-    }
+        .await
 }
 
-async fn recover_acceptance(state: &AppState, request: Arc<Request>) -> Result<Success, HubError> {
+async fn recover_acceptance(
+    state: &AppState,
+    request: Arc<Request>,
+    client: &mut ClientReply,
+) -> Result<Success, HubError> {
     let lookup = request.clone();
     let observed = state
         .reads
@@ -667,7 +720,7 @@ async fn recover_acceptance(state: &AppState, request: Arc<Request>) -> Result<S
         Ok(Ok(journal::Observed::Terminal(reply))) => reply,
         Ok(Ok(journal::Observed::Accepted(required_nodes))) => {
             let terminal = outcome::unknown_terminal(&request)?;
-            finish(state, request, required_nodes, terminal).await
+            finish(state, request, required_nodes, terminal, client).await
         }
         _ => Err(outcome::unknown(&request)),
     }
@@ -678,9 +731,36 @@ async fn finish(
     request: Arc<Request>,
     required_nodes: Vec<NodeId>,
     terminal: outcome::Terminal,
+    client: &mut ClientReply,
+) -> Result<Success, HubError> {
+    let mut shutdown = state.shutdown.clone();
+    let finalization = async {
+        tokio::select! {
+            biased;
+            _ = shutdown.changed() => request.unconfirmed_delivery(),
+            result = persist_terminal(state, &request, required_nodes, terminal) => result,
+        }
+    };
+    tokio::pin!(finalization);
+    tokio::select! {
+        biased;
+        result = &mut finalization => result,
+        () = tokio::time::sleep(FINALIZATION_REPLY_TIMEOUT) => {
+            client.send(request.unconfirmed_delivery());
+            // Releasing the HTTP request does not release ownership of the
+            // accepted operation. Retry only the SQLite receipt.
+            finalization.await
+        }
+    }
+}
+
+async fn persist_terminal(
+    state: &AppState,
+    request: &Arc<Request>,
+    required_nodes: Vec<NodeId>,
+    terminal: outcome::Terminal,
 ) -> Result<Success, HubError> {
     let terminal = Arc::new(terminal);
-    let deadline = tokio::time::Instant::now() + Duration::from_secs(2);
     let mut delay = Duration::from_millis(10);
     loop {
         let hub_id = state.meta.hub_id.clone();
@@ -718,30 +798,32 @@ async fn finish(
             .await;
         match result {
             Ok(true) => return terminal.response(),
-            Err(WriteFailure::Storage(StorageError::Overloaded))
-                if tokio::time::Instant::now() < deadline =>
-            {
-                tokio::time::sleep(delay).await;
-                delay = (delay * 2).min(Duration::from_millis(200));
-            }
+            Err(WriteFailure::Storage(StorageError::Overloaded)) => {}
             result => {
-                tracing::warn!(operation_id = %request.id, ?result, "Could not confirm a delivery receipt");
                 // Tx 1 completed. A duplicate or unacknowledged Tx 2 may have
                 // recorded a terminal result, which a fresh read can prove.
+                let ambiguous = matches!(
+                    &result,
+                    Err(WriteFailure::Storage(
+                        StorageError::WriteOutcomeUnknown | StorageError::CommitFailed(_)
+                    ))
+                );
                 let check_request = request.clone();
-                if let Ok(Ok(journal::Observed::Terminal(result))) = state
+                let observed = state
                     .reads
                     .read(move |conn| Ok(journal::observe_acceptance(conn, &check_request)))
-                    .await
-                {
-                    return result;
+                    .await;
+                match observed {
+                    Ok(Ok(journal::Observed::Terminal(result))) => return result,
+                    Ok(Ok(journal::Observed::Accepted(_))) if ambiguous => {}
+                    _ => {
+                        tracing::warn!(operation_id = %request.id, ?result, "Could not confirm a delivery receipt");
+                        return request.unconfirmed_delivery();
+                    }
                 }
-                return if request.is_answer() {
-                    request.message_reply(DeliveryState::Unknown)
-                } else {
-                    Err(outcome::unknown(&request))
-                };
             }
         }
+        tokio::time::sleep(delay).await;
+        delay = (delay * 2).min(Duration::from_millis(200));
     }
 }

@@ -260,8 +260,9 @@ fn verify(mac: Verifier, stored: &str) -> bool {
         return false;
     }
     let mut bytes = [0; SECRET_BYTES];
-    for (byte, pair) in bytes.iter_mut().zip(stored.as_bytes().chunks_exact(2)) {
-        let (Some(high), Some(low)) = (hex_digit(pair[0]), hex_digit(pair[1])) else {
+    let (pairs, _) = stored.as_bytes().as_chunks::<2>();
+    for (byte, &[high, low]) in bytes.iter_mut().zip(pairs) {
+        let (Some(high), Some(low)) = (hex_digit(high), hex_digit(low)) else {
             return false;
         };
         *byte = (high << 4) | low;

@@ -798,29 +798,44 @@ where
     }
 }
 
+struct StoredAdminReceipt {
+    kind: String,
+    digest: String,
+    state: String,
+    result: Option<String>,
+    error: Option<String>,
+}
+
 fn find_receipt<T: DeserializeOwned>(
     conn: &Connection,
     actor_id: &str,
     operation: &AdminOperation,
 ) -> Result<Option<T>, HubError> {
-    let found: Option<(String, String, String, Option<String>, Option<String>)> = conn
+    let found = conn
         .query_row(
             "SELECT kind, request_sha256, state, result_json, error_json
                FROM operations WHERE actor_id = ?1 AND operation_key = ?2",
             params![actor_id, operation.key],
             |row| {
-                Ok((
-                    row.get(0)?,
-                    row.get(1)?,
-                    row.get(2)?,
-                    row.get(3)?,
-                    row.get(4)?,
-                ))
+                Ok(StoredAdminReceipt {
+                    kind: row.get(0)?,
+                    digest: row.get(1)?,
+                    state: row.get(2)?,
+                    result: row.get(3)?,
+                    error: row.get(4)?,
+                })
             },
         )
         .optional()?;
 
-    let Some((kind, digest, state, result, error)) = found else {
+    let Some(StoredAdminReceipt {
+        kind,
+        digest,
+        state,
+        result,
+        error,
+    }) = found
+    else {
         return Ok(None);
     };
     if kind != operation.kind || digest != operation.digest {
