@@ -331,12 +331,12 @@ impl ClientAdapter for MockAdapter {
         mode: StopMode,
     ) -> BoxFuture<'a, Result<StopOutcome>> {
         Box::pin(async move {
-            lock(&self.state.stop_modes).push(mode);
+            lock(&self.state.stop_modes).push(mode.clone());
             let session = handle
                 .downcast_ref::<MockSession>()
                 .ok_or_else(|| NodeError::internal("The fixture session is missing"))?;
             Ok(match mode {
-                StopMode::CancelTurn => StopOutcome::TurnCancelled,
+                StopMode::CancelTurn { .. } => StopOutcome::TurnCancelled,
                 StopMode::StopSession => {
                     session.close();
                     StopOutcome::Stopped

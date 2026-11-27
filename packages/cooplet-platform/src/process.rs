@@ -6,9 +6,11 @@ mod sys;
 mod sys;
 
 use std::{
+    ffi::CString,
     io,
     mem::MaybeUninit,
-    os::unix::process::CommandExt,
+    os::unix::{ffi::OsStrExt, process::CommandExt},
+    path::Path,
     process::{Child, ChildStderr, ChildStdin, ChildStdout, Command, ExitStatus},
     thread,
     time::Duration,
@@ -21,6 +23,22 @@ use crate::{MonoInstant, MonotonicClock, PlatformError, current_euid};
 const POLL_INTERVAL: Duration = Duration::from_millis(20);
 const KILL_CONFIRM_TIMEOUT: Duration = Duration::from_secs(1);
 const SPAWN_CLEANUP_GRACE: Duration = Duration::from_millis(100);
+
+/// Check whether a pathname is executable using this process's effective IDs.
+pub fn can_execute(path: &Path) -> io::Result<bool> {
+    let path = CString::new(path.as_os_str().as_bytes())?;
+    // SAFETY: path is NUL-terminated and valid for the call. The flags select
+    // the effective user/group checks and the process's working directory.
+    if unsafe { libc::faccessat(libc::AT_FDCWD, path.as_ptr(), libc::X_OK, libc::AT_EACCESS) } == 0
+    {
+        return Ok(true);
+    }
+    let error = io::Error::last_os_error();
+    match error.kind() {
+        io::ErrorKind::PermissionDenied | io::ErrorKind::NotFound => Ok(false),
+        _ => Err(error),
+    }
+}
 
 /// Return a verified boot identifier on Linux, when the kernel exposes one.
 pub fn current_linux_boot_id() -> Option<String> {
@@ -89,6 +107,22 @@ impl ProcessIdentity {
             }
             Err(error) => Err(error),
         }
+    }
+
+    /// Verify a socket peer belongs to this still-running managed group.
+    /// A launcher can delegate the socket to a child with a different PID.
+    pub fn owns_peer(&self, peer_pid: u32, peer_uid: u32) -> Result<bool, PlatformError> {
+        if peer_uid != current_euid() || peer_pid <= 1 {
+            return Ok(false);
+        }
+        let peer_pid = libc::pid_t::try_from(peer_pid).map_err(|_| {
+            PlatformError::InvalidProcessIdentity("expected a positive peer PID".into())
+        })?;
+        let (peer, _) = sys::capture(peer_pid)?;
+        Ok(!peer.exited
+            && peer.uid == peer_uid
+            && u32::try_from(peer.pgid) == Ok(self.pgid)
+            && self.probe()? == ProcessProbe::Running)
     }
 
     fn validated_structural_pid(&self) -> Result<libc::pid_t, PlatformError> {
@@ -571,6 +605,23 @@ mod tests {
         assert!(outcome.leader_status.is_some());
         assert!(handle.observe_exit()?);
         assert_eq!(handle.terminate_and_reap(Duration::ZERO)?, outcome);
+        Ok(())
+    }
+
+    #[test]
+    fn socket_peer_needs_the_effective_uid_even_with_a_matching_group() -> TestResult {
+        let mut command = Command::new("sh");
+        command.args(["-c", "exec sleep 20"]);
+        let mut handle = ProcessHandle::spawn_isolated_group(&mut command)?;
+        let identity = handle.identity();
+        assert!(identity.owns_peer(identity.pid, current_euid())?);
+        assert!(!identity.owns_peer(identity.pid, current_euid().wrapping_add(1))?);
+        assert_ne!(
+            handle
+                .terminate_and_reap(Duration::from_millis(100))?
+                .outcome,
+            TerminateOutcome::CleanupUnverified
+        );
         Ok(())
     }
 

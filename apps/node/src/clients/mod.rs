@@ -1,6 +1,7 @@
 //! Native client contract. The Node selects a registered adapter by its opaque kind.
 
 mod binding;
+pub mod codex;
 mod registry;
 mod runtime;
 mod templates;
@@ -271,7 +272,7 @@ pub enum SubmitOutcome {
     AwaitingApproval(ApprovalWait),
     /// The first native write was prevented by the admission deadline.
     Expired,
-    /// The adapter can prove that no native write happened.
+    /// The adapter can prove that the native client did not accept the input.
     Unavailable(String),
     /// A native write may have started, and the adapter could not verify its outcome.
     Unknown(String),
@@ -286,9 +287,12 @@ pub enum ApprovalRespondOutcome {
     Unknown(String),
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug)]
 pub enum StopMode {
-    CancelTurn,
+    /// Check admission immediately before the first possible interrupt write.
+    CancelTurn {
+        admission: AdmissionGuard,
+    },
     StopSession,
 }
 
@@ -297,6 +301,8 @@ pub enum StopOutcome {
     Stopped,
     TurnCancelled,
     Unsupported(String),
+    /// No interrupt was accepted because of a temporary condition.
+    Unavailable(String),
     AlreadyGone,
     Unknown(String),
 }
