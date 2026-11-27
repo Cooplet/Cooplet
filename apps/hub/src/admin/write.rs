@@ -625,20 +625,19 @@ fn validate_username(value: &str) -> Result<(), HubError> {
 }
 
 fn validate_display_name(value: &str) -> Result<(), HubError> {
-    validate_label(value)?;
-    if value.trim().is_empty() {
-        return Err(HubError::invalid("Name must not be blank"));
-    }
-    Ok(())
+    cooplet_protocol::validate_display_name(value).map_err(|_| {
+        HubError::invalid(
+            "Name must be non-blank, at most 128 UTF-8 bytes, and free of control, bidirectional, or zero-width characters",
+        )
+    })
 }
 
 fn validate_label(value: &str) -> Result<(), HubError> {
-    if value.len() > 128 || value.chars().any(char::is_control) {
-        return Err(HubError::invalid(
-            "Name or label exceeds 128 UTF-8 bytes or contains a control character",
-        ));
-    }
-    Ok(())
+    cooplet_protocol::validate_label(value).map_err(|_| {
+        HubError::invalid(
+            "Label exceeds 128 UTF-8 bytes or contains a forbidden control, bidirectional, or zero-width character",
+        )
+    })
 }
 
 fn normalize_grants(

@@ -11,10 +11,13 @@ use cooplet_client::{
 use cooplet_node::{
     clients::{
         AdapterEventKind, ApprovalWait, ApprovalWaitKind, ParticipantRuntimeState, SubmitOutcome,
+        TurnInput,
     },
     delivery::{MessageView, SendMessageResponse},
 };
-use cooplet_protocol::{DeliveryState, ErrorCode, MessageId, ParticipantState, ProblemDetails};
+use cooplet_protocol::{
+    AuthorKind, DeliveryState, ErrorCode, MessageId, ParticipantState, ProblemDetails,
+};
 use cooplet_storage::WriteOutcome;
 use serde_json::{Value, json};
 
@@ -91,14 +94,21 @@ async fn adapter_receives_readable_attachment_paths_for_both_delivery_modes() ->
                     .await
             });
             let held = mock.next_submit().await?;
-            let header = held
-                .request
-                .envelope
+            assert!(held.request.input.is_direct_human());
+            let TurnInput::Direct(ref inbound) = held.request.input else {
+                return Err("Expected direct TurnInput".into());
+            };
+            assert_eq!(inbound.author.kind, AuthorKind::Human);
+            assert_eq!(inbound.attachments.len(), 1);
+            assert_eq!(inbound.attachments[0].blob_id, attachment.blob_id);
+
+            let rendered = held.request.input.render_canonical()?;
+            let meta_line = rendered
                 .lines()
-                .nth(1)
-                .ok_or("Missing peer metadata")?;
-            let header: Value = serde_json::from_str(header)?;
-            let file = &header["attachments"][0];
+                .nth(2)
+                .ok_or("Missing bounded metadata line")?;
+            let meta: Value = serde_json::from_str(meta_line)?;
+            let file = &meta["attachments"][0];
             assert_eq!(file["blob_id"], attachment.blob_id.as_str());
             let path = if state_name.to_str().is_some() {
                 assert!(file.get("local_path_bytes").is_none());
@@ -963,17 +973,490 @@ async fn answer_target_matrix_and_queue_attachment_unavailable() -> TestResult {
         cancelled.delivery_detail.as_deref(),
         Some("attachment_unavailable")
     );
-    let queue_state: String = node
+    let (queue_state, queue_envelope): (String, String) = node
         .reads
         .read(move |conn| {
             Ok(conn.query_row(
-                "SELECT state FROM intake_queue WHERE message_id = ?1",
+                "SELECT state, payload_envelope FROM intake_queue WHERE message_id = ?1",
                 [queued_id.as_str()],
-                |row| row.get(0),
+                |row| Ok((row.get(0)?, row.get(1)?)),
             )?)
         })
         .await?;
     assert_eq!(queue_state, "cancelled");
+    assert!(queue_envelope.is_empty());
     assert_eq!(mock.submits(), 0);
+    node.stop().await
+}
+
+#[tokio::test]
+async fn direct_and_queued_messages_preserve_author_provenance_and_clear_terminal_envelopes()
+-> TestResult {
+    let mock = MockAdapter::default();
+    let mut node = TestNode::start(mock.clone()).await?;
+    let alice_ws = node.workspace_dir.join("alice");
+    let bob_ws = node.workspace_dir.join("bob");
+    std::fs::create_dir_all(&alice_ws)?;
+    std::fs::create_dir_all(&bob_ws)?;
+    let sender = node
+        .create(
+            "create-provenance-sender",
+            json!({
+                "client_kind": "mock",
+                "name": "alice",
+                "workspace_dir": alice_ws.to_string_lossy()
+            }),
+        )
+        .await?;
+    let recipient = node
+        .create(
+            "create-provenance-recipient",
+            json!({
+                "client_kind": "mock",
+                "name": "bob",
+                "workspace_dir": bob_ws.to_string_lossy()
+            }),
+        )
+        .await?;
+    let sender_session = mock.session(&sender, 1).ok_or("Missing sender session")?;
+    let recipient_session = mock
+        .session(&recipient, 1)
+        .ok_or("Missing recipient session")?;
+    let agent = node.agent_client(&sender_session).await?;
+    let op_id = node.client.whoami().await?.actor_id;
+
+    // 1. Direct message from operator preserves Human provenance.
+    let op_direct = {
+        let client = node.client.clone();
+        let to = recipient.clone();
+        tokio::spawn(async move {
+            client
+                .post_json::<_, SendMessageResponse>(
+                    "/v1/messages",
+                    &json!({"to": to, "body": "operator direct"}),
+                    Some("prov-op-direct"),
+                )
+                .await
+        })
+    };
+    let held = mock.next_submit().await?;
+    assert!(held.request.input.is_direct_human());
+    let TurnInput::Direct(ref msg) = held.request.input else {
+        return Err("Expected direct TurnInput".into());
+    };
+    assert_eq!(msg.author.kind, AuthorKind::Human);
+    assert_eq!(msg.author.actor_id, op_id);
+    assert_eq!(msg.author.name, "operator");
+    let rendered = held.request.input.render_canonical()?;
+    assert!(rendered.starts_with("[Cooplet direct_message author_kind=human "));
+    assert!(rendered.contains("<cooplet-content boundary=\""));
+    recipient_session
+        .emit(AdapterEventKind::StateChanged(
+            ParticipantRuntimeState::Working,
+        ))
+        .await?;
+    node.participant_when(&recipient, |view| view.state == ParticipantState::Working)
+        .await?;
+    recipient_session
+        .emit(AdapterEventKind::StateChanged(
+            ParticipantRuntimeState::Idle,
+        ))
+        .await?;
+    node.participant_when(&recipient, |view| view.state == ParticipantState::Idle)
+        .await?;
+    held.finish(SubmitOutcome::Accepted {
+        native_turn_id: None,
+    })?;
+    assert_eq!(op_direct.await??.delivery_state, DeliveryState::Delivered);
+
+    // 2. Direct message from peer agent preserves Agent provenance (!is_direct_human).
+    let peer_direct = {
+        let client = agent.clone();
+        let to = recipient.clone();
+        tokio::spawn(async move {
+            client
+                .post_json::<_, SendMessageResponse>(
+                    "/v1/messages",
+                    &json!({"to": to, "body": "peer direct"}),
+                    Some("prov-peer-direct"),
+                )
+                .await
+        })
+    };
+    let held = mock.next_submit().await?;
+    assert!(!held.request.input.is_direct_human());
+    let TurnInput::Direct(ref msg) = held.request.input else {
+        return Err("Expected direct TurnInput".into());
+    };
+    assert_eq!(msg.author.kind, AuthorKind::Agent);
+    assert_eq!(msg.author.actor_id, sender.as_str());
+    assert_eq!(msg.author.name, "alice");
+    let rendered = held.request.input.render_canonical()?;
+    let first_line = rendered.lines().next().ok_or("Missing header line")?;
+    assert!(first_line.starts_with("[Cooplet direct_message author_kind=agent "));
+    assert!(!first_line.contains("alice"));
+    held.finish(SubmitOutcome::Accepted {
+        native_turn_id: None,
+    })?;
+    assert_eq!(peer_direct.await??.delivery_state, DeliveryState::Delivered);
+
+    // 3. Queued message from peer stores v2 envelope, preserves Agent provenance on drain,
+    //    and clears payload_envelope once delivered.
+    recipient_session
+        .emit(AdapterEventKind::StateChanged(
+            ParticipantRuntimeState::Working,
+        ))
+        .await?;
+    node.participant_when(&recipient, |view| view.state == ParticipantState::Working)
+        .await?;
+    let queued_peer: SendMessageResponse = agent
+        .post_json(
+            "/v1/messages",
+            &json!({
+                "to": recipient,
+                "body": "peer queued",
+                "delivery_mode": "queue_until_idle"
+            }),
+            Some("prov-peer-queued"),
+        )
+        .await?;
+    let queued_peer_id = queued_peer
+        .message_id
+        .ok_or("Missing queued peer message id")?;
+    let stored_raw: String = {
+        let id = queued_peer_id.clone();
+        node.reads
+            .read(move |conn| {
+                Ok(conn.query_row(
+                    "SELECT payload_envelope FROM intake_queue WHERE message_id = ?1",
+                    [id.as_str()],
+                    |row| row.get(0),
+                )?)
+            })
+            .await?
+    };
+    let stored_json: Value = serde_json::from_str(&stored_raw)?;
+    assert_eq!(stored_json["v"], 2);
+    assert_eq!(stored_json["input"]["kind"], "direct");
+    assert_eq!(stored_json["input"]["author"]["kind"], "agent");
+
+    recipient_session
+        .emit(AdapterEventKind::StateChanged(
+            ParticipantRuntimeState::Idle,
+        ))
+        .await?;
+    let held = mock.next_submit().await?;
+    assert!(!held.request.input.is_direct_human());
+    let TurnInput::Direct(ref msg) = held.request.input else {
+        return Err("Expected direct TurnInput".into());
+    };
+    assert_eq!(msg.author.kind, AuthorKind::Agent);
+    assert_eq!(msg.author.name, "alice");
+    assert_eq!(msg.body, "peer queued");
+    held.finish(SubmitOutcome::Accepted {
+        native_turn_id: None,
+    })?;
+    message_state(&node.client, &queued_peer_id, DeliveryState::Delivered).await?;
+    let (state, envelope): (String, String) = {
+        let id = queued_peer_id.clone();
+        node.reads
+            .read(move |conn| {
+                Ok(conn.query_row(
+                    "SELECT state, payload_envelope FROM intake_queue WHERE message_id = ?1",
+                    [id.as_str()],
+                    |row| Ok((row.get(0)?, row.get(1)?)),
+                )?)
+            })
+            .await?
+    };
+    assert_eq!(state, "delivered");
+    assert!(envelope.is_empty());
+
+    // 4. Expired queued row clears payload_envelope.
+    recipient_session
+        .emit(AdapterEventKind::StateChanged(
+            ParticipantRuntimeState::Working,
+        ))
+        .await?;
+    node.participant_when(&recipient, |view| view.state == ParticipantState::Working)
+        .await?;
+    let queued_expired: SendMessageResponse = node
+        .client
+        .post_json(
+            "/v1/messages",
+            &json!({
+                "to": recipient,
+                "body": "will expire",
+                "delivery_mode": "queue_until_idle"
+            }),
+            Some("prov-expired"),
+        )
+        .await?;
+    let expired_id = queued_expired
+        .message_id
+        .ok_or("Missing expired message id")?;
+    {
+        let id = expired_id.clone();
+        node.db
+            .write_sqlite(move |tx| {
+                tx.execute(
+                    "UPDATE intake_queue SET deadline_at_ms = 0 WHERE message_id = ?1",
+                    [id.as_str()],
+                )?;
+                Ok(WriteOutcome::new(()))
+            })
+            .await?;
+    }
+    recipient_session
+        .emit(AdapterEventKind::StateChanged(
+            ParticipantRuntimeState::Idle,
+        ))
+        .await?;
+    message_state(&node.client, &expired_id, DeliveryState::Expired).await?;
+    let (state, envelope): (String, String) = {
+        let id = expired_id.clone();
+        node.reads
+            .read(move |conn| {
+                Ok(conn.query_row(
+                    "SELECT state, payload_envelope FROM intake_queue WHERE message_id = ?1",
+                    [id.as_str()],
+                    |row| Ok((row.get(0)?, row.get(1)?)),
+                )?)
+            })
+            .await?
+    };
+    assert_eq!(state, "expired");
+    assert!(envelope.is_empty());
+
+    // 5. Queued message whose submit outcome is Unknown clears payload_envelope.
+    let queued_unknown: SendMessageResponse = node
+        .client
+        .post_json(
+            "/v1/messages",
+            &json!({
+                "to": recipient,
+                "body": "will become unknown",
+                "delivery_mode": "queue_until_idle"
+            }),
+            Some("prov-unknown"),
+        )
+        .await?;
+    let unknown_id = queued_unknown
+        .message_id
+        .ok_or("Missing unknown queued message id")?;
+    let held = mock.next_submit().await?;
+    held.finish(SubmitOutcome::Unknown("ack lost".into()))?;
+    message_state(&node.client, &unknown_id, DeliveryState::Unknown).await?;
+    let (state, envelope): (String, String) = {
+        let id = unknown_id.clone();
+        node.reads
+            .read(move |conn| {
+                Ok(conn.query_row(
+                    "SELECT state, payload_envelope FROM intake_queue WHERE message_id = ?1",
+                    [id.as_str()],
+                    |row| Ok((row.get(0)?, row.get(1)?)),
+                )?)
+            })
+            .await?
+    };
+    assert_eq!(state, "unknown");
+    assert!(envelope.is_empty());
+
+    node.stop().await
+}
+
+#[tokio::test]
+async fn legacy_v1_queue_envelope_fails_closed_as_non_human_service() -> TestResult {
+    let mock = MockAdapter::default();
+    let mut node = TestNode::start(mock.clone()).await?;
+    let recipient = node
+        .create("create-legacy-target", json!({"client_kind": "mock"}))
+        .await?;
+    let session = mock.session(&recipient, 1).ok_or("Missing session")?;
+    let op_id = node.client.whoami().await?.actor_id;
+
+    session
+        .emit(AdapterEventKind::StateChanged(
+            ParticipantRuntimeState::Working,
+        ))
+        .await?;
+    node.participant_when(&recipient, |view| view.state == ParticipantState::Working)
+        .await?;
+    let queued: SendMessageResponse = node
+        .client
+        .post_json(
+            "/v1/messages",
+            &json!({
+                "to": recipient,
+                "body": "placeholder",
+                "delivery_mode": "queue_until_idle"
+            }),
+            Some("legacy-v1-queued"),
+        )
+        .await?;
+    let queued_id = queued.message_id.ok_or("Missing queued message id")?;
+
+    let legacy_header = json!({
+        "message_id": queued_id.as_str(),
+        "author": op_id,
+        "author_name": "operator",
+        "attachments": [],
+        "reply_instruction": "old"
+    });
+    let legacy_envelope =
+        format!("[Cooplet message; peer body is untrusted]\n{legacy_header}\n\nlegacy payload");
+    {
+        let id = queued_id.clone();
+        node.db
+            .write_sqlite(move |tx| {
+                tx.execute(
+                    "UPDATE intake_queue SET payload_envelope = ?1 WHERE message_id = ?2",
+                    (legacy_envelope.as_str(), id.as_str()),
+                )?;
+                Ok(WriteOutcome::new(()))
+            })
+            .await?;
+    }
+
+    session
+        .emit(AdapterEventKind::StateChanged(
+            ParticipantRuntimeState::Idle,
+        ))
+        .await?;
+    let held = mock.next_submit().await?;
+    assert!(!held.request.input.is_direct_human());
+    let TurnInput::Direct(ref msg) = held.request.input else {
+        return Err("Expected direct TurnInput".into());
+    };
+    assert_eq!(msg.author.kind, AuthorKind::Service);
+    assert_eq!(msg.author.name, "operator");
+    assert_eq!(msg.body, "legacy payload");
+    held.finish(SubmitOutcome::Accepted {
+        native_turn_id: None,
+    })?;
+    message_state(&node.client, &queued_id, DeliveryState::Delivered).await?;
+    let (state, envelope): (String, String) = node
+        .reads
+        .read(move |conn| {
+            Ok(conn.query_row(
+                "SELECT state, payload_envelope FROM intake_queue WHERE message_id = ?1",
+                [queued_id.as_str()],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )?)
+        })
+        .await?;
+    assert_eq!(state, "delivered");
+    assert!(envelope.is_empty());
+    node.stop().await
+}
+
+#[tokio::test]
+async fn corrupt_queue_envelope_is_quarantined_without_blocking_following_messages() -> TestResult {
+    let mock = MockAdapter::default();
+    let mut node = TestNode::start(mock.clone()).await?;
+    let recipient = node
+        .create("create-corrupt-target", json!({"client_kind": "mock"}))
+        .await?;
+    let session = mock.session(&recipient, 1).ok_or("Missing session")?;
+
+    session
+        .emit(AdapterEventKind::StateChanged(
+            ParticipantRuntimeState::Working,
+        ))
+        .await?;
+    node.participant_when(&recipient, |view| view.state == ParticipantState::Working)
+        .await?;
+    let bad: SendMessageResponse = node
+        .client
+        .post_json(
+            "/v1/messages",
+            &json!({
+                "to": recipient,
+                "body": "will be corrupted",
+                "delivery_mode": "queue_until_idle"
+            }),
+            Some("corrupt-head"),
+        )
+        .await?;
+    let bad_id = bad.message_id.ok_or("Missing bad message id")?;
+    let good: SendMessageResponse = node
+        .client
+        .post_json(
+            "/v1/messages",
+            &json!({
+                "to": recipient,
+                "body": "healthy follower",
+                "delivery_mode": "queue_until_idle"
+            }),
+            Some("corrupt-follower"),
+        )
+        .await?;
+    let good_id = good.message_id.ok_or("Missing good message id")?;
+
+    {
+        let id = bad_id.clone();
+        node.db
+            .write_sqlite(move |tx| {
+                tx.execute(
+                    "UPDATE intake_queue SET payload_envelope = '{corrupt' WHERE message_id = ?1",
+                    [id.as_str()],
+                )?;
+                Ok(WriteOutcome::new(()))
+            })
+            .await?;
+    }
+
+    session
+        .emit(AdapterEventKind::StateChanged(
+            ParticipantRuntimeState::Idle,
+        ))
+        .await?;
+    let held = mock.next_submit().await?;
+    assert_eq!(held.request.message_id.as_ref(), Some(&good_id));
+    assert!(held.request.input.is_direct_human());
+    let TurnInput::Direct(ref msg) = held.request.input else {
+        return Err("Expected direct TurnInput".into());
+    };
+    assert_eq!(msg.body, "healthy follower");
+    held.finish(SubmitOutcome::Accepted {
+        native_turn_id: None,
+    })?;
+
+    let quarantined = message_state(&node.client, &bad_id, DeliveryState::Unavailable).await?;
+    assert_eq!(
+        quarantined.delivery_detail.as_deref(),
+        Some("corrupt_envelope")
+    );
+    let (bad_state, bad_envelope): (String, String) = {
+        let id = bad_id.clone();
+        node.reads
+            .read(move |conn| {
+                Ok(conn.query_row(
+                    "SELECT state, payload_envelope FROM intake_queue WHERE message_id = ?1",
+                    [id.as_str()],
+                    |row| Ok((row.get(0)?, row.get(1)?)),
+                )?)
+            })
+            .await?
+    };
+    assert_eq!(bad_state, "cancelled");
+    assert!(bad_envelope.is_empty());
+
+    message_state(&node.client, &good_id, DeliveryState::Delivered).await?;
+    let (good_state, good_envelope): (String, String) = {
+        let id = good_id.clone();
+        node.reads
+            .read(move |conn| {
+                Ok(conn.query_row(
+                    "SELECT state, payload_envelope FROM intake_queue WHERE message_id = ?1",
+                    [id.as_str()],
+                    |row| Ok((row.get(0)?, row.get(1)?)),
+                )?)
+            })
+            .await?
+    };
+    assert_eq!(good_state, "delivered");
+    assert!(good_envelope.is_empty());
+    assert_eq!(mock.submits(), 1);
     node.stop().await
 }

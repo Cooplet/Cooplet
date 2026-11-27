@@ -17,7 +17,7 @@ use crate::{
         AdapterBinding, AdapterConfig, AgentOverrides, ClientAdapter, CoreBinding, DiscoveryReport,
         EffectiveAgentOptions, LifecycleBlock, LifecycleBlockKind, OpenedSession,
         ParticipantRuntimeState, ProcessOwnership, SessionOpenMode, SessionOpenRequest,
-        TuiAttachPlan, load_template,
+        TuiAttachPlan, compose_session_instructions, load_template, load_template_options,
     },
     config::CREDS_DIR,
     error::{NodeError, Result},
@@ -117,15 +117,16 @@ impl AgentService {
         let id = ParticipantId::generate()?;
         let _mutation = self.mutation(&id)?;
         let name = request.name.unwrap_or_else(|| id.to_string());
-        if name.is_empty()
-            || name.len() > 128
-            || name.chars().any(|c| {
-                c.is_control() || c.is_whitespace() || cooplet_protocol::is_bidi_or_line_control(c)
-            })
-        {
+        if cooplet_protocol::validate_actor_handle(&name).is_err() {
             return Err(invalid(
                 "invalid_name",
                 "An agent name must be a nonempty handle of at most 128 bytes",
+            ));
+        }
+        if name.eq_ignore_ascii_case("operator") {
+            return Err(invalid(
+                "reserved_name",
+                "The participant name 'operator' is reserved for the local human operator",
             ));
         }
         let default_workspace = self.0.config.workspace_dir.clone();
@@ -179,13 +180,24 @@ impl AgentService {
     }
 
     async fn plan(&self, input: OpenPlanInput) -> Result<OpenPlan> {
+        let has_frozen_instructions = input
+            .previous
+            .as_ref()
+            .and_then(|previous| previous.binding.core.frozen_instructions.as_ref())
+            .is_some();
         let template = match input.template_id.clone() {
             Some(id) => {
                 let workspace = input.workspace.clone();
                 Some(
-                    tokio::task::spawn_blocking(move || load_template(&workspace, &id))
-                        .await
-                        .map_err(NodeError::internal)??,
+                    tokio::task::spawn_blocking(move || {
+                        if has_frozen_instructions {
+                            load_template_options(&workspace, &id)
+                        } else {
+                            load_template(&workspace, &id)
+                        }
+                    })
+                    .await
+                    .map_err(NodeError::internal)??,
                 )
             }
             None => None,
@@ -233,6 +245,17 @@ impl AgentService {
             || overrides.clone(),
             |template| template.options.merged(&overrides),
         );
+        let instructions = input
+            .previous
+            .as_ref()
+            .and_then(|previous| previous.binding.core.frozen_instructions.clone())
+            .or_else(|| {
+                Some(compose_session_instructions(
+                    template
+                        .as_ref()
+                        .and_then(|template| template.instructions.as_deref()),
+                ))
+            });
         Ok(OpenPlan {
             id: input.id,
             name: input.name,
@@ -242,7 +265,7 @@ impl AgentService {
             client_kind,
             adapter,
             effective_options,
-            instructions: template.and_then(|template| template.instructions),
+            instructions,
             previous: input.previous,
             ephemeral_for_run_id: input.ephemeral_for_run_id,
         })
@@ -371,6 +394,7 @@ impl AgentService {
             .to_owned();
         let template_id = plan.template_id.clone();
         let overrides = plan.overrides.clone();
+        let frozen_instructions = plan.instructions.clone();
         let resume = plan.previous.as_ref().map(|previous| previous.generation);
         let run = plan.ephemeral_for_run_id.clone();
         let auth = self.0.auth.clone();
@@ -389,6 +413,7 @@ impl AgentService {
             }
             let core = CoreBinding {
                 overrides,
+                frozen_instructions,
                 lifecycle_block: Some(LifecycleBlock { kind: LifecycleBlockKind::SpawnUncertain, boot_id }),
                 ..CoreBinding::default()
             };

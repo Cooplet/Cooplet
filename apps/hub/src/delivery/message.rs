@@ -1,7 +1,7 @@
 use cooplet_protocol::{
-    AggregateType, AnswerPayload, AttachmentRef, BridgeCommand, DeliveryMode, DeliveryState,
-    ErrorCode, EventKind, HubId, MessageId, NodeId, OperationId, ParticipantId, QuestionPayload,
-    ServiceScope,
+    AggregateType, AnswerPayload, AttachmentRef, AuthorKind, BridgeCommand, DeliveryMode,
+    DeliveryState, ErrorCode, EventKind, HubId, MessageId, NodeId, OperationId, ParticipantId,
+    QuestionPayload, ServiceScope,
 };
 use cooplet_storage::EventNotice;
 use rusqlite::{Connection, OptionalExtension, Transaction, params};
@@ -97,9 +97,16 @@ impl MessageRequest {
         Ok(())
     }
 
-    pub(super) fn bridge_command(&self, message_id: &MessageId) -> BridgeCommand {
+    pub(super) fn bridge_command(
+        &self,
+        message_id: &MessageId,
+        sender_kind: AuthorKind,
+        sender_name: &str,
+    ) -> BridgeCommand {
         BridgeCommand::SendMessage {
             message_id: message_id.clone(),
+            sender_kind,
+            sender_name: sender_name.to_owned(),
             recipient_id: self.target_participant_id.clone(),
             in_reply_to: self.in_reply_to.clone(),
             body: self.body.clone(),
@@ -139,6 +146,34 @@ pub(super) fn preflight(
                 "Replies must remain within the same single-node dialogue.",
             ));
         }
+        let same_sender = parent.view.sender_node_id.is_none()
+            && caller.participant_id() == Some(&parent.view.sender_actor_id);
+        let reversed_sender = parent.view.target_node_id.is_none()
+            && caller.participant_id() == Some(&parent.view.target_participant_id);
+        if !same_sender && !reversed_sender && !caller.is_admin() {
+            return Err(HubError::new(
+                ErrorCode::Forbidden,
+                "This caller is not a participant in the referenced dialogue.",
+            ));
+        }
+        let target_matches = (same_sender
+            && parent.view.target_node_id.as_ref() == Some(node_id)
+            && parent.view.target_participant_id == request.target_participant_id)
+            || (reversed_sender
+                && parent.view.sender_node_id.as_ref() == Some(node_id)
+                && parent.view.sender_actor_id == request.target_participant_id)
+            || (caller.is_admin()
+                && !same_sender
+                && !reversed_sender
+                && ((parent.view.sender_node_id.as_ref() == Some(node_id)
+                    && parent.view.sender_actor_id == request.target_participant_id)
+                    || (parent.view.target_node_id.as_ref() == Some(node_id)
+                        && parent.view.target_participant_id == request.target_participant_id)));
+        if !target_matches {
+            return Err(HubError::invalid(
+                "A reply must remain between the original dialogue participants.",
+            ));
+        }
     }
     if let Some(question) = &request.question
         && question.expires_at_ms.is_some_and(|expires| expires <= now)
@@ -176,7 +211,7 @@ fn answer_target(
         parent.view.target_node_id.as_ref(),
         &parent.view.target_participant_id,
     );
-    if !addressed_to_caller && !caller.is_admin() && !caller.is_service() {
+    if !addressed_to_caller && !caller.is_admin() {
         let target_is_agent = match &parent.view.target_node_id {
             Some(node_id) => {
                 find_participant_kind(db, node_id, &parent.view.target_participant_id)?.as_deref()

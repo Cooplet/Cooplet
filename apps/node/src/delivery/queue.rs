@@ -7,6 +7,7 @@ use rusqlite::{OptionalExtension, Transaction, params};
 
 use super::{
     DeliveryService, SubmitFence,
+    envelope::decode_queue_envelope,
     queries::{sql_error, update_delivery},
     send::{outcome_detail, submit_state},
 };
@@ -18,12 +19,14 @@ use crate::{
 
 const QUEUE_LIMIT: u8 = 64;
 pub(super) const ATTACHMENT_UNAVAILABLE: &str = "attachment_unavailable";
+const CORRUPT_ENVELOPE: &str = "corrupt_envelope";
 const RECEIPT_UNCONFIRMED: &str = "receipt_unconfirmed";
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum PreClaim {
     Ready,
     Expired,
+    CorruptEnvelope,
     AttachmentUnavailable,
 }
 
@@ -90,6 +93,7 @@ impl DeliveryService {
         let Some(item) = self.oldest(id).await? else {
             return Ok(false);
         };
+        let decoded_input = decode_queue_envelope(&item.envelope, &item.message_id);
         let Ok(mut slot) = session.try_submit(item.message_id.as_str()) else {
             return Ok(false);
         };
@@ -98,6 +102,8 @@ impl DeliveryService {
             let now = (self.clock)()?;
             let pre_claim = if now >= item.deadline {
                 PreClaim::Expired
+            } else if decoded_input.is_err() {
+                PreClaim::CorruptEnvelope
             } else if self.attachments_available(&item.attachments, now).await? {
                 PreClaim::Ready
             } else {
@@ -127,11 +133,14 @@ impl DeliveryService {
                 return self.persisted_idle(id, generation).await;
             }
         };
+        let Ok(input) = decoded_input else {
+            slot.release_without_wakeup();
+            return Ok(false);
+        };
         let QueueItem {
             queue_id,
             message_id,
             deadline,
-            envelope,
             ..
         } = item;
         let outcome = match (self.clock)() {
@@ -141,7 +150,7 @@ impl DeliveryService {
                 slot.submit(SubmitTurnRequest {
                     operation_key: message_id.to_string(),
                     message_id: Some(message_id.clone()),
-                    envelope,
+                    input,
                     output_schema: None,
                     steer: false,
                     admission,
@@ -285,6 +294,8 @@ impl DeliveryService {
                 let now = clock().map_err(NodeError::from)?;
                 let terminal = if pre_claim == PreClaim::Expired || now >= deadline {
                     Some(("expired", DeliveryState::Expired, QUEUE_EXPIRED_DETAIL))
+                } else if pre_claim == PreClaim::CorruptEnvelope {
+                    Some(("cancelled", DeliveryState::Unavailable, CORRUPT_ENVELOPE))
                 } else if pre_claim == PreClaim::AttachmentUnavailable
                     || !still_live(tx, &attachments, now)?
                 {
@@ -298,7 +309,7 @@ impl DeliveryService {
                 };
                 if let Some((queue, message, detail)) = terminal {
                     let updated = tx.execute(
-                        "UPDATE intake_queue SET state = ?1, resolved_at_ms = ?2
+                        "UPDATE intake_queue SET state = ?1, resolved_at_ms = ?2, payload_envelope = ''
                      WHERE queue_id = ?3 AND state = 'queued'",
                         params![queue, now, queue_id],
                     )?;
@@ -441,8 +452,11 @@ fn finish_queued_tx(
         _ => ("queued", submit_state(outcome), None),
     };
     if tx.execute(
-        "UPDATE intake_queue SET state = ?1, resolved_at_ms = ?2
-     WHERE queue_id = ?3 AND state = 'dispatched'",
+        "UPDATE intake_queue
+         SET state = ?1,
+             resolved_at_ms = ?2,
+             payload_envelope = CASE WHEN ?1 = 'queued' THEN payload_envelope ELSE '' END
+         WHERE queue_id = ?3 AND state = 'dispatched'",
         params![queue, (queue != "queued").then_some(now), queue_id],
     )? != 1
     {
@@ -556,7 +570,7 @@ pub(super) fn expire_for_recipient(
     events: &mut Vec<EventNotice>,
 ) -> rusqlite::Result<()> {
     let mut statement = tx.prepare_cached(
-        "UPDATE intake_queue SET state = 'expired', resolved_at_ms = ?1
+        "UPDATE intake_queue SET state = 'expired', resolved_at_ms = ?1, payload_envelope = ''
          WHERE participant_id = ?2 AND state = 'queued' AND deadline_at_ms <= ?1
          RETURNING message_id",
     )?;

@@ -503,6 +503,8 @@ fn bridge_and_event_nested_validation_and_object_defaults() -> TestResult {
         "command": {
             "type": "send_message",
             "message_id": "msg_00000000000000000000000000",
+            "sender_kind": "human",
+            "sender_name": "Operator",
             "recipient_id": PART,
             "body": "hi",
             "attachments": [{
@@ -524,6 +526,8 @@ fn bridge_and_event_nested_validation_and_object_defaults() -> TestResult {
         "command": {
             "type": "send_message",
             "message_id": "msg_00000000000000000000000000",
+            "sender_kind": "agent",
+            "sender_name": "reviewer",
             "recipient_id": PART,
             "body": "hi",
             "question": {"prompt": "q?", "mode": "text"},
@@ -680,5 +684,125 @@ fn bridge_and_event_nested_validation_and_object_defaults() -> TestResult {
             .is_err()
     );
 
+    Ok(())
+}
+
+#[test]
+fn author_kind_and_strict_display_handle_actor_validation() -> TestResult {
+    for (kind, wire) in [
+        (AuthorKind::Human, "human"),
+        (AuthorKind::Agent, "agent"),
+        (AuthorKind::Service, "service"),
+    ] {
+        assert_eq!(kind.as_str(), wire);
+        assert_eq!(wire.parse::<AuthorKind>()?, kind);
+        assert_eq!(serde_json::to_value(kind)?, json!(wire));
+    }
+    for rejected in ["system", "workflow", "operator", ""] {
+        assert!(rejected.parse::<AuthorKind>().is_err());
+        assert!(serde_json::from_value::<AuthorKind>(json!(rejected)).is_err());
+    }
+
+    assert!(validate_display_name("Orchestrateur d’équipe").is_ok());
+    assert!(validate_label("").is_ok());
+    assert!(validate_actor_handle("worker-1").is_ok());
+    assert!(validate_actor_id("node_01/part_01").is_ok());
+    assert!(validate_display_name(&"a".repeat(128)).is_ok());
+    assert!(validate_display_name(&"a".repeat(129)).is_err());
+
+    for bad in [
+        "",
+        "   ",
+        "bad\nline",
+        "bidi\u{202E}spoof",
+        "line\u{2028}sep",
+        "para\u{2029}sep",
+        "isolate\u{2066}x",
+        "zwsp\u{200B}spoof",
+        "bom\u{FEFF}spoof",
+        "shy\u{00AD}spoof",
+        "\u{2060}",
+        "operator\u{2060}",
+        "cgj\u{034F}x",
+        "mvs\u{180E}x",
+        "\u{3164}",
+        "hangul\u{115F}x",
+        "annot\u{FFF9}x",
+        "tag\u{E0020}smuggle",
+    ] {
+        assert!(validate_display_name(bad).is_err(), "{bad:?}");
+        assert!(validate_actor_handle(bad).is_err(), "{bad:?}");
+        assert!(validate_actor_id(bad).is_err(), "{bad:?}");
+    }
+    assert!(validate_actor_handle("has space").is_err());
+    assert!(validate_actor_id("has space").is_err());
+    assert!(validate_label("bidi\u{202E}").is_err());
+    assert!(validate_label("zwsp\u{200B}").is_err());
+    assert!(validate_label("wj\u{2060}").is_err());
+    assert!(validate_label("tag\u{E0020}").is_err());
+
+    // BridgeCommand::SendMessage validates sender_name and carries sender_kind.
+    let valid_send = json!({
+        "op_id": OP,
+        "actor_id": "usr_00000000000000000000000001",
+        "admission_budget_ms": 100,
+        "delivery_mode": "direct_now",
+        "command": {
+            "type": "send_message",
+            "message_id": "msg_00000000000000000000000000",
+            "sender_kind": "human",
+            "sender_name": "Hub Admin",
+            "recipient_id": PART,
+            "body": "hello"
+        }
+    });
+    strict_round_trip::<CommandReqPayload>(valid_send.clone())?;
+
+    let mut bad_sender_name = valid_send.clone();
+    bad_sender_name["command"]["sender_name"] = json!("Admin\u{200B}");
+    assert!(
+        BridgeFrame::encode_json(
+            1,
+            &serde_json::from_value::<CommandReqPayload>(bad_sender_name)?
+        )
+        .is_err()
+    );
+    let mut bad_actor = valid_send;
+    bad_actor["actor_id"] = json!("actor with space");
+    assert!(
+        BridgeFrame::encode_json(1, &serde_json::from_value::<CommandReqPayload>(bad_actor)?)
+            .is_err()
+    );
+
+    // ThreadPostWire carries author_kind and strictly validates author_actor_id & author_handle.
+    let valid_thread = json!({
+        "delivery_id": OP,
+        "thread_id": THREAD,
+        "member_id": PART,
+        "from_seq": 1,
+        "to_seq": 1,
+        "posts": [{
+            "seq": 1,
+            "post_id": "msg_00000000000000000000000001",
+            "author_actor_id": "usr_00000000000000000000000001",
+            "author_kind": "human",
+            "author_handle": "owner",
+            "body": "hi",
+            "created_at_ms": 1
+        }],
+        "delivery_mode": "queue_until_idle",
+        "admission_budget_ms": 100
+    });
+    strict_round_trip::<ThreadDeliverPayload>(valid_thread.clone())?;
+
+    let mut bad_handle = valid_thread;
+    bad_handle["posts"][0]["author_handle"] = json!("bad handle");
+    assert!(
+        BridgeFrame::encode_json(
+            1,
+            &serde_json::from_value::<ThreadDeliverPayload>(bad_handle)?
+        )
+        .is_err()
+    );
     Ok(())
 }

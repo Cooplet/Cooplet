@@ -14,9 +14,9 @@ use std::{
 };
 
 use cooplet_protocol::{
-    ApprovalDecision, BridgeCommand, CommandReqPayload, DeliveryMode, DeliveryState, ErrorCode,
-    MessageId, NodeId, OperationId, ParticipantId, RunId, ServiceScope, canonical_sha256,
-    validate_idempotency_key,
+    ApprovalDecision, AuthorKind, BridgeCommand, CommandReqPayload, DeliveryMode, DeliveryState,
+    ErrorCode, MessageId, NodeId, OperationId, ParticipantId, RunId, ServiceScope,
+    canonical_sha256, validate_idempotency_key,
 };
 use cooplet_storage::{StorageError, WriteFailure, WriteOutcome};
 use http::StatusCode;
@@ -61,6 +61,13 @@ pub(crate) async fn send_message(
             "Sending a message requires a participant identity.",
         )
     })?;
+    let sender_kind = caller.author_kind().ok_or_else(|| {
+        HubError::new(
+            ErrorCode::Forbidden,
+            "Sending a message requires a human or service identity.",
+        )
+    })?;
+    let sender_name = caller.display_name().to_owned();
     let message_id = MessageId::generate()?;
     input.normalize()?;
     let reply = execute(
@@ -70,6 +77,8 @@ pub(crate) async fn send_message(
         Action::Message {
             message_id,
             sender,
+            sender_kind,
+            sender_name,
             input: Box::new(input),
         },
     )
@@ -230,6 +239,8 @@ enum Action {
     Message {
         message_id: MessageId,
         sender: ParticipantId,
+        sender_kind: AuthorKind,
+        sender_name: String,
         input: Box<MessageRequest>,
     },
 }
@@ -408,10 +419,12 @@ impl Request {
             Action::Message {
                 message_id,
                 sender,
+                sender_kind,
+                sender_name,
                 input,
             } => (
                 sender.as_str(),
-                input.bridge_command(message_id),
+                input.bridge_command(message_id, *sender_kind, sender_name),
                 input.delivery_mode.unwrap_or(DeliveryMode::DirectNow),
                 input.queue_ttl_ms,
             ),
@@ -694,6 +707,7 @@ async fn accept_request(
                     message_id,
                     sender,
                     input,
+                    ..
                 } => {
                     let delivery_state = match local.as_ref().map(|success| &success.body) {
                         Some(Reply::Message(receipt)) => receipt.delivery_state,

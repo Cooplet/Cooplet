@@ -344,7 +344,7 @@ pub(super) fn expire_queued(
     limit: i64,
 ) -> rusqlite::Result<Vec<EventNotice>> {
     let sql = format!(
-        "UPDATE intake_queue SET state = 'expired', resolved_at_ms = ?1
+        "UPDATE intake_queue SET state = 'expired', resolved_at_ms = ?1, payload_envelope = ''
          WHERE queue_id IN ({QUEUE_DEADLINES}) RETURNING queue_id, message_id"
     );
     let mut expired = tx

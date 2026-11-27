@@ -7,7 +7,7 @@ use serde_json::{Value, json};
 use super::*;
 use crate::{
     clients::AdapterRegistry,
-    config::{NodeConfig, operator_path},
+    config::{NodeConfig, OpenNode, operator_path},
     daemon::Node,
 };
 
@@ -107,5 +107,109 @@ async fn delegated_bearers_obey_http_scope_and_operator_only_shutdown() -> TestR
     assert_eq!(manage.health().await?.status, "ok");
     shutdown.send_replace(true);
     task.await??;
+    Ok(())
+}
+
+#[tokio::test]
+async fn auth_lookup_fails_closed_when_participant_kind_mismatches_principal_kind() -> TestResult {
+    let root = Scratch(PrivateFs::ensure_private_dir(
+        &std::env::temp_dir().join(NodeId::generate()?.as_str()),
+    )?);
+    let state = root.0.join("state");
+    let node = OpenNode::start(NodeConfig::new(state.clone(), root.0.clone())).await?;
+    let now = crate::now_ms()?;
+    let op_cred = Credential::read(&operator_path(&state))?;
+
+    // Valid operator credential maps to AuthorKind::Human.
+    let operator = node
+        .auth
+        .authenticate(node.engine.reads(), op_cred.token.clone(), now)
+        .await?;
+    assert_eq!(operator.author_kind(), AuthorKind::Human);
+
+    // If an agent row is tampered into having an operator credential (or vice versa),
+    // lookup must fail closed with Unauthorized.
+    let agent_id = ParticipantId::generate()?;
+    let forged_op_cred = Credential::new(
+        node.info.node_id.clone(),
+        agent_id.clone(),
+        op_cred.address()?,
+    )?;
+    let forged_part_cred = Credential::new(
+        node.info.node_id.clone(),
+        op_cred.participant_id.clone(),
+        op_cred.address()?,
+    )?;
+    let auth = node.auth.clone();
+    let aid = agent_id.clone();
+    let fop = forged_op_cred.clone();
+    let fpart = forged_part_cred.clone();
+    node.engine
+        .db()
+        .write_sqlite(move |tx| {
+            tx.execute(
+                "INSERT INTO participants (participant_id, kind, name, state, created_at_ms, updated_at_ms)
+                 VALUES (?1, 'agent', 'tampered-agent', 'idle', ?2, ?2)",
+                params![aid.as_str(), now],
+            )?;
+            auth.insert_credential(tx, &fop, PrincipalKind::Operator, now)?;
+            auth.insert_credential(tx, &fpart, PrincipalKind::Participant, now)?;
+            Ok(WriteOutcome::new(()))
+        })
+        .await?;
+
+    let err_op = node
+        .auth
+        .authenticate(node.engine.reads(), forged_op_cred.token, now)
+        .await
+        .err()
+        .ok_or("Operator credential linked to agent row must fail closed")?;
+    assert_eq!(err_op.code(), ErrorCode::Unauthorized);
+
+    let err_part = node
+        .auth
+        .authenticate(node.engine.reads(), forged_part_cred.token, now)
+        .await
+        .err()
+        .ok_or("Participant credential linked to human row must fail closed")?;
+    assert_eq!(err_part.code(), ErrorCode::Unauthorized);
+
+    // Adapter and WorkflowRun credentials linked to a participant row must also fail closed.
+    for (principal_kind, kind_str) in [
+        (PrincipalKind::Adapter, "adapter"),
+        (PrincipalKind::WorkflowRun, "workflow_run"),
+    ] {
+        let mut raw = [0u8; 32];
+        random_bytes(&mut raw)?;
+        let token = hex(&raw);
+        let verifier = hex(&node
+            .auth
+            .mac(principal_kind, &token)?
+            .finalize()
+            .into_bytes());
+        let tok_id = TokenId::generate()?;
+        let op_pid = op_cred.participant_id.clone();
+        node.engine
+            .db()
+            .write_sqlite(move |tx| {
+                tx.execute(
+                    "INSERT INTO participant_credentials
+                     (token_id, participant_id, principal_kind, actor_id, scopes_json, verifier_hmac, created_at_ms)
+                     VALUES (?1, ?2, ?3, 'tampered', '[\"read\"]', ?4, ?5)",
+                    params![tok_id.as_str(), op_pid.as_str(), kind_str, verifier, now],
+                )?;
+                Ok(WriteOutcome::new(()))
+            })
+            .await?;
+        let err = node
+            .auth
+            .authenticate(node.engine.reads(), token, now)
+            .await
+            .err()
+            .ok_or("Adapter/WorkflowRun linked to participant row must fail closed")?;
+        assert_eq!(err.code(), ErrorCode::Unauthorized);
+    }
+
+    node.engine.shutdown().await?;
     Ok(())
 }

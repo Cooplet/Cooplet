@@ -7,6 +7,14 @@ use crate::{
 };
 
 crate::wire::wire_string_enum! {
+    pub enum AuthorKind {
+        Human => "human",
+        Agent => "agent",
+        Service => "service",
+    }
+}
+
+crate::wire::wire_string_enum! {
     pub enum ParticipantKind {
         Agent => "agent",
         Human => "human",

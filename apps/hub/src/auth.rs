@@ -1,8 +1,8 @@
 use std::collections::BTreeSet;
 
 use cooplet_protocol::{
-    ErrorCode, NodeId, ParticipantId, PrincipalKind, ServicePrincipalId, ServiceScope, TokenId,
-    UserId, WhoamiResponse,
+    AuthorKind, ErrorCode, NodeId, ParticipantId, PrincipalKind, ServicePrincipalId, ServiceScope,
+    TokenId, UserId, WhoamiResponse,
 };
 use cooplet_storage::ReadPool;
 use rusqlite::{Connection, OptionalExtension, Row, Transaction, params};
@@ -88,8 +88,16 @@ impl AuthenticatedCaller {
         )
     }
 
-    pub(crate) fn is_service(&self) -> bool {
-        matches!(self.identity, Identity::Service { .. })
+    pub(crate) fn display_name(&self) -> &str {
+        &self.display_name
+    }
+
+    pub(crate) fn author_kind(&self) -> Option<AuthorKind> {
+        match self.identity {
+            Identity::Human { .. } => Some(AuthorKind::Human),
+            Identity::Service { .. } => Some(AuthorKind::Service),
+            Identity::Node { .. } => None,
+        }
     }
 
     pub(crate) fn is_global_reader(&self) -> bool {

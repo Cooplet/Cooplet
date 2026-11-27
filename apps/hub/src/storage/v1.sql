@@ -180,6 +180,7 @@ CREATE TABLE thread_posts (
     seq                 INTEGER NOT NULL,
     post_id             TEXT    NOT NULL UNIQUE,
     author_actor_id     TEXT    NOT NULL,
+    author_kind         TEXT    NOT NULL CHECK (author_kind IN ('human','agent','service')),
     author_handle       TEXT    NOT NULL,
     in_reply_to_post_id TEXT,
     body                TEXT    NOT NULL,

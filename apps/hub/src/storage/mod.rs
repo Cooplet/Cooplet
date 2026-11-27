@@ -64,10 +64,7 @@ pub(crate) async fn init(state_dir: &Path, display_name: &str) -> StartupResult<
         )
         .into());
     }
-    if display_name.trim().is_empty()
-        || display_name.len() > 128
-        || display_name.chars().any(char::is_control)
-    {
+    if cooplet_protocol::validate_display_name(display_name).is_err() {
         return Err(io::Error::other("invalid Hub display name").into());
     }
     let state_dir: PathBuf = state_dir.components().collect();

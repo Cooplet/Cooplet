@@ -29,6 +29,9 @@ pub struct CoreBinding {
     pub runtime_event_seq: Option<u64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub overrides: Option<AgentOverrides>,
+    /// Initial Level-1 + template instructions frozen at `create` and reused on `resume`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub frozen_instructions: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub pending_approval: Option<PendingApprovalRecord>,
     #[serde(skip_serializing_if = "Option::is_none")]
