@@ -100,7 +100,8 @@ impl Fixture {
     }
 
     fn doctor(&self, mode: &str) -> Test<Value> {
-        let output = self.command(mode)?
+        let output = self
+            .command(mode)?
             .env("PATH", &self.root)
             .args(["node", "doctor"])
             .output()?;
