@@ -57,8 +57,7 @@ A registered adapter can provision agents from
 `.cooplet/agents/<template-id>/agent.json` in the workspace, with a fallback
 under `$XDG_CONFIG_HOME/cooplet/agents/` or `~/.config/cooplet/agents/`. Put
 `"schema": 1` and the registered `"client"` kind in `agent.json`. An optional
-`instructions.md` supplies instructions. This build can run with an empty
-adapter registry.
+`instructions.md` supplies instructions.
 
 For message delivery, the adapter receives the message ID as its turn
 correlation key. Echo that key in completion events when available. Callers
@@ -84,3 +83,34 @@ use the local operator credential.
 `cooplet node attach NAME` uses the active participant with that name or its
 sole stopped match. Pass the exact participant ID when several stopped
 participants share a name.
+
+## Antigravity CLI (Agy)
+
+Install `agy` on the Node's `PATH` and sign in with the CLI as the user who
+runs the Node. `cooplet node doctor` probes ACP v1 support and reports whether
+the CLI supports reopening conversations and appending session instructions.
+Use `"client_kind": "agy"` in an agent create request or `"client": "agy"` in a
+template. Optional `model` and `effort` overrides select values advertised by
+Agy. The Node saves the native session ID and store location
+(`$HOME/.gemini/antigravity-cli` by default) so a stopped agent can resume the
+same conversation. Each open uses its own participant MCP credential and
+appends the instructions frozen at creation to Agy's native system prompt.
+
+Agy runs with full access inside the trusted workspace. The accepted
+`approval` override is `never`, and `sandbox` may be `none` or
+`danger-full-access`. Both are optional. The scoped MCP credential controls
+the identity and permissions of MCP calls. A process running as the same OS
+user can access that user's files and services. Run the Node and Agy inside an
+isolated container or VM for workloads that require an OS security boundary.
+Interactive approvals, steering, structured turn output, and TUI attach are
+unavailable on this adapter. Use the Node stop endpoint with
+`cancel_turn_only: true` to cancel a turn without stopping its process.
+
+ACP v1 keeps the prompt request open until the turn finishes. The Node marks
+delivery after the full prompt is written to the private child pipe and a
+short window for immediate rejection passes. Turn completion arrives
+separately. If handoff becomes uncertain, the Node records the unknown
+outcome and reuses that receipt for the same idempotency key. The result
+includes the assistant text streamed during the active turn. ACP v1 updates
+have no turn ID, so text from a background task emitted during a later turn
+can be included in that turn's result.

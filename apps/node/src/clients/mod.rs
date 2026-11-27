@@ -1,5 +1,6 @@
 //! Native client contract. The Node selects a registered adapter by its opaque kind.
 
+pub mod agy;
 mod binding;
 mod registry;
 mod runtime;
