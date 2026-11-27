@@ -710,7 +710,9 @@ fn split_extension(basename: &str) -> (&str, &str) {
 }
 
 fn unsafe_filename_char(c: char) -> bool {
-    c.is_control() || matches!(c, '/' | '\\' | ':' | '<' | '>' | '|' | '?' | '*' | '"')
+    c.is_control()
+        || cooplet_protocol::is_bidi_or_line_control(c)
+        || matches!(c, '/' | '\\' | ':' | '<' | '>' | '|' | '?' | '*' | '"')
 }
 
 fn checked_dir(path: &Path) -> Result<Option<File>, StorageError> {

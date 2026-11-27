@@ -13,8 +13,10 @@ pub use fs::PrivateFs;
 pub use lock::{FileLock, LockProbe};
 pub use process::{
     PendingCleanup, ProcessHandle, ProcessIdentity, ProcessProbe, SpawnError, TerminateOutcome,
-    Termination,
+    Termination, current_linux_boot_id,
 };
+#[cfg(target_os = "linux")]
+pub use process::{PidfdPoll, poll_pidfds};
 pub use publish::{AtomicPublish, PublishOutcome};
 
 pub fn current_euid() -> u32 {

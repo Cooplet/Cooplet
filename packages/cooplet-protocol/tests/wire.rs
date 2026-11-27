@@ -432,7 +432,21 @@ fn attachment_approval_question_and_canonical_edge_cases() -> TestResult {
         assert!(att.validate().is_err(), "accepted bad mime {bad_mime:?}");
     }
     validate_attachment_name("spec.md")?;
-    for bad_name in ["", "   ", "a\0b", "a\nb", "a\x1bb", &"a".repeat(256)] {
+    for bad_name in [
+        "",
+        "   ",
+        "a\0b",
+        "a\nb",
+        "a\x1bb",
+        "a\u{0085}b",
+        "report\u{202E}gpj.exe",
+        "a\u{2066}b\u{2069}.txt",
+        "a\u{200E}b.txt",
+        "a\u{061C}b.txt",
+        "a\u{2028}b.txt",
+        "a\u{2029}b.txt",
+        &"a".repeat(256),
+    ] {
         assert!(
             validate_attachment_name(bad_name).is_err(),
             "accepted bad name {bad_name:?}"

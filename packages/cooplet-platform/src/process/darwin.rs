@@ -170,6 +170,9 @@ pub(super) fn terminate_detached(
     pid: libc::pid_t,
     _grace: Duration,
 ) -> Result<TerminateOutcome, PlatformError> {
+    if super::is_self_pid_or_pgid(pid) {
+        return Ok(TerminateOutcome::CleanupUnverified);
+    }
     // Darwin has no stable group address for a persisted PID. A changed
     // KERN_BOOTTIME can also reflect a wall-clock adjustment.
     Ok(if group_absent(pid).is_ok_and(|absent| absent) {

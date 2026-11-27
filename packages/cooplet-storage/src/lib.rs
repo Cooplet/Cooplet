@@ -21,7 +21,7 @@ use tokio::{
     task::JoinHandle as Task,
 };
 
-pub use actor::{DbActor, WriteOutcome};
+pub use actor::{DbActor, EventNotice, WriteOutcome};
 pub use blob_store::{BlobDiskStore, BlobInput, StoredBlob, safe_disk_name};
 pub use config::{BlobStoreConfig, DEFAULT_MAX_BLOB_BYTES, StorageConfig, SynchronousMode};
 pub use error::{StorageError, WriteError, WriteFailure};
@@ -87,8 +87,9 @@ impl StorageEngine {
     ///
     /// The check runs once on the writer thread with a read-only connection
     /// and the database sidecar held. Returning an error aborts startup before
-    /// read-write open, migrations or blob recovery. On success the same
-    /// sidecar remains held for managed startup and normal operation.
+    /// read-write open, migrations or blob recovery. Preflight sees committed
+    /// WAL data without creating WAL or shared-memory files. On success the
+    /// same sidecar remains held for managed startup and normal operation.
     pub async fn open_existing_managed_checked(
         config: StorageConfig,
         migrations: &[Migration],
@@ -101,9 +102,47 @@ impl StorageEngine {
             migrations,
             hooks,
             blob_config,
-            Some(Box::new(check)),
+            Some(pragma::ExistingDatabaseCheck {
+                require_database: true,
+                validate: Box::new(check),
+            }),
         )
         .await
+    }
+
+    /// Create a managed database or check its existing state before opening it
+    /// for writes. The database sidecar protects that choice and the check.
+    pub async fn open_managed_checked(
+        config: StorageConfig,
+        migrations: &[Migration],
+        hooks: Arc<dyn GcHooks>,
+        blob_config: Option<BlobStoreConfig>,
+        check: impl FnOnce(&rusqlite::Connection) -> Result<(), StorageError> + Send + 'static,
+    ) -> Result<Self, StorageError> {
+        Self::open_managed_database(
+            config,
+            migrations,
+            hooks,
+            blob_config,
+            Some(pragma::ExistingDatabaseCheck {
+                require_database: false,
+                validate: Box::new(check),
+            }),
+        )
+        .await
+    }
+
+    /// Inspect an offline database under a shared guard on its existing
+    /// sidecar. Other inspections can run concurrently. No writer or
+    /// maintenance worker is started.
+    pub async fn check_existing<T: Send + 'static>(
+        config: StorageConfig,
+        migrations: &[Migration],
+        check: impl FnOnce(&rusqlite::Connection) -> Result<T, StorageError> + Send + 'static,
+    ) -> Result<T, StorageError> {
+        pragma::validate_config(&config)?;
+        let target = migrate::target_version(migrations)?;
+        tokio::task::spawn_blocking(move || pragma::check_existing(&config, target, check)).await?
     }
 
     async fn open_managed_database(

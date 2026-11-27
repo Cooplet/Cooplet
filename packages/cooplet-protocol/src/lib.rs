@@ -58,17 +58,32 @@ pub fn validate_step_key(key: &str) -> Result<(), ValidationError> {
     }
 }
 
-/// Validate a user-facing attachment filename (1..=255 UTF-8 bytes, non-blank, no ASCII controls).
+/// Validate a user-facing attachment filename (1..=255 UTF-8 bytes, non-blank,
+/// no control characters, line/paragraph separators, or Unicode bidirectional
+/// override/isolate marks).
 pub fn validate_attachment_name(name: &str) -> Result<(), ValidationError> {
     if name.is_empty()
         || name.len() > 255
         || name.trim().is_empty()
-        || name.bytes().any(|byte| byte < 0x20 || byte == 0x7f)
+        || name
+            .chars()
+            .any(|ch| ch.is_control() || is_bidi_or_line_control(ch))
     {
         Err(ValidationError("attachment name"))
     } else {
         Ok(())
     }
+}
+
+/// Returns `true` for Unicode bidirectional override/isolate controls and line/paragraph separators.
+pub fn is_bidi_or_line_control(ch: char) -> bool {
+    matches!(
+        ch,
+        '\u{061C}'
+            | '\u{200E}'..='\u{200F}'
+            | '\u{2028}'..='\u{202E}'
+            | '\u{2066}'..='\u{2069}'
+    )
 }
 
 /// Validate an RFC 9110 concrete media type (`type/subtype` with optional parameters).

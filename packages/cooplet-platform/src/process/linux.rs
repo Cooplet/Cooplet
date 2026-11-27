@@ -5,20 +5,31 @@ use std::{
     os::unix::fs::MetadataExt,
     path::Path,
     ptr,
+    sync::OnceLock,
     time::Duration,
 };
 
 use super::{ProcessIdentity, Snapshot, StopState, TerminateOutcome, group_absent};
 use crate::{PlatformError, current_euid};
 
-fn boot_id() -> io::Result<String> {
+static BOOT_ID: OnceLock<String> = OnceLock::new();
+
+fn boot_id_str() -> io::Result<&'static str> {
+    if let Some(cached) = BOOT_ID.get() {
+        return Ok(cached.as_str());
+    }
     let id = fs::read_to_string("/proc/sys/kernel/random/boot_id")?;
     let id = id.trim();
     if valid_boot_id(id) {
-        Ok(id.into())
+        let _ = BOOT_ID.set(id.to_owned());
+        BOOT_ID.get().map(String::as_str).ok_or_else(invalid_proc)
     } else {
         Err(invalid_proc())
     }
+}
+
+pub(super) fn boot_id() -> io::Result<String> {
+    boot_id_str().map(str::to_owned)
 }
 
 fn valid_boot_id(id: &str) -> bool {
@@ -54,7 +65,7 @@ pub(super) fn capture(pid: libc::pid_t) -> Result<(Snapshot, String), PlatformEr
     if stat.ticks != after.ticks || stat.pgid != after.pgid {
         return Err(invalid_proc().into());
     }
-    let boot = boot_id()?;
+    let boot = boot_id_str()?;
     Ok((
         Snapshot {
             pgid: stat.pgid,
@@ -295,8 +306,11 @@ pub(super) fn terminate_detached(
     pid: libc::pid_t,
     grace: Duration,
 ) -> Result<TerminateOutcome, PlatformError> {
-    if boot_id().is_ok_and(|boot| Some(boot.as_str()) != boot_from_token(&identity.start_token)) {
+    if boot_id_str().is_ok_and(|boot| Some(boot) != boot_from_token(&identity.start_token)) {
         return Ok(TerminateOutcome::AlreadyGone);
+    }
+    if super::is_self_pid_or_pgid(pid) {
+        return Ok(TerminateOutcome::CleanupUnverified);
     }
     if group_absent(pid).is_ok_and(|absent| absent) {
         return Ok(TerminateOutcome::AlreadyGone);
@@ -395,27 +409,70 @@ pub(super) fn open_pidfd(pid: libc::pid_t) -> io::Result<OwnedFd> {
     }
 }
 
+fn poll_fds(targets: &mut [libc::pollfd], timeout_ms: libc::c_int) -> io::Result<libc::c_int> {
+    let nfds = libc::nfds_t::try_from(targets.len()).map_err(|_| invalid_proc())?;
+    loop {
+        for target in targets.iter_mut() {
+            target.revents = 0;
+        }
+        // SAFETY: `targets` is a valid writable slice of `nfds` `pollfd` entries.
+        let ready = unsafe { libc::poll(targets.as_mut_ptr(), nfds, timeout_ms) };
+        if ready >= 0 {
+            return Ok(ready);
+        }
+        let error = io::Error::last_os_error();
+        if error.kind() != io::ErrorKind::Interrupted {
+            return Err(error);
+        }
+    }
+}
+
 pub(super) fn pidfd_exited(fd: &OwnedFd) -> io::Result<bool> {
-    let mut target = libc::pollfd {
+    let mut targets = [libc::pollfd {
         fd: fd.as_raw_fd(),
         events: libc::POLLIN,
         revents: 0,
-    };
-    loop {
-        target.revents = 0;
-        // SAFETY: poll receives one valid writable pollfd and a nonblocking timeout.
-        match unsafe { libc::poll(&mut target, 1, 0) } {
-            0 => return Ok(false),
-            1 if target.revents & (libc::POLLIN | libc::POLLHUP) != 0 => return Ok(true),
-            1 => return Err(invalid_proc()),
-            _ => {
-                let error = io::Error::last_os_error();
-                if error.kind() != io::ErrorKind::Interrupted {
-                    return Err(error);
-                }
-            }
+    }];
+    match poll_fds(&mut targets, 0)? {
+        0 => Ok(false),
+        1 if targets[0].revents & (libc::POLLIN | libc::POLLHUP) != 0 => Ok(true),
+        _ => Err(invalid_proc()),
+    }
+}
+
+pub(super) fn poll_pidfds(
+    pidfds: &[&OwnedFd],
+    wake: &io::PipeReader,
+) -> io::Result<super::PidfdPoll> {
+    let mut targets = Vec::with_capacity(pidfds.len() + 1);
+    targets.push(libc::pollfd {
+        fd: wake.as_raw_fd(),
+        events: libc::POLLIN,
+        revents: 0,
+    });
+    for pidfd in pidfds {
+        targets.push(libc::pollfd {
+            fd: pidfd.as_raw_fd(),
+            events: libc::POLLIN,
+            revents: 0,
+        });
+    }
+    poll_fds(&mut targets, -1)?;
+    let wake_revents = targets[0].revents;
+    let woken = wake_revents & libc::POLLIN != 0;
+    let wake_closed =
+        !woken && (wake_revents & (libc::POLLHUP | libc::POLLERR | libc::POLLNVAL) != 0);
+    let mut exited = Vec::new();
+    for (index, target) in targets[1..].iter().enumerate() {
+        if target.revents & (libc::POLLIN | libc::POLLHUP | libc::POLLERR | libc::POLLNVAL) != 0 {
+            exited.push(index);
         }
     }
+    Ok(super::PidfdPoll {
+        woken,
+        wake_closed,
+        exited,
+    })
 }
 
 fn pidfd_signal(fd: &OwnedFd, signal: libc::c_int, flags: libc::c_uint) -> io::Result<()> {

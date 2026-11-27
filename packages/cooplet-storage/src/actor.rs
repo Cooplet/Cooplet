@@ -6,7 +6,7 @@ use std::{
 };
 
 use cooplet_platform::FileLock;
-use cooplet_protocol::EventEnvelope;
+use cooplet_protocol::EventKind;
 use rusqlite::{Connection, Transaction, TransactionBehavior};
 use tokio::sync::{broadcast, mpsc, oneshot};
 
@@ -15,10 +15,19 @@ use crate::{
     gc::checkpoint, pragma,
 };
 
+/// Lightweight wake-up emitted after a transaction commits an event row.
+/// Subscribers read full envelopes from `ReadPool`, keeping the broadcast ring
+/// fixed-size regardless of payload sizes.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct EventNotice {
+    pub seq: u64,
+    pub kind: EventKind,
+}
+
 #[derive(Debug)]
 pub struct WriteOutcome<T> {
     pub value: T,
-    pub events: Vec<EventEnvelope>,
+    pub events: Vec<EventNotice>,
 }
 
 impl<T> WriteOutcome<T> {
@@ -29,7 +38,7 @@ impl<T> WriteOutcome<T> {
         }
     }
 
-    pub fn with_events(value: T, events: Vec<EventEnvelope>) -> Self {
+    pub fn with_events(value: T, events: Vec<EventNotice>) -> Self {
         Self { value, events }
     }
 }
@@ -52,7 +61,7 @@ struct WriterHandle {
 #[derive(Clone)]
 pub struct DbActor {
     inbox: Arc<Mutex<Option<mpsc::Sender<Job>>>>,
-    events: broadcast::Sender<EventEnvelope>,
+    events: broadcast::Sender<EventNotice>,
 }
 
 impl DbActor {
@@ -137,7 +146,7 @@ impl DbActor {
         Ok((actor, reads, thread))
     }
 
-    pub fn subscribe(&self) -> broadcast::Receiver<EventEnvelope> {
+    pub fn subscribe(&self) -> broadcast::Receiver<EventNotice> {
         self.events.subscribe()
     }
 
