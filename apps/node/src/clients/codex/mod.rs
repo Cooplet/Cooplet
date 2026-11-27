@@ -391,8 +391,9 @@ impl ClientAdapter for CodexAdapter {
                     Err(Failure::Rejected(Rejection::NoIntake | Rejection::UnsupportedMethod)) => {
                         StopOutcome::Unsupported("Codex rejected the interrupt".into())
                     }
-                    Err(Failure::NotSent(reason)) => StopOutcome::Unsupported(reason.into()),
-                    Err(Failure::Uncertain(reason)) => StopOutcome::Unknown(reason.into()),
+                    Err(Failure::NotSent(reason) | Failure::Uncertain(reason)) => {
+                        StopOutcome::Unknown(reason.into())
+                    }
                     _ => StopOutcome::Unknown("Codex did not acknowledge the interrupt".into()),
                 },
             )

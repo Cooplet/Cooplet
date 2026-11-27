@@ -26,7 +26,7 @@ use tokio_tungstenite::{
 
 use super::{
     approvals::ReplyError,
-    events::{Observations, ProtocolResult, Snapshot, native_id},
+    events::{Observations, ProtocolResult, Snapshot, SubmittedInput, native_id},
 };
 use crate::clients::{
     AdapterEvent, ApprovalDecision, ApprovalWait, ParticipantRuntimeState as State,
@@ -395,6 +395,7 @@ fn send(
             return Ok(());
         }
     };
+    let named_output = prepared.packet.pointer("/params/toolOutput").is_some();
     let text = prepared.packet.to_string();
     if text.len() > MAX_MESSAGE_BYTES || pending.len() >= MAX_PENDING {
         let _ = result.send(Err(Failure::NotSent("Codex request capacity exceeded")));
@@ -421,7 +422,14 @@ fn send(
             operation_key,
             schema,
             ..
-        } => observed.begin_submit(operation_key, schema.is_some()),
+        } => {
+            let input = if named_output {
+                SubmittedInput::NamedOutput
+            } else {
+                SubmittedInput::UserMessage(operation_key)
+            };
+            observed.begin_submit(input, schema.is_some());
+        }
         Operation::Approval(_) => {
             observed.approvals.consume_current();
             // A response is a JSON-RPC result, with no acknowledgement for the answering client.

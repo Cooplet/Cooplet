@@ -69,7 +69,13 @@ enum Phase {
         early_completions: Vec<DeferredTurnCompletion>,
     },
     Running(Run),
-    Fenced,
+    Fenced(Option<FencedSubmission>),
+}
+
+struct FencedSubmission {
+    slot_id: u64,
+    operation_key: String,
+    early_completions: Vec<DeferredTurnCompletion>,
 }
 
 struct DeferredTurnCompletion {
@@ -123,6 +129,28 @@ enum SlotEvent {
 }
 
 impl Run {
+    fn new(operation_key: String, native_turn_id: Option<String>) -> Self {
+        Self {
+            operation_key,
+            has_correlation: native_turn_id.is_some(),
+            native_turn_id,
+            saw_working: false,
+            completed: false,
+            idle: false,
+        }
+    }
+
+    fn correlate_completion(&self, completion: &mut DeferredTurnCompletion) -> bool {
+        let matches = self.matches_completion(
+            completion.native_turn_id.as_deref(),
+            completion.operation_key.as_deref(),
+        );
+        if matches && completion.operation_key.is_none() {
+            completion.operation_key = Some(self.operation_key.clone());
+        }
+        matches
+    }
+
     fn matches_completion(&self, turn_id: Option<&str>, operation_key: Option<&str>) -> bool {
         match (self.native_turn_id.as_deref(), turn_id, operation_key) {
             (Some(expected), Some(actual), key) => {
@@ -233,7 +261,7 @@ impl LiveSession {
 
     fn observe(&self, event_seq: u64, changes_runtime: bool) -> bool {
         let mut state = lock(&self.state);
-        if matches!(state.phase, Phase::Fenced) || state.last_event_seq >= event_seq {
+        if matches!(state.phase, Phase::Fenced(_)) || state.last_event_seq >= event_seq {
             return false;
         }
         if changes_runtime {
@@ -252,7 +280,7 @@ impl LiveSession {
         mut completion: Option<DeferredTurnCompletion>,
     ) -> RecordOutcome {
         let mut state = lock(&self.state);
-        if matches!(state.phase, Phase::Fenced) || state.last_event_seq >= event_seq {
+        if matches!(state.phase, Phase::Fenced(_)) || state.last_event_seq >= event_seq {
             return RecordOutcome {
                 early_limit_exceeded: false,
                 immediate_completion: None,
@@ -272,7 +300,7 @@ impl LiveSession {
                 ..
             } if early_events.len() >= MAX_EARLY_EVENTS => {
                 state.current = ParticipantState::Unknown;
-                state.phase = Phase::Fenced;
+                state.phase = Phase::Fenced(None);
                 RecordOutcome {
                     early_limit_exceeded: true,
                     immediate_completion: None,
@@ -328,13 +356,31 @@ impl LiveSession {
 
     #[cfg(target_os = "linux")]
     pub(super) fn is_fenced(&self) -> bool {
-        matches!(lock(&self.state).phase, Phase::Fenced)
+        matches!(lock(&self.state).phase, Phase::Fenced(_))
     }
 
     fn fence(&self) {
         let mut state = lock(&self.state);
         state.current = ParticipantState::Unknown;
-        state.phase = Phase::Fenced;
+        if matches!(state.phase, Phase::Fenced(_)) {
+            return;
+        }
+        if let Phase::Submitting {
+            slot_id,
+            operation_key,
+            early_completions,
+            submitted: true,
+            ..
+        } = std::mem::replace(&mut state.phase, Phase::Fenced(None))
+            && !early_completions.is_empty()
+        {
+            // A ready ACK may still finish this exact slot after stream loss.
+            state.phase = Phase::Fenced(Some(FencedSubmission {
+                slot_id,
+                operation_key,
+                early_completions,
+            }));
+        }
     }
 
     pub(super) fn wake_if_idle(&self) {
@@ -432,6 +478,30 @@ impl SubmitSlot {
     fn apply_finish(&mut self, outcome: &SubmitOutcome, approval_current: bool) -> FinishPlan {
         self.finished = true;
         let mut state = lock(&self.live.state);
+        if let Phase::Fenced(fenced) = &mut state.phase
+            && fenced
+                .as_ref()
+                .is_some_and(|submission| submission.slot_id == self.slot_id)
+        {
+            let deferred = match (fenced.take(), outcome) {
+                (Some(submission), SubmitOutcome::Accepted { native_turn_id }) => {
+                    let run = Run::new(submission.operation_key, native_turn_id.clone());
+                    submission
+                        .early_completions
+                        .into_iter()
+                        .filter_map(|mut completion| {
+                            run.correlate_completion(&mut completion)
+                                .then_some(completion)
+                        })
+                        .collect()
+                }
+                _ => Vec::new(),
+            };
+            return FinishPlan {
+                deferred,
+                disconnect: false,
+            };
+        }
         let Phase::Submitting { slot_id, .. } = &state.phase else {
             return FinishPlan {
                 deferred: Vec::new(),
@@ -458,20 +528,9 @@ impl SubmitSlot {
         };
         match outcome {
             SubmitOutcome::Accepted { native_turn_id } => {
-                let mut run = Run {
-                    operation_key,
-                    native_turn_id: native_turn_id.clone(),
-                    has_correlation: native_turn_id.is_some(),
-                    saw_working: false,
-                    completed: false,
-                    idle: false,
-                };
+                let mut run = Run::new(operation_key, native_turn_id.clone());
                 for completion in &mut early_completions {
-                    if completion.operation_key.is_none()
-                        && run.matches_completion(completion.native_turn_id.as_deref(), None)
-                    {
-                        completion.operation_key = Some(run.operation_key.clone());
-                    }
+                    run.correlate_completion(completion);
                 }
                 let mut opens = false;
                 for event in early_events {
@@ -491,7 +550,7 @@ impl SubmitSlot {
             }
             SubmitOutcome::Unknown(_) => {
                 state.current = ParticipantState::Unknown;
-                state.phase = Phase::Fenced;
+                state.phase = Phase::Fenced(None);
                 FinishPlan {
                     deferred: Vec::new(),
                     disconnect: true,
@@ -562,7 +621,7 @@ impl Drop for SubmitSlot {
             }
             if self.native_started {
                 state.current = ParticipantState::Unknown;
-                state.phase = Phase::Fenced;
+                state.phase = Phase::Fenced(None);
                 fenced = true;
             } else {
                 state.phase = Phase::Open;
@@ -1031,9 +1090,10 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn positive_ack_already_ready_survives_event_stream_loss() -> SessionTestResult {
-        use super::{SubmitOutcome, SubmitTurnRequest};
+    async fn ready_ack_and_its_early_terminal_survive_event_stream_loss() -> SessionTestResult {
+        use super::{DeferredTurnCompletion, SubmitOutcome, SubmitTurnRequest, TurnFinishStatus};
         use cooplet_platform::AdmissionGuard;
+        use serde_json::json;
         use std::{
             future::Future,
             task::{Context, Poll, Waker},
@@ -1045,30 +1105,60 @@ mod tests {
             .try_submit("simultaneous-ack")
             .map_err(|error| format!("{error:?}"))?;
         let admission = AdmissionGuard::new(Duration::from_secs(10));
-        let submit = slot.submit(SubmitTurnRequest {
-            operation_key: "simultaneous-ack".into(),
-            message_id: None,
-            input: test_turn_input()?,
-            output_schema: None,
-            steer: false,
-            admission: admission.clone(),
-        });
-        tokio::pin!(submit);
-        assert!(matches!(
-            submit
-                .as_mut()
-                .poll(&mut Context::from_waker(Waker::noop())),
-            Poll::Pending
-        ));
-        ack.send(SubmitOutcome::Accepted {
-            native_turn_id: Some("acknowledged".into()),
-        })
-        .map_err(|_| "stub acknowledgement receiver closed")?;
-        live.disconnect();
+        let outcome = {
+            let submit = slot.submit(SubmitTurnRequest {
+                operation_key: "simultaneous-ack".into(),
+                message_id: None,
+                input: test_turn_input()?,
+                output_schema: None,
+                steer: false,
+                admission: admission.clone(),
+            });
+            tokio::pin!(submit);
+            assert!(matches!(
+                submit
+                    .as_mut()
+                    .poll(&mut Context::from_waker(Waker::noop())),
+                Poll::Pending
+            ));
+            for (seq, id) in [(1, "unrelated"), (2, "acknowledged")] {
+                let recorded = live.record(
+                    seq,
+                    None,
+                    SlotEvent::Completed {
+                        turn_id: Some(id.into()),
+                        operation_key: None,
+                    },
+                    Some(DeferredTurnCompletion {
+                        native_turn_id: Some(id.into()),
+                        operation_key: None,
+                        status: TurnFinishStatus::Completed,
+                        text: id.into(),
+                        structured: Some(json!({"id": id})),
+                    }),
+                );
+                assert!(recorded.immediate_completion.is_none());
+            }
+            ack.send(SubmitOutcome::Accepted {
+                native_turn_id: Some("acknowledged".into()),
+            })
+            .map_err(|_| "stub acknowledgement receiver closed")?;
+            live.disconnect();
+            live.disconnect();
+            submit.await
+        };
         assert!(
-            matches!(submit.await, SubmitOutcome::Accepted {native_turn_id: Some(id)} if id == "acknowledged")
+            matches!(&outcome, SubmitOutcome::Accepted {native_turn_id: Some(id)} if id == "acknowledged")
         );
         assert!(admission.is_expired());
+        let plan = slot.apply_finish(&outcome, false);
+        assert!(!plan.disconnect);
+        assert_eq!(plan.deferred.len(), 1);
+        let terminal = &plan.deferred[0];
+        assert_eq!(terminal.operation_key.as_deref(), Some("simultaneous-ack"));
+        assert_eq!(terminal.structured, Some(json!({"id":"acknowledged"})));
+        assert_eq!(live.state(), ParticipantState::Unknown);
+        assert!(live.try_submit("later").is_err());
         Ok(())
     }
 

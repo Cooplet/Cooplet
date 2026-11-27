@@ -59,7 +59,7 @@ pub(super) struct Observations {
 struct Turn {
     answer: Answer,
     schema: bool,
-    operation_key: Option<String>,
+    submitted_input: Option<SubmittedInput>,
     foreign_input: bool,
 }
 
@@ -70,8 +70,27 @@ struct Answer {
 }
 
 struct Submitted {
-    operation_key: String,
+    input: SubmittedInput,
     schema: bool,
+}
+
+pub(super) enum SubmittedInput {
+    NamedOutput,
+    UserMessage(String),
+}
+
+impl SubmittedInput {
+    fn is_foreign_user_message(&self, item: &Value) -> bool {
+        if item["type"] != "userMessage" {
+            return false;
+        }
+        match self {
+            Self::NamedOutput => true,
+            Self::UserMessage(operation_key) => item["clientId"]
+                .as_str()
+                .is_some_and(|id| id != operation_key),
+        }
+    }
 }
 
 enum Deferred {
@@ -215,11 +234,8 @@ impl Observations {
         self.submitted.is_some()
     }
 
-    pub(super) fn begin_submit(&mut self, operation_key: String, schema: bool) {
-        self.submitted = Some(Submitted {
-            operation_key,
-            schema,
-        });
+    pub(super) fn begin_submit(&mut self, input: SubmittedInput, schema: bool) {
+        self.submitted = Some(Submitted { input, schema });
     }
 
     pub(super) fn acknowledge(&mut self, turn_id: Option<&str>) -> ProtocolResult<()> {
@@ -233,7 +249,7 @@ impl Observations {
             if !self.is_completed(id) {
                 let turn = self.turn(id)?;
                 turn.schema = submitted.schema;
-                turn.operation_key = Some(submitted.operation_key);
+                turn.submitted_input = Some(submitted.input);
                 foreign_input = turn.foreign_input;
                 if self.snapshot.active_turn.is_none() {
                     self.started(id)?;
@@ -331,25 +347,21 @@ impl Observations {
         if self.is_completed(turn_id) {
             return Ok(());
         }
-        if item["type"] == "userMessage"
-            && let Some(client_id) = item["clientId"].as_str()
+        let acknowledged = self
+            .turns
+            .get(turn_id)
+            .and_then(|turn| turn.submitted_input.as_ref());
+        let pending = self.submitted.as_ref().map(|submitted| &submitted.input);
+        if acknowledged
+            .or(pending)
+            .is_some_and(|submitted| submitted.is_foreign_user_message(item))
         {
-            let claimed = self
-                .turns
-                .get(turn_id)
-                .and_then(|turn| turn.operation_key.as_deref());
-            let pending = self
-                .submitted
-                .as_ref()
-                .map(|submitted| submitted.operation_key.as_str());
-            if claimed.or(pending).is_some_and(|key| client_id != key) {
-                let acknowledged = claimed.is_some();
-                let turn = self.turn(turn_id)?;
-                if !turn.foreign_input {
-                    turn.foreign_input = true;
-                    if acknowledged {
-                        self.report_concurrent_input();
-                    }
+            let owned_turn = acknowledged.is_some();
+            let turn = self.turn(turn_id)?;
+            if !turn.foreign_input {
+                turn.foreign_input = true;
+                if owned_turn {
+                    self.report_concurrent_input();
                 }
             }
         }
@@ -543,4 +555,46 @@ fn rollout_path(thread: &Value) -> Option<PathBuf> {
         .as_str()
         .map(PathBuf::from)
         .filter(|path| path.is_absolute())
+}
+
+#[cfg(test)]
+mod tests {
+    use serde_json::json;
+
+    use super::*;
+
+    #[test]
+    fn named_output_marks_text_without_a_client_id_before_and_after_ack() -> ProtocolResult<()> {
+        for before_ack in [false, true] {
+            for item in [
+                json!({"type":"userMessage"}),
+                json!({"type":"userMessage","clientId":null}),
+            ] {
+                let (events, _receiver) = mpsc::channel(16);
+                let (snapshots, _snapshot) = watch::channel(Snapshot::default());
+                let mut observed = Observations::new(1, "attach".into(), events, snapshots);
+                observed.bind(&json!({"thread":{"id":"t","status":{"type":"idle"}}}))?;
+                observed.begin_submit(SubmittedInput::NamedOutput, false);
+                if before_ack {
+                    observed.item("turn", &item)?;
+                }
+                observed.acknowledge(Some("turn"))?;
+                if !before_ack {
+                    observed.item("turn", &item)?;
+                }
+                assert!(observed.turn("turn")?.foreign_input);
+            }
+        }
+        let text = SubmittedInput::UserMessage("our-message".into());
+        assert!(!text.is_foreign_user_message(&json!({"type":"userMessage","clientId":null})));
+        assert!(
+            !text.is_foreign_user_message(&json!({"type":"userMessage","clientId":"our-message"}))
+        );
+        assert!(
+            text.is_foreign_user_message(
+                &json!({"type":"userMessage","clientId":"foreign-message"})
+            )
+        );
+        Ok(())
+    }
 }

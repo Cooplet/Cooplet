@@ -774,3 +774,21 @@ async fn initial_workspace_routing_update_rechecks_evidence_once() -> Test {
     assert_eq!(revision, Some(1));
     Ok(())
 }
+
+#[tokio::test]
+async fn cancel_after_transport_loss_reports_uncertainty_instead_of_missing_support() -> Test {
+    let (mut peer, handle, mut events) = live(None, true).await?;
+    let adapter = CodexAdapter::new(None);
+    peer.begin("active").await?;
+    assert!(matches!(
+        next(&mut events).await?.kind,
+        AdapterEventKind::StateChanged(State::Working)
+    ));
+    drop(peer);
+    assert!(timeout(LIMIT, events.recv()).await?.is_none());
+    let cancelled = adapter
+        .cancel_or_stop(&handle, StopMode::CancelTurn)
+        .await?;
+    assert!(matches!(cancelled, StopOutcome::Unknown(_)));
+    Ok(())
+}
