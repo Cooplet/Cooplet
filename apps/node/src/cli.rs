@@ -27,7 +27,9 @@ use cooplet_node::{
     auth::{Credential, read_master},
     clients::{
         AdapterConfig, AdapterRegistry, ParticipantPage, ParticipantView, PiAdapter, TuiAttachPlan,
-        codex::CodexAdapter, list_templates,
+        agy::{AgyAdapter, AgyAdapterConfig},
+        codex::CodexAdapter,
+        list_templates,
     },
     config::{NodeConfig, check_offline_state, default_state_dir, operator_path},
     daemon::Node,
@@ -225,6 +227,8 @@ fn adapter_registry() -> CliResult<AdapterRegistry> {
         std::env::var_os("COOPLET_CODEX_BIN").map(PathBuf::from),
     )))?;
     registry.register(Arc::new(PiAdapter))?;
+    let cooplet = fs::canonicalize(std::env::current_exe()?)?;
+    registry.register(Arc::new(AgyAdapter::new(AgyAdapterConfig::new(cooplet))))?;
     Ok(registry)
 }
 
