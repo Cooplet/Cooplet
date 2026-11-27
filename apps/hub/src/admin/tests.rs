@@ -588,9 +588,13 @@ async fn invalid_enrollment_redemption_rejects_in_read_path_without_blocking_wri
     });
     inside.await?;
 
+    let missing_secret = crate::credentials::mint_enrollment(&state.master, TokenId::generate()?)?
+        .secret
+        .as_str()
+        .to_owned();
     for bad_token in [
         "not-a-valid-enrollment-token".to_owned(),
-        format!("cooplet_enroll_{}_{}", TokenId::generate()?, "a".repeat(64)),
+        missing_secret,
         revoked_secret,
     ] {
         let result = tokio::time::timeout(

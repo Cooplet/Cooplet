@@ -1414,7 +1414,7 @@ async fn submit_unavailable_and_in_progress_finish_and_extension_scoping() -> Te
     assert_eq!(status, StatusCode::CREATED);
     assert_eq!(answer.delivery_state, DeliveryState::Unavailable);
 
-    // CommandOutcome::Queued on answer_question (always direct_now) is classified as unknown.
+    // CommandOutcome::Queued on default direct_now answer_question is classified as unknown.
     bridge.set(CommandOutcome::Queued, None)?;
     let q_queued = f.inbound_question(&node, &agent, None, recipient).await?;
     let (status, answer) = send_message(

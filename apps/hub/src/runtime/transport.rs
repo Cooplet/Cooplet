@@ -60,6 +60,7 @@ pub(super) async fn serve_http1(
                     continue;
                 }
                 Err(error) => {
+                    drop(listener);
                     graceful_tx.send_replace(());
                     force_close.send_replace(());
                     let _ = time::timeout(config.force_close_timeout, wait_zero(&active_tx)).await;
@@ -93,6 +94,7 @@ pub(super) async fn serve_http1(
         });
         let mut connection = Box::pin(builder.serve_connection(io, service).with_upgrades());
         let mut graceful = graceful_rx.clone();
+        let mut force_close_task = force_close_rx.clone();
         let active = ActiveConnection::enter(&active_tx);
         tokio::spawn(async move {
             let _permit = permit;
@@ -100,9 +102,14 @@ pub(super) async fn serve_http1(
             let result = tokio::select! {
                 biased;
                 result = connection.as_mut() => result,
+                _ = force_close_task.changed() => Ok(()),
                 _ = graceful.changed() => {
                     connection.as_mut().graceful_shutdown();
-                    connection.await
+                    tokio::select! {
+                        biased;
+                        result = connection.as_mut() => result,
+                        _ = force_close_task.changed() => Ok(()),
+                    }
                 }
             };
             if let Err(error) = result {
@@ -111,6 +118,7 @@ pub(super) async fn serve_http1(
         });
     }
 
+    drop(listener);
     graceful_tx.send_replace(());
     if time::timeout(config.drain_timeout, wait_zero(&active_tx))
         .await
@@ -497,7 +505,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn server_closes_slowloris_headers_and_caps_open_connections() -> io::Result<()> {
+    async fn server_closes_slowloris_headers() -> io::Result<()> {
         let listener = TcpListener::bind("127.0.0.1:0").await?;
         let addr = listener.local_addr()?;
         let app = Router::new().route("/ping", get(|| async { "ok" }));
@@ -510,7 +518,7 @@ mod tests {
                 write_idle_timeout: Duration::from_secs(5),
                 drain_timeout: Duration::from_secs(1),
                 force_close_timeout: Duration::from_millis(500),
-                max_connections: 2,
+                max_connections: 4,
             },
             stop_rx,
         ));
@@ -523,27 +531,139 @@ mod tests {
         let closed = time::timeout(Duration::from_secs(2), slow.read(&mut buf)).await??;
         assert_eq!(closed, 0);
 
-        // Two held sockets saturate max_connections = 2; a third is dropped immediately.
+        let _ = stop_tx.send(());
+        server.await.map_err(io::Error::other)??;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn server_caps_open_connections_and_reclaims_released_permits() -> io::Result<()> {
+        let listener = TcpListener::bind("127.0.0.1:0").await?;
+        let addr = listener.local_addr()?;
+        let app = Router::new().route("/ping", get(|| async { "ok" }));
+        let (stop_tx, stop_rx) = oneshot::channel();
+        let server = tokio::spawn(serve_http1(
+            listener,
+            app,
+            HttpServerConfig {
+                header_read_timeout: Duration::from_secs(5),
+                write_idle_timeout: Duration::from_secs(5),
+                drain_timeout: Duration::from_secs(1),
+                force_close_timeout: Duration::from_millis(500),
+                max_connections: 2,
+            },
+            stop_rx,
+        ));
+
+        // Two keep-alive sockets saturate max_connections = 2.
         let mut first = TcpStream::connect(addr).await?;
         let mut second = TcpStream::connect(addr).await?;
-        first
-            .write_all(b"GET /ping HTTP/1.1\r\nHost: localhost\r\n\r\n")
-            .await?;
-        second
-            .write_all(b"GET /ping HTTP/1.1\r\nHost: localhost\r\n\r\n")
-            .await?;
+        let ping = b"GET /ping HTTP/1.1\r\nHost: localhost\r\n\r\n";
+        first.write_all(ping).await?;
+        second.write_all(ping).await?;
         let mut resp = [0u8; 128];
-        assert!(first.read(&mut resp).await? > 0);
-        assert!(second.read(&mut resp).await? > 0);
+        let n1 = time::timeout(Duration::from_secs(1), first.read(&mut resp)).await??;
+        assert!(
+            std::str::from_utf8(&resp[..n1]).is_ok_and(|text| text.starts_with("HTTP/1.1 200"))
+        );
+        let n2 = time::timeout(Duration::from_secs(1), second.read(&mut resp)).await??;
+        assert!(
+            std::str::from_utf8(&resp[..n2]).is_ok_and(|text| text.starts_with("HTTP/1.1 200"))
+        );
 
+        // A third socket sending a valid HTTP request must be dropped immediately without 200 OK.
         let mut third = TcpStream::connect(addr).await?;
-        let third_closed = time::timeout(Duration::from_secs(1), third.read(&mut buf)).await??;
-        assert_eq!(third_closed, 0);
+        let _ = third.write_all(ping).await;
+        let mut buf = [0u8; 64];
+        match time::timeout(Duration::from_secs(1), third.read(&mut buf)).await? {
+            Ok(0) => {}
+            Err(error)
+                if matches!(
+                    error.kind(),
+                    io::ErrorKind::ConnectionReset
+                        | io::ErrorKind::ConnectionAborted
+                        | io::ErrorKind::BrokenPipe
+                ) => {}
+            other => {
+                return Err(io::Error::other(format!(
+                    "expected dropped excess connection, got {other:?}"
+                )));
+            }
+        }
 
+        // Releasing one open socket frees its permit for a fourth request.
         drop(first);
+        let mut fourth = None;
+        for _ in 0..20 {
+            let mut candidate = TcpStream::connect(addr).await?;
+            if candidate.write_all(ping).await.is_ok()
+                && let Ok(Ok(n)) =
+                    time::timeout(Duration::from_millis(200), candidate.read(&mut resp)).await
+                && n > 0
+                && std::str::from_utf8(&resp[..n])
+                    .is_ok_and(|text| text.starts_with("HTTP/1.1 200"))
+            {
+                fourth = Some(candidate);
+                break;
+            }
+            time::sleep(Duration::from_millis(10)).await;
+        }
+        assert!(
+            fourth.is_some(),
+            "released connection permit was not reclaimed"
+        );
+
+        drop(fourth);
         drop(second);
         let _ = stop_tx.send(());
         server.await.map_err(io::Error::other)??;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn force_close_aborts_stalled_get_handler_and_finishes_shutdown() -> io::Result<()> {
+        let listener = TcpListener::bind("127.0.0.1:0").await?;
+        let addr = listener.local_addr()?;
+        let entered = Arc::new(tokio::sync::Notify::new());
+        let entered_handler = entered.clone();
+        let app = Router::new().route(
+            "/hang",
+            get(move || {
+                let entered = entered_handler.clone();
+                async move {
+                    entered.notify_one();
+                    future::pending::<&'static str>().await
+                }
+            }),
+        );
+        let (stop_tx, stop_rx) = oneshot::channel();
+        let server = tokio::spawn(serve_http1(
+            listener,
+            app,
+            HttpServerConfig {
+                header_read_timeout: Duration::from_secs(5),
+                write_idle_timeout: Duration::from_secs(5),
+                drain_timeout: Duration::from_millis(80),
+                force_close_timeout: Duration::from_millis(500),
+                max_connections: 4,
+            },
+            stop_rx,
+        ));
+
+        let mut client = TcpStream::connect(addr).await?;
+        client
+            .write_all(b"GET /hang HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n")
+            .await?;
+        time::timeout(Duration::from_secs(1), entered.notified()).await?;
+
+        let _ = stop_tx.send(());
+        // Force-close must abort the stalled handler task cleanly instead of timing out.
+        time::timeout(Duration::from_secs(2), server)
+            .await?
+            .map_err(io::Error::other)??;
+        let mut buf = [0u8; 16];
+        let closed = time::timeout(Duration::from_secs(1), client.read(&mut buf)).await??;
+        assert_eq!(closed, 0);
         Ok(())
     }
 }

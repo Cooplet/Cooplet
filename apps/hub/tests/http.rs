@@ -538,9 +538,11 @@ async fn scoped_service_access_and_stream_lifecycle() -> TestResult {
     let node = hub.client(Some(&hidden.node_token))?;
     let content = b"private node upload";
     let blob = upload_text(&node, "node-private-blob", content).await?;
-    // HTTP/1.1 early replay via CoopletClient with expected_sha256 + content_length returns 200 OK.
-    let replay_outcome = node
-        .upload_blob(
+    // HTTP/1.1 early replay via CoopletClient with expected_sha256 + content_length returns
+    // 200 OK before the stalled body finishes streaming without poisoning the connection pool.
+    let replay_outcome = timeout(
+        Duration::from_secs(3),
+        node.upload_blob(
             BlobUploadSpec {
                 filename: "résumé.txt".into(),
                 mime_type: "text/plain".into(),
@@ -549,12 +551,13 @@ async fn scoped_service_access_and_stream_lifecycle() -> TestResult {
                 idempotency_key: Some("node-private-blob".into()),
                 content_length: Some(content.len() as u64),
             },
-            &content[..],
-        )
-        .await?;
+            PendingReader,
+        ),
+    )
+    .await??;
     assert!(matches!(
         replay_outcome,
-        BlobUploadOutcome::VerifiedLocal(ref replayed) if replayed == &blob
+        BlobUploadOutcome::AcknowledgedWithoutLocalVerification(ref replayed) if replayed == &blob
     ));
     let mut bytes = Vec::new();
     node.download_blob_to_writer(&blob.blob_id, Some(&blob.sha256), 1024, &mut bytes)
@@ -675,6 +678,18 @@ async fn issue_service_token(admin: &CoopletClient, path: &str, key: &str) -> Te
             Some(key),
         )
         .await?)
+}
+
+struct PendingReader;
+
+impl tokio::io::AsyncRead for PendingReader {
+    fn poll_read(
+        self: std::pin::Pin<&mut Self>,
+        _cx: &mut std::task::Context<'_>,
+        _buf: &mut tokio::io::ReadBuf<'_>,
+    ) -> std::task::Poll<std::io::Result<()>> {
+        std::task::Poll::Pending
+    }
 }
 
 fn encode_chunked(body: &[u8]) -> Vec<u8> {

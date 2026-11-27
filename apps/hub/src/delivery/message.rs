@@ -528,7 +528,7 @@ pub(super) fn finalize_compact_unknown(
     message_id: &MessageId,
 ) -> Result<(), HubError> {
     tx.prepare_cached(
-        "UPDATE hub_messages SET delivery_state = 'unknown', delivery_detail = 'storage full'
+        "UPDATE hub_messages SET delivery_state = 'unknown', delivery_detail = NULL
          WHERE message_id = ?1 AND delivery_state IN ('accepted', 'dispatched')",
     )?
     .execute([message_id.as_str()])?;

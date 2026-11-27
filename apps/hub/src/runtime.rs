@@ -392,15 +392,15 @@ async fn serve(
         biased;
         () = signals.wait() => {
             background.close();
-            bridge.shutdown();
             shutdown.send_replace(());
+            bridge.shutdown();
             let _ = stop_accepting.send(());
             server.await
         }
         result = &mut server => {
             background.close();
-            bridge.shutdown();
             shutdown.send_replace(());
+            bridge.shutdown();
             result
         }
     };
