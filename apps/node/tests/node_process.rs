@@ -23,6 +23,10 @@ use rusqlite::params;
 use serde_json::{Value, json};
 use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt};
 
+#[path = "common/doctor.rs"]
+mod doctor;
+use doctor::adapter_report;
+
 type TestResult<T = ()> = Result<T, Box<dyn Error + Send + Sync>>;
 
 const COOPLET: &str = env!("CARGO_BIN_EXE_cooplet");
@@ -133,13 +137,6 @@ fn command(state: &Path, args: &[&str]) -> TestResult<std::process::Output> {
     Ok(output)
 }
 
-fn agy_report(diagnosis: &Value) -> TestResult<&Value> {
-    diagnosis["adapters"]
-        .as_array()
-        .and_then(|items| items.iter().find(|report| report["client_kind"] == "agy"))
-        .ok_or_else(|| io::Error::other("Doctor did not report the Agy adapter").into())
-}
-
 #[tokio::test]
 async fn doctor_and_run_use_the_registered_agy_adapter() -> TestResult {
     use std::{
@@ -179,7 +176,7 @@ fi
     )?;
     let (_reader, _) = json_line(daemon.stdout()?).await?;
     let unavailable: Value = serde_json::from_slice(&command(&state, &["node", "doctor"])?.stdout)?;
-    let report = agy_report(&unavailable)?;
+    let report = adapter_report(&unavailable, "agy")?;
     assert_eq!(report["available"], false);
     let output = Command::new(COOPLET)
         .args(["node", "doctor", "--state-dir"])
@@ -191,7 +188,7 @@ fi
         .output()?;
     assert!(output.status.success());
     let available: Value = serde_json::from_slice(&output.stdout)?;
-    let report = agy_report(&available)?;
+    let report = adapter_report(&available, "agy")?;
     assert_eq!(report["available"], true);
     assert_eq!(report["capabilities"]["supports_resume"], true);
     assert_eq!(report["capabilities"]["supports_tui_attach"], false);
@@ -225,9 +222,9 @@ fi
         .output()?;
     assert!(output.status.success());
     let report: Value = serde_json::from_slice(&output.stdout)?;
-    assert_eq!(agy_report(&report)?["available"], true);
+    assert_eq!(adapter_report(&report, "agy")?["available"], true);
     assert_eq!(
-        agy_report(&report)?["binary_path"],
+        adapter_report(&report, "agy")?["binary_path"],
         raw.join("agy").display().to_string()
     );
 
@@ -315,18 +312,11 @@ async fn foreground_cli_restarts_with_same_identity_and_replays_stop_without_sto
         );
         Ok(serde_json::from_slice(&output.stdout)?)
     };
-    let report = |diagnosis: &Value, kind: &str| {
-        diagnosis["adapters"]
-            .as_array()
-            .and_then(|reports| reports.iter().find(|report| report["client_kind"] == kind))
-            .cloned()
-            .unwrap_or(Value::Null)
-    };
     let diagnosis = diagnose()?;
     assert_eq!(diagnosis["running"], true);
-    assert_eq!(report(&diagnosis, "agy")["available"], false);
-    assert_eq!(report(&diagnosis, "codex")["available"], false);
-    assert_eq!(report(&diagnosis, "pi")["available"], false);
+    assert_eq!(adapter_report(&diagnosis, "agy")?["available"], false);
+    assert_eq!(adapter_report(&diagnosis, "codex")?["available"], false);
+    assert_eq!(adapter_report(&diagnosis, "pi")?["available"], false);
     assert_eq!(
         diagnosis["workspace_dir"],
         json!(std::env::current_dir()?.canonicalize()?)
@@ -343,7 +333,8 @@ esac
 "#,
     )?;
     fs::set_permissions(&pi, fs::Permissions::from_mode(0o755))?;
-    let installed = report(&diagnose()?, "pi");
+    let diagnosis = diagnose()?;
+    let installed = adapter_report(&diagnosis, "pi")?;
     assert_eq!(installed["available"], true);
     assert_eq!(installed["version"], "9.0.0");
     assert_eq!(installed["binary_path"], pi.display().to_string());
