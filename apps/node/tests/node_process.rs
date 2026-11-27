@@ -118,6 +118,7 @@ async fn operator(state: &Path) -> TestResult<CoopletClient> {
 
 fn command(state: &Path, args: &[&str]) -> TestResult<std::process::Output> {
     let output = Command::new(COOPLET)
+        .env("COOPLET_CODEX_BIN", state.join("missing-codex"))
         .arg("--state-dir")
         .arg(state)
         .args(args)
@@ -181,7 +182,8 @@ async fn foreground_cli_restarts_with_same_identity_and_replays_stop_without_sto
     );
     let diagnosis: Value = serde_json::from_slice(&command(&state, &["node", "doctor"])?.stdout)?;
     assert_eq!(diagnosis["running"], true);
-    assert_eq!(diagnosis["adapters"], json!([]));
+    assert_eq!(diagnosis["adapters"][0]["client_kind"], "codex");
+    assert_eq!(diagnosis["adapters"][0]["available"], false);
     assert_eq!(
         diagnosis["workspace_dir"],
         json!(std::env::current_dir()?.canonicalize()?)
@@ -197,6 +199,7 @@ async fn foreground_cli_restarts_with_same_identity_and_replays_stop_without_sto
         br#"{"schema":1,"client":"example"}"#,
     )?;
     let selected = Command::new(COOPLET)
+        .env("COOPLET_CODEX_BIN", state.join("missing-codex"))
         .arg("--state-dir")
         .arg(&state)
         .args(["node", "doctor", "--workspace-dir"])

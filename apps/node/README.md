@@ -57,8 +57,7 @@ A registered adapter can provision agents from
 `.cooplet/agents/<template-id>/agent.json` in the workspace, with a fallback
 under `$XDG_CONFIG_HOME/cooplet/agents/` or `~/.config/cooplet/agents/`. Put
 `"schema": 1` and the registered `"client"` kind in `agent.json`. An optional
-`instructions.md` supplies instructions. This build can run with an empty
-adapter registry.
+`instructions.md` supplies instructions.
 
 For message delivery, the adapter receives the message ID as its turn
 correlation key. Echo that key in completion events when available. Callers
@@ -84,3 +83,47 @@ use the local operator credential.
 `cooplet node attach NAME` uses the active participant with that name or its
 sole stopped match. Pass the exact participant ID when several stopped
 participants share a name.
+
+## Managed Codex
+
+Install and sign in to the Codex CLI, then run `cooplet node doctor` to check
+discovery. The Node finds `codex` on `PATH`. Set `COOPLET_CODEX_BIN` to select
+a specific executable for both `node doctor` and `node run`. Discovery checks
+app-server initialization and the required CLI flags. The reported version is
+diagnostic.
+
+Create a participant with `POST /v1/agents` and `"client_kind": "codex"` or a
+template using that client. A template can set `model`, `effort`, `approval`
+and `sandbox` using Codex values. The Node starts one managed app-server with
+a private Unix socket and a participant-scoped Cooplet MCP server. It uses the
+daemon's `CODEX_HOME` or the default `~/.codex`. Resume reopens the saved
+conversation in the original Codex home and issues a new participant credential.
+
+Keep the canonical Node state directory short enough for the full
+`runtime/<participant>.g<generation>/c.sock` path to fit the Unix socket address
+limit. Codex requires UTF-8 paths for the session. For a `native_open_failed`
+response, look for the participant ID and generation in the daemon's stderr.
+The reason covers cases such as a path limit, an unexpected socket peer, a
+failed MCP startup or an unavailable rollout.
+
+Send messages through `POST /v1/messages`. With the confirmed ChatGPT route,
+Codex receives non-human inputs as named tool outputs. Other routes receive a
+canonical text message with the verified author information. If changing the
+backend makes earlier tool outputs in a saved conversation unreadable, restore
+a compatible route and send a new message after resuming. An acknowledged
+message has been taken in by Codex. If a TUI user submits at the same time,
+Codex may handle both inputs in the same turn and produce one result.
+
+After the first saved turn, use `cooplet node attach NAME` to open that
+conversation interactively. Use the TUI to answer questions or resolve
+approvals that are available only there. For supported permission requests,
+`cooplet node approve NAME` and `cooplet node deny NAME` can send a response.
+An exact response uses `--approval-id ID --operation-key KEY`. Codex can report
+that a request was resolved without identifying which client answered, so
+Cooplet can return `delivery_unknown` for a submitted approval response.
+Follow the participant's current state for any remaining requests.
+
+The ignored native smoke test uses an installed Codex CLI and a loopback model
+fixture. It covers discovery, delivery, structured output, remote attach
+protocol and cold resume. From a host shell after building the test binary,
+run it with `COOPLET_NATIVE_CODEX_BIN` set to the absolute Codex executable path.

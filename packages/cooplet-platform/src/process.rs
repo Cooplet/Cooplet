@@ -91,6 +91,22 @@ impl ProcessIdentity {
         }
     }
 
+    /// Verify a socket peer belongs to this still-running managed group.
+    /// A launcher can delegate the socket to a child with a different PID.
+    pub fn owns_peer(&self, peer_pid: u32, peer_uid: u32) -> Result<bool, PlatformError> {
+        if peer_uid != current_euid() || peer_pid <= 1 {
+            return Ok(false);
+        }
+        let peer_pid = libc::pid_t::try_from(peer_pid).map_err(|_| {
+            PlatformError::InvalidProcessIdentity("expected a positive peer PID".into())
+        })?;
+        let (peer, _) = sys::capture(peer_pid)?;
+        Ok(!peer.exited
+            && peer.uid == peer_uid
+            && u32::try_from(peer.pgid) == Ok(self.pgid)
+            && self.probe()? == ProcessProbe::Running)
+    }
+
     fn validated_structural_pid(&self) -> Result<libc::pid_t, PlatformError> {
         let pid = structural_group_leader(self.pid, self.pgid)?;
         sys::validate_token(&self.start_token)?;
