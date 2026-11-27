@@ -26,7 +26,7 @@ impl InboundDuringWrite {
     pub(super) fn consume(
         &mut self,
         incoming: ReceivedFrame,
-        on_update: impl FnOnce(Value, std::time::Instant) -> Result<(), Fault>,
+        on_notification: impl FnOnce(&str, &Value, std::time::Instant) -> Result<(), Fault>,
     ) -> Result<(), Fault> {
         match incoming.frame {
             Frame::Request { method, .. } if method == "session/request_permission" => {
@@ -38,10 +38,8 @@ impl InboundDuringWrite {
                 }
                 self.unsupported.push(id);
             }
-            Frame::Notification { method, params }
-                if method == "session/update" && self.reply.is_none() =>
-            {
-                on_update(params, incoming.read_at)?;
+            Frame::Notification { method, params } if self.reply.is_none() => {
+                on_notification(&method, &params, incoming.read_at)?;
             }
             Frame::Response { id, reply }
                 if id.as_u64() == Some(self.id) && self.reply.is_none() =>

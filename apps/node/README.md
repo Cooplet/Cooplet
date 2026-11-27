@@ -108,9 +108,11 @@ unavailable on this adapter. Use the Node stop endpoint with
 
 ACP v1 keeps the prompt request open until the turn finishes. The Node marks
 delivery after the full prompt is written to the private child pipe and a
-short window for immediate rejection passes. Turn completion arrives
-separately. If handoff becomes uncertain, the Node records the unknown
-outcome and reuses that receipt for the same idempotency key. The result
-includes the assistant text streamed during the active turn. ACP v1 updates
-have no turn ID, so text from a background task emitted during a later turn
-can be included in that turn's result.
+short window for immediate rejection passes. The HTTP receipt reports the
+delivery state. If handoff becomes uncertain, the Node records the unknown
+outcome and reuses that receipt for the same idempotency key.
+
+The adapter collects streamed assistant text in its internal turn-completion
+event. ACP v1 updates have no turn ID, so text from a background task emitted
+during a later turn can be included in that event. Operators receive replies
+that the participant sends through the Cooplet MCP messaging tools.

@@ -31,7 +31,7 @@ use cooplet_platform::{AdmissionGuard, ProcessHandle, ProcessProbe};
 use cooplet_protocol::{
     AnswerPayload, AuthorKind, ErrorCode, MessageId, ParticipantId, PrincipalKind, ThreadId,
 };
-use futures_util::future::BoxFuture;
+use futures_util::{FutureExt, future::BoxFuture};
 use serde_json::{Value, json};
 use tokio::{sync::watch, task::JoinHandle};
 
@@ -821,6 +821,65 @@ async fn cancel_is_idempotent_and_keeps_the_session_usable() -> TestResult {
     assert_eq!(tree.frames("session/cancel")?.len(), 5);
     assert_eq!(tree.frames("session/new")?.len(), 1);
     assert_eq!(tree.frames("session/prompt")?.len(), 5);
+    Ok(())
+}
+
+#[tokio::test]
+async fn cancel_during_prompt_handoff_reports_a_natural_finish() -> TestResult {
+    let tree = Tree::new()?;
+    tree.mode("hold")?;
+    let mut config = tree.config();
+    config.fail_fast_window = Duration::from_secs(5);
+    let adapter = AgyAdapter::new(config);
+    let owner = Arc::new(Spawner::new(tree.0.clone()));
+    let mut session = adapter
+        .create_or_resume(open_request(&tree, owner.clone(), SessionOpenMode::Create)?)
+        .await?;
+    let handle = session.handle.clone();
+    let submit = adapter.submit_turn(&handle, human("held prompt")?);
+    tokio::pin!(submit);
+    assert!((&mut submit).now_or_never().is_none());
+    tree.wait_for(|frame| frame["method"] == "session/prompt", 1)
+        .await?;
+    let cancel = adapter.cancel_or_stop(&handle, StopMode::CancelTurn);
+    tokio::pin!(cancel);
+    assert!((&mut cancel).now_or_never().is_none());
+    tree.release()?;
+    assert!(matches!(submit.await, SubmitOutcome::Accepted { .. }));
+    assert!(matches!(cancel.await?, StopOutcome::Unknown(_)));
+    assert!(matches!(
+        event(&mut session, 1).await?,
+        AdapterEventKind::StateChanged(ParticipantRuntimeState::Working)
+    ));
+    finished(&mut session, 2, "turn", TurnFinishStatus::Completed, "").await?;
+    Ok(())
+}
+
+#[tokio::test]
+async fn cancel_can_finish_while_the_submit_caller_holds_its_ack() -> TestResult {
+    let tree = Tree::new()?;
+    tree.mode("cancel")?;
+    let adapter = AgyAdapter::new(tree.config());
+    let owner = Arc::new(Spawner::new(tree.0.clone()));
+    let mut session = adapter
+        .create_or_resume(open_request(&tree, owner.clone(), SessionOpenMode::Create)?)
+        .await?;
+    let handle = session.handle.clone();
+    let submit = adapter.submit_turn(&handle, human("hold acknowledgment")?);
+    tokio::pin!(submit);
+    assert!((&mut submit).now_or_never().is_none());
+    assert!(matches!(
+        event(&mut session, 1).await?,
+        AdapterEventKind::StateChanged(ParticipantRuntimeState::Working)
+    ));
+    assert!(matches!(
+        adapter
+            .cancel_or_stop(&handle, StopMode::CancelTurn)
+            .await?,
+        StopOutcome::TurnCancelled
+    ));
+    finished(&mut session, 2, "turn", TurnFinishStatus::Cancelled, "").await?;
+    assert!(matches!(submit.await, SubmitOutcome::Accepted { .. }));
     Ok(())
 }
 

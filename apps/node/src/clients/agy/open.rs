@@ -209,7 +209,7 @@ async fn rpc(wire: &mut Wire, method: &str, params: Value, stage: Stage) -> Resu
     let mut inbox = InboundDuringWrite::new(id);
     let (written, read_fault) = match wire.begin_write(request, None) {
         Ok(pending) => {
-            wire.pump_write(pending, |frame| inbox.consume(frame, |_, _| Ok(())))
+            wire.pump_write(pending, |frame| inbox.consume(frame, |_, _, _| Ok(())))
                 .await
         }
         Err(failure) => (Err(failure), None),

@@ -26,9 +26,15 @@ const CANCEL_TIMEOUT: Duration = Duration::from_secs(2);
 
 pub(super) struct Session {
     commands: mpsc::Sender<Command>,
-    state: watch::Receiver<ParticipantRuntimeState>,
+    state: watch::Receiver<Observation>,
+    submitters: watch::Sender<()>,
     stopping: watch::Sender<bool>,
     close_writer: Arc<AtomicBool>,
+}
+
+struct Observation {
+    runtime: ParticipantRuntimeState,
+    prompt_id: Option<u64>,
 }
 
 impl Session {
@@ -39,7 +45,12 @@ impl Session {
     ) -> (Self, mpsc::Receiver<AdapterEvent>) {
         let (commands, mut requests) = mpsc::channel(8);
         let (events, event_stream) = mpsc::channel(16);
-        let (state, observation) = watch::channel(ParticipantRuntimeState::Idle);
+        let (state, observation) = watch::channel(Observation {
+            runtime: ParticipantRuntimeState::Idle,
+            prompt_id: None,
+        });
+        let (submitters, _) = watch::channel(());
+        let active_submits = submitters.clone();
         let (stopping, mut stop) = watch::channel(false);
         let close_writer = wire.close_signal();
         let mut actor = Actor {
@@ -48,7 +59,7 @@ impl Session {
             state,
             event_seq: 0,
             turn: None,
-            submit_exit: None,
+            warned_unexpected_notification: false,
             fail_fast_window,
         };
         tokio::spawn(async move {
@@ -64,24 +75,26 @@ impl Session {
             while let Ok(request) = requests.try_recv() {
                 request.transport_closed();
             }
+            drop(requests);
             // A fault must keep its pipes open until submit exits. An
             // explicit stop can take over as long as we still own the wire.
             if fault.is_some() {
                 tokio::select! {
                     biased;
                     _ = &mut stopping => fault = None,
-                    () = actor.await_submit_exit() => {}
+                    () = active_submits.closed() => {}
                 }
             }
             drop(wire);
             // Even an explicit stop releases the event stream after submit.
-            actor.await_submit_exit().await;
+            active_submits.closed().await;
             actor.finish(fault).await;
         });
         (
             Self {
                 commands,
                 state: observation,
+                submitters,
                 stopping,
                 close_writer,
             },
@@ -90,7 +103,7 @@ impl Session {
     }
 
     pub(super) fn state(&self) -> ParticipantRuntimeState {
-        let state = self.state.borrow().clone();
+        let state = self.state.borrow().runtime.clone();
         if self.is_closed() && !matches!(state, ParticipantRuntimeState::Unknown { .. }) {
             ParticipantRuntimeState::Unknown {
                 reason: "Agy ACP transport is closed".into(),
@@ -124,14 +137,16 @@ impl Session {
             }
         };
         let (reply, outcome) = oneshot::channel();
+        // Keep transport teardown behind every submitted call until its caller
+        // observes the outcome or drops the future.
+        let _active_submit = self.submitters.subscribe();
+        // The writer separately checks whether this particular caller has left.
         let (_submit_scope, exit) = watch::channel(());
         place.send(Command::Submit {
             request: Box::new(request),
             exit,
             reply,
         });
-        // The sender's lifetime covers polling the ACK to completion. The actor
-        // must wait for its drop before any fault can disconnect Node's submit.
         outcome.await.unwrap_or_else(|_| {
             SubmitOutcome::Unknown("Agy ACP handoff outcome is unconfirmed".into())
         })
@@ -141,9 +156,17 @@ impl Session {
         if self.is_closed() {
             return StopOutcome::AlreadyGone;
         }
+        let Some(prompt_id) = self.state.borrow().prompt_id else {
+            return StopOutcome::TurnCancelled;
+        };
         let (reply, result) = oneshot::channel();
         match timeout(CANCEL_TIMEOUT, async {
-            if self.commands.send(Command::Cancel(reply)).await.is_err() {
+            if self
+                .commands
+                .send(Command::Cancel { prompt_id, reply })
+                .await
+                .is_err()
+            {
                 return StopOutcome::AlreadyGone;
             }
             result.await.unwrap_or_else(|_| {
@@ -170,7 +193,10 @@ enum Command {
         exit: watch::Receiver<()>,
         reply: oneshot::Sender<SubmitOutcome>,
     },
-    Cancel(oneshot::Sender<StopOutcome>),
+    Cancel {
+        prompt_id: u64,
+        reply: oneshot::Sender<StopOutcome>,
+    },
 }
 
 impl Command {
@@ -179,7 +205,7 @@ impl Command {
             Self::Submit { reply, .. } => {
                 let _ = reply.send(closed_submit());
             }
-            Self::Cancel(reply) => {
+            Self::Cancel { reply, .. } => {
                 let _ = reply.send(StopOutcome::AlreadyGone);
             }
         }
@@ -193,10 +219,10 @@ fn closed_submit() -> SubmitOutcome {
 struct Actor {
     session_id: String,
     events: mpsc::Sender<AdapterEvent>,
-    state: watch::Sender<ParticipantRuntimeState>,
+    state: watch::Sender<Observation>,
     event_seq: u64,
     turn: Option<Turn>,
-    submit_exit: Option<watch::Receiver<()>>,
+    warned_unexpected_notification: bool,
     fail_fast_window: Duration,
 }
 
@@ -225,7 +251,7 @@ impl Actor {
                 }
                 command = commands.recv() => match command {
                     Some(Command::Submit { request, exit, reply }) => self.submit(wire, *request, exit, reply).await?,
-                    Some(Command::Cancel(reply)) => self.cancel(wire, reply).await?,
+                    Some(Command::Cancel { prompt_id, reply }) => self.cancel(wire, prompt_id, reply).await?,
                     None => return Ok(()),
                 },
             }
@@ -290,10 +316,9 @@ impl Actor {
                 "prompt": [{"type": "text", "text": text}]
             }),
         );
-        // An already acknowledged fast turn can be followed immediately by
-        // another submit from a different direct adapter caller.
-        self.await_submit_exit().await;
-        self.submit_exit = Some(exit.clone());
+        // A concurrent cancel must keep the identity of the prompt it observed,
+        // including while the writer and the fail-fast window are still active.
+        self.state.send_modify(|state| state.prompt_id = Some(id));
         let mut inbox = InboundDuringWrite::new(id);
         let (written, read_fault) = match wire.begin_write(
             frame,
@@ -311,7 +336,9 @@ impl Actor {
                     cancellation: None,
                 });
                 wire.pump_write(pending, |frame| {
-                    inbox.consume(frame, |params, read_at| self.update(&params, read_at))
+                    inbox.consume(frame, |method, params, read_at| {
+                        self.notification(method, params, read_at)
+                    })
                 })
                 .await
             }
@@ -319,6 +346,7 @@ impl Actor {
         };
         if let Err(failure) = written {
             self.turn = None;
+            self.state.send_modify(|state| state.prompt_id = None);
             let outcome = match failure {
                 WriteFailure::Expired => SubmitOutcome::Expired,
                 WriteFailure::Encode | WriteFailure::FrameLimit => {
@@ -360,6 +388,7 @@ impl Actor {
             tracing::warn!(rpc_code = code, "Agy rejected a prompt during handoff");
             if matches!(code, -32602 | -32000) {
                 self.turn = None;
+                self.state.send_modify(|state| state.prompt_id = None);
                 send_outcome(
                     reply,
                     SubmitOutcome::Unavailable("Agy rejected the prompt".into()),
@@ -379,9 +408,6 @@ impl Actor {
                 native_turn_id: None,
             },
         );
-        // Node's process monitor can disconnect once either pipe is closed.
-        // Let the submit future return before handling any following fault.
-        self.await_submit_exit().await;
         Ok(())
     }
 
@@ -403,16 +429,25 @@ impl Actor {
             {
                 return Ok(Some(reply));
             }
-            Frame::Notification { method, params } if method == "session/update" => {
-                self.update(&params, received.read_at)?;
+            Frame::Notification { method, params } => {
+                self.notification(&method, &params, received.read_at)?;
             }
-            Frame::Notification { .. } | Frame::Response { .. } => {}
+            Frame::Response { .. } => {}
         }
         Ok(None)
     }
 
-    fn update(&mut self, params: &Value, read_at: std::time::Instant) -> Result<(), Fault> {
-        if params["sessionId"] != self.session_id {
+    fn notification(
+        &mut self,
+        method: &str,
+        params: &Value,
+        read_at: std::time::Instant,
+    ) -> Result<(), Fault> {
+        if method != "session/update" || params["sessionId"] != self.session_id {
+            if !self.warned_unexpected_notification {
+                self.warned_unexpected_notification = true;
+                tracing::warn!("Ignoring an unknown or misrouted Agy ACP notification");
+            }
             return Ok(());
         }
         let Some(turn) = &mut self.turn else {
@@ -441,6 +476,7 @@ impl Actor {
         let Some(mut turn) = self.turn.take() else {
             return Ok(());
         };
+        self.state.send_modify(|state| state.prompt_id = None);
         let status = match reply {
             Ok(result) => match result["stopReason"].as_str() {
                 Some("end_turn") => TurnFinishStatus::Completed,
@@ -479,13 +515,16 @@ impl Actor {
     async fn cancel(
         &mut self,
         wire: &Wire,
+        prompt_id: u64,
         reply: oneshot::Sender<StopOutcome>,
     ) -> Result<(), Fault> {
         if reply.is_closed() {
             return Ok(());
         }
-        let Some(turn) = &mut self.turn else {
-            let _ = reply.send(StopOutcome::TurnCancelled);
+        let Some(turn) = self.turn.as_mut().filter(|turn| turn.id == prompt_id) else {
+            let _ = reply.send(StopOutcome::Unknown(
+                "Agy turn finished before cancellation".into(),
+            ));
             return Ok(());
         };
         if turn
@@ -509,7 +548,8 @@ impl Actor {
     }
 
     async fn change_state(&mut self, state: ParticipantRuntimeState) -> Result<(), Fault> {
-        self.state.send_replace(state.clone());
+        self.state
+            .send_modify(|observation| observation.runtime = state.clone());
         self.emit(AdapterEventKind::StateChanged(state)).await
     }
 
@@ -524,13 +564,6 @@ impl Actor {
             .map_err(|_| Fault::EventReceiverClosed)
     }
 
-    async fn await_submit_exit(&mut self) {
-        if let Some(exit) = &mut self.submit_exit {
-            let _ = exit.changed().await;
-            self.submit_exit = None;
-        }
-    }
-
     async fn finish(&mut self, fault: Option<Result<(), Fault>>) {
         if let Some(Err(fault)) = fault
             && !matches!(fault, Fault::EventReceiverClosed)
@@ -542,7 +575,8 @@ impl Actor {
                 })
                 .await;
         } else {
-            self.state.send_replace(ParticipantRuntimeState::Stopped);
+            self.state
+                .send_modify(|state| state.runtime = ParticipantRuntimeState::Stopped);
         }
     }
 }
