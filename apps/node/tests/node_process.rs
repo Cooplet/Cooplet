@@ -119,6 +119,7 @@ async fn operator(state: &Path) -> TestResult<CoopletClient> {
 
 fn command(state: &Path, args: &[&str]) -> TestResult<std::process::Output> {
     let output = Command::new(COOPLET)
+        .env("COOPLET_CODEX_BIN", state.join("missing-codex"))
         .arg("--state-dir")
         .arg(state)
         .args(args)
@@ -201,6 +202,7 @@ async fn foreground_cli_restarts_with_same_identity_and_replays_stop_without_sto
             .args(["node", "doctor", "--state-dir"])
             .arg(&state)
             .env("PATH", &path)
+            .env_remove("COOPLET_CODEX_BIN")
             .output()?;
         assert!(
             output.status.success(),
@@ -209,16 +211,17 @@ async fn foreground_cli_restarts_with_same_identity_and_replays_stop_without_sto
         );
         Ok(serde_json::from_slice(&output.stdout)?)
     };
-    let pi_report = |diagnosis: &Value| {
+    let report = |diagnosis: &Value, kind: &str| {
         diagnosis["adapters"]
             .as_array()
-            .and_then(|reports| reports.iter().find(|report| report["client_kind"] == "pi"))
+            .and_then(|reports| reports.iter().find(|report| report["client_kind"] == kind))
             .cloned()
             .unwrap_or(Value::Null)
     };
     let diagnosis = diagnose()?;
     assert_eq!(diagnosis["running"], true);
-    assert_eq!(pi_report(&diagnosis)["available"], false);
+    assert_eq!(report(&diagnosis, "codex")["available"], false);
+    assert_eq!(report(&diagnosis, "pi")["available"], false);
     assert_eq!(
         diagnosis["workspace_dir"],
         json!(std::env::current_dir()?.canonicalize()?)
@@ -235,7 +238,7 @@ esac
 "#,
     )?;
     fs::set_permissions(&pi, fs::Permissions::from_mode(0o755))?;
-    let installed = pi_report(&diagnose()?);
+    let installed = report(&diagnose()?, "pi");
     assert_eq!(installed["available"], true);
     assert_eq!(installed["version"], "9.0.0");
     assert_eq!(installed["binary_path"], pi.display().to_string());
@@ -251,6 +254,7 @@ esac
         br#"{"schema":1,"client":"example"}"#,
     )?;
     let selected = Command::new(COOPLET)
+        .env("COOPLET_CODEX_BIN", state.join("missing-codex"))
         .arg("--state-dir")
         .arg(&state)
         .args(["node", "doctor", "--workspace-dir"])

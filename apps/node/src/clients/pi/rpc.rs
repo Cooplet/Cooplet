@@ -198,12 +198,18 @@ impl Session {
         }
     }
 
-    pub(super) async fn cancel(&self) -> StopOutcome {
+    pub(super) async fn cancel(&self, admission: &AdmissionGuard) -> StopOutcome {
         let Some(target) = self.state().turn.as_ref().map(|turn| turn.id.clone()) else {
             return StopOutcome::AlreadyGone;
         };
         // Hold the writer until cancellation is resolved so abort cannot race a later prompt.
-        let input = self.shared.input.lock().await;
+        let expired = || StopOutcome::Unavailable("Pi interrupt admission expired".into());
+        let Some(ms) = admission.remaining_ms() else {
+            return expired();
+        };
+        let Ok(input) = timeout(Duration::from_millis(ms), self.shared.input.lock()).await else {
+            return expired();
+        };
         let (id, termination) = {
             let mut state = self.state();
             let Ok(id) = state.new_id() else {
@@ -217,7 +223,7 @@ impl Session {
                 return StopOutcome::AlreadyGone;
             };
             if turn.awaiting_state_check {
-                return StopOutcome::Unknown("Pi is verifying which turn is active".into());
+                return StopOutcome::Unavailable("Pi is verifying which turn is active".into());
             }
             let (send, receive) = oneshot::channel();
             turn.cancel = Some(send);
@@ -226,13 +232,17 @@ impl Session {
 
         match self
             .shared
-            .command(input.as_ref(), id, "abort", None, None, false)
+            .command(input.as_ref(), id, "abort", None, Some(admission), false)
             .await
         {
             Ok(reply) if reply.success => match termination.await {
                 Ok(TurnFinishStatus::Cancelled) => StopOutcome::TurnCancelled,
                 _ => StopOutcome::Unknown("Pi did not confirm that the turn was cancelled".into()),
             },
+            Err(CommandError::Expired) => expired(),
+            Err(CommandError::BeforeWrite | CommandError::Busy) => {
+                StopOutcome::Unavailable("Pi could not send the interrupt".into())
+            }
             _ => StopOutcome::Unknown("Pi did not acknowledge the abort command".into()),
         }
     }
@@ -328,7 +338,7 @@ impl Shared {
         };
         let result = {
             let send_and_receive = async {
-                transfer.write(input, &bytes, admission).await?;
+                transfer.write(input, &bytes, admission, kind).await?;
                 receive.await.map_err(|_| transfer.failure())
             };
             tokio::select! {
@@ -387,6 +397,7 @@ impl Transfer<'_> {
         pipe: &Sender,
         bytes: &[u8],
         admission: Option<&AdmissionGuard>,
+        kind: &str,
     ) -> Result<(), CommandError> {
         while self.written < bytes.len() {
             if self.written == 0
@@ -413,6 +424,15 @@ impl Transfer<'_> {
                 }
                 if admission.is_some_and(AdmissionGuard::is_expired) {
                     return Err(CommandError::Expired);
+                }
+                // A full pipe can outlive the turn. Pi aborts whichever run is current.
+                if kind == "abort"
+                    && state
+                        .turn
+                        .as_ref()
+                        .is_none_or(|turn| turn.cancel.is_none() || turn.awaiting_state_check)
+                {
+                    return Err(CommandError::Busy);
                 }
                 if state.native_activity.is_busy()
                     && state.turn.as_ref().is_some_and(|turn| turn.id == self.id)

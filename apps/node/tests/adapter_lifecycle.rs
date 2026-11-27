@@ -183,7 +183,10 @@ async fn create_stop_and_resume_preserve_native_identity_and_rotate_credentials(
         .post_json(&stop_path, &json!({}), Some("stop-first"))
         .await?;
     assert_eq!(stopped["state"], "stopped");
-    assert_eq!(mock.stop_modes(), [StopMode::CancelTurn]);
+    assert!(matches!(
+        mock.stop_modes().as_slice(),
+        [StopMode::CancelTurn { .. }]
+    ));
     check_problem(agent_client.whoami().await, ErrorCode::Unauthorized)?;
 
     let attach_plan: TuiAttachPlan = node

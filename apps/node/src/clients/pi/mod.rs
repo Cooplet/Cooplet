@@ -153,7 +153,7 @@ impl ClientAdapter for PiAdapter {
                 return Ok(StopOutcome::AlreadyGone);
             };
             match mode {
-                StopMode::CancelTurn => Ok(session.cancel().await),
+                StopMode::CancelTurn { admission } => Ok(session.cancel(&admission).await),
                 StopMode::StopSession => {
                     session.close().await;
                     // The managed process owner confirms group termination.
@@ -441,7 +441,9 @@ fn executable() -> Option<PathBuf> {
     let cwd = env::current_dir().ok()?;
     env::split_paths(&path)
         .map(|directory| cwd.join(directory).join(KIND))
-        .find(|candidate| cooplet_platform::is_executable_file(candidate))
+        .find(|candidate| {
+            candidate.is_file() && cooplet_platform::can_execute(candidate).unwrap_or(false)
+        })
 }
 
 async fn discover() -> DiscoveryReport {

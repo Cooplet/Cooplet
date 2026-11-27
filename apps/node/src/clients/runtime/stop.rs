@@ -7,13 +7,16 @@ use std::{
     time::Duration,
 };
 
+use cooplet_platform::AdmissionGuard;
 use cooplet_protocol::{
     ErrorCode, EventKind, OperationId, ParticipantId, ParticipantKind, ParticipantState,
 };
 use cooplet_storage::{EventNotice, WriteOutcome};
+use futures_util::FutureExt;
 use rusqlite::{Transaction, params};
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use serde_json::json;
+use tokio::sync::watch;
 use utoipa::ToSchema;
 
 use crate::{
@@ -36,6 +39,33 @@ use super::{
 };
 
 const STOP_REQUEST_TIMEOUT: Duration = Duration::from_secs(2);
+
+async fn await_interrupt(
+    mut disconnected: watch::Receiver<()>,
+    admission: &AdmissionGuard,
+    call: impl Future<Output = Result<StopOutcome>>,
+) -> Option<StopOutcome> {
+    let started = AtomicBool::new(false);
+    let response = async {
+        started.store(true, Ordering::Relaxed);
+        tokio::time::timeout(STOP_REQUEST_TIMEOUT, call)
+            .await
+            .ok()?
+            .ok()
+    };
+    tokio::pin!(response);
+    tokio::select! {
+        biased;
+        _ = disconnected.changed() => {
+            admission.expire();
+            if !started.load(Ordering::Relaxed) {
+                return Some(StopOutcome::AlreadyGone);
+            }
+            response.as_mut().now_or_never().flatten()
+        }
+        result = response.as_mut() => result,
+    }
+}
 
 #[derive(Clone, Copy, Debug, Default, Deserialize, Serialize, ToSchema)]
 #[serde(deny_unknown_fields)]
@@ -223,31 +253,22 @@ impl AgentService {
         state: ParticipantState,
         live: &LiveSession,
     ) -> Result<StopAgentResponse> {
-        let mut disconnected = live.event_stop();
+        let disconnected = live.event_stop();
         let outcome = if live.state() == ParticipantState::Unknown {
-            Ok(Ok(StopOutcome::AlreadyGone))
+            Some(StopOutcome::AlreadyGone)
         } else {
-            let started = AtomicBool::new(false);
-            let call = async {
-                started.store(true, Ordering::Relaxed);
-                tokio::time::timeout(
-                    STOP_REQUEST_TIMEOUT,
-                    live.adapter
-                        .cancel_or_stop(&live.handle, StopMode::CancelTurn),
-                )
-                .await
-            };
-            tokio::select! {
-                biased;
-                _ = disconnected.changed() => {
-                    if started.load(Ordering::Relaxed) {
-                        Ok(Ok(StopOutcome::Unknown("session closed during turn cancel".into())))
-                    } else {
-                        Ok(Ok(StopOutcome::AlreadyGone))
-                    }
-                }
-                result = call => result,
-            }
+            let admission = AdmissionGuard::new(STOP_REQUEST_TIMEOUT);
+            await_interrupt(disconnected, &admission, async {
+                live.adapter
+                    .cancel_or_stop(
+                        &live.handle,
+                        StopMode::CancelTurn {
+                            admission: admission.clone(),
+                        },
+                    )
+                    .await
+            })
+            .await
         };
         let id = live.handle.persisted().participant_id.clone();
         let state = self
@@ -261,12 +282,13 @@ impl AgentService {
             stop_outcome: StopDisposition::TurnCancelled,
         };
         let error = match outcome {
-            Ok(Ok(StopOutcome::TurnCancelled)) => None,
-            Ok(Ok(StopOutcome::Unsupported(_))) => Some(invalid(
+            Some(StopOutcome::TurnCancelled) => None,
+            Some(StopOutcome::Unsupported(_)) => Some(invalid(
                 "cancel_unsupported",
                 "This adapter cannot cancel a turn",
             )),
-            Ok(Ok(StopOutcome::AlreadyGone)) => Some(busy("no_live_session", true)),
+            Some(StopOutcome::Unavailable(_)) => Some(busy("cancel_unavailable", true)),
+            Some(StopOutcome::AlreadyGone) => Some(busy("no_live_session", true)),
             _ => Some(unknown("cancel_outcome_unconfirmed")),
         };
         let now = now_ms()?;
@@ -640,4 +662,51 @@ pub(super) fn finish_stop(
         json!({"reason": update.reason}),
         events,
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use std::task::{Context, Poll, Waker};
+
+    use tokio::sync::oneshot;
+
+    use super::*;
+
+    #[tokio::test]
+    async fn ready_interrupt_ack_wins_over_disconnect_and_closes_admission()
+    -> std::result::Result<(), &'static str> {
+        let (shutdown, disconnected) = watch::channel(());
+        let (ack, result) = oneshot::channel();
+        let admission = AdmissionGuard::new(STOP_REQUEST_TIMEOUT);
+        let call = await_interrupt(disconnected, &admission, async {
+            result.await.map_err(crate::error::NodeError::internal)
+        });
+        tokio::pin!(call);
+        assert!(matches!(
+            call.as_mut().poll(&mut Context::from_waker(Waker::noop())),
+            Poll::Pending
+        ));
+        ack.send(StopOutcome::TurnCancelled)
+            .map_err(|_| "closed interrupt receiver")?;
+        shutdown.send_replace(());
+        assert!(matches!(call.await, Some(StopOutcome::TurnCancelled)));
+        assert!(admission.is_expired());
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn interrupt_aborted_before_first_poll_does_not_call_adapter() {
+        let (shutdown, disconnected) = watch::channel(());
+        let admission = AdmissionGuard::new(STOP_REQUEST_TIMEOUT);
+        let called = AtomicBool::new(false);
+        shutdown.send_replace(());
+        let outcome = await_interrupt(disconnected, &admission, async {
+            called.store(true, Ordering::Relaxed);
+            Ok(StopOutcome::TurnCancelled)
+        })
+        .await;
+        assert!(matches!(outcome, Some(StopOutcome::AlreadyGone)));
+        assert!(admission.is_expired());
+        assert!(!called.load(Ordering::Relaxed));
+    }
 }

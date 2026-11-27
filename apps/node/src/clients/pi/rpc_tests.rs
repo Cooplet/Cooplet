@@ -403,7 +403,7 @@ async fn retry_errors_and_cancel_use_the_current_turn_and_native_settlement() ->
     proof?;
     assert!(matches!(outcome, SubmitOutcome::Accepted { .. }));
 
-    let (cancel, proof) = tokio::join!(session.cancel(), async {
+    let (cancel, proof) = tokio::join!(session.cancel(&admission), async {
         let (abort, _) = peer.command().await?;
         assert_eq!(abort["type"], "abort");
         peer.ack(&abort, "ignored").await?;
@@ -536,6 +536,55 @@ async fn full_pipe(session: &Session) -> TestResult<usize> {
     }
     assert!(total > 0);
     Ok(total)
+}
+
+#[tokio::test]
+async fn a_blocked_interrupt_never_reaches_pi_after_revocation_or_settlement() -> TestResult {
+    for revoke in [true, false] {
+        let (session, mut events, mut peer) = fixture()?;
+        let admission = AdmissionGuard::new(WAIT);
+        let (outcome, proof) = tokio::join!(
+            session.submit("managed".into(), "work", &admission),
+            async {
+                let (command, _) = peer.command().await?;
+                peer.ack(&command, "started").await?;
+                peer.begin(&command).await
+            }
+        );
+        proof?;
+        assert!(matches!(outcome, SubmitOutcome::Accepted { .. }));
+        let filled = full_pipe(&session).await?;
+        let interrupt = AdmissionGuard::new(WAIT);
+        let cancel = session.cancel(&interrupt);
+        tokio::pin!(cancel);
+        assert!(futures_util::poll!(&mut cancel).is_pending());
+        if revoke {
+            interrupt.expire();
+        } else {
+            peer.assistant("stop", "finished").await?;
+            peer.settle(false).await?;
+            completed(
+                &mut events,
+                1,
+                "managed",
+                TurnFinishStatus::Completed,
+                "finished",
+            )
+            .await?;
+        }
+        let mut filler = vec![0; filled];
+        peer.input.read_exact(&mut filler).await?;
+        assert!(matches!(
+            timeout(WAIT, cancel).await?,
+            StopOutcome::Unavailable(_)
+        ));
+        assert!(
+            timeout(Duration::from_millis(30), peer.input.read_u8())
+                .await
+                .is_err()
+        );
+    }
+    Ok(())
 }
 
 #[tokio::test]
