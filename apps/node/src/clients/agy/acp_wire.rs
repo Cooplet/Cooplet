@@ -69,7 +69,7 @@ pub(super) enum WriteFailure {
 
 pub(super) struct Admission {
     pub guard: AdmissionGuard,
-    pub submitting: watch::Receiver<()>,
+    pub caller: watch::Receiver<()>,
 }
 
 struct WriteFrame {
@@ -164,8 +164,12 @@ impl Wire {
         })
     }
 
-    pub(super) async fn send_control(&self, value: Value) -> Result<(), WriteFailure> {
-        let pending = self.begin_write(value, None)?;
+    pub(super) async fn send_control(
+        &self,
+        value: Value,
+        admission: Option<Admission>,
+    ) -> Result<(), WriteFailure> {
+        let pending = self.begin_write(value, admission)?;
         Self::finish_write(pending, &self.closed).await
     }
 
@@ -215,7 +219,7 @@ impl Wire {
             "id": id,
             "error": {"code": -32601, "message": "Method not found"}
         });
-        self.send_control(response)
+        self.send_control(response, None)
             .await
             .map_err(|_| Fault::WriteUnconfirmed)
     }
@@ -262,7 +266,7 @@ fn write_frame(
     let abandoned = || {
         admission
             .as_ref()
-            .is_some_and(|admission| admission.submitting.has_changed().is_err())
+            .is_some_and(|admission| admission.caller.has_changed().is_err())
     };
     let mut remaining = bytes;
     while !remaining.is_empty() {

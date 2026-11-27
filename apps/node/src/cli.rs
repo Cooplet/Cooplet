@@ -26,8 +26,9 @@ use tokio::signal::unix::{SignalKind, signal};
 use cooplet_node::{
     auth::{Credential, read_master},
     clients::{
-        AdapterConfig, AdapterRegistry, ParticipantPage, ParticipantView, TuiAttachPlan,
+        AdapterConfig, AdapterRegistry, ParticipantPage, ParticipantView, PiAdapter, TuiAttachPlan,
         agy::{AgyAdapter, AgyAdapterConfig},
+        codex::CodexAdapter,
         list_templates,
     },
     config::{NodeConfig, check_offline_state, default_state_dir, operator_path},
@@ -222,6 +223,10 @@ async fn run_local_node(command: NodeCommand, dir: &Path) -> CliResult {
 
 fn adapter_registry() -> CliResult<AdapterRegistry> {
     let mut registry = AdapterRegistry::default();
+    registry.register(Arc::new(CodexAdapter::new(
+        std::env::var_os("COOPLET_CODEX_BIN").map(PathBuf::from),
+    )))?;
+    registry.register(Arc::new(PiAdapter))?;
     let cooplet = fs::canonicalize(std::env::current_exe()?)?;
     registry.register(Arc::new(AgyAdapter::new(AgyAdapterConfig::new(cooplet))))?;
     Ok(registry)

@@ -81,7 +81,7 @@ fn writer_distinguishes_prewrite_rejection_from_partial_frame() {
         assert_eq!(writer.bytes, &b"sample\n"[..allowance]);
     }
 
-    let (scope, submitting) = watch::channel(());
+    let (scope, caller) = watch::channel(());
     let mut output = Vec::new();
     assert_eq!(
         write_frame(
@@ -89,7 +89,7 @@ fn writer_distinguishes_prewrite_rejection_from_partial_frame() {
             b"sample\n",
             Some(Admission {
                 guard: AdmissionGuard::new(Duration::ZERO),
-                submitting: submitting.clone(),
+                caller: caller.clone(),
             }),
             &closed,
             &OnceLock::new(),
@@ -103,7 +103,7 @@ fn writer_distinguishes_prewrite_rejection_from_partial_frame() {
             b"sample\n",
             Some(Admission {
                 guard: AdmissionGuard::new(Duration::from_secs(10)),
-                submitting,
+                caller,
             }),
             &closed,
             &OnceLock::new(),
@@ -148,4 +148,88 @@ fn fenced_payload_write_never_terminates_the_frame() {
         Err(WriteFailure::Unknown)
     );
     assert_eq!(writer.output, b"{\"fixture\":true");
+}
+
+#[tokio::test]
+async fn expired_prompt_answers_a_server_request_received_during_the_write()
+-> Result<(), Box<dyn std::error::Error>> {
+    use crate::clients::{
+        InboundMessage, SubmitOutcome, SubmitTurnRequest, TurnInput, VerifiedAuthor,
+        agy::session::Session,
+    };
+    use cooplet_protocol::{AuthorKind, MessageId};
+    use futures_util::FutureExt;
+
+    let (writer, mut writes) = mpsc::channel(1);
+    let (frames, reader) = mpsc::channel(1);
+    let closed = Arc::new(AtomicBool::new(false));
+    let wire = Wire {
+        writer,
+        reader,
+        _keep_faulted_stdout_open: mpsc::channel(1).0,
+        closed: closed.clone(),
+        next_id: 1,
+    };
+    let (session, _events) = Session::start(wire, "session".into(), Duration::ZERO);
+    let id = MessageId::generate()?;
+    let input = TurnInput::direct(InboundMessage {
+        message_id: id.clone(),
+        author: VerifiedAuthor {
+            kind: AuthorKind::Human,
+            actor_id: "operator".into(),
+            name: "operator".into(),
+            source_node_id: None,
+        },
+        in_reply_to: None,
+        body: "hello".into(),
+        attachments: Vec::new(),
+        question: None,
+        answer: None,
+        expect_mcp_reply: false,
+    });
+    let guard = AdmissionGuard::new(Duration::from_secs(10));
+    let submit = session.submit(SubmitTurnRequest {
+        operation_key: "prompt".into(),
+        message_id: Some(id),
+        input,
+        output_schema: None,
+        steer: false,
+        admission: guard.clone(),
+    });
+    tokio::pin!(submit);
+    assert!((&mut submit).now_or_never().is_none());
+    let prompt = writes.recv().await.ok_or("missing prompt write")?;
+    frames
+        .send(Ok(ReceivedFrame {
+            frame: Frame::Request {
+                method: "fixture/request".into(),
+                id: json!("server-id"),
+            },
+            read_at: Instant::now(),
+        }))
+        .await
+        .map_err(|_| "reader closed")?;
+    // Capacity becomes available when pump_write consumes the server request.
+    drop(frames.reserve().await.map_err(|_| "reader closed")?);
+    guard.expire();
+    let mut output = Vec::new();
+    let outcome = write_frame(
+        &mut output,
+        &prompt.bytes,
+        prompt.admission,
+        &closed,
+        &prompt.started,
+    );
+    assert!(output.is_empty());
+    prompt.result.send(outcome).map_err(|_| "writer closed")?;
+    let response = tokio::time::timeout(Duration::from_secs(1), writes.recv())
+        .await?
+        .ok_or("server request was dropped")?;
+    let frame: Value = serde_json::from_slice(&response.bytes)?;
+    assert_eq!(frame["id"], "server-id");
+    assert_eq!(frame["error"]["code"], -32601);
+    response.result.send(Ok(())).map_err(|_| "writer closed")?;
+    assert!(matches!(submit.await, SubmitOutcome::Expired));
+    assert!(!session.is_closed());
+    Ok(())
 }

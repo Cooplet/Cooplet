@@ -137,6 +137,11 @@ impl AdmissionGuard {
         self.remaining_ms().is_none()
     }
 
+    /// Close admission across every clone without waiting for the deadline.
+    pub fn expire(&self) {
+        self.state.expired.store(true, Ordering::Release);
+    }
+
     pub fn remaining_ms(&self) -> Option<u64> {
         if self.state.expired.load(Ordering::Acquire) {
             return None;

@@ -2,6 +2,8 @@
 
 pub mod agy;
 mod binding;
+pub mod codex;
+mod pi;
 mod registry;
 mod runtime;
 mod templates;
@@ -9,6 +11,7 @@ mod turn_input;
 
 pub use binding::*;
 pub use cooplet_protocol::{ApprovalAction, ApprovalDecision, ApprovalWait, ApprovalWaitKind};
+pub use pi::PiAdapter;
 pub use registry::AdapterRegistry;
 pub use runtime::*;
 pub use templates::{
@@ -20,7 +23,7 @@ pub use turn_input::*;
 use std::{
     any::Any,
     collections::BTreeMap,
-    path::PathBuf,
+    path::{Path, PathBuf},
     process::{ChildStderr, ChildStdin, ChildStdout, Command},
     str::FromStr,
     sync::Arc,
@@ -29,7 +32,7 @@ use std::{
 use cooplet_platform::{AdmissionGuard, ProcessIdentity};
 use cooplet_protocol::{ErrorCode, MessageId, ParticipantId, ParticipantState};
 use futures_util::future::BoxFuture;
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Serialize, Serializer};
 use serde_json::Value;
 use tokio::sync::mpsc;
 use utoipa::ToSchema;
@@ -82,10 +85,20 @@ pub struct AdapterConfig {
 pub struct DiscoveryReport {
     pub client_kind: String,
     pub available: bool,
+    #[serde(serialize_with = "serialize_display_path")]
     pub binary_path: Option<PathBuf>,
     pub version: Option<String>,
     pub capabilities: AdapterCapabilities,
     pub detail: Option<String>,
+}
+
+fn serialize_display_path<S: Serializer>(
+    path: &Option<PathBuf>,
+    serializer: S,
+) -> std::result::Result<S::Ok, S::Error> {
+    path.as_deref()
+        .map(Path::to_string_lossy)
+        .serialize(serializer)
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -152,7 +165,46 @@ pub enum SessionOpenMode {
     },
 }
 
+/// Filesystem preparation may outlive a cancelled adapter future. The opener waits
+/// for it before cleaning the generation and rolls back a new reservation only
+/// after the process owner and database confirm that the open failed.
+#[derive(Clone, Default)]
+pub struct OpenPreparation {
+    rollback: Arc<tokio::sync::Mutex<Option<OpenRollback>>>,
+}
+
+pub type OpenRollback = Box<dyn FnOnce() -> std::io::Result<()> + Send>;
+
+impl OpenPreparation {
+    pub async fn run<T: Send + 'static>(
+        &self,
+        job: impl FnOnce(&mut Option<OpenRollback>) -> Result<T> + Send + 'static,
+    ) -> Result<T> {
+        let mut rollback = self.rollback.clone().lock_owned().await;
+        tokio::task::spawn_blocking(move || job(&mut rollback))
+            .await
+            .map_err(NodeError::internal)?
+    }
+
+    async fn wait(&self) {
+        drop(self.rollback.lock().await);
+    }
+
+    async fn undo(&self) {
+        if let Some(cleanup) = self.rollback.lock().await.take() {
+            match tokio::task::spawn_blocking(cleanup).await {
+                Ok(Ok(())) => {}
+                Ok(Err(error)) => {
+                    tracing::warn!(%error, "Could not release a native session reservation")
+                }
+                Err(error) => tracing::warn!(%error, "Native session rollback task failed"),
+            }
+        }
+    }
+}
+
 pub struct SessionOpenRequest {
+    pub preparation: OpenPreparation,
     pub participant_id: ParticipantId,
     pub generation: u64,
     pub mode: SessionOpenMode,
@@ -272,7 +324,7 @@ pub enum SubmitOutcome {
     AwaitingApproval(ApprovalWait),
     /// The first native write was prevented by the admission deadline.
     Expired,
-    /// The adapter can prove that no native write happened.
+    /// The adapter can prove that the native client did not accept the input.
     Unavailable(String),
     /// A native write may have started, and the adapter could not verify its outcome.
     Unknown(String),
@@ -287,9 +339,12 @@ pub enum ApprovalRespondOutcome {
     Unknown(String),
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug)]
 pub enum StopMode {
-    CancelTurn,
+    /// Check admission immediately before the first possible interrupt write.
+    CancelTurn {
+        admission: AdmissionGuard,
+    },
     StopSession,
 }
 
@@ -298,6 +353,8 @@ pub enum StopOutcome {
     Stopped,
     TurnCancelled,
     Unsupported(String),
+    /// No interrupt was accepted because of a temporary condition.
+    Unavailable(String),
     AlreadyGone,
     Unknown(String),
 }

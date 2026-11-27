@@ -6,6 +6,7 @@ use std::{
     time::Duration,
 };
 
+use cooplet_platform::AdmissionGuard;
 use serde_json::{Value, json};
 use tokio::{
     sync::{mpsc, oneshot, watch},
@@ -150,18 +151,27 @@ impl Session {
         })
     }
 
-    pub(super) async fn cancel(&self) -> StopOutcome {
+    pub(super) async fn cancel(&self, guard: AdmissionGuard) -> StopOutcome {
         if self.is_closed() {
             return StopOutcome::AlreadyGone;
         }
         let Some(prompt_id) = self.state.borrow().prompt_id else {
             return StopOutcome::TurnCancelled;
         };
+        if guard.is_expired() {
+            return expired_cancel();
+        }
+        let (_scope, caller) = watch::channel(());
+        let admission = Admission { guard, caller };
         let (reply, result) = oneshot::channel();
         match timeout(CANCEL_TIMEOUT, async {
             if self
                 .commands
-                .send(Command::Cancel { prompt_id, reply })
+                .send(Command::Cancel {
+                    prompt_id,
+                    admission,
+                    reply,
+                })
                 .await
                 .is_err()
             {
@@ -193,6 +203,7 @@ enum Command {
     },
     Cancel {
         prompt_id: u64,
+        admission: Admission,
         reply: oneshot::Sender<StopOutcome>,
     },
 }
@@ -215,6 +226,10 @@ async fn reject_queued_commands(mut requests: mpsc::Receiver<Command>) {
     while let Some(request) = requests.recv().await {
         request.transport_closed();
     }
+}
+
+fn expired_cancel() -> StopOutcome {
+    StopOutcome::Unavailable("Agy cancellation admission expired".into())
 }
 
 fn closed_submit() -> SubmitOutcome {
@@ -256,7 +271,7 @@ impl Actor {
                 }
                 command = commands.recv() => match command {
                     Some(Command::Submit { request, exit, reply }) => self.submit(wire, *request, exit, reply).await?,
-                    Some(Command::Cancel { prompt_id, reply }) => self.cancel(wire, prompt_id, reply).await?,
+                    Some(Command::Cancel { prompt_id, admission, reply }) => self.cancel(wire, prompt_id, admission, reply).await?,
                     None => return Ok(()),
                 },
             }
@@ -329,7 +344,7 @@ impl Actor {
             frame,
             Some(Admission {
                 guard: request.admission,
-                submitting: exit,
+                caller: exit,
             }),
         ) {
             Ok(pending) => {
@@ -368,7 +383,9 @@ impl Actor {
             return match read_fault {
                 Some(fault) => Err(fault),
                 None if failure == WriteFailure::Unwritten => Err(Fault::Closed),
-                None => Ok(()),
+                // A zero-byte refusal leaves the transport usable. The peer
+                // still needs answers to requests it sent during that write.
+                None => inbox.finish(wire).await.map(|_| ()),
             };
         }
         if let Some(fault) = read_fault {
@@ -521,6 +538,7 @@ impl Actor {
         &mut self,
         wire: &Wire,
         prompt_id: u64,
+        admission: Admission,
         reply: oneshot::Sender<StopOutcome>,
     ) -> Result<(), Fault> {
         if reply.is_closed() {
@@ -542,14 +560,30 @@ impl Actor {
             ));
             return Ok(());
         }
-        turn.cancellation = Some(reply);
-        wire.send_control(json!({
+        let frame = json!({
             "jsonrpc": "2.0",
             "method": "session/cancel",
             "params": {"sessionId": self.session_id}
-        }))
-        .await
-        .map_err(|_| Fault::WriteUnconfirmed)
+        });
+        match wire.send_control(frame, Some(admission)).await {
+            Ok(()) => turn.cancellation = Some(reply),
+            Err(WriteFailure::Expired) => {
+                let _ = reply.send(expired_cancel());
+            }
+            Err(WriteFailure::Encode | WriteFailure::FrameLimit) => {
+                let _ = reply.send(StopOutcome::Unavailable(
+                    "Could not frame Agy cancellation".into(),
+                ));
+            }
+            Err(WriteFailure::Unwritten) => {
+                let _ = reply.send(StopOutcome::Unavailable(
+                    "Agy ACP pipe closed before cancellation".into(),
+                ));
+                return Err(Fault::Closed);
+            }
+            Err(WriteFailure::Unknown) => return Err(Fault::WriteUnconfirmed),
+        }
+        Ok(())
     }
 
     async fn change_state(&mut self, state: ParticipantRuntimeState) -> Result<(), Fault> {
@@ -602,10 +636,15 @@ mod tests {
         let (commands, requests) = mpsc::channel(1);
         let permit = commands.reserve().await?;
         let (reply, result) = oneshot::channel();
+        let (_scope, caller) = watch::channel(());
         tokio::join!(reject_queued_commands(requests), async {
             commands.closed().await;
             permit.send(Command::Cancel {
                 prompt_id: 1,
+                admission: Admission {
+                    guard: AdmissionGuard::new(CANCEL_TIMEOUT),
+                    caller,
+                },
                 reply,
             });
         });

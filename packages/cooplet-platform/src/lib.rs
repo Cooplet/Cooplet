@@ -13,7 +13,7 @@ pub use fs::PrivateFs;
 pub use lock::{FileLock, LockProbe};
 pub use process::{
     PendingCleanup, ProcessHandle, ProcessIdentity, ProcessProbe, SpawnError, TerminateOutcome,
-    Termination, current_linux_boot_id,
+    Termination, can_execute, current_linux_boot_id,
 };
 #[cfg(target_os = "linux")]
 pub use process::{PidfdPoll, poll_pidfds};

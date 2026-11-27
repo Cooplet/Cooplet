@@ -82,10 +82,7 @@ impl AgyAdapter {
         let mut report = DiscoveryReport {
             client_kind: KIND.into(),
             available: false,
-            binary_path: binary
-                .as_ref()
-                .filter(|path| path.to_str().is_some())
-                .cloned(),
+            binary_path: binary.clone(),
             version: None,
             capabilities: AdapterCapabilities::default(),
             detail: None,
@@ -325,7 +322,7 @@ impl ClientAdapter for AgyAdapter {
                 return Ok(StopOutcome::AlreadyGone);
             };
             Ok(match mode {
-                StopMode::CancelTurn => session.cancel().await,
+                StopMode::CancelTurn { admission } => session.cancel(admission).await,
                 StopMode::StopSession => session.stop(),
             })
         })

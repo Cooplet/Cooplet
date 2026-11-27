@@ -2,6 +2,7 @@ use std::{
     error::Error,
     fs, io,
     io::{BufRead, BufReader, Write},
+    os::unix::{ffi::OsStrExt as _, fs::PermissionsExt as _},
     path::{Path, PathBuf},
     process::{Child, ChildStdout, Command, Stdio},
     time::Duration,
@@ -118,6 +119,7 @@ async fn operator(state: &Path) -> TestResult<CoopletClient> {
 
 fn command(state: &Path, args: &[&str]) -> TestResult<std::process::Output> {
     let output = Command::new(COOPLET)
+        .env("COOPLET_CODEX_BIN", state.join("missing-codex"))
         .arg("--state-dir")
         .arg(state)
         .args(args)
@@ -169,6 +171,7 @@ fi
         Command::new(COOPLET)
             .args(["node", "run", "--state-dir"])
             .arg(&state)
+            .env_remove("COOPLET_CODEX_BIN")
             .env("PATH", &directory.0)
             .env("HOME", &home)
             .env("COOPLET_AGY_TEST_SENTINEL", "must be removed")
@@ -181,6 +184,7 @@ fi
     let output = Command::new(COOPLET)
         .args(["node", "doctor", "--state-dir"])
         .arg(&state)
+        .env_remove("COOPLET_CODEX_BIN")
         .env("PATH", &directory.0)
         .env("HOME", &home)
         .env("COOPLET_AGY_TEST_SENTINEL", "must be removed")
@@ -216,12 +220,16 @@ fi
     let output = Command::new(COOPLET)
         .args(["node", "doctor", "--state-dir"])
         .arg(&state)
+        .env_remove("COOPLET_CODEX_BIN")
         .env("PATH", &raw)
         .output()?;
     assert!(output.status.success());
     let report: Value = serde_json::from_slice(&output.stdout)?;
     assert_eq!(agy_report(&report)?["available"], true);
-    assert_eq!(agy_report(&report)?["binary_path"], Value::Null);
+    assert_eq!(
+        agy_report(&report)?["binary_path"],
+        raw.join("agy").display().to_string()
+    );
 
     command(&state, &["node", "stop"])?;
     assert!(daemon.wait().await?.success());
@@ -230,7 +238,7 @@ fi
 
 #[tokio::test]
 async fn startup_announces_the_exact_operator_path_for_non_utf8_state() -> TestResult {
-    use std::{ffi::OsStr, os::unix::ffi::OsStrExt};
+    use std::ffi::OsStr;
 
     let directory = TestDirectory::new()?;
     let raw = directory.0.join(OsStr::from_bytes(b"state-\xff"));
@@ -277,14 +285,70 @@ async fn foreground_cli_restarts_with_same_identity_and_replays_stop_without_sto
         serde_json::from_slice::<Value>(&command(&state, &["node", "status"])?.stdout)?["status"],
         "ok"
     );
-    let diagnosis: Value = serde_json::from_slice(&command(&state, &["node", "doctor"])?.stdout)?;
+    let client_path = directory
+        .0
+        .join(std::ffi::OsStr::from_bytes(b"client-binaries-\xff"));
+    fs::create_dir(&client_path)?;
+    let first_bin = directory.0.join("first-bin");
+    fs::create_dir(&first_bin)?;
+    let shadow = first_bin.join("pi");
+    fs::write(&shadow, "#!/bin/sh\nexit 1\n")?;
+    // For the owning non-root user, execute permission for others does not apply.
+    let mode = if cooplet_platform::current_euid() == 0 {
+        0o644
+    } else {
+        0o645
+    };
+    fs::set_permissions(&shadow, fs::Permissions::from_mode(mode))?;
+    let path = std::env::join_paths([&first_bin, &client_path])?;
+    let diagnose = || -> TestResult<Value> {
+        let output = Command::new(COOPLET)
+            .args(["node", "doctor", "--state-dir"])
+            .arg(&state)
+            .env("PATH", &path)
+            .env_remove("COOPLET_CODEX_BIN")
+            .output()?;
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        Ok(serde_json::from_slice(&output.stdout)?)
+    };
+    let report = |diagnosis: &Value, kind: &str| {
+        diagnosis["adapters"]
+            .as_array()
+            .and_then(|reports| reports.iter().find(|report| report["client_kind"] == kind))
+            .cloned()
+            .unwrap_or(Value::Null)
+    };
+    let diagnosis = diagnose()?;
     assert_eq!(diagnosis["running"], true);
-    assert_eq!(agy_report(&diagnosis)?["available"], false);
+    assert_eq!(report(&diagnosis, "agy")["available"], false);
+    assert_eq!(report(&diagnosis, "codex")["available"], false);
+    assert_eq!(report(&diagnosis, "pi")["available"], false);
     assert_eq!(
         diagnosis["workspace_dir"],
         json!(std::env::current_dir()?.canonicalize()?)
     );
-    use std::os::unix::ffi::OsStrExt;
+    let pi = client_path.join("pi");
+    fs::write(
+        &pi,
+        r#"#!/bin/sh
+case "$1" in
+  --help) printf '%s\n' '  --mode <mode> text, json, or rpc' '  --session <path>' '  --extension <path>' '  --model <id>' '  --thinking <level>' ;;
+  --version) printf '%s\n' '9.0.0' ;;
+  *) exit 1 ;;
+esac
+"#,
+    )?;
+    fs::set_permissions(&pi, fs::Permissions::from_mode(0o755))?;
+    let installed = report(&diagnose()?, "pi");
+    assert_eq!(installed["available"], true);
+    assert_eq!(installed["version"], "9.0.0");
+    assert_eq!(installed["binary_path"], pi.display().to_string());
+    assert_eq!(installed["capabilities"]["supports_resume"], true);
+    assert_eq!(installed["capabilities"]["supports_tui_attach"], false);
     let workspace = directory
         .0
         .join(std::ffi::OsStr::from_bytes(b"separate-workspace-\xff"));
@@ -295,6 +359,7 @@ async fn foreground_cli_restarts_with_same_identity_and_replays_stop_without_sto
         br#"{"schema":1,"client":"example"}"#,
     )?;
     let selected = Command::new(COOPLET)
+        .env("COOPLET_CODEX_BIN", state.join("missing-codex"))
         .arg("--state-dir")
         .arg(&state)
         .args(["node", "doctor", "--workspace-dir"])

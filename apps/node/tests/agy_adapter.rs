@@ -213,6 +213,7 @@ fn open_request(
     mode: SessionOpenMode,
 ) -> TestResult<SessionOpenRequest> {
     Ok(SessionOpenRequest {
+        preparation: Default::default(),
         participant_id: ParticipantId::generate()?,
         generation: 1,
         mode,
@@ -261,6 +262,12 @@ fn turn(input: TurnInput, key: &str) -> SubmitTurnRequest {
         input,
         output_schema: None,
         steer: false,
+        admission: AdmissionGuard::new(WAIT),
+    }
+}
+
+fn cancel_turn() -> StopMode {
+    StopMode::CancelTurn {
         admission: AdmissionGuard::new(WAIT),
     }
 }
@@ -756,9 +763,7 @@ async fn cancel_is_idempotent_and_keeps_the_session_usable() -> TestResult {
     tree.reset_release()?;
     let handle = session.handle.clone();
     assert!(matches!(
-        adapter
-            .cancel_or_stop(&handle, StopMode::CancelTurn)
-            .await?,
+        adapter.cancel_or_stop(&handle, cancel_turn()).await?,
         StopOutcome::TurnCancelled
     ));
     assert!(tree.frames("session/cancel")?.is_empty());
@@ -794,10 +799,21 @@ async fn cancel_is_idempotent_and_keeps_the_session_usable() -> TestResult {
             adapter.submit_turn(&handle, steer).await,
             SubmitOutcome::Busy
         ));
+        let admission = AdmissionGuard::new(WAIT);
+        let previous_cancels = tree.frames("session/cancel")?.len();
+        let fenced = adapter.cancel_or_stop(
+            &handle,
+            StopMode::CancelTurn {
+                admission: admission.clone(),
+            },
+        );
+        tokio::pin!(fenced);
+        assert!((&mut fenced).now_or_never().is_none());
+        admission.expire();
+        assert!(matches!(fenced.await?, StopOutcome::Unavailable(_)));
+        assert_eq!(tree.frames("session/cancel")?.len(), previous_cancels);
         let before = Instant::now();
-        let outcome = adapter
-            .cancel_or_stop(&handle, StopMode::CancelTurn)
-            .await?;
+        let outcome = adapter.cancel_or_stop(&handle, cancel_turn()).await?;
         if mode == "cancel" {
             assert!(matches!(outcome, StopOutcome::TurnCancelled));
         } else {
@@ -814,9 +830,7 @@ async fn cancel_is_idempotent_and_keeps_the_session_usable() -> TestResult {
             ));
             if mode == "cancel-on-retry" {
                 assert!(matches!(
-                    adapter
-                        .cancel_or_stop(&handle, StopMode::CancelTurn)
-                        .await?,
+                    adapter.cancel_or_stop(&handle, cancel_turn()).await?,
                     StopOutcome::TurnCancelled
                 ));
             } else {
@@ -860,7 +874,7 @@ async fn cancel_during_prompt_handoff_reports_a_natural_finish() -> TestResult {
     assert!((&mut submit).now_or_never().is_none());
     tree.wait_for(|frame| frame["method"] == "session/prompt", 1)
         .await?;
-    let cancel = adapter.cancel_or_stop(&handle, StopMode::CancelTurn);
+    let cancel = adapter.cancel_or_stop(&handle, cancel_turn());
     tokio::pin!(cancel);
     assert!((&mut cancel).now_or_never().is_none());
     tree.release()?;
@@ -892,9 +906,7 @@ async fn cancel_can_finish_while_the_submit_caller_holds_its_ack() -> TestResult
         AdapterEventKind::StateChanged(ParticipantRuntimeState::Working)
     ));
     assert!(matches!(
-        adapter
-            .cancel_or_stop(&handle, StopMode::CancelTurn)
-            .await?,
+        adapter.cancel_or_stop(&handle, cancel_turn()).await?,
         StopOutcome::TurnCancelled
     ));
     finished(&mut session, 2, "turn", TurnFinishStatus::Cancelled, "").await?;

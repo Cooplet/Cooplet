@@ -1,6 +1,6 @@
 use std::{
     env, fs, io,
-    os::unix::{ffi::OsStrExt, fs::PermissionsExt},
+    os::unix::ffi::OsStrExt,
     path::{Path, PathBuf},
 };
 
@@ -141,8 +141,7 @@ pub(super) fn path_text(path: &Path) -> Result<&str> {
 }
 
 pub(super) fn executable(path: &Path) -> bool {
-    fs::metadata(path)
-        .is_ok_and(|metadata| metadata.is_file() && metadata.permissions().mode() & 0o111 != 0)
+    path.is_file() && cooplet_platform::can_execute(path).unwrap_or(false)
 }
 
 pub(super) fn validate_options(options: &EffectiveAgentOptions) -> Result<()> {

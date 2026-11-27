@@ -15,7 +15,7 @@ use crate::{
     auth::{Credential, platform_io},
     clients::{
         AdapterBinding, AdapterConfig, AgentOverrides, ClientAdapter, CoreBinding, DiscoveryReport,
-        EffectiveAgentOptions, LifecycleBlock, LifecycleBlockKind, OpenedSession,
+        EffectiveAgentOptions, LifecycleBlock, LifecycleBlockKind, OpenPreparation, OpenedSession,
         ParticipantRuntimeState, ProcessOwnership, SessionOpenMode, SessionOpenRequest,
         TuiAttachPlan, compose_session_instructions, load_template, load_template_options,
     },
@@ -300,12 +300,15 @@ impl AgentService {
             remove_runtime_dir(self.0.config.state_dir.clone(), previous_key).await;
         }
         let previous_ownership = plan.previous.as_ref().map(|previous| previous.ownership);
-        let result = self.start_open(&plan, &key, &credential).await;
+        let preparation = OpenPreparation::default();
+        let result = self
+            .start_open(&plan, &key, &credential, &preparation)
+            .await;
         let (opened, mode) = match result {
             Ok(opened) => opened,
             Err(error) => {
                 return self
-                    .rollback_open(op, &key, boot_id, previous_ownership, error)
+                    .rollback_open(op, &key, boot_id, previous_ownership, &preparation, error)
                     .await;
             }
         };
@@ -316,7 +319,7 @@ impl AgentService {
                 Ok(Some(value)) => decode(value)?,
                 _ => {
                     return self
-                        .rollback_open(op, &key, boot_id, previous_ownership, error)
+                        .rollback_open(op, &key, boot_id, previous_ownership, &preparation, error)
                         .await;
                 }
             },
@@ -454,6 +457,7 @@ impl AgentService {
         plan: &OpenPlan,
         key: &SessionKey,
         credential: &Credential,
+        preparation: &OpenPreparation,
     ) -> Result<(OpenedSession, ParticipantState)> {
         let state_dir = self.0.config.state_dir.clone();
         let prep_key = key.clone();
@@ -481,6 +485,7 @@ impl AgentService {
         };
         let spawner = Arc::new(OpeningSpawner::new(self.clone(), key.clone()));
         let request = SessionOpenRequest {
+            preparation: preparation.clone(),
             participant_id: key.0.clone(),
             generation: key.1,
             mode,
@@ -627,8 +632,10 @@ impl AgentService {
         key: &SessionKey,
         boot_id: Option<String>,
         previous_ownership: Option<ProcessOwnership>,
+        preparation: &OpenPreparation,
         error: NodeError,
     ) -> Result<T> {
+        preparation.wait().await;
         let clean = if self.has_owned_process(key) {
             self.clean_owned_process(key, None).await
         } else {
@@ -683,12 +690,17 @@ impl AgentService {
                 } else {
                     op.fail(tx, now, &saved)?;
                 }
-                Ok(WriteOutcome::with_events((), events))
+                Ok(WriteOutcome::with_events(
+                    clean && row.native_key.is_none(),
+                    events,
+                ))
             })
             .await;
-        if write.is_err() {
-            return Err(unknown("open_result_unconfirmed")
-                .with_extension("operation_id", operation.id.as_str()));
+        let unbound = write.map_err(|_| {
+            unknown("open_result_unconfirmed").with_extension("operation_id", operation.id.as_str())
+        })?;
+        if unbound {
+            preparation.undo().await;
         }
         Err(Arc::try_unwrap(error).unwrap_or_else(|_| unknown("open_result_unconfirmed")))
     }
