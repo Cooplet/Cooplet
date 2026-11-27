@@ -13,7 +13,7 @@ The workspace fitness tests enforce these internal dependency permissions.
 | `cooplet-storage` | `cooplet-protocol`, `cooplet-platform` |
 | `cooplet-client` | `cooplet-protocol` |
 | `apps/node` | `cooplet-protocol`, `cooplet-platform`, `cooplet-storage`, `cooplet-client` |
-| `apps/hub` | `cooplet-protocol`, `cooplet-platform`, `cooplet-storage`, `cooplet-client` (dev only) |
+| `apps/hub` | `cooplet-protocol`, `cooplet-platform`, `cooplet-storage`, `cooplet-client` |
 | `apps/telegram`, `apps/history` | `cooplet-protocol`, `cooplet-platform`, `cooplet-client` |
 
 Keep the protocol free of I/O. It may not depend on Tokio, SQLite, Axum, reqwest, or libc. The client may not depend on Axum or SQLite. Keep unsafe code confined to `cooplet-platform` with a safety argument for each block. Keep production Rust free of unchecked unwraps, panics, and other constructs denied by the workspace Clippy policy.
