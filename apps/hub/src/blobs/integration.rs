@@ -185,6 +185,15 @@ async fn full_quota_replay_and_first_attach_keep_the_node_boundary() -> TestResu
         .await??,
         (StatusCode::OK, attachment.clone()),
     );
+    let mut mismatched = headers.clone();
+    mismatched.insert(X_COOPLET_FILENAME, HeaderValue::from_static("other.pdf"));
+    let stalled = Body::from_stream(stream::pending::<Result<Bytes, std::io::Error>>());
+    let conflict = tokio::time::timeout(
+        Duration::from_secs(2),
+        upload(&fixture.state, &owner, &mismatched, stalled),
+    )
+    .await?;
+    assert!(conflict.is_err_and(|error| error.problem().code == ErrorCode::OperationConflict));
     let bad = upload(
         &fixture.state,
         &owner,
