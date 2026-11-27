@@ -607,6 +607,68 @@ async fn direct_fanout_waits_for_bridge_capacity_but_attempts_each_recipient_onc
 }
 
 #[tokio::test]
+async fn a_quiet_post_skips_confirmed_busy_and_expired_queue_wakes() -> TestResult {
+    let mut fixture = Fixture::new(true).await?;
+    let board = fixture.board(DeliveryMode::QueueUntilIdle).await?;
+    fixture.set_worker(ParticipantState::Idle).await?;
+    fixture
+        .post(&board, "queue-addressed", "@worker review")
+        .await?;
+    fixture
+        .attempt()
+        .await?
+        .complete(ThreadDeliveryOutcome::Delivered)?;
+    fixture.settle().await?;
+
+    // Holding every bridge slot makes even an empty scheduler pass observable.
+    let occupied = fixture.bridge.free_slot.clone().try_acquire_owned()?;
+    fixture
+        .post(&board, "quiet-confirmed", "Progress update")
+        .await?;
+    fixture.settle().await?;
+    drop(occupied);
+
+    fixture
+        .post(&board, "queue-addressed-again", "@worker review again")
+        .await?;
+    fixture
+        .attempt()
+        .await?
+        .complete(ThreadDeliveryOutcome::Busy)?;
+    fixture.settle().await?;
+    let occupied = fixture.bridge.free_slot.clone().try_acquire_owned()?;
+    fixture
+        .post(&board, "quiet-while-busy", "More context")
+        .await?;
+    fixture.settle().await?;
+    drop(occupied);
+
+    fixture.set_worker(ParticipantState::Idle).await?;
+    let retry = fixture.attempt().await?;
+    assert_eq!(retry.payload.to_seq, 4);
+    retry.complete(ThreadDeliveryOutcome::Delivered)?;
+    fixture.settle().await?;
+
+    fixture.set_worker(ParticipantState::Working).await?;
+    let post = fixture
+        .post(&board, "expiring-wake", "@worker later")
+        .await?;
+    fixture.wall.store(
+        post.created_at_ms + threads::RETENTION_MS,
+        Ordering::Relaxed,
+    );
+    fixture.set_worker(ParticipantState::Idle).await?;
+    fixture.settle().await?;
+    let occupied = fixture.bridge.free_slot.clone().try_acquire_owned()?;
+    fixture
+        .post(&board, "quiet-after-expiry", "More context")
+        .await?;
+    fixture.settle().await?;
+    drop(occupied);
+    fixture.close().await
+}
+
+#[tokio::test]
 async fn a_post_using_the_last_write_slot_still_wakes_its_node() -> TestResult {
     let mut fixture = Fixture::new(true).await?;
     fixture.state.background = crate::BackgroundWrites::new(1);
@@ -1083,4 +1145,67 @@ async fn ack_for_a_recovery_prefix_preserves_a_newer_direct_wake() -> TestResult
         fixture.close().await?;
     }
     Ok(())
+}
+
+#[tokio::test]
+async fn direct_follow_up_turns_use_the_free_slot_while_a_peer_ack_is_outstanding() -> TestResult {
+    let mut fixture = Fixture::new(true).await?;
+    fixture.bridge.free_slot.add_permits(1);
+    let thread = fixture.board(DeliveryMode::DirectNow).await?;
+    let peer = fixture.add_peer(&thread, DeliveryMode::DirectNow).await?;
+    fixture.post(&thread, "fanout-start", "@all review").await?;
+    let first = fixture.attempt().await?;
+    let other = fixture.attempt().await?;
+    assert_ne!(first.payload.member_id, other.payload.member_id);
+    fixture.blocked_scan().await?;
+
+    let member = first.payload.member_id.clone();
+    let mention = if member == peer { "@peer" } else { "@worker" };
+    fixture.post(&thread, "fanout-follow-1", mention).await?;
+    fixture.blocked_scan().await?;
+    fixture.post(&thread, "fanout-follow-2", mention).await?;
+    fixture.blocked_scan().await?;
+    first.complete(ThreadDeliveryOutcome::Delivered)?;
+
+    for seq in [2, 3] {
+        let follow_up = fixture.attempt().await?;
+        assert_eq!(follow_up.payload.member_id, member);
+        assert_eq!(
+            (follow_up.payload.from_seq, follow_up.payload.to_seq),
+            (seq, seq)
+        );
+        follow_up.complete(ThreadDeliveryOutcome::Delivered)?;
+    }
+    other.complete(ThreadDeliveryOutcome::Delivered)?;
+    fixture.settle().await?;
+    fixture.close().await
+}
+
+#[tokio::test]
+async fn transient_retry_runs_after_backoff_while_a_peer_ack_is_outstanding() -> TestResult {
+    let mut fixture = Fixture::new(true).await?;
+    fixture.bridge.free_slot.add_permits(1);
+    let thread = fixture.board(DeliveryMode::QueueUntilIdle).await?;
+    fixture
+        .add_peer(&thread, DeliveryMode::QueueUntilIdle)
+        .await?;
+    fixture.set_worker(ParticipantState::Idle).await?;
+    fixture.settle().await?;
+    fixture.post(&thread, "fanout-retry", "@all review").await?;
+    let first = fixture.attempt().await?;
+    let other = fixture.attempt().await?;
+    assert_ne!(first.payload.member_id, other.payload.member_id);
+    fixture.blocked_scan().await?;
+
+    let member = first.payload.member_id.clone();
+    let start = tokio::time::Instant::now();
+    first.complete(ThreadDeliveryOutcome::Unavailable)?;
+    let retry = fixture.attempt().await?;
+    assert!(start.elapsed() >= INITIAL_RETRY);
+    assert_eq!(retry.payload.member_id, member);
+    assert_eq!((retry.payload.from_seq, retry.payload.to_seq), (1, 1));
+    retry.complete(ThreadDeliveryOutcome::Delivered)?;
+    other.complete(ThreadDeliveryOutcome::Delivered)?;
+    fixture.settle().await?;
+    fixture.close().await
 }

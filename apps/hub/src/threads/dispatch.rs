@@ -84,15 +84,23 @@ fn signal(state: &AppState, node_id: &NodeId, idle: bool) {
 
 pub(super) async fn wake_thread(state: &AppState, thread_id: ThreadId) {
     let id = thread_id.clone();
+    let now = (state.wall_clock)();
     let nodes = read_tx(&state.reads, move |db| {
         let mut stmt = db.prepare_cached(
             "SELECT DISTINCT m.node_id FROM thread_members m JOIN nodes n USING(node_id)
+             JOIN node_participants p ON p.node_id=m.node_id AND p.participant_id=m.participant_id
              WHERE m.thread_id=?1 AND m.state='active' AND m.node_id IS NOT NULL
                AND m.role!='observer' AND m.wake_policy!='muted' AND n.status='online'
-               AND (m.last_wake_seq>0 OR m.resume_through_seq IS NOT NULL)",
+               AND p.synced_epoch=n.session_epoch AND p.kind='agent'
+               AND ((m.delivery_mode='direct_now' AND m.resume_through_seq IS NULL AND m.last_wake_seq>0)
+                    OR (p.state='idle' AND p.idle_delivery_id IS NULL
+                        AND (m.resume_through_seq IS NOT NULL
+                             OR (m.delivery_mode='queue_until_idle' AND m.last_wake_seq>m.confirmed_seq
+                                 AND EXISTS(SELECT 1 FROM thread_posts post WHERE post.thread_id=m.thread_id
+                                            AND post.seq=m.last_wake_seq AND post.expires_at_ms>?2)))))",
         )?;
         Ok(stmt
-            .query_map([id.as_str()], |row| parse_col::<NodeId>(row, 0))?
+            .query_map(params![id.as_str(), now], |row| parse_col::<NodeId>(row, 0))?
             .collect::<rusqlite::Result<Vec<_>>>()?)
     })
     .await;
@@ -227,6 +235,8 @@ async fn drive_queue(state: AppState, node_id: NodeId, mut wake: watch::Receiver
     let mut retry = false;
     let mut follow_up = false;
     let mut retries = 0;
+    let mut retry_at = None;
+    let mut shutdown = state.shutdown.clone();
     loop {
         {
             let current = wake.borrow_and_update();
@@ -258,48 +268,45 @@ async fn drive_queue(state: AppState, node_id: NodeId, mut wake: watch::Receiver
                 }
             }
         }
-        if !sweep.pending.is_empty() {
-            tokio::select! {
-                change = wake.changed() => {
-                    if change.is_err() { return; }
-                    continue;
-                },
-                completion = sweep.next() => if let Some(outcome) = completion {
-                    match outcome {
-                        Completion::Rescan => follow_up = true,
-                        Completion::Transient => retry = true,
-                        Completion::Ignore => {}
-                    }
-                }
-            }
-            scan = true;
-            continue;
-        }
-        if std::mem::take(&mut follow_up) {
+        // Reaching the end of the keyset frees the next pass to start, even
+        // if other participants still have unacknowledged deliveries.
+        if !scan && std::mem::take(&mut follow_up) {
             sweep.cursor = None;
             scan = true;
             continue;
         }
-        if std::mem::take(&mut retry) && retries < RETRIES {
+        if std::mem::take(&mut retry) && retry_at.is_none() && retries < RETRIES {
             let delay = (INITIAL_RETRY * (1 << retries)).min(MAX_RETRY);
             retries += 1;
-            let mut shutdown = state.shutdown.clone();
+            retry_at = Some(tokio::time::Instant::now() + delay);
+        }
+        if !sweep.pending.is_empty() || retry_at.is_some() {
             tokio::select! {
-                _ = shutdown.changed() => {},
                 change = wake.changed() => {
-                    if change.is_err() {
-                        return;
-                    }
-                    continue;
+                    if change.is_err() { return; }
                 }
-                () = tokio::time::sleep(delay) => {
-                    sweep.cursor = None;
+                completion = sweep.next(), if !sweep.pending.is_empty() => {
+                    match completion {
+                        Some(Completion::Rescan) => follow_up = true,
+                        Some(Completion::Transient) => retry = true,
+                        Some(Completion::Ignore) | None => {}
+                    }
                     scan = true;
                 }
+                () = async {
+                    if let Some(at) = retry_at { tokio::time::sleep_until(at).await; }
+                }, if retry_at.is_some() => {
+                    retry_at = None;
+                    // On saturation keep the current keyset position. The
+                    // scheduled retry will revisit earlier keys on wraparound.
+                    follow_up = true;
+                }
+                _ = shutdown.changed(), if retry_at.is_some() => {
+                    retry_at = None;
+                    retries = RETRIES;
+                }
             }
-            if scan {
-                continue;
-            }
+            continue;
         }
         let mut nodes = state.thread_dispatch.lock();
         if wake.borrow().revision == observed {
