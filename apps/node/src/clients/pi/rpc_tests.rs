@@ -287,9 +287,15 @@ async fn adapter_sends_canonical_direct_and_thread_input_over_lf_framing() -> Te
                 peer.errors.write_all(&vec![b'x'; 256 * 1024]).await?;
             }
             peer.begin(&command).await?;
+            // Exercise a terminal record on either side of the started response.
+            if index % 2 == 0 {
+                peer.ack(&command, "started").await?;
+            }
             peer.assistant("stop", "current answer").await?;
             peer.settle(false).await?;
-            peer.ack(&command, "started").await?;
+            if index % 2 != 0 {
+                peer.ack(&command, "started").await?;
+            }
             let (probe, _) = peer.command().await?;
             assert_eq!(probe["type"], "get_state");
             peer.frame(

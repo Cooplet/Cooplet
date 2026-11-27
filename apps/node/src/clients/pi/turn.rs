@@ -188,7 +188,9 @@ impl Turn {
     }
 
     fn begin(&mut self) -> bool {
-        self.awaiting_state_check = false;
+        if self.run == NativeRun::Waiting && self.accepted {
+            self.awaiting_state_check = false;
+        }
         self.run = match self.run {
             NativeRun::Waiting if self.accepted => NativeRun::Managed,
             NativeRun::Waiting => NativeRun::Unclaimed { conflicting: false },
@@ -246,9 +248,7 @@ impl State {
             return;
         }
         if let Some(turn) = self.turn.as_mut().filter(|turn| turn.wrote) {
-            if turn.observe(kind, frame) {
-                self.emit_finished();
-            } else {
+            if !turn.observe(kind, frame) {
                 self.close_ambiguous_stream();
             }
         } else if was_busy != self.native_activity.is_busy() {
@@ -256,16 +256,9 @@ impl State {
         }
     }
 
-    pub(super) fn accept_turn(
-        &mut self,
-        id: &str,
-        reply: &Reply,
-    ) -> (SubmitOutcome, Option<TurnResult>) {
+    pub(super) fn accept_turn(&mut self, id: &str, reply: &Reply) -> SubmitOutcome {
         let Some(turn) = self.turn.as_mut().filter(|turn| turn.id == id) else {
-            return (
-                SubmitOutcome::Unknown("Pi disconnected during intake".into()),
-                None,
-            );
+            return SubmitOutcome::Unknown("Pi disconnected during intake".into());
         };
         if !reply.success
             && turn.run != NativeRun::Managed
@@ -278,43 +271,22 @@ impl State {
             // already arrived on the native stream while the ACK was pending.
             self.turn = None;
             self.emit_native_state();
-            return (SubmitOutcome::Busy, None);
+            return SubmitOutcome::Busy;
         }
         if !reply.success || reply.data["disposition"] != "started" {
             self.close();
-            return (
-                SubmitOutcome::Unknown("Pi did not confirm that the turn started".into()),
-                None,
-            );
+            return SubmitOutcome::Unknown("Pi did not confirm that the turn started".into());
         }
         // A native input hook may run the exact same text in a separate prompt.
         // Even an exact echo does not prove that a pre-ACK result belongs to us.
-        if turn.run == NativeRun::Managed && turn.finished.is_none() {
-            self.close_ambiguous_stream();
-            return (
-                SubmitOutcome::Accepted {
-                    native_turn_id: None,
-                },
-                None,
-            );
-        }
-        let early = turn.finished.take();
-        if early.is_some() {
-            turn.awaiting_state_check = true;
-            turn.run = NativeRun::Waiting;
-            turn.saw_managed_user = false;
-            turn.assistant = None;
-        }
+        turn.awaiting_state_check = turn.run == NativeRun::Managed;
         turn.accepted = true;
         self.emit(AdapterEventKind::StateChanged(
             ParticipantRuntimeState::Working,
         ));
-        (
-            SubmitOutcome::Accepted {
-                native_turn_id: None,
-            },
-            early,
-        )
+        SubmitOutcome::Accepted {
+            native_turn_id: None,
+        }
     }
 
     pub(super) fn reconcile_early(
@@ -323,8 +295,12 @@ impl State {
         result: TurnResult,
         streaming: Option<bool>,
     ) {
-        let Some(turn) = self.turn.as_mut().filter(|turn| turn.id == id) else {
-            // The actual managed run has already completed while get_state was in flight.
+        let Some(turn) = self
+            .turn
+            .as_mut()
+            .filter(|turn| turn.id == id && turn.awaiting_state_check)
+        else {
+            // New native activity already superseded this early result.
             return;
         };
         turn.awaiting_state_check = false;
@@ -333,20 +309,28 @@ impl State {
                 if turn.run == NativeRun::Waiting
                     && matches!(self.native_activity.agent, AgentActivity::Idle) =>
             {
-                turn.finished = Some(result);
-                self.emit_finished();
+                self.emit_finished(result);
             }
             Some(_) => {} // Keep collecting the managed run after its ACK.
             None => self.close(),
         }
     }
 
-    fn emit_finished(&mut self) {
-        if let Some(turn) = self.turn.as_mut()
-            && turn.accepted
-            && let Some(finished) = turn.finished.take()
-            && let Some(turn) = self.turn.take()
-        {
+    pub(super) fn finish_or_check(&mut self) -> Option<(String, TurnResult)> {
+        let turn = self.turn.as_mut().filter(|turn| turn.accepted)?;
+        let result = turn.finished.take()?;
+        if turn.awaiting_state_check {
+            turn.run = NativeRun::Waiting;
+            turn.saw_managed_user = false;
+            turn.assistant = None;
+            return Some((turn.id.clone(), result));
+        }
+        self.emit_finished(result);
+        None
+    }
+
+    fn emit_finished(&mut self, finished: TurnResult) {
+        if let Some(turn) = self.turn.take() {
             self.emit(AdapterEventKind::TurnCompleted {
                 operation_key: Some(turn.operation_key),
                 native_turn_id: None,

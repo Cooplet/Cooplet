@@ -501,7 +501,6 @@ impl State {
     }
 
     fn handle(&mut self, mut frame: Value) -> Option<(String, TurnResult)> {
-        let mut early = None;
         let kind = frame["type"].as_str().unwrap_or_default();
         match kind {
             "response" => {
@@ -516,9 +515,7 @@ impl State {
                     {
                         reply.notifications = pending.notifications.unwrap_or_default();
                         if self.turn.as_ref().is_some_and(|turn| turn.id == pending.id) {
-                            let (outcome, result) = self.accept_turn(&pending.id, &reply);
-                            reply.outcome = Some(outcome);
-                            early = result.map(|result| (pending.id, result));
+                            reply.outcome = Some(self.accept_turn(&pending.id, &reply));
                         }
                         let _ = pending.reply.send(reply);
                     } else {
@@ -553,7 +550,7 @@ impl State {
             }
             _ => self.handle_turn_event(kind, &frame),
         }
-        early
+        self.finish_or_check()
     }
 }
 
