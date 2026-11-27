@@ -29,6 +29,7 @@ const MASTER_KEY: &str = "hub.master.key";
 const ADMIN_TOKEN: &str = "admin.token";
 const BLOB_DIR: &str = "blobs";
 const ADMIN_SCOPES: &str = r#"["read","collaborate","manage"]"#;
+const SQLITE_MAX_PAGE_COUNT: u32 = u32::MAX - 1;
 const MIGRATION_V1: Migration = Migration {
     version: 1,
     name: "initial Hub schema",
@@ -75,18 +76,7 @@ pub(crate) async fn init(state_dir: &Path, display_name: &str) -> StartupResult<
     let mut config = StorageConfig::new(state_dir.join(DATABASE));
     config.read_pool_size = 1;
     let engine = if existing {
-        // The checked open also starts the maintenance driver. Park its first
-        // tick until this bootstrap command releases the database.
-        config.gc_interval = Duration::MAX;
-        let state_dir = state_dir.clone();
-        StorageEngine::open_existing_managed_checked(
-            config,
-            &[MIGRATION_V1],
-            Arc::new(gc::HubGcHooks::default()),
-            None,
-            move |connection| check_existing_init(connection, &state_dir),
-        )
-        .await?
+        open_existing_for_init(config, state_dir.clone()).await?
     } else {
         StorageEngine::open(config, &[MIGRATION_V1]).await?
     };
@@ -95,6 +85,24 @@ pub(crate) async fn init(state_dir: &Path, display_name: &str) -> StartupResult<
     let result = result?;
     shutdown?;
     Ok(result)
+}
+
+async fn open_existing_for_init(
+    mut config: StorageConfig,
+    state_dir: PathBuf,
+) -> Result<StorageEngine, StorageError> {
+    // The bootstrap check must also open Hubs that grew under a larger run limit.
+    config.max_page_count = SQLITE_MAX_PAGE_COUNT;
+    // Park maintenance until this command releases the database.
+    config.gc_interval = Duration::MAX;
+    StorageEngine::open_existing_managed_checked(
+        config,
+        &[MIGRATION_V1],
+        Arc::new(gc::HubGcHooks::default()),
+        None,
+        move |connection| check_existing_init(connection, &state_dir),
+    )
+    .await
 }
 
 async fn initialize_locked(

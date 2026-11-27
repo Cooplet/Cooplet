@@ -77,6 +77,26 @@ async fn gate_sqlite_hygiene() -> TestResult {
 }
 
 #[tokio::test]
+async fn repeated_init_opens_a_database_larger_than_its_default_budget() -> TestResult {
+    let scratch = Scratch::new()?;
+    let initialized = init(&scratch.0, "Original Hub").await?;
+    let mut config = StorageConfig::new(scratch.0.join(DATABASE));
+    // Scale down the runtime page budget so a freshly migrated Hub exceeds it.
+    config.max_page_count = 1;
+    assert!(matches!(
+        open(&scratch.0, DEFAULT_MAX_BLOB_BYTES, 10 * 1024 * 1024 * 1024, 1).await,
+        Err(error) if matches!(error.downcast_ref::<StorageError>(), Some(StorageError::PageLimit { .. }))
+    ));
+
+    let engine = open_existing_for_init(config, scratch.0.clone()).await?;
+    let repeated = initialize_locked(&scratch.0, "Other Name", &engine).await?;
+    assert_eq!(repeated.hub_id, initialized.hub_id);
+    assert!(repeated.token_path.is_none());
+    engine.shutdown().await?;
+    Ok(())
+}
+
+#[tokio::test]
 async fn bootstrap_is_private_idempotent_and_cleans_interrupted_staging() -> TestResult {
     let scratch = Scratch::new()?;
     let staging = scratch
