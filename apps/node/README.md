@@ -49,19 +49,22 @@ Reusing a `node stop` key prints the original receipt. Use a fresh key to stop
 the currently running daemon.
 
 When the Node is stopped, `node doctor` checks the saved credentials against
-the database with a read-only connection. The report identifies the workspace
-it inspects for agent templates. It defaults to the current directory. Pass
-`cooplet node doctor --workspace-dir PATH` to inspect another workspace.
+the database with a read-only connection. It also reports client availability
+and the workspace it inspects for agent templates. The workspace defaults to
+the current directory. Pass `cooplet node doctor --workspace-dir PATH` to
+inspect another workspace.
 
 A registered adapter can provision agents from
 `.cooplet/agents/<template-id>/agent.json` in the workspace, with a fallback
 under `$XDG_CONFIG_HOME/cooplet/agents/` or `~/.config/cooplet/agents/`. Put
 `"schema": 1` and the registered `"client"` kind in `agent.json`. An optional
-`instructions.md` supplies instructions.
+`instructions.md` supplies instructions. Node freezes those instructions when
+it creates the participant and reuses them on resume.
 
-For message delivery, the adapter receives the message ID as its turn
-correlation key. Echo that key in completion events when available. Callers
-can independently reuse the same HTTP idempotency key.
+Each submitted turn has an operation key. The adapter returns that key with
+the completion event. Some inputs, such as Thread batches, have no outer
+message ID. Callers can reuse the original HTTP idempotency key to recover
+the receipt.
 
 Each attachment in the adapter's message envelope includes its blob ID, name,
 and absolute `local_path`. A non-UTF-8 path is encoded as `local_path: null`
@@ -136,3 +139,39 @@ with `--ignored --exact native_codex_smoke` for the CLI lifecycle and remote
 attach. Run the `cooplet_node` unit test binary with
 `--ignored --exact clients::codex::tests::native_structured_smoke` for the
 adapter's structured result.
+
+## Managed Pi participants
+
+Install [Pi](https://pi.dev/) on the Node's `PATH` and configure a model in Pi.
+`cooplet node doctor` reports whether the installed CLI advertises the required
+RPC options. Node uses Pi's native RPC mode and verifies the session and active
+Cooplet MCP tools before exposing the participant as ready.
+
+Send `{"client_kind":"pi","name":"reviewer"}` to `POST /v1/agents` to create
+a participant. A template can set `"client":"pi"`. The `model` option uses
+Pi's model selector, and `effort` uses Pi's `--thinking` levels. Explicit
+`approval` and `sandbox` options are unsupported.
+
+Use `POST /v1/messages` to deliver a turn, and
+`POST /v1/agents/{id}/stop` and `POST /v1/agents/{id}/resume` to stop and
+reopen the same conversation. Set `"cancel_turn_only":true` on stop to
+cancel the current run and keep the session open. Pi stores native JSONL in
+`cooplet-sessions/` under `$PI_CODING_AGENT_DIR` or `~/.pi/agent`. Preserve
+that directory alongside Node state for cold resume. Cooplet reports TUI
+attachment as unsupported for both running and stopped Pi participants.
+
+A delivered receipt confirms Pi intake. Pi saves the assistant turn in its
+native history. To send a reply through Cooplet, the participant calls the
+Cooplet MCP `send_message` tool.
+
+A Pi extension can request another model response before the current turn
+settles. Cooplet waits for settlement and uses the final assistant response.
+If a Pi extension starts overlapping native runs and Pi's events cannot
+identify their completion, Node marks the participant unknown. Stop and
+resume the participant to reopen the conversation.
+During manual Pi compaction, the participant is busy. Queued messages
+become eligible when compaction ends.
+
+Run `python3 apps/node/tests/pi_live.py` after building Node to exercise the
+production registry, native Pi and participant MCP against a local model
+fixture. The test accepts `--pi PATH` and `--cooplet PATH`.

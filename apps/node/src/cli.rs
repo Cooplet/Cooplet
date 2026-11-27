@@ -26,7 +26,7 @@ use tokio::signal::unix::{SignalKind, signal};
 use cooplet_node::{
     auth::{Credential, read_master},
     clients::{
-        AdapterConfig, AdapterRegistry, ParticipantPage, ParticipantView, TuiAttachPlan,
+        AdapterConfig, AdapterRegistry, ParticipantPage, ParticipantView, PiAdapter, TuiAttachPlan,
         codex::CodexAdapter, list_templates,
     },
     config::{NodeConfig, check_offline_state, default_state_dir, operator_path},
@@ -224,6 +224,7 @@ fn adapter_registry() -> CliResult<AdapterRegistry> {
     registry.register(Arc::new(CodexAdapter::new(
         std::env::var_os("COOPLET_CODEX_BIN").map(PathBuf::from),
     )))?;
+    registry.register(Arc::new(PiAdapter))?;
     Ok(registry)
 }
 

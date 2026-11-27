@@ -235,6 +235,24 @@ impl ClientAdapter for ManagedAdapter {
             // Keep the pipe open while paused. A killed Node closes it and lets
             // the child leave even on platforms without detached signaling.
             if matches!(mode, OpenMode::PauseAfterSpawn) {
+                let reservation = self.root.join("uncommitted-session");
+                let identity = launched.identity;
+                request
+                    .preparation
+                    .run(move |rollback| {
+                        fs::write(&reservation, b"pending")?;
+                        *rollback = Some(Box::new(move || {
+                            if identity.probe().map_err(io::Error::other)? == ProcessProbe::Running
+                            {
+                                return Err(io::Error::other(
+                                    "The process still owns this reservation",
+                                ));
+                            }
+                            fs::remove_file(reservation)
+                        }));
+                        Ok(())
+                    })
+                    .await?;
                 let _keep_child_running = launched.stdin;
                 return std::future::pending().await;
             }
@@ -601,7 +619,7 @@ async fn shutdown_cancels_pending_managed_open_and_reaps_the_process() -> TestRe
         })
     };
     tokio::time::timeout(WAIT, async {
-        while !receipt_path(&tree.0, 1).is_file() {
+        while !tree.0.join("uncommitted-session").is_file() {
             tokio::time::sleep(POLL).await;
         }
     })
@@ -641,6 +659,7 @@ async fn shutdown_cancels_pending_managed_open_and_reaps_the_process() -> TestRe
         matches!(interrupted, Err(ClientError::Problem(problem)) if problem.code == ErrorCode::Overloaded)
     );
     assert!(!spawned.credential.try_exists()?);
+    assert!(!tree.0.join("uncommitted-session").try_exists()?);
     wait_until_reaped(&spawned.process).await?;
     let restarted = open_node(
         tree.config(),

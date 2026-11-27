@@ -160,7 +160,8 @@ impl PrivateFs {
         Ok(removed)
     }
 
-    pub fn read_private_file(path: &Path, max_bytes: u64) -> Result<Vec<u8>, PlatformError> {
+    /// Open a regular single-link file owned by the current user with mode `0600`.
+    pub fn open_private_file(path: &Path) -> Result<File, PlatformError> {
         let path: PathBuf = path.components().collect();
         let file = OpenOptions::new()
             .read(true)
@@ -169,6 +170,12 @@ impl PrivateFs {
         let metadata = file.metadata()?;
         verify_private_file(&path, &metadata, 0o600)?;
         verify_path(&path, &metadata)?;
+        Ok(file)
+    }
+
+    pub fn read_private_file(path: &Path, max_bytes: u64) -> Result<Vec<u8>, PlatformError> {
+        let file = Self::open_private_file(path)?;
+        let metadata = file.metadata()?;
         if metadata.len() > max_bytes {
             return Err(PlatformError::FileTooLarge {
                 limit_bytes: max_bytes,
