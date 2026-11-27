@@ -167,12 +167,33 @@ impl AuthenticatedCaller {
     }
 }
 
-const TOKEN_SELECT: &str = "
+const SELECT_BEARER_TOKEN: &str = "
     SELECT t.token_id, t.token_kind, t.verifier_hmac, t.is_admin, t.scopes_json,
            t.allowed_nodes_json, t.expires_at_ms, t.revoked_at_ms,
            p.principal_id, p.kind, p.participant_id, p.scopes_json,
            p.allowed_nodes_json, p.disabled_at_ms, p.display_name
-    FROM auth_tokens t JOIN principals p ON p.principal_id = t.principal_id";
+    FROM auth_tokens t JOIN principals p ON p.principal_id = t.principal_id
+    WHERE t.token_id = ?1 AND t.token_kind = 'bearer_api'";
+
+const SELECT_SERVICE_TOKEN: &str = "
+    SELECT t.token_id, t.token_kind, t.verifier_hmac, t.is_admin, t.scopes_json,
+           t.allowed_nodes_json, t.expires_at_ms, t.revoked_at_ms,
+           p.principal_id, p.kind, p.participant_id, p.scopes_json,
+           p.allowed_nodes_json, p.disabled_at_ms, p.display_name
+    FROM auth_tokens t JOIN principals p ON p.principal_id = t.principal_id
+    WHERE t.verifier_hmac = ?1 AND t.principal_id = ?2 AND t.token_kind = 'service_token'";
+
+const SELECT_REVERIFY_TOKEN: &str = "
+    SELECT t.token_id, t.token_kind, t.verifier_hmac, t.is_admin, t.scopes_json,
+           t.allowed_nodes_json, t.expires_at_ms, t.revoked_at_ms,
+           p.principal_id, p.kind, p.participant_id, p.scopes_json,
+           p.allowed_nodes_json, p.disabled_at_ms, p.display_name
+    FROM auth_tokens t JOIN principals p ON p.principal_id = t.principal_id
+    WHERE t.token_id = ?1 AND t.principal_id = ?2";
+
+const SELECT_NODE: &str = "
+    SELECT credential_hmac, generation, status = 'revoked' OR revoked_at_ms IS NOT NULL, display_name
+    FROM nodes WHERE node_id = ?1";
 
 struct TokenRow {
     token_id: String,
@@ -278,7 +299,7 @@ impl TokenRow {
     }
 }
 
-pub(crate) fn expand_scopes(highest: Option<ServiceScope>) -> BTreeSet<ServiceScope> {
+fn expand_scopes(highest: Option<ServiceScope>) -> BTreeSet<ServiceScope> {
     [
         ServiceScope::Read,
         ServiceScope::Collaborate,
@@ -308,17 +329,18 @@ struct NodeRow {
 }
 
 fn node(conn: &Connection, id: &NodeId) -> Result<NodeRow, HubError> {
-    conn.query_row(
-        "SELECT credential_hmac, generation, status = 'revoked' OR revoked_at_ms IS NOT NULL, display_name
-         FROM nodes WHERE node_id = ?1",
-        [id.as_str()],
-        |row| Ok(NodeRow {
-            verifier: row.get(0)?,
-            generation: row.get(1)?,
-            revoked: row.get(2)?,
-            display_name: row.get(3)?,
-        }),
-    ).optional()?.ok_or_else(unauthorized)
+    let mut statement = conn.prepare_cached(SELECT_NODE)?;
+    statement
+        .query_row([id.as_str()], |row| {
+            Ok(NodeRow {
+                verifier: row.get(0)?,
+                generation: row.get(1)?,
+                revoked: row.get(2)?,
+                display_name: row.get(3)?,
+            })
+        })
+        .optional()?
+        .ok_or_else(unauthorized)
 }
 
 fn node_caller(id: NodeId, row: NodeRow) -> Result<AuthenticatedCaller, HubError> {
@@ -342,32 +364,35 @@ pub(crate) async fn authenticate(
     master: &std::sync::Arc<Master>,
     secret: &str,
 ) -> Result<AuthenticatedCaller, HubError> {
-    // The storage pool owns the blocking read. Move an owned copy of the secret
-    // across that boundary and keep it local to the authentication query.
-    let secret = secret.to_owned();
+    // Reject malformed Bearer syntax before touching the blocking read pool.
+    let credential = ApiCredential::parse(secret).ok_or_else(unauthorized)?;
     let master = master.clone();
     reads
-        .read(move |conn| Ok(authenticate_on(conn, &master, &secret)))
+        .read(move |conn| Ok(authenticate_on(conn, &master, &credential)))
         .await?
 }
 
 fn authenticate_on(
     conn: &Connection,
     master: &Master,
-    secret: &str,
+    credential: &ApiCredential,
 ) -> Result<AuthenticatedCaller, HubError> {
-    let credential = ApiCredential::parse(secret).ok_or_else(unauthorized)?;
-    let token = match &credential {
-        ApiCredential::Bearer(id, _) => conn.query_row(
-            concat_token_select("WHERE t.token_id = ?1 AND t.token_kind = 'bearer_api'").as_str(),
-            [id.as_str()],
-            TokenRow::read,
-        ).optional()?,
-        ApiCredential::Service(id, _) => conn.query_row(
-            concat_token_select("WHERE t.verifier_hmac = ?1 AND t.principal_id = ?2 AND t.token_kind = 'service_token'").as_str(),
-            params![credential.service_lookup(master)?, id.as_str()],
-            TokenRow::read,
-        ).optional()?,
+    let token = match credential {
+        ApiCredential::Bearer(id, _) => {
+            let mut statement = conn.prepare_cached(SELECT_BEARER_TOKEN)?;
+            statement
+                .query_row([id.as_str()], TokenRow::read)
+                .optional()?
+        }
+        ApiCredential::Service(id, _) => {
+            let mut statement = conn.prepare_cached(SELECT_SERVICE_TOKEN)?;
+            statement
+                .query_row(
+                    params![credential.service_lookup(master)?, id.as_str()],
+                    TokenRow::read,
+                )
+                .optional()?
+        }
         ApiCredential::Node(id, _) => {
             let row = node(conn, id)?;
             if !credential.verify(master, &row.verifier, row.generation)? {
@@ -381,10 +406,6 @@ fn authenticate_on(
         return Err(unauthorized());
     }
     token.authorize(now_ms())
-}
-
-fn concat_token_select(predicate: &str) -> String {
-    format!("{TOKEN_SELECT} {predicate}")
 }
 
 pub(crate) fn reverify_caller_tx(
@@ -407,15 +428,17 @@ pub(crate) async fn reverify_caller(
 
 fn reverify_on(conn: &Connection, caller: &AuthenticatedCaller, now: i64) -> Result<(), HubError> {
     let current = match &caller.identity {
-        Identity::Human { token, .. } | Identity::Service { token, .. } => conn
-            .query_row(
-                concat_token_select("WHERE t.token_id = ?1 AND t.principal_id = ?2").as_str(),
-                params![token.id.as_str(), caller.actor_id()],
-                TokenRow::read,
-            )
-            .optional()?
-            .ok_or_else(unauthorized)?
-            .authorize(now)?,
+        Identity::Human { token, .. } | Identity::Service { token, .. } => {
+            let mut statement = conn.prepare_cached(SELECT_REVERIFY_TOKEN)?;
+            statement
+                .query_row(
+                    params![token.id.as_str(), caller.actor_id()],
+                    TokenRow::read,
+                )
+                .optional()?
+                .ok_or_else(unauthorized)?
+                .authorize(now)?
+        }
         Identity::Node { id, generation } => {
             let row = node(conn, id)?;
             if row.generation != *generation {
@@ -457,5 +480,119 @@ impl RevocationWatch {
     pub(crate) fn bump(&self) {
         self.0
             .send_modify(|version| *version = version.saturating_add(1));
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::error::Error;
+
+    use super::*;
+
+    type TestResult<T = ()> = Result<T, Box<dyn Error>>;
+
+    fn sample_token(
+        principal_scopes: &str,
+        token_scopes: &str,
+        principal_nodes: Option<String>,
+        token_nodes: Option<String>,
+        expires_at_ms: i64,
+    ) -> TestResult<TokenRow> {
+        Ok(TokenRow {
+            token_id: TokenId::generate()?.to_string(),
+            token_kind: "service_token".into(),
+            verifier: "0".repeat(64),
+            is_admin_token: false,
+            token_scopes: token_scopes.into(),
+            token_nodes,
+            expires_at_ms,
+            revoked_at_ms: None,
+            principal_id: ServicePrincipalId::generate()?.to_string(),
+            principal_kind: "service".into(),
+            participant_id: None,
+            principal_scopes: principal_scopes.into(),
+            principal_nodes,
+            disabled_at_ms: None,
+            display_name: "Service".into(),
+        })
+    }
+
+    #[test]
+    fn expired_tokens_are_rejected_at_or_after_deadline() -> TestResult {
+        let row = sample_token(r#"["read"]"#, r#"["read"]"#, None, None, 1_000)?;
+        let err = row
+            .authorize(1_000)
+            .err()
+            .ok_or("accepted token at exact expiry")?;
+        assert_eq!(err.problem().code, ErrorCode::Unauthorized);
+
+        let row = sample_token(r#"["read"]"#, r#"["read"]"#, None, None, 999)?;
+        let err = row.authorize(1_000).err().ok_or("accepted expired token")?;
+        assert_eq!(err.problem().code, ErrorCode::Unauthorized);
+
+        let row = sample_token(r#"["read"]"#, r#"["read"]"#, None, None, 1_001)?;
+        assert!(row.authorize(1_000).is_ok());
+        Ok(())
+    }
+
+    #[test]
+    fn allowed_nodes_and_scopes_intersect_principal_and_token_grants() -> TestResult {
+        let a = NodeId::generate()?;
+        let b = NodeId::generate()?;
+        let c = NodeId::generate()?;
+
+        let overlapped = sample_token(
+            r#"["collaborate"]"#,
+            r#"["manage"]"#,
+            Some(serde_json::to_string(&[&a, &b])?),
+            Some(serde_json::to_string(&[&b, &c])?),
+            5_000,
+        )?
+        .authorize(1_000)?;
+        assert!(!overlapped.allows_node(&a));
+        assert!(overlapped.allows_node(&b));
+        assert!(!overlapped.allows_node(&c));
+        assert_eq!(
+            overlapped.whoami().scopes,
+            vec![ServiceScope::Read, ServiceScope::Collaborate]
+        );
+        assert!(overlapped.require_scope(ServiceScope::Collaborate).is_ok());
+        assert!(overlapped.require_scope(ServiceScope::Manage).is_err());
+
+        let disjoint = sample_token(
+            r#"["read"]"#,
+            r#"["read"]"#,
+            Some(serde_json::to_string(&[&a])?),
+            Some(serde_json::to_string(&[&c])?),
+            5_000,
+        )?
+        .authorize(1_000)?;
+        assert_eq!(disjoint.allowed_nodes(), Some(&BTreeSet::new()));
+        assert!(!disjoint.allows_node(&a));
+        assert!(!disjoint.allows_node(&c));
+        assert!(!disjoint.is_global_reader());
+
+        let principal_only = sample_token(
+            r#"["read"]"#,
+            r#"["read"]"#,
+            Some(serde_json::to_string(&[&a])?),
+            None,
+            5_000,
+        )?
+        .authorize(1_000)?;
+        assert!(principal_only.allows_node(&a));
+        assert!(!principal_only.allows_node(&b));
+
+        let token_only = sample_token(
+            r#"["read"]"#,
+            r#"["read"]"#,
+            None,
+            Some(serde_json::to_string(&[&c])?),
+            5_000,
+        )?
+        .authorize(1_000)?;
+        assert!(token_only.allows_node(&c));
+        assert!(!token_only.allows_node(&a));
+        Ok(())
     }
 }

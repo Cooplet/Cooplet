@@ -9,8 +9,10 @@ use serde_json::{Value, json};
 
 use super::*;
 use crate::{
+    auth,
     bridge::OfflineBridge,
     credentials::mint_service,
+    now_ms,
     storage::{
         self,
         events::{NewEvent, append},
@@ -158,7 +160,7 @@ impl Fixture {
         Ok(stream(
             &self.state,
             caller,
-            query(after),
+            stream_query(after),
             self.state.revocations.subscribe(),
         )
         .await?
@@ -187,6 +189,10 @@ fn query(after: u64) -> EventsQuery {
         limit: None,
         kinds: None,
     }
+}
+
+fn stream_query(after: u64) -> EventStreamQuery {
+    EventStreamQuery { after, kinds: None }
 }
 
 fn nodes(ids: &[NodeId]) -> EventAudience {
@@ -385,7 +391,7 @@ async fn stream_emits_one_terminal_frame_when_retention_passes_its_scan_cursor()
     let error = stream(
         &fixture.state,
         &fixture.admin,
-        query(279),
+        stream_query(279),
         fixture.state.revocations.subscribe(),
     )
     .await
@@ -409,10 +415,7 @@ fn event_filter_requires_valid_nonempty_csv_and_deduplicates_labels() -> TestRes
         kinds: Some("node.status,node.status".into()),
         ..query(0)
     };
-    assert_eq!(
-        query.validated()?.kinds,
-        HashSet::from([EventKind::NodeStatus])
-    );
+    assert_eq!(query.validated()?.1, vec![EventKind::NodeStatus]);
     Ok(())
 }
 
@@ -422,9 +425,8 @@ async fn quiet_stream_reconciles_a_durable_commit_without_a_wake() -> TestResult
     // Isolate the stream from broadcasts while using the real writer and reader.
     let (_silent, wake) = watch::channel((0, 0));
     let mut body = super::stream::response(
-        Reader::new(&fixture.state, &fixture.admin, HashSet::new()),
+        Reader::new(&fixture.state, &fixture.admin, Vec::new()),
         0,
-        None,
         wake,
         fixture.state.revocations.subscribe(),
         fixture.state.shutdown.clone(),
@@ -449,5 +451,197 @@ async fn quiet_stream_reconciles_a_durable_commit_without_a_wake() -> TestResult
     };
     assert!(matches!(event, Some(EventStreamFrame::Event { event }) if event.seq == 1));
     drop(body);
+    fixture.close().await
+}
+
+#[test]
+fn event_stream_query_rejects_limit_and_kind_queries_use_index() -> TestResult {
+    use axum::extract::Query;
+    assert!(
+        Query::<EventStreamQuery>::try_from_uri(&http::Uri::from_static(
+            "/v1/events/stream?after=0&limit=1"
+        ))
+        .is_err()
+    );
+    assert!(
+        Query::<EventStreamQuery>::try_from_uri(&http::Uri::from_static(
+            "/v1/events/stream?after=12&kinds=node.status"
+        ))
+        .is_ok()
+    );
+
+    let db = rusqlite::Connection::open_in_memory()?;
+    db.execute_batch(include_str!("../storage/v1.sql"))?;
+    db.execute_batch(
+        "WITH RECURSIVE n(seq) AS (VALUES (1) UNION ALL SELECT seq + 1 FROM n WHERE seq < 5000)
+         INSERT INTO events (seq, event_id, kind, aggregate_type, aggregate_id, payload_json, created_at_ms)
+         SELECT seq, 'evt-' || seq, CASE WHEN seq % 100 = 0 THEN 'blob.stored' ELSE 'node.status' END,
+                'node', 'node', '{}', seq FROM n;
+         ANALYZE;",
+    )?;
+    let explain = |sql: &str, bindings: &[&dyn rusqlite::ToSql]| -> rusqlite::Result<String> {
+        let mut stmt = db.prepare(&format!("EXPLAIN QUERY PLAN {sql}"))?;
+        let lines = stmt
+            .query_map(bindings, |row| row.get::<_, String>(3))?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        Ok(lines.join("\n"))
+    };
+    let single = explain(
+        SELECT_SINGLE_KIND_EVENTS,
+        &[&"blob.stored", &0u64, &5000u64, &101usize],
+    )?;
+    assert!(single.contains("idx_hub_events_kind_seq"), "{single}");
+    assert!(!single.contains("USE TEMP B-TREE"), "{single}");
+
+    let rare_multi = explain(
+        SELECT_KIND_SEQS,
+        &[&"blob.stored", &0u64, &5000u64, &101usize],
+    )?;
+    assert!(
+        rare_multi.contains("COVERING INDEX idx_hub_events_kind_seq"),
+        "{rare_multi}"
+    );
+    assert!(!rare_multi.contains("USE TEMP B-TREE"), "{rare_multi}");
+    let dense_multi = explain(
+        SELECT_KIND_SEQS,
+        &[&"node.status", &0u64, &5000u64, &101usize],
+    )?;
+    assert!(!dense_multi.contains("USE TEMP B-TREE"), "{dense_multi}");
+    Ok(())
+}
+
+#[tokio::test]
+async fn single_and_multi_kind_queries_return_ordered_events_and_advance_watermark() -> TestResult {
+    let fixture = Fixture::new().await?;
+    let hub = fixture.state.meta.hub_id.clone();
+    fixture
+        .state
+        .db
+        .write_sqlite(move |tx| {
+            let now = now_ms();
+            let mut events = Vec::new();
+            for (index, kind) in [
+                EventKind::NodeStatus,
+                EventKind::BlobStored,
+                EventKind::BlobDeleted,
+                EventKind::NodeStatus,
+                EventKind::BlobStored,
+            ]
+            .into_iter()
+            .enumerate()
+            {
+                events.push(append(
+                    tx,
+                    &hub,
+                    NewEvent {
+                        kind,
+                        aggregate_type: AggregateType::Node,
+                        aggregate_id: hub.as_str(),
+                        actor_id: None,
+                        created_at_ms: now,
+                        data: json!({ "index": index + 1 }),
+                        audience: EventAudience::GlobalArchiveOnly,
+                    },
+                )?);
+            }
+            Ok(WriteOutcome::with_events((), events))
+        })
+        .await?;
+
+    let single = page(
+        &fixture.state,
+        &fixture.admin,
+        EventsQuery {
+            after: 0,
+            limit: Some(10),
+            kinds: Some("blob.stored".into()),
+        },
+    )
+    .await?;
+    assert_eq!(
+        single.items.iter().map(|e| e.seq).collect::<Vec<_>>(),
+        vec![2, 5]
+    );
+    assert_eq!(single.next_seq, 5);
+    assert!(!single.has_more);
+
+    let multi_first = page(
+        &fixture.state,
+        &fixture.admin,
+        EventsQuery {
+            after: 0,
+            limit: Some(2),
+            kinds: Some("blob.deleted,blob.stored".into()),
+        },
+    )
+    .await?;
+    assert_eq!(
+        multi_first.items.iter().map(|e| e.seq).collect::<Vec<_>>(),
+        vec![2, 3]
+    );
+    assert_eq!(multi_first.next_seq, 3);
+    assert!(multi_first.has_more);
+
+    let multi_second = page(
+        &fixture.state,
+        &fixture.admin,
+        EventsQuery {
+            after: multi_first.next_seq,
+            limit: Some(10),
+            kinds: Some("blob.deleted,blob.stored".into()),
+        },
+    )
+    .await?;
+    assert_eq!(
+        multi_second.items.iter().map(|e| e.seq).collect::<Vec<_>>(),
+        vec![5]
+    );
+    assert_eq!(multi_second.next_seq, 5);
+    assert!(!multi_second.has_more);
+
+    fixture.close().await
+}
+
+#[tokio::test]
+async fn stream_closes_naturally_when_token_ttl_expires_without_revocation_bump() -> TestResult {
+    let fixture = Fixture::new().await?;
+    let principal = ServicePrincipalId::generate()?;
+    let token_id = TokenId::generate()?;
+    let token = mint_service(&fixture.state.master, &principal)?;
+    let verifier = token.verifier;
+    let now = now_ms();
+    fixture
+        .state
+        .db
+        .write_sqlite(move |tx| {
+            tx.execute(
+                "INSERT INTO principals (principal_id, kind, username, display_name, scopes_json,
+                    allowed_nodes_json, created_at_ms, updated_at_ms)
+                 VALUES (?1, 'service', ?1, 'Short TTL', '[\"read\"]', NULL, ?2, ?2)",
+                params![principal.as_str(), now],
+            )?;
+            tx.execute(
+                "INSERT INTO auth_tokens (token_id, principal_id, token_kind, verifier_hmac,
+                    scopes_json, expires_at_ms, created_at_ms)
+                 VALUES (?1, ?2, 'service_token', ?3, '[\"read\"]', ?4, ?5)",
+                params![
+                    token_id.as_str(),
+                    principal.as_str(),
+                    verifier,
+                    now + 150,
+                    now
+                ],
+            )?;
+            Ok(WriteOutcome::new(()))
+        })
+        .await?;
+    let caller = auth::authenticate(
+        &fixture.state.reads,
+        &fixture.state.master,
+        token.secret.as_str(),
+    )
+    .await?;
+    let mut body = fixture.stream(&caller, 0).await?;
+    assert_eq!(next_frame(&mut body).await?, None);
     fixture.close().await
 }

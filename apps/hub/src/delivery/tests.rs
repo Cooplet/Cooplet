@@ -51,7 +51,7 @@ struct Fixture {
     dir: TempDir,
     state: AppState,
     admin: AuthenticatedCaller,
-    _shutdown: watch::Sender<()>,
+    shutdown: watch::Sender<()>,
 }
 
 impl Fixture {
@@ -85,7 +85,7 @@ impl Fixture {
             dir,
             state,
             admin,
-            _shutdown: shutdown,
+            shutdown,
         })
     }
 
@@ -245,6 +245,9 @@ struct FakeState {
     submits: AtomicUsize,
     permits: AtomicUsize,
     response: Mutex<(CommandOutcome, Option<ProblemDetails>)>,
+    resource_id: Mutex<Option<String>>,
+    result: Mutex<Option<serde_json::Value>>,
+    submit_error: Mutex<Option<SubmitError>>,
     reserved: Notify,
     submitted: Notify,
     actor: Mutex<Option<String>>,
@@ -260,6 +263,9 @@ impl FakeBridge {
                 submits: AtomicUsize::new(0),
                 permits: AtomicUsize::new(0),
                 response: Mutex::new((CommandOutcome::Delivered, None)),
+                resource_id: Mutex::new(None),
+                result: Mutex::new(None),
+                submit_error: Mutex::new(None),
                 reserved: Notify::new(),
                 submitted: Notify::new(),
                 actor: Mutex::new(None),
@@ -275,6 +281,38 @@ impl FakeBridge {
             .response
             .lock()
             .map_err(|_| "fake bridge poisoned")? = (outcome, problem);
+        *self
+            .shared
+            .submit_error
+            .lock()
+            .map_err(|_| "fake bridge poisoned")? = None;
+        Ok(())
+    }
+
+    fn set_payload(
+        &self,
+        resource_id: Option<String>,
+        result: Option<serde_json::Value>,
+    ) -> TestResult {
+        *self
+            .shared
+            .resource_id
+            .lock()
+            .map_err(|_| "fake bridge poisoned")? = resource_id;
+        *self
+            .shared
+            .result
+            .lock()
+            .map_err(|_| "fake bridge poisoned")? = result;
+        Ok(())
+    }
+
+    fn set_submit_error(&self, error: Option<SubmitError>) -> TestResult {
+        *self
+            .shared
+            .submit_error
+            .lock()
+            .map_err(|_| "fake bridge poisoned")? = error;
         Ok(())
     }
 }
@@ -299,17 +337,37 @@ impl CommandPermit for FakePermit {
             if self.0.stalled.load(Ordering::SeqCst) {
                 self.0.resume.notified().await;
             }
+            if let Some(error) = *self
+                .0
+                .submit_error
+                .lock()
+                .map_err(|_| SubmitError::Unknown)?
+            {
+                return Err(error);
+            }
             let (outcome, problem) = self
                 .0
                 .response
                 .lock()
                 .map_err(|_| SubmitError::Unknown)?
                 .clone();
+            let resource_id = self
+                .0
+                .resource_id
+                .lock()
+                .map_err(|_| SubmitError::Unknown)?
+                .clone();
+            let result = self
+                .0
+                .result
+                .lock()
+                .map_err(|_| SubmitError::Unknown)?
+                .clone();
             Ok(CommandResPayload {
                 op_id: payload.op_id,
                 outcome,
-                resource_id: None,
-                result: None,
+                resource_id,
+                result,
                 error: problem,
             })
         })
@@ -350,7 +408,7 @@ fn prepare_message(
     mut input: MessageRequest,
 ) -> TestResult<Arc<Request>> {
     let message_id = MessageId::generate()?;
-    input.normalize(&message_id)?;
+    input.normalize()?;
     let sender = caller
         .participant_id()
         .ok_or("expected a participant identity")?
@@ -386,8 +444,8 @@ async fn all_bridge_outcomes_replay_exact_terminal_result() -> TestResult {
         ),
         (
             CommandOutcome::Queued,
-            Some((202, DeliveryState::Queued)),
             None,
+            Some(ErrorCode::DeliveryUnknown),
         ),
         (
             CommandOutcome::Succeeded,
@@ -648,7 +706,7 @@ async fn failed_attachment_releases_the_bridge_permit_and_operation_key() -> Tes
             ErrorCode::NotFound,
         )?;
     }
-    assert_eq!(bridge.shared.reserves.load(Ordering::SeqCst), 33);
+    assert_eq!(bridge.shared.reserves.load(Ordering::SeqCst), 0);
     assert_eq!(bridge.shared.submits.load(Ordering::SeqCst), 0);
     assert_eq!(bridge.shared.permits.load(Ordering::SeqCst), 0);
     let (_, delivered) =
@@ -1116,7 +1174,7 @@ async fn restart_recovers_persisted_answer_acceptance_before_real_http_replay() 
         engine,
         state,
         dir,
-        _shutdown: shutdown,
+        shutdown,
         ..
     } = f;
     state.background.close();
@@ -1146,6 +1204,572 @@ async fn restart_recovers_persisted_answer_acceptance_before_real_http_replay() 
     assert_eq!(restart_bridge.shared.reserves.load(Ordering::SeqCst), 0);
     assert_eq!(restart_bridge.shared.submits.load(Ordering::SeqCst), 0);
     drop(http);
+    f.close().await?;
+    Ok(())
+}
+
+#[tokio::test]
+async fn control_commands_resource_id_validation_and_result_budget() -> TestResult {
+    let bridge = FakeBridge::new();
+    bridge.set(CommandOutcome::Succeeded, None)?;
+    let f = Fixture::new(bridge.clone()).await?;
+    let node = NodeId::generate()?;
+    let agent = ParticipantId::generate()?;
+    f.node(&node, &agent, "agent").await?;
+
+    // Blank agent selectors are rejected before bridge dispatch.
+    for payload in [
+        json!({"target_node_id": node, "client_kind": "   "}),
+        json!({"target_node_id": node, "template_id": "\t"}),
+    ] {
+        result_code(
+            create_agent(
+                &f.state,
+                &f.admin,
+                "blank-selector",
+                serde_json::from_value(payload)?,
+            )
+            .await,
+            ErrorCode::InvalidRequest,
+        )?;
+    }
+
+    // CreateAgent validates ParticipantId resource_id and drops oversized >64 KiB result.
+    let created_agent = ParticipantId::generate()?;
+    bridge.set_payload(
+        Some(created_agent.to_string()),
+        Some(json!({"blob": "x".repeat(70 * 1024)})),
+    )?;
+    let receipt = create_agent(
+        &f.state,
+        &f.admin,
+        "create-oversized-result",
+        serde_json::from_value(json!({"target_node_id": node, "client_kind": "codex"}))?,
+    )
+    .await?;
+    assert_eq!(receipt.resource_id.as_deref(), Some(created_agent.as_str()));
+    assert!(receipt.result.is_none());
+
+    // Invalid resource_id on CreateAgent or RunWorkflow turns into unknown.
+    bridge.set_payload(Some("not-a-participant".into()), None)?;
+    result_code(
+        create_agent(
+            &f.state,
+            &f.admin,
+            "create-bad-resource-id",
+            serde_json::from_value(json!({"target_node_id": node, "client_kind": "codex"}))?,
+        )
+        .await,
+        ErrorCode::DeliveryUnknown,
+    )?;
+
+    let run_id = RunId::generate()?;
+    bridge.set_payload(Some("bad\nrun".into()), None)?;
+    result_code(
+        run_workflow(
+            &f.state,
+            &f.admin,
+            "run-bad-resource-id",
+            serde_json::from_value(json!({
+                "target_node_id": node,
+                "workflow_name": "deploy",
+                "workspace_dir": "."
+            }))?,
+        )
+        .await,
+        ErrorCode::DeliveryUnknown,
+    )?;
+
+    // Happy path + replay for stop_agent, respond_approval, run_workflow, cancel_workflow.
+    bridge.set_payload(Some(run_id.to_string()), Some(json!({"ok": true})))?;
+    let run_req = || -> TestResult<RunWorkflowRequest> {
+        Ok(serde_json::from_value(json!({
+            "target_node_id": node,
+            "workflow_name": "deploy",
+            "workspace_dir": "."
+        }))?)
+    };
+    let ran = run_workflow(&f.state, &f.admin, "run-workflow-ok", run_req()?).await?;
+    assert_eq!(ran.resource_id.as_deref(), Some(run_id.as_str()));
+    assert_eq!(ran.result, Some(json!({"ok": true})));
+    assert_eq!(
+        run_workflow(&f.state, &f.admin, "run-workflow-ok", run_req()?).await?,
+        ran
+    );
+
+    bridge.set_payload(None, Some(json!({"stopped": true})))?;
+    let stop_req = || -> TestResult<StopAgentRequest> {
+        Ok(serde_json::from_value(json!({"target_node_id": node}))?)
+    };
+    let stopped = stop_agent(
+        &f.state,
+        &f.admin,
+        "stop-agent-ok",
+        agent.clone(),
+        stop_req()?,
+    )
+    .await?;
+    assert_eq!(
+        stop_agent(
+            &f.state,
+            &f.admin,
+            "stop-agent-ok",
+            agent.clone(),
+            stop_req()?
+        )
+        .await?,
+        stopped
+    );
+
+    let approval_req = || -> TestResult<RespondApprovalRequest> {
+        Ok(serde_json::from_value(json!({
+            "target_node_id": node,
+            "approval_id": "apr_123",
+            "action": "approve"
+        }))?)
+    };
+    let approved = respond_approval(
+        &f.state,
+        &f.admin,
+        "approval-ok",
+        agent.clone(),
+        approval_req()?,
+    )
+    .await?;
+    assert_eq!(
+        respond_approval(&f.state, &f.admin, "approval-ok", agent, approval_req()?).await?,
+        approved
+    );
+
+    let cancel_req = || -> TestResult<CancelWorkflowRequest> {
+        Ok(serde_json::from_value(json!({"target_node_id": node}))?)
+    };
+    let cancelled = cancel_workflow(
+        &f.state,
+        &f.admin,
+        "cancel-workflow-ok",
+        run_id.clone(),
+        cancel_req()?,
+    )
+    .await?;
+    assert_eq!(
+        cancel_workflow(
+            &f.state,
+            &f.admin,
+            "cancel-workflow-ok",
+            run_id,
+            cancel_req()?
+        )
+        .await?,
+        cancelled
+    );
+
+    f.close().await?;
+    Ok(())
+}
+
+#[tokio::test]
+async fn submit_unavailable_and_in_progress_finish_and_extension_scoping() -> TestResult {
+    let bridge = FakeBridge::new();
+    let f = Fixture::new(bridge.clone()).await?;
+    let node = NodeId::generate()?;
+    let agent = ParticipantId::generate()?;
+    f.node(&node, &agent, "agent").await?;
+
+    // SubmitError::Unavailable maps identically to CommandOutcome::Unavailable.
+    bridge.set_submit_error(Some(SubmitError::Unavailable))?;
+    result_code(
+        send_message(
+            &f.state,
+            &f.admin,
+            "submit-unavailable-msg",
+            direct(&node, &agent)?,
+        )
+        .await,
+        ErrorCode::BridgeUnavailable,
+    )?;
+    result_code(
+        send_message(
+            &f.state,
+            &f.admin,
+            "submit-unavailable-msg",
+            direct(&node, &agent)?,
+        )
+        .await,
+        ErrorCode::BridgeUnavailable,
+    )?;
+
+    let recipient = f
+        .admin
+        .participant_id()
+        .ok_or("missing admin participant")?;
+    let q_unavail = f.inbound_question(&node, &agent, None, recipient).await?;
+    let (status, answer) = send_message(
+        &f.state,
+        &f.admin,
+        "submit-unavailable-ans",
+        serde_json::from_value(answer_for(&node, &agent, &q_unavail))?,
+    )
+    .await?;
+    assert_eq!(status, StatusCode::CREATED);
+    assert_eq!(answer.delivery_state, DeliveryState::Unavailable);
+
+    // CommandOutcome::Queued on answer_question (always direct_now) is classified as unknown.
+    bridge.set(CommandOutcome::Queued, None)?;
+    let q_queued = f.inbound_question(&node, &agent, None, recipient).await?;
+    let (status, answer) = send_message(
+        &f.state,
+        &f.admin,
+        "queued-answer-anomaly",
+        serde_json::from_value(answer_for(&node, &agent, &q_queued))?,
+    )
+    .await?;
+    assert_eq!(status, StatusCode::CREATED);
+    assert_eq!(answer.delivery_state, DeliveryState::Unknown);
+
+    // copy_extensions scopes fields per ErrorCode: NotFound must not carry approval_id or existing_answer_id.
+    let mut mixed = ProblemDetails::new(ErrorCode::NotFound, "Not found");
+    mixed
+        .extensions
+        .insert("approval_id".into(), json!("apr_leak"));
+    mixed
+        .extensions
+        .insert("existing_answer_id".into(), json!("msg_leak"));
+    bridge.set(CommandOutcome::Rejected, Some(mixed))?;
+    let problem = send_message(
+        &f.state,
+        &f.admin,
+        "rejected-not-found-ext",
+        direct(&node, &agent)?,
+    )
+    .await
+    .err()
+    .ok_or("expected rejected error")?;
+    assert_eq!(problem.problem().code, ErrorCode::NotFound);
+    assert!(!problem.problem().extensions.contains_key("approval_id"));
+    assert!(
+        !problem
+            .problem()
+            .extensions
+            .contains_key("existing_answer_id")
+    );
+
+    // journal::finish transitions an 'in_progress' operation cleanly to terminal.
+    bridge.set(CommandOutcome::Delivered, None)?;
+    bridge.shared.stalled.store(true, Ordering::SeqCst);
+    let state = f.state.clone();
+    let admin = f.admin.clone();
+    let msg = direct(&node, &agent)?;
+    let in_flight =
+        tokio::spawn(async move { send_message(&state, &admin, "finish-in-progress", msg).await });
+    tokio::time::timeout(Duration::from_secs(2), bridge.shared.submitted.notified()).await?;
+    f.state
+        .db
+        .write_sqlite(|tx| {
+            tx.execute(
+                "UPDATE operations SET state = 'in_progress' WHERE operation_key = 'finish-in-progress'",
+                [],
+            )?;
+            Ok(WriteOutcome::new(()))
+        })
+        .await?;
+    bridge.shared.resume.notify_one();
+    let (status, delivered) = in_flight.await??;
+    assert_eq!(status, StatusCode::CREATED);
+    assert_eq!(delivered.delivery_state, DeliveryState::Delivered);
+
+    f.close().await?;
+    Ok(())
+}
+
+#[tokio::test]
+async fn storage_full_during_finalization_falls_back_to_compact_unknown() -> TestResult {
+    let bridge = FakeBridge::new();
+    bridge.set(CommandOutcome::Delivered, None)?;
+    bridge.shared.stalled.store(true, Ordering::SeqCst);
+    let f = Fixture::new(bridge.clone()).await?;
+    let node = NodeId::generate()?;
+    let agent = ParticipantId::generate()?;
+    f.node(&node, &agent, "agent").await?;
+
+    let state = f.state.clone();
+    let admin = f.admin.clone();
+    let msg = direct(&node, &agent)?;
+    let key = "disk-full-tx2";
+    let pending = tokio::spawn(async move { send_message(&state, &admin, key, msg).await });
+    tokio::time::timeout(Duration::from_secs(2), bridge.shared.submitted.notified()).await?;
+
+    // Trigger SQLITE_FULL on the next events INSERT (message.delivery_updated in Tx 2).
+    f.state
+        .db
+        .write_sqlite(|tx| {
+            tx.execute(
+                "UPDATE sqlite_sequence SET seq = 9223372036854775807 WHERE name = 'events'",
+                [],
+            )?;
+            Ok(WriteOutcome::new(()))
+        })
+        .await?;
+    bridge.shared.resume.notify_one();
+    result_code(pending.await?, ErrorCode::DeliveryUnknown)?;
+    // Replay must return 503 delivery_unknown rather than permanent 409 operation_in_progress.
+    result_code(
+        send_message(&f.state, &f.admin, key, direct(&node, &agent)?).await,
+        ErrorCode::DeliveryUnknown,
+    )?;
+    f.close().await?;
+    Ok(())
+}
+
+#[tokio::test]
+async fn shutdown_rejects_new_commands_but_commits_inflight_confirmed_outcomes() -> TestResult {
+    let bridge = FakeBridge::new();
+    bridge.set(CommandOutcome::Delivered, None)?;
+    bridge.shared.stalled.store(true, Ordering::SeqCst);
+    let f = Fixture::new(bridge.clone()).await?;
+    let node = NodeId::generate()?;
+    let agent = ParticipantId::generate()?;
+    f.node(&node, &agent, "agent").await?;
+
+    // Start one command before shutdown; signal shutdown while it is in submit().
+    let state = f.state.clone();
+    let admin = f.admin.clone();
+    let msg = direct(&node, &agent)?;
+    let inflight =
+        tokio::spawn(async move { send_message(&state, &admin, "inflight-shutdown", msg).await });
+    tokio::time::timeout(Duration::from_secs(2), bridge.shared.submitted.notified()).await?;
+
+    f.shutdown.send_replace(());
+    // A new command arriving after shutdown fails closed before Tx 1.
+    result_code(
+        send_message(&f.state, &f.admin, "after-shutdown", direct(&node, &agent)?).await,
+        ErrorCode::Overloaded,
+    )?;
+    assert_eq!(bridge.shared.submits.load(Ordering::SeqCst), 1);
+
+    // Release the already-submitted command while DbActor is still alive: Attempt 1 commits.
+    bridge.shared.resume.notify_one();
+    let (status, receipt) = inflight.await??;
+    assert_eq!(status, StatusCode::CREATED);
+    assert_eq!(receipt.delivery_state, DeliveryState::Delivered);
+
+    // Bounded BackgroundWrites rejects overflow with 503 Overloaded.
+    let bounded = crate::BackgroundWrites::new(1);
+    let (hold_tx, hold_rx) = oneshot::channel::<()>();
+    let first = bounded.spawn(async move {
+        let _ = hold_rx.await;
+    })?;
+    result_code(bounded.spawn(async {}), ErrorCode::Overloaded)?;
+    let _ = hold_tx.send(());
+    first.await?;
+    bounded.drain().await;
+
+    f.close().await?;
+    Ok(())
+}
+
+#[tokio::test]
+async fn attachment_cap_valid_attach_question_expiry_and_human_member_acl() -> TestResult {
+    let bridge = FakeBridge::new();
+    let f = Fixture::new(bridge.clone()).await?;
+    let node = NodeId::generate()?;
+    let agent = ParticipantId::generate()?;
+    f.node(&node, &agent, "agent").await?;
+
+    // More than 32 attachments is rejected statically before touching the database.
+    let too_many: Vec<_> = (0..33)
+        .map(|i| {
+            Ok::<_, Box<dyn Error + Send + Sync>>(json!({
+                "blob_id": BlobId::generate()?,
+                "name": format!("f{i}.txt"),
+                "mime_type": "text/plain",
+                "size_bytes": 1,
+                "sha256": "0".repeat(64),
+            }))
+        })
+        .collect::<Result<_, _>>()?;
+    result_code(
+        send_message(
+            &f.state,
+            &f.admin,
+            "too-many-attachments",
+            serde_json::from_value(json!({
+                "target_node_id": node,
+                "target_participant_id": agent,
+                "body": "Files",
+                "attachments": too_many,
+            }))?,
+        )
+        .await,
+        ErrorCode::InvalidRequest,
+    )?;
+
+    // Valid send_message with an uploaded blob succeeds and attaches the blob to target_node.
+    let mut headers = http::HeaderMap::new();
+    headers.insert(
+        http::header::CONTENT_TYPE,
+        http::HeaderValue::from_static("text/plain"),
+    );
+    headers.insert(
+        cooplet_client::X_COOPLET_FILENAME,
+        http::HeaderValue::from_static("note.txt"),
+    );
+    let (_, uploaded) = crate::blobs::upload(
+        &f.state,
+        &f.admin,
+        &headers,
+        axum::body::Body::from("hello"),
+    )
+    .await?;
+    let (status, sent) = send_message(
+        &f.state,
+        &f.admin,
+        "valid-attachment-msg",
+        serde_json::from_value(json!({
+            "target_node_id": node,
+            "target_participant_id": agent,
+            "body": "See attachment",
+            "attachments": [uploaded],
+        }))?,
+    )
+    .await?;
+    assert_eq!(status, StatusCode::CREATED);
+    assert_eq!(sent.delivery_state, DeliveryState::Delivered);
+    let attached_node: Option<String> = f
+        .state
+        .reads
+        .read(move |db| {
+            Ok(db.query_row(
+                "SELECT scope_node_id FROM blobs WHERE blob_id = ?1",
+                [uploaded.blob_id.as_str()],
+                |row| row.get(0),
+            )?)
+        })
+        .await?;
+    assert_eq!(attached_node.as_deref(), Some(node.as_str()));
+
+    // Expired question returns 409 question_expired.
+    let expired_q = MessageId::generate()?;
+    let q_id = expired_q.clone();
+    let n_id = node.clone();
+    let a_id = agent.clone();
+    let admin_part = f
+        .admin
+        .participant_id()
+        .ok_or("missing admin participant")?
+        .clone();
+    let ap_id = admin_part.clone();
+    f.state
+        .db
+        .write_sqlite(move |tx| {
+            let now = now_ms();
+            let q_json = serde_json::to_string(&json!({
+                "mode": "text",
+                "prompt": "Expired?",
+                "expires_at_ms": now - 1_000,
+            }))
+            .map_err(|e| rusqlite::Error::ToSqlConversionFailure(Box::new(e)))?;
+            tx.execute(
+                "INSERT INTO hub_messages (message_id, sender_actor_id, sender_node_id,
+                    target_node_id, target_participant_id, body, question_json,
+                    delivery_mode, delivery_state, created_at_ms, expires_at_ms)
+                 VALUES (?1, ?2, ?3, NULL, ?4, '', ?5, 'direct_now', 'delivered', ?6, ?7)",
+                rusqlite::params![
+                    q_id.as_str(),
+                    a_id.as_str(),
+                    n_id.as_str(),
+                    ap_id.as_str(),
+                    q_json,
+                    now - 2_000,
+                    now + 600_000
+                ],
+            )?;
+            Ok(WriteOutcome::new(()))
+        })
+        .await?;
+    result_code(
+        send_message(
+            &f.state,
+            &f.admin,
+            "answer-expired-q",
+            serde_json::from_value(answer_for(&node, &agent, &expired_q))?,
+        )
+        .await,
+        ErrorCode::QuestionExpired,
+    )?;
+
+    // HumanMember answer ACL: allowed for an agent target on allowed_nodes, forbidden for another human.
+    let member_user = cooplet_protocol::UserId::generate()?;
+    let member_part = ParticipantId::generate()?;
+    let member_tok_id = TokenId::generate()?;
+    let member_tok = mint_bearer(&f.state.master, member_tok_id.clone())?;
+    let member_verifier = member_tok.verifier;
+    let m_user = member_user.clone();
+    let m_part = member_part.clone();
+    let m_tok_id = member_tok_id.clone();
+    let m_nodes = serde_json::to_string(&[&node])?;
+    f.state
+        .db
+        .write_sqlite(move |tx| {
+            let now = now_ms();
+            tx.execute(
+                "INSERT INTO principals (principal_id, kind, username, display_name,
+                    participant_id, scopes_json, allowed_nodes_json, created_at_ms, updated_at_ms)
+                 VALUES (?1, 'human_member', 'member1', 'Member', ?2, '[\"collaborate\"]', ?3, ?4, ?4)",
+                rusqlite::params![m_user.as_str(), m_part.as_str(), m_nodes, now],
+            )?;
+            tx.execute(
+                "INSERT INTO auth_tokens (token_id, principal_id, token_kind, verifier_hmac,
+                    scopes_json, allowed_nodes_json, expires_at_ms, created_at_ms)
+                 VALUES (?1, ?2, 'bearer_api', ?3, '[\"collaborate\"]', NULL, ?4, ?5)",
+                rusqlite::params![m_tok_id.as_str(), m_user.as_str(), member_verifier, now + 60_000, now],
+            )?;
+            Ok(WriteOutcome::new(()))
+        })
+        .await?;
+    let member = authenticate(&f.state.reads, &f.state.master, member_tok.secret.as_str()).await?;
+
+    let q_for_admin = f.inbound_question(&node, &agent, None, &admin_part).await?;
+    result_code(
+        send_message(
+            &f.state,
+            &member,
+            "member-for-other-human",
+            serde_json::from_value(answer_for(&node, &agent, &q_for_admin))?,
+        )
+        .await,
+        ErrorCode::Forbidden,
+    )?;
+
+    let other_agent = ParticipantId::generate()?;
+    f.state
+        .db
+        .write_sqlite({
+            let node = node.clone();
+            let other_agent = other_agent.clone();
+            move |tx| {
+                tx.execute(
+                    "INSERT INTO node_participants (node_id, participant_id, kind, name, state, synced_epoch, updated_at_ms)
+                     VALUES (?1, ?2, 'agent', 'Other agent', 'idle', 0, ?3)",
+                    rusqlite::params![node.as_str(), other_agent.as_str(), now_ms()],
+                )?;
+                Ok(WriteOutcome::new(()))
+            }
+        })
+        .await?;
+    let q_for_agent = f
+        .inbound_question(&node, &agent, Some(&node), &other_agent)
+        .await?;
+    let (status, answered) = send_message(
+        &f.state,
+        &member,
+        "member-for-agent",
+        serde_json::from_value(answer_for(&node, &agent, &q_for_agent))?,
+    )
+    .await?;
+    assert_eq!(status, StatusCode::CREATED);
+    assert_eq!(answered.delivery_state, DeliveryState::Delivered);
+
     f.close().await?;
     Ok(())
 }

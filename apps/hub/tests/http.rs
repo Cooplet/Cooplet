@@ -27,7 +27,7 @@ async fn bootstrap_enrollment_and_admin_boundary() -> TestResult {
     assert_eq!(cli_openapi.stdout, http_openapi.body);
 
     let wrong_id = HubId::generate()?;
-    let mismatch = hub
+    let mismatch_raw = hub
         .raw(
             "GET",
             "/v1/health",
@@ -38,7 +38,7 @@ async fn bootstrap_enrollment_and_admin_boundary() -> TestResult {
             &[],
         )
         .await?;
-    let mismatch = mismatch.problem(409, ErrorCode::HubIdentityMismatch)?;
+    let mismatch = mismatch_raw.problem(409, ErrorCode::HubIdentityMismatch)?;
     assert_eq!(mismatch.extensions["actual_hub_id"], hub.id.as_str());
 
     let auth_header = format!("Bearer {}", hub.secret);
@@ -77,6 +77,23 @@ async fn bootstrap_enrollment_and_admin_boundary() -> TestResult {
     assert_eq!(health.status, 200);
 
     let original = hub.issue_enrollment_cli("Test Node", "first-enrollment")?;
+    let cli_replay = hub_command()
+        .args(["enrollment-token", "create", "--hub", hub.origin.as_str()])
+        .args(["--hub-id", hub.id.as_str(), "--token-file"])
+        .arg(hub.admin_token_path())
+        .args([
+            "--name",
+            "Test Node",
+            "--idempotency-key",
+            "first-enrollment",
+        ])
+        .output()?;
+    assert!(cli_replay.status.success(), "CLI enrollment replay failed");
+    let cli_replay_json: Value = serde_json::from_slice(&cli_replay.stdout)?;
+    assert_eq!(cli_replay_json["already_issued"], true);
+    assert!(cli_replay_json.get("token").is_none());
+    assert_eq!(cli_replay_json["token_id"], original.token_id);
+
     let replay: Value = admin
         .post_json(
             "/v1/enrollment-tokens",
@@ -88,6 +105,95 @@ async fn bootstrap_enrollment_and_admin_boundary() -> TestResult {
     assert_eq!(replay["token_id"], original.token_id);
     assert_eq!(replay["already_issued"], true);
     assert!(replay.get("token").is_none());
+
+    // Public and error responses always carry X-Cooplet-Hub and Cache-Control: no-store.
+    for response in [&http_openapi, &health, &mismatch_raw, &duplicate] {
+        assert_eq!(
+            response
+                .headers
+                .get("x-cooplet-hub")
+                .and_then(|v| v.to_str().ok()),
+            Some(hub.id.as_str())
+        );
+        assert_eq!(
+            response
+                .headers
+                .get(http::header::CACHE_CONTROL)
+                .and_then(|v| v.to_str().ok()),
+            Some("no-store")
+        );
+    }
+
+    // Duplicate Authorization on public /v1/info and any Authorization on /v1/enrollment/token
+    // return 401 without WWW-Authenticate.
+    let info_dup_auth = hub
+        .raw(
+            "GET",
+            "/v1/info",
+            &[
+                ("Authorization", &auth_header),
+                ("Authorization", &auth_header),
+            ],
+            &[],
+        )
+        .await?;
+    info_dup_auth.problem(401, ErrorCode::Unauthorized)?;
+    assert!(
+        info_dup_auth
+            .headers
+            .get(http::header::WWW_AUTHENTICATE)
+            .is_none()
+    );
+    let enroll_with_auth = hub
+        .raw(
+            "POST",
+            "/v1/enrollment/token",
+            &[
+                ("X-Cooplet-Hub", hub.id.as_str()),
+                ("Authorization", &auth_header),
+                ("Content-Type", "application/json"),
+                ("Content-Length", "2"),
+            ],
+            b"{}",
+        )
+        .await?;
+    enroll_with_auth.problem(401, ErrorCode::Unauthorized)?;
+    assert!(
+        enroll_with_auth
+            .headers
+            .get(http::header::WWW_AUTHENTICATE)
+            .is_none()
+    );
+
+    // 404 and 405 fallbacks return matching ProblemDetails via CoopletClient.
+    expect_problem(
+        admin.get_json::<Value>("/v1/does-not-exist", &[]).await,
+        ErrorCode::NotFound,
+    )?;
+    let method_err = admin
+        .post_json::<_, Value>("/v1/info", &json!({}), Some("wrong-method"))
+        .await;
+    match method_err {
+        Err(cooplet_client::ClientError::Problem(problem)) => {
+            assert_eq!(problem.status, 405);
+            assert_eq!(problem.code, ErrorCode::InvalidRequest);
+        }
+        other => return Err(format!("expected 405 problem, got {other:?}").into()),
+    }
+
+    // GET /v1/events/stream rejects unknown query parameters including limit.
+    let stream_limit = hub
+        .raw(
+            "GET",
+            "/v1/events/stream?limit=1",
+            &[
+                ("X-Cooplet-Hub", hub.id.as_str()),
+                ("Authorization", &auth_header),
+            ],
+            &[],
+        )
+        .await?;
+    stream_limit.problem(400, ErrorCode::InvalidRequest)?;
 
     let (first, second) = tokio::join!(redeem(&empty, &original), redeem(&empty, &original));
     let (enrolled, failure) = match (first, second) {
@@ -106,6 +212,45 @@ async fn bootstrap_enrollment_and_admin_boundary() -> TestResult {
         node.get_json::<Value>("/v1/nodes", &[]).await,
         ErrorCode::Forbidden,
     )?;
+    expect_problem(
+        node.get_json::<Value>("/v1/events", &[]).await,
+        ErrorCode::Forbidden,
+    )?;
+    expect_problem(
+        node.post_json::<_, Value>(
+            "/v1/messages",
+            &json!({
+                "target_node_id": original.node_id,
+                "target_participant_id": ParticipantId::generate()?,
+                "body": "hello"
+            }),
+            Some("node-forbidden-message"),
+        )
+        .await,
+        ErrorCode::Forbidden,
+    )?;
+    expect_problem(
+        node.get_json::<Value>("/v1/principals", &[]).await,
+        ErrorCode::AdminHumanRequired,
+    )?;
+
+    // Bodyless POST accepts genuinely empty 0-byte body without Content-Type and replays with {}.
+    let empty_revoke = hub
+        .raw(
+            "POST",
+            &format!("/v1/enrollment-tokens/{}/revoke", original.token_id),
+            &[
+                ("X-Cooplet-Hub", hub.id.as_str()),
+                ("Authorization", &auth_header),
+                ("Idempotency-Key", "consumed-enrollment"),
+            ],
+            &[],
+        )
+        .await?;
+    assert_eq!(empty_revoke.status, 200);
+    let empty_revoke_json: Value = serde_json::from_slice(&empty_revoke.body)?;
+    assert_eq!(empty_revoke_json["already_consumed"], true);
+    assert_eq!(empty_revoke_json["revoked"], false);
 
     let consumed: Value = admin
         .post_json(
@@ -202,19 +347,61 @@ async fn bootstrap_enrollment_and_admin_boundary() -> TestResult {
             .await?;
         response.problem(413, ErrorCode::PayloadTooLarge)?;
     }
+    let oversized_enroll = vec![b' '; 16 * 1024 + 1];
+    let enroll_len = oversized_enroll.len().to_string();
     hub.raw(
         "POST",
         "/v1/enrollment/token",
         &[
             ("X-Cooplet-Hub", hub.id.as_str()),
             ("Content-Type", "application/json"),
-            ("Content-Length", &length),
+            ("Content-Length", &enroll_len),
         ],
-        &oversized,
+        &oversized_enroll,
     )
     .await?
     .problem(413, ErrorCode::PayloadTooLarge)?;
-    hub.raw("GET", "/v1/info", &[("Transfer-Encoding", "chunked")], &[])
+
+    let chunked_enroll = encode_chunked(&oversized_enroll);
+    hub.raw(
+        "POST",
+        "/v1/enrollment/token",
+        &[
+            ("X-Cooplet-Hub", hub.id.as_str()),
+            ("Content-Type", "application/json"),
+            ("Transfer-Encoding", "chunked"),
+        ],
+        &chunked_enroll,
+    )
+    .await?
+    .problem(413, ErrorCode::PayloadTooLarge)?;
+
+    let chunked_json = encode_chunked(&oversized);
+    for path in [
+        "/v1/principals".to_owned(),
+        format!("/v1/nodes/{node_id}/revoke"),
+    ] {
+        hub.raw(
+            "POST",
+            &path,
+            &[
+                ("X-Cooplet-Hub", hub.id.as_str()),
+                ("Authorization", &auth_header),
+                ("Content-Type", "application/json"),
+                ("Transfer-Encoding", "chunked"),
+                ("Idempotency-Key", "oversized-chunked"),
+            ],
+            &chunked_json,
+        )
+        .await?
+        .problem(413, ErrorCode::PayloadTooLarge)?;
+    }
+
+    // Open-socket GET requests with body headers must be rejected immediately without waiting for bytes.
+    hub.raw_open("GET", "/v1/info", &[("Content-Length", "1")])
+        .await?
+        .problem(413, ErrorCode::PayloadTooLarge)?;
+    hub.raw_open("GET", "/v1/info", &[("Transfer-Encoding", "chunked")])
         .await?
         .problem(400, ErrorCode::InvalidRequest)?;
 
@@ -267,6 +454,39 @@ async fn scoped_service_access_and_stream_lifecycle() -> TestResult {
         1
     );
     assert_eq!(nodes["items"][0]["node_id"], allowed.node_id.as_str());
+
+    // Admin unscoped catalogs: GET /v1/principals pagination, GET /v1/nodes, GET /v1/participants.
+    let principals_p1: Value = admin
+        .get_json("/v1/principals", &[("limit", "1".into())])
+        .await?;
+    assert_eq!(
+        principals_p1["items"]
+            .as_array()
+            .ok_or("principals missing")?
+            .len(),
+        1
+    );
+    let next_principal = string(&principals_p1, "next_after")?;
+    let principals_p2: Value = admin
+        .get_json("/v1/principals", &[("after", next_principal)])
+        .await?;
+    assert_eq!(
+        principals_p2["items"]
+            .as_array()
+            .ok_or("principals page 2 missing")?
+            .len(),
+        1
+    );
+    let admin_nodes: Value = admin.get_json("/v1/nodes", &[]).await?;
+    assert_eq!(
+        admin_nodes["items"]
+            .as_array()
+            .ok_or("admin nodes missing")?
+            .len(),
+        2
+    );
+    let admin_participants: Value = admin.get_json("/v1/participants", &[]).await?;
+    assert!(admin_participants["items"].is_array());
     for path in ["/v1/nodes", "/v1/participants"] {
         expect_problem(
             service
@@ -318,6 +538,24 @@ async fn scoped_service_access_and_stream_lifecycle() -> TestResult {
     let node = hub.client(Some(&hidden.node_token))?;
     let content = b"private node upload";
     let blob = upload_text(&node, "node-private-blob", content).await?;
+    // HTTP/1.1 early replay via CoopletClient with expected_sha256 + content_length returns 200 OK.
+    let replay_outcome = node
+        .upload_blob(
+            BlobUploadSpec {
+                filename: "résumé.txt".into(),
+                mime_type: "text/plain".into(),
+                verification: UploadVerification::LocalSha256,
+                expected_sha256: Some(blob.sha256.clone()),
+                idempotency_key: Some("node-private-blob".into()),
+                content_length: Some(content.len() as u64),
+            },
+            &content[..],
+        )
+        .await?;
+    assert!(matches!(
+        replay_outcome,
+        BlobUploadOutcome::VerifiedLocal(ref replayed) if replayed == &blob
+    ));
     let mut bytes = Vec::new();
     node.download_blob_to_writer(&blob.blob_id, Some(&blob.sha256), 1024, &mut bytes)
         .await?;
@@ -437,6 +675,13 @@ async fn issue_service_token(admin: &CoopletClient, path: &str, key: &str) -> Te
             Some(key),
         )
         .await?)
+}
+
+fn encode_chunked(body: &[u8]) -> Vec<u8> {
+    let mut encoded = format!("{:x}\r\n", body.len()).into_bytes();
+    encoded.extend_from_slice(body);
+    encoded.extend_from_slice(b"\r\n0\r\n\r\n");
+    encoded
 }
 
 fn later() -> TestResult<i64> {

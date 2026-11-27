@@ -1,21 +1,23 @@
-use std::{collections::BTreeSet, error::Error, str::FromStr};
-
 use cooplet_protocol::{
     AggregateType, AnswerPayload, AttachmentRef, BridgeCommand, DeliveryMode, DeliveryState,
     ErrorCode, EventEnvelope, EventKind, HubId, MessageId, NodeId, OperationId, ParticipantId,
     QuestionPayload, ServiceScope,
 };
-use rusqlite::{Connection, OptionalExtension, Row, Transaction, params, types::Type};
-use serde::{Serialize, de::DeserializeOwned};
-use serde_json::json;
+use rusqlite::{Connection, OptionalExtension, Transaction, params};
+use serde::Serialize;
 
 use crate::{
     AppState,
     auth::AuthenticatedCaller,
-    blobs::attach_to_node,
+    blobs::{attach_to_node, preflight_node_attachments},
     error::HubError,
     now_ms,
-    storage::events::{self, EventAudience, NewEvent},
+    storage::{
+        events::{self, NewEvent, message_delivery_updated_data, question_answered_data},
+        sql::{
+            dialog_node_ids, nodes_audience, parse_col, parse_json, parse_opt_col, parse_opt_json,
+        },
+    },
 };
 
 use super::{
@@ -23,12 +25,35 @@ use super::{
 };
 
 const MESSAGE_TTL_MS: i64 = 90 * 24 * 60 * 60 * 1_000;
+pub(super) const MAX_MESSAGE_ATTACHMENTS: usize = 32;
 
 impl MessageRequest {
-    pub(super) fn normalize(&mut self, message_id: &MessageId) -> Result<(), HubError> {
-        self.bridge_command(message_id)
-            .validate()
-            .map_err(|error| HubError::invalid(error.to_string()))?;
+    pub(super) fn normalize(&mut self) -> Result<(), HubError> {
+        if self.question.is_some() && self.answer.is_some() {
+            return Err(HubError::invalid(
+                "A message cannot carry both a question and an answer.",
+            ));
+        }
+        if self.attachments.len() > MAX_MESSAGE_ATTACHMENTS {
+            return Err(HubError::invalid(
+                "A message may carry at most 32 attachments.",
+            ));
+        }
+        for attachment in &self.attachments {
+            attachment
+                .validate()
+                .map_err(|error| HubError::invalid(error.to_string()))?;
+        }
+        if let Some(question) = &self.question {
+            question
+                .validate()
+                .map_err(|error| HubError::invalid(error.to_string()))?;
+        }
+        if let Some(answer) = &self.answer {
+            answer
+                .validate()
+                .map_err(|error| HubError::invalid(error.to_string()))?;
+        }
         if self.body.trim().is_empty()
             && self.attachments.is_empty()
             && self.question.is_none()
@@ -119,6 +144,7 @@ pub(super) fn preflight(
     {
         return Err(HubError::invalid("Question expiry must be in the future."));
     }
+    preflight_node_attachments(db, caller, node_id, &request.attachments, now)?;
     Ok(Target {
         notify: Some(node_id.clone()),
         attachment_node: Some(node_id.clone()),
@@ -177,12 +203,11 @@ fn answer_target(
             "The question has expired.",
         ));
     }
-    let existing = db
-        .query_row(
-            "SELECT message_id FROM hub_messages WHERE in_reply_to = ?1 AND answer_json IS NOT NULL",
-            [parent_id.as_str()],
-            |row| id_at::<MessageId>(row, 0),
-        )
+    let mut existing_query = db.prepare_cached(
+        "SELECT message_id FROM hub_messages WHERE in_reply_to = ?1 AND answer_json IS NOT NULL",
+    )?;
+    let existing = existing_query
+        .query_row([parent_id.as_str()], |row| parse_col::<MessageId>(row, 0))
         .optional()?;
     if let Some(existing) = existing {
         return Err(HubError::new(
@@ -199,6 +224,12 @@ fn answer_target(
         _ => None,
     };
     let attachment_node = parent.view.sender_node_id.or(parent.view.target_node_id);
+    if !request.attachments.is_empty() {
+        let node_id = attachment_node.as_ref().ok_or_else(|| {
+            HubError::new(ErrorCode::Forbidden, "The message has no attachment scope.")
+        })?;
+        preflight_node_attachments(db, caller, node_id, &request.attachments, now)?;
+    }
     Ok(Target {
         notify,
         attachment_node,
@@ -212,12 +243,12 @@ pub(super) fn find_participant_kind(
     node: &NodeId,
     id: &ParticipantId,
 ) -> rusqlite::Result<Option<String>> {
-    db.query_row(
+    let mut statement = db.prepare_cached(
         "SELECT kind FROM node_participants WHERE node_id = ?1 AND participant_id = ?2",
-        params![node.as_str(), id.as_str()],
-        |row| row.get(0),
-    )
-    .optional()
+    )?;
+    statement
+        .query_row(params![node.as_str(), id.as_str()], |row| row.get(0))
+        .optional()
 }
 
 pub(crate) async fn get_message(
@@ -261,7 +292,7 @@ impl MessageRecord {
 }
 
 fn load(db: &Connection, id: &MessageId, now: i64) -> Result<MessageRecord, HubError> {
-    db.query_row(
+    let mut statement = db.prepare_cached(
         "SELECT m.message_id, m.sender_actor_id, m.sender_node_id, m.target_node_id,
                 m.target_participant_id, m.in_reply_to, m.body, m.attachments_json,
                 m.question_json, m.answer_json, m.delivery_mode, m.delivery_state,
@@ -270,77 +301,42 @@ fn load(db: &Connection, id: &MessageId, now: i64) -> Result<MessageRecord, HubE
          FROM hub_messages m
          LEFT JOIN hub_messages parent ON parent.message_id = m.in_reply_to
          WHERE m.message_id = ?1 AND m.expires_at_ms > ?2",
-        params![id.as_str(), now],
-        |row| {
-            let sender_node_id = optional_id_at::<NodeId>(row, 2)?;
-            let target_node_id = optional_id_at::<NodeId>(row, 3)?;
-            let node_ids: BTreeSet<_> = [
+    )?;
+    statement
+        .query_row(params![id.as_str(), now], |row| {
+            let sender_node_id = parse_opt_col::<NodeId>(row, 2)?;
+            let target_node_id = parse_opt_col::<NodeId>(row, 3)?;
+            let node_ids = dialog_node_ids(
                 sender_node_id.clone(),
                 target_node_id.clone(),
-                optional_id_at::<NodeId>(row, 17)?,
-                optional_id_at::<NodeId>(row, 18)?,
-            ]
-            .into_iter()
-            .flatten()
-            .collect();
+                parse_opt_col::<NodeId>(row, 17)?,
+                parse_opt_col::<NodeId>(row, 18)?,
+            );
             Ok(MessageRecord {
                 view: HubMessageView {
-                    message_id: id_at(row, 0)?,
-                    sender_actor_id: id_at(row, 1)?,
+                    message_id: parse_col(row, 0)?,
+                    sender_actor_id: parse_col(row, 1)?,
                     sender_node_id,
                     target_node_id,
-                    target_participant_id: id_at(row, 4)?,
-                    in_reply_to: optional_id_at(row, 5)?,
+                    target_participant_id: parse_col(row, 4)?,
+                    in_reply_to: parse_opt_col(row, 5)?,
                     body: row.get(6)?,
-                    attachments: serde_json::from_str(&row.get::<_, String>(7)?)
-                        .map_err(|error| decode_error(7, error))?,
-                    question: optional_json_at(row, 8)?,
-                    answer: optional_json_at(row, 9)?,
-                    delivery_mode: id_at(row, 10)?,
-                    delivery_state: id_at(row, 11)?,
+                    attachments: parse_json(row, 7)?,
+                    question: parse_opt_json(row, 8)?,
+                    answer: parse_opt_json(row, 9)?,
+                    delivery_mode: parse_col(row, 10)?,
+                    delivery_state: parse_col(row, 11)?,
                     delivery_detail: row.get(12)?,
-                    operation_id: optional_id_at(row, 13)?,
+                    operation_id: parse_opt_col(row, 13)?,
                     created_at_ms: row.get(14)?,
                     delivered_at_ms: row.get(15)?,
                 },
-                node_ids: node_ids.into_iter().collect(),
+                node_ids,
                 expires_at_ms: row.get(16)?,
             })
-        },
-    )
-    .optional()?
-    .ok_or_else(|| HubError::new(ErrorCode::NotFound, "The message does not exist."))
-}
-
-fn id_at<T: FromStr>(row: &Row<'_>, index: usize) -> rusqlite::Result<T>
-where
-    T::Err: Error + Send + Sync + 'static,
-{
-    row.get::<_, String>(index)?
-        .parse()
-        .map_err(|error| decode_error(index, error))
-}
-
-fn optional_id_at<T: FromStr>(row: &Row<'_>, index: usize) -> rusqlite::Result<Option<T>>
-where
-    T::Err: Error + Send + Sync + 'static,
-{
-    row.get::<_, Option<String>>(index)?
-        .map(|value| value.parse().map_err(|error| decode_error(index, error)))
-        .transpose()
-}
-
-fn optional_json_at<T: DeserializeOwned>(
-    row: &Row<'_>,
-    index: usize,
-) -> rusqlite::Result<Option<T>> {
-    row.get::<_, Option<String>>(index)?
-        .map(|value| serde_json::from_str(&value).map_err(|error| decode_error(index, error)))
-        .transpose()
-}
-
-fn decode_error(index: usize, error: impl Error + Send + Sync + 'static) -> rusqlite::Error {
-    rusqlite::Error::FromSqlConversionFailure(index, Type::Text, Box::new(error))
+        })
+        .optional()?
+        .ok_or_else(|| HubError::new(ErrorCode::NotFound, "The message does not exist."))
 }
 
 pub(super) struct NewMessage<'a> {
@@ -382,37 +378,37 @@ pub(super) fn insert(
         .as_ref()
         .map(serde_json::to_string)
         .transpose()?;
-    tx.execute(
+    tx.prepare_cached(
         "INSERT INTO hub_messages (
              message_id, sender_actor_id, target_node_id, target_participant_id, in_reply_to,
              body, attachments_json, question_json, answer_json, delivery_mode, delivery_state,
              operation_id, created_at_ms, delivered_at_ms, expires_at_ms
          ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15)",
-        params![
-            id.as_str(),
-            sender.as_str(),
-            body.target_node_id.as_ref().map(NodeId::as_str),
-            body.target_participant_id.as_str(),
-            body.in_reply_to.as_ref().map(MessageId::as_str),
-            body.body,
-            serde_json::to_string(&body.attachments)?,
-            question_json,
-            answer_json,
-            body.delivery_mode
-                .unwrap_or(DeliveryMode::DirectNow)
-                .as_str(),
-            state.as_str(),
-            operation_id.as_str(),
-            now,
-            (state == DeliveryState::Delivered).then_some(now),
-            target.message_expires_at_ms,
-        ],
-    )?;
+    )?
+    .execute(params![
+        id.as_str(),
+        sender.as_str(),
+        body.target_node_id.as_ref().map(NodeId::as_str),
+        body.target_participant_id.as_str(),
+        body.in_reply_to.as_ref().map(MessageId::as_str),
+        body.body,
+        serde_json::to_string(&body.attachments)?,
+        question_json,
+        answer_json,
+        body.delivery_mode
+            .unwrap_or(DeliveryMode::DirectNow)
+            .as_str(),
+        state.as_str(),
+        operation_id.as_str(),
+        now,
+        (state == DeliveryState::Delivered).then_some(now),
+        target.message_expires_at_ms,
+    ])?;
 
-    let audience = audience(&target.required_nodes);
+    let audience = nodes_audience(&target.required_nodes);
     let mut committed = Vec::with_capacity(2);
     if let (Some(question_id), Some(answer)) = (&body.in_reply_to, &body.answer) {
-        committed.push(events::append(
+        committed.push(events::record(
             tx,
             hub_id,
             NewEvent {
@@ -421,12 +417,7 @@ pub(super) fn insert(
                 aggregate_id: question_id.as_str(),
                 actor_id: Some(caller.actor_id()),
                 created_at_ms: now,
-                data: json!({
-                    "question_message_id": question_id,
-                    "answer_message_id": id,
-                    "answered_by": sender,
-                    "answer": answer,
-                }),
+                data: question_answered_data(question_id, id, sender, answer),
                 audience: audience.clone(),
             },
         )?);
@@ -444,7 +435,7 @@ pub(super) fn insert(
         answer: body.answer.as_ref(),
         delivery_state: state,
     })?;
-    committed.push(events::append(
+    committed.push(events::record(
         tx,
         hub_id,
         NewEvent {
@@ -457,6 +448,9 @@ pub(super) fn insert(
             audience,
         },
     )?);
+    if let Some(last) = committed.last() {
+        events::advance_head(tx, last.seq)?;
+    }
     Ok(committed)
 }
 
@@ -493,30 +487,27 @@ pub(super) fn finalize(
     update: DeliveryUpdate<'_>,
 ) -> Result<Option<EventEnvelope>, HubError> {
     let delivered_at_ms = (update.delivery_state == DeliveryState::Delivered).then_some(update.now);
-    let changed = tx.execute(
-        "UPDATE hub_messages SET delivery_state = ?2, delivery_detail = ?3, delivered_at_ms = ?4
-         WHERE message_id = ?1 AND delivery_state IN ('accepted', 'dispatched')",
-        params![
+    let changed = tx
+        .prepare_cached(
+            "UPDATE hub_messages SET delivery_state = ?2, delivery_detail = ?3, delivered_at_ms = ?4
+             WHERE message_id = ?1 AND delivery_state IN ('accepted', 'dispatched')",
+        )?
+        .execute(params![
             update.message_id.as_str(),
             update.delivery_state.as_str(),
             update.detail,
             delivered_at_ms
-        ],
-    )?;
+        ])?;
     if changed == 0 {
         return Ok(None);
     }
-    let mut data = json!({
-        "message_id": update.message_id,
-        "target_node_id": update.target_node_id,
-        "delivery_state": update.delivery_state,
-    });
-    if let Some(detail) = update.detail {
-        data["delivery_detail"] = json!(detail);
-    }
-    if let Some(delivered_at_ms) = delivered_at_ms {
-        data["delivered_at_ms"] = json!(delivered_at_ms);
-    }
+    let data = message_delivery_updated_data(
+        update.message_id,
+        update.target_node_id,
+        update.delivery_state,
+        update.detail,
+        delivered_at_ms,
+    );
     Ok(Some(events::append(
         tx,
         hub_id,
@@ -527,17 +518,19 @@ pub(super) fn finalize(
             actor_id: Some(update.actor_id),
             created_at_ms: update.now,
             data,
-            audience: audience(update.required_nodes),
+            audience: nodes_audience(update.required_nodes),
         },
     )?))
 }
 
-fn audience(nodes: &[NodeId]) -> EventAudience {
-    if nodes.is_empty() {
-        EventAudience::GlobalArchiveOnly
-    } else {
-        EventAudience::Nodes {
-            node_ids: nodes.to_vec(),
-        }
-    }
+pub(super) fn finalize_compact_unknown(
+    tx: &Transaction<'_>,
+    message_id: &MessageId,
+) -> Result<(), HubError> {
+    tx.prepare_cached(
+        "UPDATE hub_messages SET delivery_state = 'unknown', delivery_detail = 'storage full'
+         WHERE message_id = ?1 AND delivery_state IN ('accepted', 'dispatched')",
+    )?
+    .execute([message_id.as_str()])?;
+    Ok(())
 }

@@ -489,20 +489,6 @@ fn blob_event_sql_error_rolls_back_the_blob_and_yields_gc_to_event_pruning() -> 
     )?;
 
     let gc = HubGcHooks::default();
-    let failed = {
-        let tx = database.transaction()?;
-        gc.prune_batch(&tx, 14 * DAY, 200)
-    };
-    assert!(
-        matches!(failed, Err(error) if error.sqlite_error_code() == Some(rusqlite::ErrorCode::DiskFull))
-    );
-    let before: (Option<i64>, u64, u64) = database.query_row(
-        "SELECT (SELECT deleted_at_ms FROM blobs), events_pruned_through_seq, (SELECT COUNT(*) FROM events) FROM hub_meta",
-        [],
-        |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
-    )?;
-    assert_eq!(before, (None, 0, 1));
-
     let tx = database.transaction()?;
     assert!(gc.prune_batch(&tx, 14 * DAY, 200)?.has_more);
     tx.commit()?;
@@ -806,4 +792,52 @@ fn explain(
         .query_map(params, |row| row.get::<_, String>(3))?
         .collect::<rusqlite::Result<Vec<_>>>()?;
     Ok(details.join("\n"))
+}
+
+#[tokio::test]
+async fn gc_once_prunes_all_expired_events_when_blob_tombstone_hits_disk_full() -> TestResult {
+    let scratch = Scratch::new()?;
+    init(&scratch.0, "DiskFull GC Hub").await?;
+    let hub = open_default(&scratch.0).await?;
+    let blob_id = BlobId::generate()?;
+    hub.engine
+        .db()
+        .write_sqlite(move |tx| {
+            tx.execute(
+                "INSERT INTO blobs (blob_id, sha256, size_bytes, mime_type, original_name,
+                                    safe_disk_name, disk_rel_path, owner_actor_id,
+                                    created_at_ms, expires_at_ms)
+                 VALUES (?1, 'sha', 1, 'text/plain', 'file', 'file', 'file', 'owner', 0, 1)",
+                [blob_id.as_str()],
+            )?;
+            tx.execute_batch(
+                "WITH RECURSIVE n(seq) AS (VALUES (1) UNION ALL SELECT seq + 1 FROM n WHERE seq < 400)
+                 INSERT INTO events (seq, event_id, kind, aggregate_type, aggregate_id, payload_json, created_at_ms)
+                 SELECT seq, 'evt-' || seq, 'node.status', 'node', 'node', '{}', 0 FROM n;
+                 UPDATE hub_meta SET events_head_seq = 400 WHERE id = 1;
+                 UPDATE sqlite_sequence SET seq = 9223372036854775807 WHERE name = 'events';",
+            )?;
+            Ok(WriteOutcome::new(()))
+        })
+        .await?;
+
+    hub.engine.gc_once(14 * DAY).await?;
+    assert_eq!(watermarks(&hub).await?, (400, 400, 0));
+    let blob_deleted: Option<i64> = hub
+        .engine
+        .reads()
+        .read(|conn| Ok(conn.query_row("SELECT deleted_at_ms FROM blobs", [], |row| row.get(0))?))
+        .await?;
+    assert_eq!(blob_deleted, None);
+    hub.engine.shutdown().await?;
+    Ok(())
+}
+
+#[tokio::test]
+async fn init_and_open_reject_empty_state_dir() -> TestResult {
+    let init_err = init(Path::new(""), "Empty").await;
+    assert!(init_err.is_err());
+    let open_err = open_default(Path::new("")).await;
+    assert!(open_err.is_err());
+    Ok(())
 }

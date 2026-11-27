@@ -3,7 +3,6 @@ mod transport;
 use std::{
     error::Error,
     fs,
-    future::IntoFuture,
     io::{self, Write},
     net::SocketAddr,
     path::PathBuf,
@@ -33,11 +32,13 @@ use crate::{
     openapi::openapi_bytes,
     storage::{self, HubStorage},
 };
-use transport::WriteIdleListener;
+use transport::{HttpServerConfig, serve_http1};
 
+const HEADER_READ_TIMEOUT: Duration = Duration::from_secs(10);
 const WRITE_IDLE_TIMEOUT: Duration = Duration::from_secs(30);
 const DRAIN_TIMEOUT: Duration = Duration::from_secs(5);
 const FORCE_CLOSE_TIMEOUT: Duration = Duration::from_secs(1);
+const BACKGROUND_DRAIN_TIMEOUT: Duration = Duration::from_secs(5);
 const MAX_ADMIN_TOKEN_BYTES: u64 = 1024;
 const MAX_ENROLLMENT_TTL_MS: i64 = 86_400_000;
 
@@ -375,42 +376,40 @@ async fn serve(
     signals: ShutdownSignals,
 ) -> io::Result<()> {
     let background = state.background.clone();
-    let (force_close, force_close_rx) = watch::channel(());
-    let listener = WriteIdleListener::new(socket, WRITE_IDLE_TIMEOUT, force_close_rx);
+    let bridge = state.bridge.clone();
+    let config = HttpServerConfig {
+        header_read_timeout: HEADER_READ_TIMEOUT,
+        write_idle_timeout: WRITE_IDLE_TIMEOUT,
+        drain_timeout: DRAIN_TIMEOUT,
+        force_close_timeout: FORCE_CLOSE_TIMEOUT,
+        max_connections: limits.max_connections(),
+    };
     let (stop_accepting, stopped) = oneshot::channel();
-    let served = {
-        let server = axum::serve(listener, router(state, limits))
-            .with_graceful_shutdown(async move {
-                let _ = stopped.await;
-            })
-            .into_future();
-        tokio::pin!(server);
-        tokio::select! {
-            biased;
-            () = signals.wait() => {
-                background.close();
-                shutdown.send_replace(());
-                let _ = stop_accepting.send(());
-                match time::timeout(DRAIN_TIMEOUT, &mut server).await {
-                    Ok(result) => result,
-                    Err(_) => {
-                        tracing::warn!("HTTP drain timed out; closing remaining connections");
-                        force_close.send_replace(());
-                        time::timeout(FORCE_CLOSE_TIMEOUT, &mut server).await.unwrap_or_else(|_| {
-                            Err(io::Error::new(io::ErrorKind::TimedOut, "HTTP shutdown did not finish"))
-                        })
-                    }
-                }
-            }
-            result = &mut server => {
-                background.close();
-                shutdown.send_replace(());
-                force_close.send_replace(());
-                result
-            }
+    let app = router(state, limits);
+    let server = serve_http1(socket, app, config, stopped);
+    tokio::pin!(server);
+    let served = tokio::select! {
+        biased;
+        () = signals.wait() => {
+            background.close();
+            bridge.shutdown();
+            shutdown.send_replace(());
+            let _ = stop_accepting.send(());
+            server.await
+        }
+        result = &mut server => {
+            background.close();
+            bridge.shutdown();
+            shutdown.send_replace(());
+            result
         }
     };
-    background.drain().await;
+    if time::timeout(BACKGROUND_DRAIN_TIMEOUT, background.drain())
+        .await
+        .is_err()
+    {
+        tracing::warn!("Background write drain timed out during Hub shutdown");
+    }
     served
 }
 

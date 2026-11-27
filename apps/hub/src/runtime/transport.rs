@@ -1,60 +1,187 @@
 use std::{
-    future::Future,
+    future::{Future, poll_fn},
     io::{self, IoSlice},
-    net::SocketAddr,
     pin::Pin,
+    sync::Arc,
     task::{Context, Poll},
     time::Duration,
 };
 
-use axum::serve::Listener;
-use socket2::SockRef;
+use axum::{Router, body::Body};
+use hyper::{Request, body::Incoming, server::conn::http1, service::service_fn};
+use hyper_util::rt::{TokioIo, TokioTimer};
+use socket2::{SockRef, TcpKeepalive};
 use tokio::{
     io::{AsyncRead, AsyncWrite, ReadBuf},
     net::{TcpListener, TcpStream},
-    sync::watch,
+    sync::{Semaphore, oneshot, watch},
     time::{self, Sleep},
 };
+use tower_service::Service;
 
-pub(super) struct WriteIdleListener {
-    inner: TcpListener,
-    timeout: Duration,
-    force_close: watch::Receiver<()>,
+const TCP_KEEPALIVE_TIME: Duration = Duration::from_secs(30);
+const TCP_KEEPALIVE_INTERVAL: Duration = Duration::from_secs(10);
+#[cfg(any(target_os = "linux", target_os = "macos", target_os = "freebsd"))]
+const TCP_KEEPALIVE_RETRIES: u32 = 3;
+
+#[derive(Clone, Copy)]
+pub(super) struct HttpServerConfig {
+    pub(super) header_read_timeout: Duration,
+    pub(super) write_idle_timeout: Duration,
+    pub(super) drain_timeout: Duration,
+    pub(super) force_close_timeout: Duration,
+    pub(super) max_connections: usize,
 }
 
-impl WriteIdleListener {
-    pub(super) fn new(
-        inner: TcpListener,
-        timeout: Duration,
-        force_close: watch::Receiver<()>,
-    ) -> Self {
-        Self {
-            inner,
-            timeout,
-            force_close,
-        }
-    }
-}
+pub(super) async fn serve_http1(
+    listener: TcpListener,
+    app: Router,
+    config: HttpServerConfig,
+    mut stop_accepting: oneshot::Receiver<()>,
+) -> io::Result<()> {
+    let (graceful_tx, graceful_rx) = watch::channel(());
+    let (force_close, force_close_rx) = watch::channel(());
+    let (active_tx, _) = watch::channel(0usize);
+    let connections = Arc::new(Semaphore::new(config.max_connections.max(1)));
+    let mut builder = http1::Builder::new();
+    builder
+        .timer(TokioTimer::new())
+        .header_read_timeout(config.header_read_timeout);
 
-impl Listener for WriteIdleListener {
-    type Io = WriteIdle<TcpStream>;
-    type Addr = SocketAddr;
+    loop {
+        let stream = tokio::select! {
+            biased;
+            _ = &mut stop_accepting => break,
+            accepted = listener.accept() => match accepted {
+                Ok((stream, _)) => stream,
+                Err(error) if is_transient_accept_error(&error) => {
+                    tracing::warn!(%error, "Transient TCP accept error");
+                    time::sleep(Duration::from_millis(50)).await;
+                    continue;
+                }
+                Err(error) => {
+                    graceful_tx.send_replace(());
+                    force_close.send_replace(());
+                    let _ = time::timeout(config.force_close_timeout, wait_zero(&active_tx)).await;
+                    return Err(error);
+                }
+            }
+        };
 
-    async fn accept(&mut self) -> (Self::Io, Self::Addr) {
-        let (stream, address) = Listener::accept(&mut self.inner).await;
-        if let Err(error) = SockRef::from(&stream).set_keepalive(true) {
-            tracing::warn!(%error, "Could not enable TCP keepalive");
-        }
-        let mut shutdown = self.force_close.clone();
+        let Ok(permit) = connections.clone().try_acquire_owned() else {
+            tracing::warn!(
+                max_connections = config.max_connections,
+                "Rejecting TCP connection above max_connections limit"
+            );
+            drop(stream);
+            continue;
+        };
+        configure_tcp(&stream);
+        let mut shutdown = force_close_rx.clone();
         let forced = Box::pin(async move {
             let _ = shutdown.changed().await;
         });
-        (WriteIdle::new(stream, self.timeout, forced), address)
+        let io = TokioIo::new(WriteIdle::new(stream, config.write_idle_timeout, forced));
+        let router = app.clone();
+        let service = service_fn(move |request: Request<Incoming>| {
+            let mut router = router.clone();
+            async move {
+                poll_fn(|cx| <Router as Service<Request<Body>>>::poll_ready(&mut router, cx))
+                    .await?;
+                router.call(request.map(Body::new)).await
+            }
+        });
+        let mut connection = Box::pin(builder.serve_connection(io, service).with_upgrades());
+        let mut graceful = graceful_rx.clone();
+        let active = ActiveConnection::enter(&active_tx);
+        tokio::spawn(async move {
+            let _permit = permit;
+            let _active = active;
+            let result = tokio::select! {
+                biased;
+                result = connection.as_mut() => result,
+                _ = graceful.changed() => {
+                    connection.as_mut().graceful_shutdown();
+                    connection.await
+                }
+            };
+            if let Err(error) = result {
+                tracing::debug!(%error, "HTTP connection ended");
+            }
+        });
     }
 
-    fn local_addr(&self) -> io::Result<Self::Addr> {
-        self.inner.local_addr()
+    graceful_tx.send_replace(());
+    if time::timeout(config.drain_timeout, wait_zero(&active_tx))
+        .await
+        .is_ok()
+    {
+        return Ok(());
     }
+    tracing::warn!("HTTP drain timed out; closing remaining connections");
+    force_close.send_replace(());
+    if time::timeout(config.force_close_timeout, wait_zero(&active_tx))
+        .await
+        .is_ok()
+    {
+        Ok(())
+    } else {
+        Err(io::Error::new(
+            io::ErrorKind::TimedOut,
+            "HTTP shutdown did not finish",
+        ))
+    }
+}
+
+struct ActiveConnection(watch::Sender<usize>);
+
+impl ActiveConnection {
+    fn enter(active: &watch::Sender<usize>) -> Self {
+        active.send_modify(|count| *count += 1);
+        Self(active.clone())
+    }
+}
+
+impl Drop for ActiveConnection {
+    fn drop(&mut self) {
+        self.0.send_modify(|count| *count -= 1);
+    }
+}
+
+async fn wait_zero(active: &watch::Sender<usize>) {
+    let _ = active.subscribe().wait_for(|count| *count == 0).await;
+}
+
+fn configure_tcp(stream: &TcpStream) {
+    let _ = stream.set_nodelay(true);
+    let keepalive = TcpKeepalive::new()
+        .with_time(TCP_KEEPALIVE_TIME)
+        .with_interval(TCP_KEEPALIVE_INTERVAL);
+    #[cfg(any(target_os = "linux", target_os = "macos", target_os = "freebsd"))]
+    let keepalive = keepalive.with_retries(TCP_KEEPALIVE_RETRIES);
+    if let Err(error) = SockRef::from(stream).set_tcp_keepalive(&keepalive) {
+        tracing::warn!(%error, "Could not configure TCP keepalive");
+    }
+}
+
+fn is_transient_accept_error(error: &io::Error) -> bool {
+    if matches!(
+        error.kind(),
+        io::ErrorKind::ConnectionRefused
+            | io::ErrorKind::ConnectionAborted
+            | io::ErrorKind::ConnectionReset
+            | io::ErrorKind::Interrupted
+            | io::ErrorKind::WouldBlock
+            | io::ErrorKind::OutOfMemory
+    ) {
+        return true;
+    }
+    // ENFILE (23) and EMFILE (24) on Linux/BSD/macOS indicate temporary descriptor exhaustion.
+    #[cfg(unix)]
+    if matches!(error.raw_os_error(), Some(23 | 24)) {
+        return true;
+    }
+    false
 }
 
 pub(super) struct WriteIdle<I> {
@@ -183,8 +310,10 @@ impl<I: AsyncWrite + Unpin> AsyncWrite for WriteIdle<I> {
 mod tests {
     use std::future;
 
-    use super::*;
+    use axum::routing::get;
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    use super::*;
 
     #[derive(Clone, Copy)]
     enum Behavior {
@@ -322,19 +451,30 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn listener_enables_keepalive_and_can_interrupt_idle_sockets() -> io::Result<()> {
-        let (stop, stop_rx) = watch::channel(());
-        let mut listener = WriteIdleListener::new(
-            TcpListener::bind("127.0.0.1:0").await?,
-            Duration::from_secs(30),
-            stop_rx,
-        );
+    async fn configure_tcp_enables_tuned_keepalive_and_force_close_interrupts_reads()
+    -> io::Result<()> {
+        let listener = TcpListener::bind("127.0.0.1:0").await?;
         let _peer = TcpStream::connect(listener.local_addr()?).await?;
-        let (mut accepted, _) = listener.accept().await;
-        assert!(SockRef::from(&accepted.inner).keepalive()?);
-        let (waiting, observed) = tokio::sync::oneshot::channel();
+        let (stream, _) = listener.accept().await?;
+        configure_tcp(&stream);
+        let sock = SockRef::from(&stream);
+        assert!(sock.keepalive()?);
+        assert_eq!(sock.tcp_keepalive_time()?, TCP_KEEPALIVE_TIME);
+        assert_eq!(sock.tcp_keepalive_interval()?, TCP_KEEPALIVE_INTERVAL);
+        #[cfg(any(target_os = "linux", target_os = "macos", target_os = "freebsd"))]
+        assert_eq!(sock.tcp_keepalive_retries()?, TCP_KEEPALIVE_RETRIES);
+
+        let (stop, mut stop_rx) = watch::channel(());
+        let mut wrapped = WriteIdle::new(
+            stream,
+            Duration::from_secs(30),
+            Box::pin(async move {
+                let _ = stop_rx.changed().await;
+            }),
+        );
+        let (waiting, observed) = oneshot::channel();
         let read = tokio::spawn(async move {
-            let mut read = std::pin::pin!(accepted.read_u8());
+            let mut read = std::pin::pin!(wrapped.read_u8());
             let mut waiting = Some(waiting);
             future::poll_fn(|cx| {
                 let result = read.as_mut().poll(cx);
@@ -353,6 +493,57 @@ mod tests {
             .map_err(io::Error::other)?
             .err();
         assert!(error.is_some_and(|error| error.kind() == io::ErrorKind::ConnectionAborted));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn server_closes_slowloris_headers_and_caps_open_connections() -> io::Result<()> {
+        let listener = TcpListener::bind("127.0.0.1:0").await?;
+        let addr = listener.local_addr()?;
+        let app = Router::new().route("/ping", get(|| async { "ok" }));
+        let (stop_tx, stop_rx) = oneshot::channel();
+        let server = tokio::spawn(serve_http1(
+            listener,
+            app,
+            HttpServerConfig {
+                header_read_timeout: Duration::from_millis(120),
+                write_idle_timeout: Duration::from_secs(5),
+                drain_timeout: Duration::from_secs(1),
+                force_close_timeout: Duration::from_millis(500),
+                max_connections: 2,
+            },
+            stop_rx,
+        ));
+
+        // Incomplete headers must be closed promptly by header_read_timeout.
+        let mut slow = TcpStream::connect(addr).await?;
+        slow.write_all(b"GET /ping HTTP/1.1\r\nHost: localhost\r\n")
+            .await?;
+        let mut buf = [0u8; 32];
+        let closed = time::timeout(Duration::from_secs(2), slow.read(&mut buf)).await??;
+        assert_eq!(closed, 0);
+
+        // Two held sockets saturate max_connections = 2; a third is dropped immediately.
+        let mut first = TcpStream::connect(addr).await?;
+        let mut second = TcpStream::connect(addr).await?;
+        first
+            .write_all(b"GET /ping HTTP/1.1\r\nHost: localhost\r\n\r\n")
+            .await?;
+        second
+            .write_all(b"GET /ping HTTP/1.1\r\nHost: localhost\r\n\r\n")
+            .await?;
+        let mut resp = [0u8; 128];
+        assert!(first.read(&mut resp).await? > 0);
+        assert!(second.read(&mut resp).await? > 0);
+
+        let mut third = TcpStream::connect(addr).await?;
+        let third_closed = time::timeout(Duration::from_secs(1), third.read(&mut buf)).await??;
+        assert_eq!(third_closed, 0);
+
+        drop(first);
+        drop(second);
+        let _ = stop_tx.send(());
+        server.await.map_err(io::Error::other)??;
         Ok(())
     }
 }

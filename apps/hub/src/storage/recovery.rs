@@ -1,15 +1,16 @@
-use std::collections::BTreeSet;
-
 use cooplet_protocol::{
-    AggregateType, ErrorCode, EventEnvelope, EventKind, HubId, MessageId, NodeId, ProblemDetails,
+    AggregateType, DeliveryState, ErrorCode, EventEnvelope, EventKind, HubId, MessageId, NodeId,
+    ProblemDetails,
 };
 use cooplet_storage::{StorageEngine, StorageError, WriteOutcome};
 use rusqlite::{Transaction, params};
-use serde_json::json;
 
 use super::{
-    events::{EventAudience, NewEvent, advance_head, encode_error, record},
-    id_at, optional_id_at,
+    events::{
+        EventAudience, NewEvent, advance_head, encode_error, message_delivery_updated_data,
+        node_disconnected_data, record,
+    },
+    sql::{dialog_node_ids, nodes_audience, parse_col, parse_opt_col},
 };
 
 const RESTARTED: &str = "hub restarted before delivery confirmation";
@@ -77,17 +78,23 @@ fn recover_nodes(
         tx.prepare("SELECT node_id, session_epoch FROM nodes WHERE status = 'online'")?;
     let mut rows = statement.query([])?;
     while let Some(row) = rows.next()? {
-        let node_id: NodeId = id_at(row, 0)?;
+        let node_id: NodeId = parse_col(row, 0)?;
         let session_epoch: u64 = row.get(1)?;
-        events.push(record(tx, hub_id, NewEvent {
-            kind: EventKind::NodeDisconnected,
-            aggregate_type: AggregateType::Node,
-            aggregate_id: node_id.as_str(),
-            actor_id: None,
-            created_at_ms: now,
-            data: json!({"node_id": node_id, "status": "offline", "session_epoch": session_epoch}),
-            audience: EventAudience::Nodes { node_ids: vec![node_id.clone()] },
-        })?);
+        events.push(record(
+            tx,
+            hub_id,
+            NewEvent {
+                kind: EventKind::NodeDisconnected,
+                aggregate_type: AggregateType::Node,
+                aggregate_id: node_id.as_str(),
+                actor_id: None,
+                created_at_ms: now,
+                data: node_disconnected_data(&node_id, "offline", session_epoch),
+                audience: EventAudience::Nodes {
+                    node_ids: vec![node_id.clone()],
+                },
+            },
+        )?);
     }
     tx.execute(
         "UPDATE nodes SET status = 'offline' WHERE status = 'online'",
@@ -105,24 +112,14 @@ fn recover_messages(
     let mut statement = tx.prepare(RECOVERABLE_MESSAGES)?;
     let mut rows = statement.query([])?;
     while let Some(row) = rows.next()? {
-        let message_id: MessageId = id_at(row, 0)?;
-        let target: Option<NodeId> = optional_id_at(row, 2)?;
-        let nodes: BTreeSet<NodeId> = [
-            optional_id_at(row, 1)?,
+        let message_id: MessageId = parse_col(row, 0)?;
+        let target: Option<NodeId> = parse_opt_col(row, 2)?;
+        let nodes = dialog_node_ids(
+            parse_opt_col(row, 1)?,
             target.clone(),
-            optional_id_at(row, 3)?,
-            optional_id_at(row, 4)?,
-        ]
-        .into_iter()
-        .flatten()
-        .collect();
-        let audience = if nodes.is_empty() {
-            EventAudience::GlobalArchiveOnly
-        } else {
-            EventAudience::Nodes {
-                node_ids: nodes.into_iter().collect(),
-            }
-        };
+            parse_opt_col(row, 3)?,
+            parse_opt_col(row, 4)?,
+        );
         events.push(record(
             tx,
             hub_id,
@@ -132,13 +129,14 @@ fn recover_messages(
                 aggregate_id: message_id.as_str(),
                 actor_id: None,
                 created_at_ms: now,
-                data: json!({
-                    "message_id": message_id,
-                    "target_node_id": target,
-                    "delivery_state": "unknown",
-                    "delivery_detail": RESTARTED,
-                }),
-                audience,
+                data: message_delivery_updated_data(
+                    &message_id,
+                    target.as_ref(),
+                    DeliveryState::Unknown,
+                    Some(RESTARTED),
+                    None,
+                ),
+                audience: nodes_audience(&nodes),
             },
         )?);
     }

@@ -1,4 +1,4 @@
-use std::sync::Arc;
+use std::{sync::Arc, time::Duration};
 
 use axum::{
     body::Body,
@@ -14,7 +14,12 @@ use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 
 use crate::{AppState, auth, error::HubError};
 
-use super::{BEARER_CHALLENGE, ENROLLMENT_BODY_LIMIT, JSON_BODY_LIMIT, extract::Revocations};
+use super::{
+    BEARER_CHALLENGE, ENROLLMENT_BODY_LIMIT, JSON_BODY_LIMIT,
+    extract::{ReadTimeout, Revocations},
+};
+
+const ENROLLMENT_READ_TIMEOUT: Duration = Duration::from_secs(5);
 
 #[derive(Clone, Copy, PartialEq)]
 pub(super) enum Access {
@@ -75,6 +80,9 @@ async fn admit(gate: Gate, mut request: Request, next: Next) -> Result<Response,
             if authorization.is_some() {
                 return Err(unauthorized());
             }
+            request
+                .extensions_mut()
+                .insert(ReadTimeout(ENROLLMENT_READ_TIMEOUT));
         }
         access => {
             let revocations =

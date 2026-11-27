@@ -118,13 +118,27 @@ impl Modify for HttpConventions {
                     .build(),
             );
 
-            if let Some(post) = item.post.as_mut() {
-                describe_post(post, path);
+            for operation in [
+                item.post.as_mut(),
+                item.put.as_mut(),
+                item.patch.as_mut(),
+                item.delete.as_mut(),
+            ]
+            .into_iter()
+            .flatten()
+            {
+                describe_mutating(operation, path);
             }
 
-            for operation in [item.get.as_mut(), item.post.as_mut()]
-                .into_iter()
-                .flatten()
+            for operation in [
+                item.get.as_mut(),
+                item.post.as_mut(),
+                item.put.as_mut(),
+                item.patch.as_mut(),
+                item.delete.as_mut(),
+            ]
+            .into_iter()
+            .flatten()
             {
                 describe_responses(operation, public, requires_bearer);
             }
@@ -132,7 +146,36 @@ impl Modify for HttpConventions {
     }
 }
 
-fn describe_post(operation: &mut Operation, path: &str) {
+fn describe_mutating(operation: &mut Operation, path: &str) {
+    if path == "/v1/blobs" {
+        let parameters = operation.parameters.get_or_insert_with(Vec::new);
+        parameters.push(
+            ParameterBuilder::new()
+                .name("X-Cooplet-Sha256")
+                .parameter_in(ParameterIn::Header)
+                .required(Required::False)
+                .description(Some("Lowercase SHA-256 hex digest."))
+                .schema(Some(
+                    ObjectBuilder::new()
+                        .schema_type(Type::String)
+                        .pattern(Some("^[0-9a-f]{64}$")),
+                ))
+                .build(),
+        );
+        parameters.push(
+            ParameterBuilder::new()
+                .name("Content-Length")
+                .parameter_in(ParameterIn::Header)
+                .required(Required::False)
+                .description(Some("Length of the file body in bytes."))
+                .schema(Some(
+                    ObjectBuilder::new()
+                        .schema_type(Type::Integer)
+                        .minimum(Some(0)),
+                ))
+                .build(),
+        );
+    }
     if path != "/v1/enrollment/token" {
         operation.parameters.get_or_insert_with(Vec::new).push(
             ParameterBuilder::new()
@@ -271,6 +314,67 @@ mod tests {
         let value: Value = serde_json::from_slice(openapi_bytes()?)?;
         assert_eq!(value["openapi"], "3.1.0");
         check(&value, &value);
+        Ok(())
+    }
+
+    #[test]
+    fn http_conventions_cover_all_mutating_methods_and_non_nullable_blob_headers()
+    -> Result<(), Box<dyn Error>> {
+        use utoipa::openapi::path::{OperationBuilder, PathItem};
+
+        let mut doc = utoipa::openapi::OpenApiBuilder::new().build();
+        let mut synthetic = PathItem::default();
+        synthetic.put = Some(OperationBuilder::new().build());
+        synthetic.patch = Some(OperationBuilder::new().build());
+        synthetic.delete = Some(OperationBuilder::new().build());
+        doc.paths.paths.insert("/v1/items/{id}".into(), synthetic);
+        HttpConventions.modify(&mut doc);
+        let item = doc
+            .paths
+            .paths
+            .get("/v1/items/{id}")
+            .ok_or("missing synthetic path")?;
+        for operation in [item.put.as_ref(), item.patch.as_ref(), item.delete.as_ref()] {
+            let operation = operation.ok_or("missing synthetic operation")?;
+            let has_idempotency = operation
+                .parameters
+                .as_ref()
+                .is_some_and(|params| params.iter().any(|p| p.name == "Idempotency-Key"));
+            assert!(has_idempotency);
+            assert!(operation.responses.responses.contains_key("401"));
+            assert!(operation.responses.responses.contains_key("503"));
+        }
+
+        let value: Value = serde_json::from_slice(openapi_bytes()?)?;
+        let blob_params = value["paths"]["/v1/blobs"]["post"]["parameters"]
+            .as_array()
+            .ok_or("missing /v1/blobs parameters")?;
+        for (name, expected_type) in [
+            ("X-Cooplet-Sha256", "string"),
+            ("Content-Length", "integer"),
+        ] {
+            let param = blob_params
+                .iter()
+                .find(|param| param["name"] == name)
+                .ok_or("missing optional blob header")?;
+            assert_eq!(param["required"], false);
+            assert_eq!(param["schema"]["type"], expected_type);
+        }
+        let stream_params = value["paths"]["/v1/events/stream"]["get"]["parameters"]
+            .as_array()
+            .ok_or("missing /v1/events/stream parameters")?;
+        assert!(!stream_params.iter().any(|param| param["name"] == "limit"));
+        let page_limit = value["paths"]["/v1/events"]["get"]["parameters"]
+            .as_array()
+            .ok_or("missing /v1/events parameters")?
+            .iter()
+            .find(|param| param["name"] == "limit")
+            .ok_or("missing limit parameter")?;
+        assert_eq!(page_limit["schema"]["default"], 100);
+        assert_eq!(
+            value["components"]["schemas"]["MessageRequest"]["properties"]["attachments"]["maxItems"],
+            32
+        );
         Ok(())
     }
 }

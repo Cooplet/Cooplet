@@ -3,7 +3,6 @@ use std::{
     fs::{self, File, Metadata},
     io::{self, Write},
     path::{Path, PathBuf},
-    str::FromStr,
     sync::{Arc, Mutex},
     time::Duration,
 };
@@ -13,13 +12,15 @@ use cooplet_protocol::{HubId, ParticipantId, TokenId, UserId};
 use cooplet_storage::{
     BlobStoreConfig, Migration, StorageConfig, StorageEngine, StorageError, WriteOutcome,
 };
-use rusqlite::{Connection, Row, params, types::Type};
+use rusqlite::{Connection, params};
 
 use crate::credentials::{Master, mint_bearer};
 
 pub(crate) mod events;
 mod gc;
+pub(crate) mod operations;
 mod recovery;
+pub(crate) mod sql;
 
 #[cfg(test)]
 mod tests;
@@ -56,6 +57,13 @@ pub(crate) struct InitResult {
 }
 
 pub(crate) async fn init(state_dir: &Path, display_name: &str) -> StartupResult<InitResult> {
+    if state_dir.as_os_str().is_empty() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "Hub state directory path must not be empty",
+        )
+        .into());
+    }
     if display_name.trim().is_empty()
         || display_name.len() > 128
         || display_name.chars().any(char::is_control)
@@ -191,6 +199,13 @@ pub(crate) async fn open(
     max_total_blob_bytes: u64,
     max_page_count: u32,
 ) -> StartupResult<HubStorage> {
+    if state_dir.as_os_str().is_empty() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "Hub state directory path must not be empty",
+        )
+        .into());
+    }
     let mut config = StorageConfig::new(state_dir.join(DATABASE));
     config.read_pool_size = 8;
     config.broadcast_capacity = 64;
@@ -325,7 +340,7 @@ fn read_meta(connection: &Connection) -> Result<Option<(HubMeta, String)>, Stora
     };
     let id: i64 = row.get(0)?;
     let meta = HubMeta {
-        hub_id: id_at(row, 1)?,
+        hub_id: sql::parse_col(row, 1)?,
         display_name: row.get(2)?,
     };
     let fingerprint: String = row.get(3)?;
@@ -424,36 +439,7 @@ fn publish_secret(dir: &File, target: &str, bytes: &[u8]) -> Result<(), StorageE
     result
 }
 
-fn id_at<T>(row: &Row<'_>, index: usize) -> rusqlite::Result<T>
-where
-    T: FromStr,
-    T::Err: Error + Send + Sync + 'static,
-{
-    parse_id(row.get(index)?, index)
-}
-
-fn optional_id_at<T>(row: &Row<'_>, index: usize) -> rusqlite::Result<Option<T>>
-where
-    T: FromStr,
-    T::Err: Error + Send + Sync + 'static,
-{
-    row.get::<_, Option<String>>(index)?
-        .map(|text| parse_id(text, index))
-        .transpose()
-}
-
-fn parse_id<T>(text: String, index: usize) -> rusqlite::Result<T>
-where
-    T: FromStr,
-    T::Err: Error + Send + Sync + 'static,
-{
-    text.parse().map_err(|error| {
-        rusqlite::Error::FromSqlConversionFailure(index, Type::Text, Box::new(error))
-    })
-}
-
 fn hub_id(connection: &Connection) -> rusqlite::Result<HubId> {
-    connection.query_row("SELECT hub_id FROM hub_meta WHERE id = 1", [], |row| {
-        id_at(row, 0)
-    })
+    let mut statement = connection.prepare_cached("SELECT hub_id FROM hub_meta WHERE id = 1")?;
+    statement.query_row([], |row| sql::parse_col(row, 0))
 }

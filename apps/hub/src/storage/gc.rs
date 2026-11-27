@@ -1,17 +1,24 @@
 use std::{
     collections::BTreeMap,
     io,
-    sync::atomic::{AtomicUsize, Ordering},
+    sync::{
+        Mutex,
+        atomic::{AtomicUsize, Ordering},
+    },
 };
 
-use cooplet_protocol::{AggregateType, BlobId, EventEnvelope, EventKind, NodeId, ThreadId};
+use cooplet_protocol::{
+    AggregateType, AttachmentRef, BlobId, EventEnvelope, EventKind, NodeId, ThreadId,
+};
 use cooplet_storage::{BlobRecord, BlobState, BlobTombstone, GcBatchOutcome, GcHooks};
-use rusqlite::{Connection, OptionalExtension, Row, Transaction, params};
-use serde_json::json;
+use rusqlite::{
+    Connection, ErrorCode as SqliteErrorCode, OptionalExtension, Row, Transaction, params,
+};
 
 use super::{
-    events::{NewEvent, advance_head, blob_audience, encode_error, record},
-    hub_id, id_at, optional_id_at,
+    events::{BlobScope, NewEvent, advance_head, blob_event_data, encode_error, record},
+    hub_id,
+    sql::{parse_col, parse_opt_col},
 };
 
 const DAY_MS: i64 = 86_400_000;
@@ -29,9 +36,18 @@ pub(super) const DELETE_EXPIRED_TOKENS: &str = "DELETE FROM auth_tokens WHERE to
          LIMIT ?2
      )";
 
+#[derive(Clone, Copy)]
+struct EventCountCache {
+    floor: u64,
+    head: u64,
+    min_count: u64,
+    max_count: u64,
+}
+
 #[derive(Default)]
 pub(super) struct HubGcHooks {
     next_phase: AtomicUsize,
+    event_count_cache: Mutex<Option<EventCountCache>>,
 }
 
 impl GcHooks for HubGcHooks {
@@ -53,10 +69,33 @@ impl GcHooks for HubGcHooks {
                 1 => prune_operations(tx, now_ms, limit / 2)?,
                 2 => prune_messages(tx, now_ms, limit / 2)?,
                 3 => {
-                    events = prune_blobs(tx, now_ms, limit.saturating_sub(1) / 2)?;
-                    events.len()
+                    // Blob pruning inserts blob.deleted events. Isolate DiskFull in a
+                    // savepoint so pure-DELETE phases can reclaim pages in the same cycle.
+                    tx.execute_batch("SAVEPOINT gc_blobs")?;
+                    match prune_blobs(tx, now_ms, limit.saturating_sub(1) / 2) {
+                        Ok(created) => {
+                            tx.execute_batch("RELEASE SAVEPOINT gc_blobs")?;
+                            events = created;
+                            events.len()
+                        }
+                        Err(error)
+                            if error.sqlite_error_code() == Some(SqliteErrorCode::DiskFull) =>
+                        {
+                            tx.execute_batch(
+                                "ROLLBACK TO SAVEPOINT gc_blobs; RELEASE SAVEPOINT gc_blobs",
+                            )?;
+                            tracing::warn!("Skipping blob tombstone events while database is full");
+                            0
+                        }
+                        Err(error) => {
+                            let _ = tx.execute_batch(
+                                "ROLLBACK TO SAVEPOINT gc_blobs; RELEASE SAVEPOINT gc_blobs",
+                            );
+                            return Err(error);
+                        }
+                    }
                 }
-                _ => prune_events(tx, now_ms, limit.saturating_sub(1), EVENT_CAP)?,
+                _ => self.prune_events_cached(tx, now_ms, limit.saturating_sub(1), EVENT_CAP)?,
             };
             if changed > 0 {
                 return Ok(GcBatchOutcome {
@@ -81,7 +120,7 @@ impl GcHooks for HubGcHooks {
         statement
             .query_map(params![time, id, limit], |row| {
                 Ok(BlobTombstone {
-                    record: blob_record(row, id_at(row, 0)?)?,
+                    record: blob_record(row, parse_col(row, 0)?)?,
                     deleted_at_ms: row.get(3)?,
                 })
             })?
@@ -98,16 +137,16 @@ impl GcHooks for HubGcHooks {
             .disk_rel_path
             .to_str()
             .ok_or_else(|| encode_error(io::Error::other("invalid blob path encoding")))?;
-        Ok(tx.execute(
+        let mut statement = tx.prepare_cached(
             "DELETE FROM blobs WHERE blob_id = ?1 AND deleted_at_ms = ?2
                                  AND disk_rel_path = ?3 AND size_bytes = ?4",
-            params![
-                observed.record.blob_id.as_str(),
-                observed.deleted_at_ms,
-                path,
-                observed.record.size_bytes
-            ],
-        )? == 1)
+        )?;
+        Ok(statement.execute(params![
+            observed.record.blob_id.as_str(),
+            observed.deleted_at_ms,
+            path,
+            observed.record.size_bytes
+        ])? == 1)
     }
 
     fn lookup_blobs(
@@ -140,6 +179,22 @@ impl GcHooks for HubGcHooks {
     }
 }
 
+impl HubGcHooks {
+    fn prune_events_cached(
+        &self,
+        tx: &Transaction<'_>,
+        now: i64,
+        limit: usize,
+        cap: u64,
+    ) -> rusqlite::Result<usize> {
+        let mut cache = self
+            .event_count_cache
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        prune_events(tx, now, limit, cap, &mut cache)
+    }
+}
+
 fn blob_record(row: &Row<'_>, blob_id: BlobId) -> rusqlite::Result<BlobRecord> {
     Ok(BlobRecord {
         blob_id,
@@ -149,52 +204,44 @@ fn blob_record(row: &Row<'_>, blob_id: BlobId) -> rusqlite::Result<BlobRecord> {
 }
 
 fn prune_tokens(tx: &Transaction<'_>, now: i64, limit: usize) -> rusqlite::Result<usize> {
-    tx.execute(
-        DELETE_EXPIRED_TOKENS,
-        params![now.saturating_sub(DAY_MS), limit],
-    )
+    let mut statement = tx.prepare_cached(DELETE_EXPIRED_TOKENS)?;
+    statement.execute(params![now.saturating_sub(DAY_MS), limit])
 }
 
 fn prune_operations(tx: &Transaction<'_>, now: i64, limit: usize) -> rusqlite::Result<usize> {
-    tx.execute(
+    let mut statement = tx.prepare_cached(
         "DELETE FROM operations WHERE operation_id IN (
              SELECT operation_id FROM operations WHERE expires_at_ms <= ?1 ORDER BY expires_at_ms LIMIT ?2
          )",
-        params![now, limit],
-    )
+    )?;
+    statement.execute(params![now, limit])
 }
 
 fn prune_messages(tx: &Transaction<'_>, now: i64, limit: usize) -> rusqlite::Result<usize> {
-    let detached = tx.execute(
+    let mut detach = tx.prepare_cached(
         "UPDATE hub_messages SET in_reply_to = NULL WHERE rowid IN (
              SELECT child.rowid FROM hub_messages child WHERE child.in_reply_to IN (
                  SELECT message_id FROM hub_messages WHERE expires_at_ms <= ?1 ORDER BY expires_at_ms LIMIT ?2
              ) LIMIT ?2
          )",
-        params![now, limit],
     )?;
-    let removed = tx.execute(
+    let detached = detach.execute(params![now, limit])?;
+    let mut delete = tx.prepare_cached(
         "DELETE FROM hub_messages WHERE message_id IN (
              SELECT expired.message_id FROM (
                  SELECT message_id FROM hub_messages WHERE expires_at_ms <= ?1 ORDER BY expires_at_ms LIMIT ?2
              ) expired
              WHERE NOT EXISTS (SELECT 1 FROM hub_messages child WHERE child.in_reply_to = expired.message_id)
          )",
-        params![now, limit],
     )?;
+    let removed = delete.execute(params![now, limit])?;
     Ok(detached + removed)
 }
 
 struct ExpiredBlob {
-    id: BlobId,
-    name: String,
-    mime_type: String,
-    size: u64,
-    sha256: String,
+    attachment: AttachmentRef,
     owner: String,
-    node_id: Option<NodeId>,
-    thread_id: Option<ThreadId>,
-    attached_at_ms: Option<i64>,
+    scope: BlobScope,
 }
 
 fn prune_blobs(
@@ -210,16 +257,20 @@ fn prune_blobs(
     )?;
     let candidates = statement
         .query_map(params![now, limit], |row| {
+            let blob_id: BlobId = parse_col(row, 0)?;
+            let node_id: Option<NodeId> = parse_opt_col(row, 6)?;
+            let thread_id: Option<ThreadId> = parse_opt_col(row, 7)?;
+            let attached_at_ms: Option<i64> = row.get(8)?;
             Ok(ExpiredBlob {
-                id: id_at(row, 0)?,
-                name: row.get(1)?,
-                mime_type: row.get(2)?,
-                size: row.get(3)?,
-                sha256: row.get(4)?,
+                attachment: AttachmentRef {
+                    blob_id,
+                    name: row.get(1)?,
+                    mime_type: row.get(2)?,
+                    size_bytes: row.get(3)?,
+                    sha256: row.get(4)?,
+                },
                 owner: row.get(5)?,
-                node_id: optional_id_at(row, 6)?,
-                thread_id: optional_id_at(row, 7)?,
-                attached_at_ms: row.get(8)?,
+                scope: BlobScope::from_columns(attached_at_ms, node_id, thread_id),
             })
         })?
         .collect::<rusqlite::Result<Vec<_>>>()?;
@@ -228,33 +279,21 @@ fn prune_blobs(
     }
     let hub_id = hub_id(tx)?;
     let mut events = Vec::with_capacity(candidates.len());
+    let mut mark_deleted =
+        tx.prepare_cached("UPDATE blobs SET deleted_at_ms = ?1 WHERE blob_id = ?2")?;
     for blob in candidates {
-        tx.execute(
-            "UPDATE blobs SET deleted_at_ms = ?1 WHERE blob_id = ?2",
-            params![now, blob.id.as_str()],
-        )?;
+        mark_deleted.execute(params![now, blob.attachment.blob_id.as_str()])?;
         events.push(record(
             tx,
             &hub_id,
             NewEvent {
                 kind: EventKind::BlobDeleted,
                 aggregate_type: AggregateType::Blob,
-                aggregate_id: blob.id.as_str(),
+                aggregate_id: blob.attachment.blob_id.as_str(),
                 actor_id: None,
                 created_at_ms: now,
-                data: json!({
-                    "blob_id": blob.id,
-                    "original_name": blob.name,
-                    "mime_type": blob.mime_type,
-                    "size_bytes": blob.size,
-                    "sha256": blob.sha256,
-                }),
-                audience: blob_audience(
-                    &blob.owner,
-                    blob.attached_at_ms,
-                    blob.node_id,
-                    blob.thread_id,
-                ),
+                data: blob_event_data(&blob.attachment),
+                audience: blob.scope.event_audience(&blob.owner),
             },
         )?);
     }
@@ -264,20 +303,41 @@ fn prune_blobs(
     Ok(events)
 }
 
-fn prune_events(tx: &Transaction<'_>, now: i64, limit: usize, cap: u64) -> rusqlite::Result<usize> {
-    let (floor, head): (u64, u64) = tx.query_row(
+fn prune_events(
+    tx: &Transaction<'_>,
+    now: i64,
+    limit: usize,
+    cap: u64,
+    cache: &mut Option<EventCountCache>,
+) -> rusqlite::Result<usize> {
+    let mut meta = tx.prepare_cached(
         "SELECT events_pruned_through_seq, events_head_seq FROM hub_meta WHERE id = 1",
-        [],
-        |row| Ok((row.get(0)?, row.get(1)?)),
     )?;
-    // The span bounds the count even with sequence gaps. Only when the cap
-    // could be exceeded, count the compact index instead of walking event payloads.
-    let mut excess = if head.saturating_sub(floor) > cap {
-        let count: u64 = tx.query_row("SELECT COUNT(*) FROM events", [], |row| row.get(0))?;
-        count.saturating_sub(cap)
+    let (floor, head): (u64, u64) = meta.query_row([], |row| Ok((row.get(0)?, row.get(1)?)))?;
+    // The span bounds the count even with sequence gaps. When the span exceeds the
+    // cap, reuse rollback-safe min/max count bounds before scanning the index.
+    let (mut excess, bounds) = if head.saturating_sub(floor) <= cap {
+        *cache = None;
+        (0, None)
+    } else if let Some(cached) = *cache
+        && cached.floor == floor
+        && head >= cached.head
+    {
+        let min_count = cached.min_count;
+        let max_count = cached.max_count.saturating_add(head - cached.head);
+        if min_count.saturating_sub(cap) >= limit as u64 {
+            (min_count - cap, Some((min_count, max_count)))
+        } else if max_count <= cap {
+            (0, Some((min_count, max_count)))
+        } else {
+            let count: u64 = tx.query_row("SELECT COUNT(*) FROM events", [], |row| row.get(0))?;
+            (count.saturating_sub(cap), Some((count, count)))
+        }
     } else {
-        0
+        let count: u64 = tx.query_row("SELECT COUNT(*) FROM events", [], |row| row.get(0))?;
+        (count.saturating_sub(cap), Some((count, count)))
     };
+
     let cutoff = now.saturating_sub(EVENT_RETENTION);
     let mut statement = tx.prepare_cached(
         "SELECT seq, created_at_ms FROM events WHERE seq > ?1 ORDER BY seq LIMIT ?2",
@@ -295,16 +355,29 @@ fn prune_events(tx: &Transaction<'_>, now: i64, limit: usize, cap: u64) -> rusql
     }
     drop(rows);
     if through == floor {
+        if let Some((min_count, max_count)) = bounds {
+            *cache = Some(EventCountCache {
+                floor,
+                head,
+                min_count,
+                max_count,
+            });
+        }
         return Ok(0);
     }
-    let removed = tx.execute(
-        "DELETE FROM events WHERE seq > ?1 AND seq <= ?2",
-        params![floor, through],
-    )?;
-    tx.execute(
+    let mut delete = tx.prepare_cached("DELETE FROM events WHERE seq > ?1 AND seq <= ?2")?;
+    let removed = delete.execute(params![floor, through])?;
+    let mut update_floor = tx.prepare_cached(
         "UPDATE hub_meta SET events_pruned_through_seq = MAX(events_pruned_through_seq, ?1) WHERE id = 1",
-        [through],
     )?;
+    update_floor.execute([through])?;
+    // Keying on the new floor invalidates the cache automatically if this tx rolls back.
+    *cache = bounds.map(|(min_count, max_count)| EventCountCache {
+        floor: through,
+        head,
+        min_count: min_count.saturating_sub(removed as u64),
+        max_count: max_count.saturating_sub(removed as u64),
+    });
     Ok(removed)
 }
 
@@ -323,14 +396,48 @@ mod tests {
              SELECT value, value, 'node.status', 'node', 'node', '{}', 1
                FROM json_each('[1,4,7,15,100]');"
         )?;
-        assert_eq!(prune_events(&tx, 1, 1, 3)?, 1);
-        assert_eq!(prune_events(&tx, 1, 20, 3)?, 1);
-        assert_eq!(prune_events(&tx, 1, 20, 3)?, 0);
+        let mut cache = None;
+        assert_eq!(prune_events(&tx, 1, 1, 3, &mut cache)?, 1);
+        assert_eq!(prune_events(&tx, 1, 20, 3, &mut cache)?, 1);
+        assert_eq!(prune_events(&tx, 1, 20, 3, &mut cache)?, 0);
         assert_eq!(
             tx.query_row("SELECT events_pruned_through_seq FROM hub_meta", [], |r| {
                 r.get::<_, u64>(0)
             })?,
             4
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn event_count_cache_invalidates_on_rollback_and_skips_recount_in_steady_state()
+    -> rusqlite::Result<()> {
+        let mut db = Connection::open_in_memory()?;
+        db.execute_batch(include_str!("v1.sql"))?;
+        db.execute_batch(
+            "INSERT INTO hub_meta VALUES (1, 'hub', 'Hub', 'key', 0, 10, 1, 1);
+             INSERT INTO events(seq,event_id,kind,aggregate_type,aggregate_id,payload_json,created_at_ms)
+             SELECT value, value, 'node.status', 'node', 'node', '{}', 1
+               FROM json_each('[1,2,3,4,5,6,7,8,9,10]');"
+        )?;
+        let mut cache = None;
+        {
+            let tx = db.transaction()?;
+            assert_eq!(prune_events(&tx, 1, 2, 3, &mut cache)?, 2);
+            // Roll back the transaction; cache holds floor=2 while DB stays at floor=0.
+        }
+        assert_eq!(cache.map(|entry| entry.floor), Some(2));
+        let tx = db.transaction()?;
+        assert_eq!(prune_events(&tx, 1, 2, 3, &mut cache)?, 2);
+        assert_eq!(prune_events(&tx, 1, 2, 3, &mut cache)?, 2);
+        assert_eq!(prune_events(&tx, 1, 2, 3, &mut cache)?, 2);
+        assert_eq!(prune_events(&tx, 1, 2, 3, &mut cache)?, 1);
+        assert_eq!(prune_events(&tx, 1, 2, 3, &mut cache)?, 0);
+        tx.commit()?;
+        assert_eq!(
+            db.query_row("SELECT COUNT(*) FROM events", [], |row| row
+                .get::<_, u64>(0))?,
+            3
         );
         Ok(())
     }

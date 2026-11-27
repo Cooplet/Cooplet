@@ -1,27 +1,17 @@
-use cooplet_protocol::{DeliveryState, ErrorCode, MessageId, NodeId, OperationId, ProblemDetails};
+use cooplet_protocol::{DeliveryState, MessageId, NodeId};
 use http::StatusCode;
-use rusqlite::{Connection, OptionalExtension, Transaction, params};
+use rusqlite::{Connection, Transaction};
 use serde::{Deserialize, Serialize};
 
-use crate::error::{HubError, bounded_problem_json};
+use crate::{
+    error::{HubError, bounded_problem_json},
+    storage::operations::{self, FinishOperation, NewOperation, StoredOperation},
+};
 
 use super::{
     ANSWER_KIND, MessageReceipt, Reply, Request, Success, Target, check_node_access,
     outcome::{self, Terminal},
 };
-
-const OPERATION_TTL_MS: i64 = 30 * 24 * 60 * 60 * 1_000;
-
-struct StoredOperation {
-    operation_id: String,
-    kind: String,
-    fingerprint: String,
-    target_node_id: Option<String>,
-    state: String,
-    resource_id: Option<String>,
-    result_json: Option<String>,
-    error_json: Option<String>,
-}
 
 #[derive(Deserialize, Serialize)]
 struct RecordedResult {
@@ -56,26 +46,8 @@ impl RecordedResult {
     }
 }
 
-fn load(db: &Connection, request: &Request) -> rusqlite::Result<Option<StoredOperation>> {
-    db.query_row(
-        "SELECT operation_id, kind, request_sha256, target_node_id, state, resource_id, result_json, error_json
-         FROM operations WHERE actor_id = ?1 AND operation_key = ?2",
-        params![request.caller.actor_id(), request.key],
-        |row| Ok(StoredOperation {
-            operation_id: row.get(0)?,
-            kind: row.get(1)?,
-            fingerprint: row.get(2)?,
-            target_node_id: row.get(3)?,
-            state: row.get(4)?,
-            resource_id: row.get(5)?,
-            result_json: row.get(6)?,
-            error_json: row.get(7)?,
-        }),
-    ).optional()
-}
-
 pub(super) fn replay(db: &Connection, request: &Request) -> Result<Option<Success>, HubError> {
-    let Some(saved) = load(db, request)? else {
+    let Some(saved) = operations::load(db, request.caller.actor_id(), &request.key)? else {
         return Ok(None);
     };
     if let Some(node_id) = &saved.target_node_id {
@@ -84,74 +56,49 @@ pub(super) fn replay(db: &Connection, request: &Request) -> Result<Option<Succes
     }
     // A locally accepted answer can cover two nodes, or have no WS target.
     if saved.kind == ANSWER_KIND {
-        check_node_access(&request.caller, &saved.result()?.required_node_ids)?;
+        check_node_access(&request.caller, &recorded_result(&saved)?.required_node_ids)?;
     }
-    if saved.kind != request.kind.as_str() || saved.fingerprint != request.fingerprint {
-        return Err(HubError::new(
-            ErrorCode::OperationConflict,
-            "This key already identifies a different operation.",
-        ));
-    }
-    saved.reply().map(Some)
+    saved.check_match(request.kind.as_str(), &request.fingerprint)?;
+    reply(&saved).map(Some)
 }
 
-impl StoredOperation {
-    fn id(&self) -> Result<OperationId, HubError> {
-        OperationId::parse(&self.operation_id).map_err(HubError::internal)
-    }
+fn message_id(saved: &StoredOperation) -> Result<MessageId, HubError> {
+    let id = saved
+        .resource_id
+        .as_deref()
+        .ok_or_else(|| HubError::internal("operation has no message ID"))?;
+    MessageId::parse(id).map_err(HubError::internal)
+}
 
-    fn message_id(&self) -> Result<MessageId, HubError> {
-        let id = self
-            .resource_id
-            .as_deref()
-            .ok_or_else(|| HubError::internal("operation has no message ID"))?;
-        MessageId::parse(id).map_err(HubError::internal)
-    }
+fn recorded_result(saved: &StoredOperation) -> Result<RecordedResult, HubError> {
+    let data = saved
+        .result_json
+        .as_deref()
+        .ok_or_else(|| HubError::internal("operation has no recorded metadata"))?;
+    Ok(serde_json::from_str(data)?)
+}
 
-    fn result(&self) -> Result<RecordedResult, HubError> {
-        let data = self
-            .result_json
-            .as_deref()
-            .ok_or_else(|| HubError::internal("operation has no recorded metadata"))?;
-        Ok(serde_json::from_str(data)?)
-    }
-
-    fn reply(&self) -> Result<Success, HubError> {
-        match self.state.as_str() {
-            "succeeded" => self.result()?.into_success(),
-            "failed" => {
-                let data = self
-                    .error_json
-                    .as_deref()
-                    .ok_or_else(|| HubError::internal("failed operation has no recorded error"))?;
-                Err(HubError::from_problem(serde_json::from_str::<
-                    ProblemDetails,
-                >(data)?))
-            }
-            "accepted" | "in_progress" => Err(HubError::new(
-                ErrorCode::OperationInProgress,
-                "The operation is still in progress.",
-            )
-            .with_extension("operation_id", self.id()?.as_str())),
-            "unknown" if self.kind == ANSWER_KIND => Ok(Success {
-                status: StatusCode::CREATED,
-                body: Reply::Message(MessageReceipt {
-                    operation_id: self.id()?,
-                    message_id: self.message_id()?,
-                    in_reply_to: self.result()?.in_reply_to,
-                    delivery_state: DeliveryState::Unknown,
-                }),
-            }),
-            "unknown" => {
-                let mut error = HubError::new(ErrorCode::DeliveryUnknown, outcome::UNKNOWN_DETAIL)
-                    .with_extension("operation_id", self.id()?.as_str());
-                if let Some(id) = &self.resource_id {
-                    error = error.with_extension("message_id", id.as_str());
-                }
-                Err(error)
-            }
-            _ => Err(HubError::internal("unrecognized persisted operation state")),
+fn reply(saved: &StoredOperation) -> Result<Success, HubError> {
+    match saved.state.as_str() {
+        "succeeded" => recorded_result(saved)?.into_success(),
+        "failed" => Err(saved.failed_error()?),
+        "accepted" | "in_progress" => {
+            Err(saved.in_progress_error("The operation is still in progress.")?)
         }
+        "unknown" if saved.kind == ANSWER_KIND => Ok(Success {
+            status: StatusCode::CREATED,
+            body: Reply::Message(MessageReceipt {
+                operation_id: saved.id()?,
+                message_id: message_id(saved)?,
+                in_reply_to: recorded_result(saved)?.in_reply_to,
+                delivery_state: DeliveryState::Unknown,
+            }),
+        }),
+        "unknown" => {
+            let has_message = saved.kind == "message.send";
+            Err(saved.unknown_error(outcome::UNKNOWN_DETAIL, has_message)?)
+        }
+        _ => Err(HubError::internal("unrecognized persisted operation state")),
     }
 }
 
@@ -162,15 +109,17 @@ pub(super) enum Observed {
 }
 
 pub(super) fn observe_acceptance(db: &Connection, request: &Request) -> Result<Observed, HubError> {
-    let Some(saved) = load(db, request)? else {
+    let Some(saved) = operations::load(db, request.caller.actor_id(), &request.key)? else {
         return Ok(Observed::Missing);
     };
     if saved.operation_id != request.id.as_str() {
         return Ok(Observed::Missing);
     }
     match saved.state.as_str() {
-        "accepted" | "in_progress" => Ok(Observed::Accepted(saved.result()?.required_node_ids)),
-        _ => Ok(Observed::Terminal(saved.reply())),
+        "accepted" | "in_progress" => Ok(Observed::Accepted(
+            recorded_result(&saved)?.required_node_ids,
+        )),
+        _ => Ok(Observed::Terminal(reply(&saved))),
     }
 }
 
@@ -181,29 +130,26 @@ pub(super) fn insert(
     local: Option<&Success>,
     now: i64,
 ) -> Result<(), HubError> {
-    let result = RecordedResult::new(request, &target.required_nodes, local);
-    tx.execute(
-        "INSERT INTO operations (
-            operation_id, actor_id, operation_key, kind, request_sha256, target_node_id, state,
-            resource_id, result_json, created_at_ms, updated_at_ms, expires_at_ms
-         ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?10, ?11)",
-        params![
-            request.id.as_str(),
-            request.caller.actor_id(),
-            request.key,
-            request.kind.as_str(),
-            request.fingerprint,
-            request.action.target_node().map(NodeId::as_str),
-            if local.is_some() {
+    let result =
+        serde_json::to_string(&RecordedResult::new(request, &target.required_nodes, local))?;
+    operations::insert(
+        tx,
+        NewOperation {
+            operation_id: &request.id,
+            actor_id: request.caller.actor_id(),
+            key: &request.key,
+            kind: request.kind.as_str(),
+            request_sha256: &request.fingerprint,
+            target_node_id: request.action.target_node().map(NodeId::as_str),
+            state: if local.is_some() {
                 "succeeded"
             } else {
                 "accepted"
             },
-            request.message_id().map(MessageId::as_str),
-            serde_json::to_string(&result)?,
-            now,
-            now.saturating_add(OPERATION_TTL_MS),
-        ],
+            resource_id: request.message_id().map(MessageId::as_str),
+            result_json: Some(&result),
+            now_ms: now,
+        },
     )?;
     Ok(())
 }
@@ -215,7 +161,11 @@ pub(super) fn finish(
     terminal: &Terminal,
     now: i64,
 ) -> Result<bool, HubError> {
-    let result = RecordedResult::new(request, required_nodes, terminal.success.as_ref());
+    let result = serde_json::to_string(&RecordedResult::new(
+        request,
+        required_nodes,
+        terminal.success.as_ref(),
+    ))?;
     let problem = terminal
         .problem
         .as_ref()
@@ -228,17 +178,37 @@ pub(super) fn finish(
         .message_id()
         .map(MessageId::as_str)
         .or(terminal.resource_id.as_deref());
-    let changed = tx.execute(
-        "UPDATE operations SET state = ?2, resource_id = ?3, result_json = ?4, error_json = ?5, updated_at_ms = ?6
-         WHERE operation_id = ?1 AND state = 'accepted'",
-        params![
-            request.id.as_str(),
-            terminal.state.as_str(),
+    Ok(operations::finish(
+        tx,
+        FinishOperation {
+            operation_id: &request.id,
+            state: terminal.state.as_str(),
             resource_id,
-            serde_json::to_string(&result)?,
-            problem,
-            now,
-        ],
-    )?;
-    Ok(changed == 1)
+            result_json: Some(&result),
+            error_json: problem.as_deref(),
+            now_ms: now,
+        },
+    )?)
+}
+
+/// Compact in-place transition to `unknown` when SQLITE_FULL prevents writing a
+/// large terminal payload, avoiding an operation stuck forever in `accepted`.
+pub(super) fn finish_compact_unknown(
+    tx: &Transaction<'_>,
+    request: &Request,
+    required_nodes: &[NodeId],
+    now: i64,
+) -> Result<bool, HubError> {
+    let result = serde_json::to_string(&RecordedResult::new(request, required_nodes, None))?;
+    Ok(operations::finish(
+        tx,
+        FinishOperation {
+            operation_id: &request.id,
+            state: "unknown",
+            resource_id: request.message_id().map(MessageId::as_str),
+            result_json: Some(&result),
+            error_json: None,
+            now_ms: now,
+        },
+    )?)
 }

@@ -5,18 +5,20 @@ use cooplet_protocol::{
 use cooplet_storage::{StorageError, WriteError, WriteFailure, WriteOutcome};
 use rusqlite::{Connection, OptionalExtension, Transaction, params};
 use serde::{Serialize, de::DeserializeOwned};
-use serde_json::json;
 
 use crate::{
     AppState,
     auth::{AuthenticatedCaller, reverify_caller_tx},
     credentials::{
-        EnrollmentCredential, SecretToken, enrollment_node_id, mint_bearer, mint_enrollment,
-        mint_node, mint_service,
+        EnrollmentCredential, Master, SecretToken, enrollment_node_id, mint_bearer,
+        mint_enrollment, mint_node, mint_service,
     },
     error::HubError,
     now_ms,
-    storage::events::{EventAudience, NewEvent, append},
+    storage::{
+        events::{EventAudience, NewEvent, append, node_disconnected_data},
+        operations::{self, NewOperation},
+    },
 };
 
 use super::{
@@ -29,11 +31,16 @@ use super::{
     },
 };
 
-const OPERATION_TTL_MS: i64 = 30 * 24 * 60 * 60 * 1_000;
 const DEFAULT_ENROLLMENT_TTL_MS: i64 = 15 * 60 * 1_000;
 const MAX_ENROLLMENT_TTL_MS: i64 = 24 * 60 * 60 * 1_000;
 const MAX_SAFE_JSON_INTEGER: i64 = 9_007_199_254_740_991;
 const INITIAL_NODE_GENERATION: u64 = 1;
+const SELECT_ENROLLMENT_FOR_REDEEM: &str = "
+    SELECT t.principal_id, t.label, t.verifier_hmac,
+           t.revoked_at_ms IS NULL AND t.consumed_at_ms IS NULL
+             AND t.expires_at_ms > ?2 AND p.disabled_at_ms IS NULL
+      FROM auth_tokens t JOIN principals p USING (principal_id)
+     WHERE t.token_id = ?1 AND t.token_kind = 'enrollment_token'";
 
 pub(crate) async fn create_principal(
     state: &AppState,
@@ -422,53 +429,46 @@ pub(crate) async fn redeem_enrollment(
     if let Some(name) = &request.name {
         validate_display_name(name)?;
     }
+    // Parse syntax and run an RO check before touching the single writer thread so
+    // unauthenticated invalid tokens cannot saturate DbActor.
+    let credential =
+        EnrollmentCredential::parse(&request.token).ok_or_else(unauthorized_enrollment)?;
+    let precheck_master = state.master.clone();
+    let credential = state
+        .reads
+        .read(move |conn| {
+            Ok(
+                verify_enrollment_on(conn, &precheck_master, &credential, now_ms())
+                    .map(|_| credential),
+            )
+        })
+        .await??;
+
     let master = state.master.clone();
     let (node_id, secret) = state
         .db
         .write(move |tx| {
-            let credential =
-                EnrollmentCredential::parse(&request.token).ok_or_else(unauthorized_enrollment)?;
             let now = now_ms();
+            let (owner, label) = verify_enrollment_on(tx, &master, &credential, now)?;
             let token_id = credential.token_id.as_str();
-            let enrollment: Option<(String, String, String, bool)> = tx
-                .query_row(
-                    "SELECT t.principal_id, t.label, t.verifier_hmac,
-                            t.revoked_at_ms IS NULL AND t.consumed_at_ms IS NULL
-                              AND t.expires_at_ms > ?2 AND p.disabled_at_ms IS NULL
-                       FROM auth_tokens t JOIN principals p USING (principal_id)
-                      WHERE t.token_id = ?1 AND t.token_kind = 'enrollment_token'",
-                    params![token_id, now],
-                    |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
-                )
-                .optional()?;
-
-            let Some((owner, label, verifier, available)) = enrollment else {
-                return Err(unauthorized_enrollment().into());
-            };
-            if !credential.verify(&master, &verifier)? || !available {
-                return Err(unauthorized_enrollment().into());
-            }
-
             let node_id = enrollment_node_id(&credential.token_id)?;
             let minted = mint_node(&master, &node_id, INITIAL_NODE_GENERATION)?;
             let name = request.name.unwrap_or(label);
-            tx.execute(
-                "UPDATE auth_tokens SET consumed_at_ms = ?1 WHERE token_id = ?2",
-                params![now, token_id],
-            )?;
-            tx.execute(
+            tx.prepare_cached("UPDATE auth_tokens SET consumed_at_ms = ?1 WHERE token_id = ?2")?
+                .execute(params![now, token_id])?;
+            tx.prepare_cached(
                 "INSERT INTO nodes (node_id, display_name, owner_principal_id, credential_hmac,
                                 generation, session_epoch, status, enrolled_at_ms)
              VALUES (?1, ?2, ?3, ?4, ?5, 0, 'offline', ?6)",
-                params![
-                    node_id.as_str(),
-                    name,
-                    owner,
-                    minted.verifier,
-                    INITIAL_NODE_GENERATION,
-                    now,
-                ],
-            )?;
+            )?
+            .execute(params![
+                node_id.as_str(),
+                name,
+                owner,
+                minted.verifier,
+                INITIAL_NODE_GENERATION,
+                now,
+            ])?;
             Ok::<_, WriteError<HubError>>(WriteOutcome::new((node_id, minted.secret)))
         })
         .await?;
@@ -478,6 +478,27 @@ pub(crate) async fn redeem_enrollment(
         generation: INITIAL_NODE_GENERATION,
         node_token: secret.into_string(),
     })
+}
+
+fn verify_enrollment_on(
+    conn: &Connection,
+    master: &Master,
+    credential: &EnrollmentCredential,
+    now: i64,
+) -> Result<(String, String), HubError> {
+    let mut statement = conn.prepare_cached(SELECT_ENROLLMENT_FOR_REDEEM)?;
+    let enrollment: Option<(String, String, String, bool)> = statement
+        .query_row(params![credential.token_id.as_str(), now], |row| {
+            Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?))
+        })
+        .optional()?;
+    let Some((owner, label, verifier, available)) = enrollment else {
+        return Err(unauthorized_enrollment());
+    };
+    if !credential.verify(master, &verifier)? || !available {
+        return Err(unauthorized_enrollment());
+    }
+    Ok((owner, label))
 }
 
 pub(crate) async fn revoke_node(
@@ -492,13 +513,14 @@ pub(crate) async fn revoke_node(
     let hub_id = state.meta.hub_id.clone();
     let actor_id = caller.actor_id().to_owned();
     let commit = admin_write(state, caller, operation, move |tx, now| {
-        let (status, revoked_at, session_epoch): (String, Option<i64>, u64) = tx.query_row(
-            "SELECT status, revoked_at_ms, session_epoch FROM nodes WHERE node_id = ?1",
-            [node_id.as_str()],
-            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
-        )
-        .optional()?
-        .ok_or_else(|| not_found("Node not found"))?;
+        let (status, revoked_at, session_epoch): (String, Option<i64>, u64) = tx
+            .query_row(
+                "SELECT status, revoked_at_ms, session_epoch FROM nodes WHERE node_id = ?1",
+                [node_id.as_str()],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .optional()?
+            .ok_or_else(|| not_found("Node not found"))?;
         let changed = revoked_at.is_none() && status != "revoked";
         let mut events = Vec::new();
         if changed {
@@ -506,7 +528,10 @@ pub(crate) async fn revoke_node(
                 "UPDATE nodes SET status = 'revoked', revoked_at_ms = ?1 WHERE node_id = ?2",
                 params![now, node_id.as_str()],
             )?;
-            tx.execute("DELETE FROM node_participants WHERE node_id = ?1", [node_id.as_str()])?;
+            tx.execute(
+                "DELETE FROM node_participants WHERE node_id = ?1",
+                [node_id.as_str()],
+            )?;
             if status == "online" {
                 events.push(append(
                     tx,
@@ -517,14 +542,22 @@ pub(crate) async fn revoke_node(
                         aggregate_id: node_id.as_str(),
                         actor_id: Some(&actor_id),
                         created_at_ms: now,
-                        data: json!({ "node_id": node_id, "status": "revoked", "session_epoch": session_epoch }),
-                        audience: EventAudience::Nodes { node_ids: vec![node_id.clone()] },
+                        data: node_disconnected_data(&node_id, "revoked", session_epoch),
+                        audience: EventAudience::Nodes {
+                            node_ids: vec![node_id.clone()],
+                        },
                     },
                 )?);
             }
         }
         let resource_id = node_id.to_string();
-        let mut commit = AdminCommit::new(Revoked { id: node_id, revoked: true }, resource_id);
+        let mut commit = AdminCommit::new(
+            Revoked {
+                id: node_id,
+                revoked: true,
+            },
+            resource_id,
+        );
         commit.changed = changed;
         commit.events = events;
         Ok(commit)
@@ -741,36 +774,38 @@ where
     let actor_id = caller.actor_id().to_owned();
     let write_actor = actor_id.clone();
     let write_operation = operation.clone();
-    let result = state.db.write(move |tx| {
-        let now = now_ms();
-        reverify_caller_tx(tx, &caller, now)?;
-        caller.require_admin()?;
-        if let Some(data) = find_receipt(tx, &write_actor, &write_operation)? {
-            return Ok(WriteOutcome::new(AdminCommit::replay(data)));
-        }
+    let result = state
+        .db
+        .write(move |tx| {
+            let now = now_ms();
+            reverify_caller_tx(tx, &caller, now)?;
+            caller.require_admin()?;
+            if let Some(data) = find_receipt(tx, &write_actor, &write_operation)? {
+                return Ok(WriteOutcome::new(AdminCommit::replay(data)));
+            }
 
-        let mut commit = apply(tx, now)?;
-        let receipt = serde_json::to_string(&commit.data).map_err(HubError::from)?;
-        let operation_id = OperationId::generate().map_err(HubError::from)?;
-        tx.execute(
-            "INSERT INTO operations (operation_id, actor_id, operation_key, kind, request_sha256, state,
-                                     resource_id, result_json, created_at_ms, updated_at_ms, expires_at_ms)
-             VALUES (?1, ?2, ?3, ?4, ?5, 'succeeded', ?6, ?7, ?8, ?8, ?9)",
-            params![
-                operation_id.as_str(),
-                write_actor,
-                write_operation.key,
-                write_operation.kind,
-                write_operation.digest,
-                commit.resource_id,
-                receipt,
-                now,
-                now.saturating_add(OPERATION_TTL_MS),
-            ],
-        )?;
-        let events = std::mem::take(&mut commit.events);
-        Ok::<_, WriteError<HubError>>(WriteOutcome::with_events(commit, events))
-    }).await;
+            let mut commit = apply(tx, now)?;
+            let receipt = serde_json::to_string(&commit.data).map_err(HubError::from)?;
+            let operation_id = OperationId::generate().map_err(HubError::from)?;
+            operations::insert(
+                tx,
+                NewOperation {
+                    operation_id: &operation_id,
+                    actor_id: &write_actor,
+                    key: &write_operation.key,
+                    kind: write_operation.kind,
+                    request_sha256: &write_operation.digest,
+                    target_node_id: None,
+                    state: "succeeded",
+                    resource_id: commit.resource_id.as_deref(),
+                    result_json: Some(&receipt),
+                    now_ms: now,
+                },
+            )?;
+            let events = std::mem::take(&mut commit.events);
+            Ok::<_, WriteError<HubError>>(WriteOutcome::with_events(commit, events))
+        })
+        .await;
 
     match result {
         Ok(commit) => {
@@ -798,65 +833,29 @@ where
     }
 }
 
-struct StoredAdminReceipt {
-    kind: String,
-    digest: String,
-    state: String,
-    result: Option<String>,
-    error: Option<String>,
-}
-
 fn find_receipt<T: DeserializeOwned>(
     conn: &Connection,
     actor_id: &str,
     operation: &AdminOperation,
 ) -> Result<Option<T>, HubError> {
-    let found = conn
-        .query_row(
-            "SELECT kind, request_sha256, state, result_json, error_json
-               FROM operations WHERE actor_id = ?1 AND operation_key = ?2",
-            params![actor_id, operation.key],
-            |row| {
-                Ok(StoredAdminReceipt {
-                    kind: row.get(0)?,
-                    digest: row.get(1)?,
-                    state: row.get(2)?,
-                    result: row.get(3)?,
-                    error: row.get(4)?,
-                })
-            },
-        )
-        .optional()?;
-
-    let Some(StoredAdminReceipt {
-        kind,
-        digest,
-        state,
-        result,
-        error,
-    }) = found
-    else {
+    let Some(saved) = operations::load(conn, actor_id, &operation.key)? else {
         return Ok(None);
     };
-    if kind != operation.kind || digest != operation.digest {
-        return Err(HubError::new(
-            ErrorCode::OperationConflict,
-            "Idempotency key was used for a different request",
-        ));
-    }
-    match (state.as_str(), result, error) {
-        ("succeeded", Some(body), _) => Ok(Some(serde_json::from_str(&body)?)),
-        ("failed" | "unknown", _, Some(body)) => {
-            Err(HubError::from_problem(serde_json::from_str(&body)?))
+    saved.check_match(operation.kind, &operation.digest)?;
+    match saved.state.as_str() {
+        "succeeded" => {
+            let body = saved.result_json.as_deref().ok_or_else(|| {
+                HubError::internal("successful administrator receipt has no body")
+            })?;
+            Ok(Some(serde_json::from_str(body)?))
         }
-        ("unknown", _, _) => Err(HubError::new(
-            ErrorCode::DeliveryUnknown,
-            "The Hub could not confirm the write outcome",
-        )),
-        ("accepted" | "in_progress", _, _) => Err(HubError::new(
-            ErrorCode::OperationInProgress,
-            "The operation is still in progress",
-        )),
+        "failed" => Err(saved.failed_error()?),
+        "unknown" => {
+            Err(saved.unknown_error("The Hub could not confirm the write outcome.", false)?)
+        }
+        "accepted" | "in_progress" => {
+            Err(saved.in_progress_error("The operation is still in progress.")?)
+        }
         _ => Err(HubError::internal(
             "Invalid persisted administrator operation receipt",
         )),

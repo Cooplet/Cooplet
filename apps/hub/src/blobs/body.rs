@@ -50,6 +50,7 @@ pub(super) struct UploadReader {
     pending: Bytes,
     idle: Pin<Box<Sleep>>,
     stopped: Pin<Box<dyn Future<Output = ()> + Send>>,
+    closed: bool,
 }
 
 impl UploadReader {
@@ -61,6 +62,7 @@ impl UploadReader {
             stopped: Box::pin(async move {
                 let _ = shutdown.changed().await;
             }),
+            closed: false,
         }
     }
 
@@ -80,7 +82,8 @@ impl AsyncRead for UploadReader {
         buffer: &mut ReadBuf<'_>,
     ) -> Poll<io::Result<()>> {
         let this = self.get_mut();
-        if this.stopped.as_mut().poll(cx).is_ready() {
+        if this.closed || this.stopped.as_mut().poll(cx).is_ready() {
+            this.closed = true;
             return Poll::Ready(Err(io::Error::other(UploadReadError::Shutdown)));
         }
         if buffer.remaining() == 0 {
@@ -177,6 +180,14 @@ mod tests {
         let mut buffer = [0u8; 1];
         let result = reader.read(&mut buffer).await;
         assert!(result.is_err_and(|error| {
+            error
+                .get_ref()
+                .and_then(|source| source.downcast_ref::<UploadReadError>())
+                .is_some_and(|error| matches!(error, UploadReadError::Shutdown))
+        }));
+        // Polling again after shutdown must stay fused instead of re-polling a finished future.
+        let second = reader.read(&mut buffer).await;
+        assert!(second.is_err_and(|error| {
             error
                 .get_ref()
                 .and_then(|source| source.downcast_ref::<UploadReadError>())

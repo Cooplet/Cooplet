@@ -102,23 +102,41 @@ impl Domain {
         }
     }
 
-    fn parse(self, wire: &str) -> Option<(String, &str)> {
+    fn parse(self, wire: &str) -> Option<(String, SecretHex)> {
         let (ulid, secret) = wire.strip_prefix(self.prefix())?.split_once('.')?;
-        if ulid.len() != 26 || !is_hex_secret(secret) {
+        if ulid.len() != 26 {
             return None;
         }
+        let secret = SecretHex::parse(secret)?;
         Some((format!("{}{ulid}", self.id_prefix()), secret))
     }
 }
 
-pub(crate) enum ApiCredential<'a> {
-    Bearer(TokenId, &'a str),
-    Service(ServicePrincipalId, &'a str),
-    Node(NodeId, &'a str),
+pub(crate) struct SecretHex([u8; SECRET_BYTES * 2]);
+
+impl SecretHex {
+    fn parse(hex: &str) -> Option<Self> {
+        if !is_hex_secret(hex) {
+            return None;
+        }
+        let bytes: [u8; SECRET_BYTES * 2] = hex.as_bytes().try_into().ok()?;
+        Some(Self(bytes))
+    }
+
+    fn as_str(&self) -> &str {
+        // Every byte was validated as lowercase ASCII hex in SecretHex::parse.
+        std::str::from_utf8(&self.0).unwrap_or("")
+    }
 }
 
-impl<'a> ApiCredential<'a> {
-    pub(crate) fn parse(wire: &'a str) -> Option<Self> {
+pub(crate) enum ApiCredential {
+    Bearer(TokenId, SecretHex),
+    Service(ServicePrincipalId, SecretHex),
+    Node(NodeId, SecretHex),
+}
+
+impl ApiCredential {
+    pub(crate) fn parse(wire: &str) -> Option<Self> {
         if let Some((id, secret)) = Domain::Bearer.parse(wire) {
             return Some(Self::Bearer(TokenId::parse(&id).ok()?, secret));
         }
@@ -131,11 +149,13 @@ impl<'a> ApiCredential<'a> {
 
     fn mac(&self, master: &Master, generation: u64) -> Result<Verifier, HubError> {
         match self {
-            Self::Bearer(id, raw) => master.mac(Domain::Bearer.tag(), &[id.as_str(), raw]),
-            Self::Service(id, raw) => master.mac(Domain::Service.tag(), &[id.as_str(), raw]),
+            Self::Bearer(id, raw) => master.mac(Domain::Bearer.tag(), &[id.as_str(), raw.as_str()]),
+            Self::Service(id, raw) => {
+                master.mac(Domain::Service.tag(), &[id.as_str(), raw.as_str()])
+            }
             Self::Node(id, raw) => master.mac(
                 Domain::Node.tag(),
-                &[id.as_str(), &generation.to_string(), raw],
+                &[id.as_str(), &generation.to_string(), raw.as_str()],
             ),
         }
     }
@@ -157,13 +177,13 @@ impl<'a> ApiCredential<'a> {
     }
 }
 
-pub(crate) struct EnrollmentCredential<'a> {
+pub(crate) struct EnrollmentCredential {
     pub(crate) token_id: TokenId,
-    raw: &'a str,
+    raw: SecretHex,
 }
 
-impl<'a> EnrollmentCredential<'a> {
-    pub(crate) fn parse(wire: &'a str) -> Option<Self> {
+impl EnrollmentCredential {
+    pub(crate) fn parse(wire: &str) -> Option<Self> {
         let (id, raw) = Domain::Enrollment.parse(wire)?;
         Some(Self {
             token_id: TokenId::parse(&id).ok()?,
@@ -174,7 +194,7 @@ impl<'a> EnrollmentCredential<'a> {
     pub(crate) fn verify(&self, master: &Master, stored: &str) -> Result<bool, HubError> {
         let mac = master.mac(
             Domain::Enrollment.tag(),
-            &[self.token_id.as_str(), self.raw],
+            &[self.token_id.as_str(), self.raw.as_str()],
         )?;
         Ok(verify(mac, stored))
     }

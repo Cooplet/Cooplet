@@ -14,6 +14,7 @@ use crate::{
     auth,
     bridge::OfflineBridge,
     credentials::mint_node,
+    now_ms,
     storage::{
         self,
         events::{EventAudience, StoredEvent},
@@ -381,5 +382,56 @@ async fn revoked_upload_cannot_register_at_eof() -> TestResult {
         })
         .await?;
     assert_eq!(rows, 0);
+    fixture.close().await
+}
+
+#[tokio::test]
+async fn enrolled_node_can_attach_own_blob_only_to_its_own_node() -> TestResult {
+    let fixture = Fixture::new(2 * LIMIT).await?;
+    let (own_id, own_node) = fixture.node().await?;
+    let (other_id, _) = fixture.node().await?;
+    let (_, attachment) = upload(
+        &fixture.state,
+        &own_node,
+        &upload_headers(None),
+        Body::from("nodefile"),
+    )
+    .await?;
+
+    let caller = own_node.clone();
+    let foreign_node = other_id.clone();
+    let foreign_attachment = attachment.clone();
+    let denied = fixture
+        .state
+        .db
+        .write::<_, HubError, _>(move |tx| {
+            attach_to_node(tx, &caller, &foreign_node, &[foreign_attachment], now_ms())?;
+            Ok(WriteOutcome::new(()))
+        })
+        .await;
+    assert!(
+        denied
+            .map_err(HubError::from)
+            .is_err_and(|error| error.problem().code == ErrorCode::Forbidden)
+    );
+
+    let caller = own_node.clone();
+    let target_node = own_id.clone();
+    let own_attachment = attachment.clone();
+    fixture
+        .state
+        .db
+        .write::<_, HubError, _>(move |tx| {
+            attach_to_node(tx, &caller, &target_node, &[own_attachment], now_ms())?;
+            Ok(WriteOutcome::new(()))
+        })
+        .await?;
+
+    let scope = fixture
+        .state
+        .reads
+        .read(move |conn| Ok(lookup_blob(conn, &attachment.blob_id)?.map(|row| row.scope)))
+        .await?;
+    assert_eq!(scope, Some(crate::storage::events::BlobScope::Node(own_id)));
     fixture.close().await
 }

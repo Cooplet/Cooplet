@@ -121,6 +121,10 @@ impl Hub {
         self.client(Some(&self.secret))
     }
 
+    pub fn admin_token_path(&self) -> PathBuf {
+        self.state.0.join("admin.token")
+    }
+
     pub fn issue_enrollment_cli(&self, label: &str, key: &str) -> TestResult<IssuedEnrollment> {
         let output = hub_command()
             .args(["enrollment-token", "create", "--hub", self.origin.as_str()])
@@ -156,6 +160,56 @@ impl Hub {
         timeout(Duration::from_secs(3), async {
             socket.write_all(request.as_bytes()).await?;
             socket.write_all(body).await?;
+            socket.read_to_end(&mut response).await?;
+            Ok::<_, io::Error>(())
+        })
+        .await??;
+
+        let header_end = response
+            .windows(4)
+            .position(|window| window == b"\r\n\r\n")
+            .ok_or("missing HTTP response header")?;
+        let header = std::str::from_utf8(&response[..header_end])?;
+        let status: u16 = header
+            .split_whitespace()
+            .nth(1)
+            .ok_or("missing HTTP status")?
+            .parse()?;
+        let mut headers = http::HeaderMap::new();
+        for line in header.split("\r\n").skip(1) {
+            let (name, value) = line.split_once(':').ok_or("invalid HTTP response header")?;
+            headers.append(name.parse::<http::HeaderName>()?, value.trim().parse()?);
+        }
+        let body = response
+            .get(header_end + 4..)
+            .ok_or("missing HTTP body")?
+            .to_vec();
+        Ok(RawResponse {
+            status,
+            body,
+            headers,
+        })
+    }
+
+    /// Send only the HTTP request headers and keep the socket open to verify immediate rejection.
+    pub async fn raw_open(
+        &self,
+        method: &str,
+        path: &str,
+        headers: &[(&str, &str)],
+    ) -> TestResult<RawResponse> {
+        let mut request = format!(
+            "{method} {path} HTTP/1.1\r\nHost: {}\r\nConnection: close\r\n",
+            self.address
+        );
+        for (key, value) in headers {
+            request.push_str(&format!("{key}: {value}\r\n"));
+        }
+        request.push_str("\r\n");
+        let mut socket = TcpStream::connect(self.address).await?;
+        let mut response = Vec::new();
+        timeout(Duration::from_secs(2), async {
+            socket.write_all(request.as_bytes()).await?;
             socket.read_to_end(&mut response).await?;
             Ok::<_, io::Error>(())
         })

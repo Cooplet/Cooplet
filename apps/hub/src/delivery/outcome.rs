@@ -1,15 +1,18 @@
 use cooplet_protocol::{
-    CommandOutcome, CommandResPayload, DeliveryState, ErrorCode, MessageId, ProblemDetails,
+    CommandOutcome, CommandResPayload, DeliveryMode, DeliveryState, ErrorCode, MessageId,
+    ParticipantId, ProblemDetails, RunId,
 };
 use serde_json::Value;
 
-use crate::{bridge::SubmitError, error::HubError};
+use crate::{bridge::SubmitError, error::HubError, storage::sql::json_byte_len};
 
-use super::{CommandReceipt, Reply, Request, Success};
+use super::{CommandReceipt, Kind, Reply, Request, Success};
 
 pub(super) const UNKNOWN_DETAIL: &str =
     "The Hub could not confirm whether the command was delivered.";
 const MAX_DETAIL_BYTES: usize = 4096;
+const MAX_RESOURCE_ID_BYTES: usize = 128;
+pub(super) const MAX_RESULT_BYTES: usize = 64 * 1024;
 
 pub(super) enum TerminalState {
     Succeeded,
@@ -52,8 +55,19 @@ pub(super) fn classify(
     request: &Request,
     response: Result<CommandResPayload, SubmitError>,
 ) -> Result<Terminal, HubError> {
-    let Ok(response) = response else {
-        return unknown_terminal(request);
+    let response = match response {
+        Ok(response) => response,
+        Err(SubmitError::Unavailable) => {
+            return failure(
+                request,
+                DeliveryState::Unavailable,
+                ProblemDetails::new(
+                    ErrorCode::BridgeUnavailable,
+                    "The node could not deliver the command.",
+                ),
+            );
+        }
+        Err(SubmitError::Unknown) => return unknown_terminal(request),
     };
     if response.op_id != request.id {
         tracing::warn!(
@@ -68,24 +82,51 @@ pub(super) fn classify(
         CommandOutcome::Delivered if addresses_message => {
             message_success(request, DeliveryState::Delivered)
         }
-        CommandOutcome::Queued if addresses_message => {
+        CommandOutcome::Queued
+            if addresses_message
+                && request.delivery_mode() == Some(DeliveryMode::QueueUntilIdle) =>
+        {
             message_success(request, DeliveryState::Queued)
         }
-        CommandOutcome::Succeeded if !addresses_message => Ok(Terminal {
-            state: TerminalState::Succeeded,
-            success: Some(Success {
-                status: request.kind.default_status(),
-                body: Reply::Command(CommandReceipt {
-                    operation_id: request.id.clone(),
-                    resource_id: response.resource_id.clone(),
-                    result: response.result,
+        CommandOutcome::Succeeded if !addresses_message => {
+            if let Some(resource_id) = response.resource_id.as_deref()
+                && !valid_resource_id(request.kind, resource_id)
+            {
+                tracing::warn!(
+                    operation_id = %request.id,
+                    kind = request.kind.as_str(),
+                    "Bridge returned an invalid resource_id for a succeeded command"
+                );
+                return unknown_terminal(request);
+            }
+            let result = match response.result {
+                Some(value) if json_byte_len(&value)? <= MAX_RESULT_BYTES => Some(value),
+                Some(_) => {
+                    tracing::warn!(
+                        operation_id = %request.id,
+                        kind = request.kind.as_str(),
+                        "Dropping oversized node command result exceeding 64 KiB budget"
+                    );
+                    None
+                }
+                None => None,
+            };
+            Ok(Terminal {
+                state: TerminalState::Succeeded,
+                success: Some(Success {
+                    status: request.kind.default_status(),
+                    body: Reply::Command(CommandReceipt {
+                        operation_id: request.id.clone(),
+                        resource_id: response.resource_id.clone(),
+                        result,
+                    }),
                 }),
-            }),
-            problem: None,
-            delivery: None,
-            delivery_detail: None,
-            resource_id: response.resource_id,
-        }),
+                problem: None,
+                delivery: None,
+                delivery_detail: None,
+                resource_id: response.resource_id,
+            })
+        }
         CommandOutcome::Unknown
         | CommandOutcome::Delivered
         | CommandOutcome::Queued
@@ -127,6 +168,20 @@ pub(super) fn classify(
             )
             .with_extension("reason", "admission_expired"),
         ),
+    }
+}
+
+fn valid_resource_id(kind: Kind, value: &str) -> bool {
+    if value.trim().is_empty()
+        || value.len() > MAX_RESOURCE_ID_BYTES
+        || value.chars().any(char::is_control)
+    {
+        return false;
+    }
+    match kind {
+        Kind::CreateAgent => ParticipantId::parse(value).is_ok(),
+        Kind::RunWorkflow => RunId::parse(value).is_ok(),
+        _ => true,
     }
 }
 
@@ -234,28 +289,32 @@ fn rejected(remote: Option<&ProblemDetails>) -> ProblemDetails {
 
 fn copy_extensions(local: &mut ProblemDetails, remote: &ProblemDetails) {
     let value = |name| remote.extensions.get(name).and_then(Value::as_str);
-    if let Some(approval_id) = value("approval_id")
-        && !approval_id.trim().is_empty()
-        && approval_id.len() <= MAX_DETAIL_BYTES
-        && !approval_id.chars().any(char::is_control)
-    {
-        local
-            .extensions
-            .insert("approval_id".into(), Value::from(approval_id));
-    }
-    if let Some(action_hint) = value("action_hint") {
-        let action_hint = if action_hint.len() > MAX_DETAIL_BYTES {
-            "Check the participant for a pending approval.".into()
-        } else {
-            clean_text(action_hint)
-        };
-        if !action_hint.trim().is_empty() {
+    if local.code == ErrorCode::AwaitingApproval {
+        if let Some(approval_id) = value("approval_id")
+            && !approval_id.trim().is_empty()
+            && approval_id.len() <= MAX_DETAIL_BYTES
+            && !approval_id.chars().any(char::is_control)
+        {
             local
                 .extensions
-                .insert("action_hint".into(), Value::from(action_hint));
+                .insert("approval_id".into(), Value::from(approval_id));
+        }
+        if let Some(action_hint) = value("action_hint") {
+            let action_hint = if action_hint.len() > MAX_DETAIL_BYTES {
+                "Check the participant for a pending approval.".into()
+            } else {
+                clean_text(action_hint)
+            };
+            if !action_hint.trim().is_empty() {
+                local
+                    .extensions
+                    .insert("action_hint".into(), Value::from(action_hint));
+            }
         }
     }
-    if let Some(id) = value("existing_answer_id").filter(|id| MessageId::parse(id).is_ok()) {
+    if local.code == ErrorCode::QuestionAlreadyAnswered
+        && let Some(id) = value("existing_answer_id").filter(|id| MessageId::parse(id).is_ok())
+    {
         local
             .extensions
             .insert("existing_answer_id".into(), Value::from(id));

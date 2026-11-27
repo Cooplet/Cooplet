@@ -27,6 +27,8 @@ use crate::{
     event_bus::EventWake, storage::HubMeta,
 };
 
+const DEFAULT_MAX_BACKGROUND_WRITES: usize = 512;
+
 #[derive(Clone)]
 pub(crate) struct AppState {
     pub(crate) db: DbActor,
@@ -65,13 +67,7 @@ impl AppState {
             bridge,
             event_wake: EventWake::new(engine.db(), shutdown.clone()),
             shutdown,
-            background: BackgroundWrites(
-                watch::channel(WriteTasks {
-                    open: true,
-                    active: 0,
-                })
-                .0,
-            ),
+            background: BackgroundWrites::new(DEFAULT_MAX_BACKGROUND_WRITES),
         })
     }
 }
@@ -82,24 +78,47 @@ pub(crate) struct BackgroundWrites(watch::Sender<WriteTasks>);
 struct WriteTasks {
     open: bool,
     active: usize,
+    limit: usize,
 }
 
 impl BackgroundWrites {
+    pub(crate) fn new(limit: usize) -> Self {
+        Self(
+            watch::channel(WriteTasks {
+                open: true,
+                active: 0,
+                limit: limit.max(1),
+            })
+            .0,
+        )
+    }
+
     /// Own writes whose commit or post-commit notification must outlive the HTTP caller.
     pub(crate) fn spawn<F>(&self, task: F) -> Result<JoinHandle<F::Output>, HubError>
     where
         F: Future + Send + 'static,
         F::Output: Send + 'static,
     {
-        if !self.0.send_if_modified(|tasks| {
-            if tasks.open {
-                tasks.active += 1;
+        let mut closed = false;
+        let accepted = self.0.send_if_modified(|tasks| {
+            if !tasks.open {
+                closed = true;
+                return false;
             }
-            tasks.open
-        }) {
+            if tasks.active >= tasks.limit {
+                return false;
+            }
+            tasks.active += 1;
+            true
+        });
+        if !accepted {
             return Err(HubError::new(
                 ErrorCode::Overloaded,
-                "The Hub is shutting down.",
+                if closed {
+                    "The Hub is shutting down."
+                } else {
+                    "Too many background writes are in progress."
+                },
             ));
         }
         let active = ActiveWrite(self.0.clone());

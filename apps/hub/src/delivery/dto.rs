@@ -15,6 +15,7 @@ pub(crate) struct MessageRequest {
     pub(super) delivery_mode: Option<DeliveryMode>,
     pub(super) queue_ttl_ms: Option<u64>,
     #[serde(default)]
+    #[schema(max_items = 32)]
     pub(super) attachments: Vec<AttachmentRef>,
     pub(super) question: Option<QuestionPayload>,
     pub(super) in_reply_to: Option<MessageId>,
@@ -31,7 +32,7 @@ pub(crate) struct MessageReceipt {
     pub(super) delivery_state: DeliveryState,
 }
 
-#[derive(Clone, Debug, Deserialize, Serialize, ToSchema)]
+#[derive(Clone, Debug, PartialEq, Eq, Deserialize, Serialize, ToSchema)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct CommandReceipt {
     pub(super) operation_id: OperationId,

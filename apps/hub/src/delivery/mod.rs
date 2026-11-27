@@ -5,7 +5,13 @@ mod outcome;
 #[cfg(test)]
 mod tests;
 
-use std::{sync::Arc, time::Duration};
+use std::{
+    sync::{
+        Arc,
+        atomic::{AtomicU64, Ordering},
+    },
+    time::Duration,
+};
 
 use cooplet_protocol::{
     ApprovalDecision, BridgeCommand, CommandReqPayload, DeliveryMode, DeliveryState, ErrorCode,
@@ -16,7 +22,10 @@ use cooplet_storage::{StorageError, WriteFailure, WriteOutcome};
 use http::StatusCode;
 use rusqlite::{Connection, Transaction};
 use serde::{Deserialize, Serialize};
-use tokio::sync::oneshot;
+use tokio::{
+    sync::{oneshot, watch},
+    time::Instant,
+};
 
 use crate::{
     AppState,
@@ -24,6 +33,7 @@ use crate::{
     bridge::{CommandPermit, ReserveError, SubmitError},
     error::HubError,
     now_ms,
+    storage::sql::read_verified_tx,
 };
 
 pub(crate) use dto::{
@@ -34,6 +44,9 @@ pub(crate) use message::get_message;
 
 const ANSWER_KIND: &str = "answer_question";
 const FINALIZATION_REPLY_TIMEOUT: Duration = Duration::from_secs(2);
+const FINALIZATION_RETRY_BUDGET: Duration = Duration::from_secs(75);
+const MAX_RETRY_BACKOFF: Duration = Duration::from_secs(5);
+static JITTER_COUNTER: AtomicU64 = AtomicU64::new(1);
 
 pub(crate) async fn send_message(
     state: &AppState,
@@ -49,7 +62,7 @@ pub(crate) async fn send_message(
         )
     })?;
     let message_id = MessageId::generate()?;
-    input.normalize(&message_id)?;
+    input.normalize()?;
     let reply = execute(
         state,
         caller,
@@ -74,6 +87,11 @@ pub(crate) async fn create_agent(
     request: CreateAgentRequest,
 ) -> Result<CommandReceipt, HubError> {
     caller.require_scope(ServiceScope::Manage)?;
+    let blank =
+        |value: &Option<String>| value.as_deref().is_some_and(|text| text.trim().is_empty());
+    if blank(&request.client_kind) || blank(&request.template_id) {
+        return Err(HubError::invalid("Agent selectors must not be blank."));
+    }
     if request.client_kind.is_none() && request.template_id.is_none() {
         return Err(HubError::invalid(
             "Specify a client kind or an agent template.",
@@ -335,6 +353,15 @@ impl Request {
         }
     }
 
+    fn delivery_mode(&self) -> Option<DeliveryMode> {
+        match &self.action {
+            Action::Message { input, .. } => {
+                Some(input.delivery_mode.unwrap_or(DeliveryMode::DirectNow))
+            }
+            Action::Control { .. } => None,
+        }
+    }
+
     fn in_reply_to(&self) -> Option<&MessageId> {
         match &self.action {
             Action::Message { input, .. } => input.in_reply_to.as_ref(),
@@ -449,13 +476,12 @@ struct Success {
 }
 
 pub(super) fn active_node(db: &Connection, id: &NodeId) -> rusqlite::Result<bool> {
-    db.query_row(
+    let mut statement = db.prepare_cached(
         "SELECT EXISTS (
             SELECT 1 FROM nodes WHERE node_id = ?1 AND status <> 'revoked' AND revoked_at_ms IS NULL
         )",
-        [id.as_str()],
-        |row| row.get(0),
-    )
+    )?;
+    statement.query_row([id.as_str()], |row| row.get(0))
 }
 
 fn participant_kind(
@@ -553,29 +579,24 @@ struct Reservation {
 }
 
 async fn probe(state: &AppState, request: Arc<Request>) -> Result<Probe, HubError> {
-    state
-        .reads
-        .read(move |conn| {
-            let tx = conn.unchecked_transaction()?;
-            let now = now_ms();
-            Ok(
-                authorized_replay(&tx, &request, now).and_then(|reply| match reply {
-                    Some(reply) => Ok(Probe::Replay(reply)),
-                    None => request.preflight(&tx, now).map(Probe::New),
-                }),
-            )
-        })
-        .await?
+    let caller = request.caller.clone();
+    read_verified_tx(
+        &state.reads,
+        &caller,
+        move |tx, _, now| match journal::replay(tx, &request)? {
+            Some(reply) => Ok(Probe::Replay(reply)),
+            None => request.preflight(tx, now).map(Probe::New),
+        },
+    )
+    .await
 }
 
 async fn replay_only(state: &AppState, request: Arc<Request>) -> Result<Option<Success>, HubError> {
-    state
-        .reads
-        .read(move |conn| {
-            let tx = conn.unchecked_transaction()?;
-            Ok(authorized_replay(&tx, &request, now_ms()))
-        })
-        .await?
+    let caller = request.caller.clone();
+    read_verified_tx(&state.reads, &caller, move |tx, _, _| {
+        journal::replay(tx, &request)
+    })
+    .await
 }
 
 fn authorized_replay(
@@ -611,6 +632,13 @@ async fn deliver_owned(
     reservation: Option<Reservation>,
     client: &mut ClientReply,
 ) -> Result<Success, HubError> {
+    if state.shutdown.has_changed().unwrap_or(true) {
+        drop(reservation);
+        return Err(HubError::new(
+            ErrorCode::Overloaded,
+            "The Hub is shutting down.",
+        ));
+    }
     let reserved_node = reservation
         .as_ref()
         .map(|reservation| reservation.node.clone());
@@ -726,14 +754,15 @@ async fn finish(
     terminal: outcome::Terminal,
     client: &mut ClientReply,
 ) -> Result<Success, HubError> {
-    let mut shutdown = state.shutdown.clone();
-    let finalization = async {
-        tokio::select! {
-            biased;
-            _ = shutdown.changed() => request.unconfirmed_delivery(),
-            result = persist_terminal(state, &request, required_nodes, terminal) => result,
-        }
-    };
+    let shutdown = state.shutdown.clone();
+    let finalization = persist_terminal(
+        state,
+        &request,
+        required_nodes,
+        terminal,
+        shutdown,
+        FINALIZATION_RETRY_BUDGET,
+    );
     tokio::pin!(finalization);
     tokio::select! {
         biased;
@@ -741,7 +770,7 @@ async fn finish(
         () = tokio::time::sleep(FINALIZATION_REPLY_TIMEOUT) => {
             client.send(request.unconfirmed_delivery());
             // Releasing the HTTP request does not release ownership of the
-            // accepted operation. Retry only the SQLite receipt.
+            // accepted operation. Retry only the SQLite receipt within budget.
             finalization.await
         }
     }
@@ -752,46 +781,37 @@ async fn persist_terminal(
     request: &Arc<Request>,
     required_nodes: Vec<NodeId>,
     terminal: outcome::Terminal,
+    mut shutdown: watch::Receiver<()>,
+    retry_budget: Duration,
 ) -> Result<Success, HubError> {
     let terminal = Arc::new(terminal);
+    let deadline = Instant::now() + retry_budget;
     let mut delay = Duration::from_millis(10);
+    let mut storage_full_fallback = false;
     loop {
-        let hub_id = state.meta.hub_id.clone();
-        let tx_request = request.clone();
-        let tx_terminal = terminal.clone();
-        let required_nodes = required_nodes.clone();
-        let result = state
-            .db
-            .write(move |tx| {
-                let now = now_ms();
-                let receipt = journal::finish(tx, &tx_request, &required_nodes, &tx_terminal, now)?;
-                if !receipt {
-                    return Ok::<_, cooplet_storage::WriteError<HubError>>(WriteOutcome::new(
-                        false,
-                    ));
-                }
-                let event = match (tx_request.message_id(), tx_terminal.delivery) {
-                    (Some(message_id), Some(delivery_state)) => message::finalize(
-                        tx,
-                        &hub_id,
-                        message::DeliveryUpdate {
-                            message_id,
-                            target_node_id: tx_request.action.target_node(),
-                            required_nodes: &required_nodes,
-                            actor_id: tx_request.caller.actor_id(),
-                            delivery_state,
-                            detail: tx_terminal.delivery_detail.as_deref(),
-                            now,
-                        },
-                    )?,
-                    _ => None,
-                };
-                Ok(WriteOutcome::with_events(true, event.into_iter().collect()))
-            })
-            .await;
+        // Always allow at least one write attempt even if shutdown arrived while
+        // the bridge call was in flight: DbActor is still open during drain.
+        let result = if storage_full_fallback {
+            write_compact_unknown(state, request, &required_nodes).await
+        } else {
+            write_terminal(state, request, &required_nodes, &terminal).await
+        };
         match result {
-            Ok(true) => return terminal.response(),
+            Ok(true) => {
+                return if storage_full_fallback {
+                    request.unconfirmed_delivery()
+                } else {
+                    terminal.response()
+                };
+            }
+            Err(error) if is_storage_full(&error) && !storage_full_fallback => {
+                // Immediately attempt an in-place shrinking transition to `unknown`
+                // so the receipt does not stay stranded in `accepted` (409).
+                storage_full_fallback = true;
+                continue;
+            }
             Err(WriteFailure::Storage(StorageError::Overloaded)) => {}
+            Err(error) if is_storage_full(&error) => {}
             result => {
                 // Tx 1 completed. A duplicate or unacknowledged Tx 2 may have
                 // recorded a terminal result, which a fresh read can prove.
@@ -816,7 +836,105 @@ async fn persist_terminal(
                 }
             }
         }
-        tokio::time::sleep(delay).await;
-        delay = (delay * 2).min(Duration::from_millis(200));
+        if shutdown.has_changed().unwrap_or(true) || Instant::now() >= deadline {
+            tracing::warn!(
+                operation_id = %request.id,
+                "Stopped delivery receipt finalization after shutdown or retry budget"
+            );
+            return request.unconfirmed_delivery();
+        }
+        let wait = jittered_delay(delay).min(deadline.saturating_duration_since(Instant::now()));
+        tokio::select! {
+            biased;
+            _ = shutdown.changed() => {
+                tracing::warn!(
+                    operation_id = %request.id,
+                    "Stopped delivery receipt retries on Hub shutdown"
+                );
+                return request.unconfirmed_delivery();
+            }
+            () = tokio::time::sleep(wait) => {}
+        }
+        delay = (delay * 2).min(MAX_RETRY_BACKOFF);
     }
+}
+
+async fn write_terminal(
+    state: &AppState,
+    request: &Arc<Request>,
+    required_nodes: &[NodeId],
+    terminal: &Arc<outcome::Terminal>,
+) -> Result<bool, WriteFailure<HubError>> {
+    let hub_id = state.meta.hub_id.clone();
+    let tx_request = request.clone();
+    let tx_terminal = terminal.clone();
+    let required_nodes = required_nodes.to_vec();
+    state
+        .db
+        .write(move |tx| {
+            let now = now_ms();
+            let receipt = journal::finish(tx, &tx_request, &required_nodes, &tx_terminal, now)?;
+            if !receipt {
+                return Ok::<_, cooplet_storage::WriteError<HubError>>(WriteOutcome::new(false));
+            }
+            let event = match (tx_request.message_id(), tx_terminal.delivery) {
+                (Some(message_id), Some(delivery_state)) => message::finalize(
+                    tx,
+                    &hub_id,
+                    message::DeliveryUpdate {
+                        message_id,
+                        target_node_id: tx_request.action.target_node(),
+                        required_nodes: &required_nodes,
+                        actor_id: tx_request.caller.actor_id(),
+                        delivery_state,
+                        detail: tx_terminal.delivery_detail.as_deref(),
+                        now,
+                    },
+                )?,
+                _ => None,
+            };
+            Ok(WriteOutcome::with_events(true, event.into_iter().collect()))
+        })
+        .await
+}
+
+async fn write_compact_unknown(
+    state: &AppState,
+    request: &Arc<Request>,
+    required_nodes: &[NodeId],
+) -> Result<bool, WriteFailure<HubError>> {
+    let tx_request = request.clone();
+    let required_nodes = required_nodes.to_vec();
+    state
+        .db
+        .write(move |tx| {
+            let now = now_ms();
+            let receipt = journal::finish_compact_unknown(tx, &tx_request, &required_nodes, now)?;
+            if !receipt {
+                return Ok::<_, cooplet_storage::WriteError<HubError>>(WriteOutcome::new(false));
+            }
+            if let Some(message_id) = tx_request.message_id() {
+                message::finalize_compact_unknown(tx, message_id)?;
+            }
+            Ok::<_, cooplet_storage::WriteError<HubError>>(WriteOutcome::new(true))
+        })
+        .await
+}
+
+fn is_storage_full(error: &WriteFailure<HubError>) -> bool {
+    matches!(error, WriteFailure::Storage(StorageError::StorageFull))
+        || matches!(error, WriteFailure::App(err) if err.problem().code == ErrorCode::StorageFull)
+}
+
+fn jittered_delay(base: Duration) -> Duration {
+    let max_jitter_ms = u64::try_from(base.as_millis() / 2).unwrap_or(0);
+    if max_jitter_ms == 0 {
+        return base;
+    }
+    let mut x = JITTER_COUNTER.fetch_add(1, Ordering::Relaxed)
+        ^ u64::try_from(now_ms()).unwrap_or(0).rotate_left(13);
+    x ^= x << 13;
+    x ^= x >> 7;
+    x ^= x << 17;
+    base + Duration::from_millis(x % (max_jitter_ms + 1))
 }

@@ -5,7 +5,7 @@ use axum::{
     response::{IntoResponse, Response},
 };
 use bytes::Bytes;
-use cooplet_protocol::{EventEnvelope, EventStreamFrame};
+use cooplet_protocol::EventStreamFrame;
 use cooplet_storage::DbActor;
 use futures_util::stream;
 use http::header;
@@ -14,7 +14,7 @@ use tokio::{
     time::Instant,
 };
 
-use super::{Budget, Cursor, Reader, Snapshot, Watermarks};
+use super::{Budget, Cursor, Reader, StreamSnapshot, Watermarks};
 use crate::{auth, error::HubError, now_ms};
 
 const STREAM_SCAN_LIMIT: usize = 256;
@@ -22,6 +22,7 @@ const PING_INTERVAL: Duration = Duration::from_secs(15);
 const AUTH_INTERVAL: Duration = Duration::from_secs(30);
 const MAX_IDLE_EXPIRY_WAIT_MS: i64 = 30_000;
 const NDJSON_MEDIA_TYPE: &str = "application/x-ndjson";
+const PING_FRAME: &[u8] = b"{\"type\":\"ping\"}\n";
 
 type Watermark = (u64, u64);
 
@@ -59,14 +60,13 @@ impl EventWake {
 pub(super) async fn response(
     reader: Arc<Reader>,
     after: u64,
-    limit: Option<usize>,
     mut wake: watch::Receiver<Watermark>,
     mut revocations: watch::Receiver<u64>,
     mut shutdown: watch::Receiver<()>,
 ) -> Result<Response, HubError> {
     let budget = Budget {
         rows: STREAM_SCAN_LIMIT,
-        items: limit.map_or(STREAM_SCAN_LIMIT, |items| items.min(STREAM_SCAN_LIMIT)),
+        items: STREAM_SCAN_LIMIT,
     };
     wake.borrow_and_update();
     let initial = tokio::select! {
@@ -75,7 +75,10 @@ pub(super) async fn response(
             cooplet_protocol::ErrorCode::Overloaded,
             "The Hub is shutting down.",
         )),
-        initial = reader.snapshot(Cursor::Initial(after), budget) => initial?.into_page()?,
+        initial = reader.snapshot_stream(Cursor::Initial(after), budget) => match initial? {
+            StreamSnapshot::Batch(batch) => batch,
+            StreamSnapshot::CursorLost(watermarks) => return Err(watermarks.problem()),
+        },
     };
     if revocations.has_changed().unwrap_or(true) {
         revocations.borrow_and_update();
@@ -88,7 +91,7 @@ pub(super) async fn response(
         revocations,
         shutdown,
         budget,
-        pending: initial.items.into(),
+        pending: initial.frames.into(),
         pending_resync: None,
         cursor: initial.next_seq,
         needs_scan: initial.has_more,
@@ -98,16 +101,7 @@ pub(super) async fn response(
     };
     let frames = stream::unfold(state, |mut stream| async move {
         let frame = stream.next_frame().await?;
-        match serde_json::to_vec(&frame) {
-            Ok(mut bytes) => {
-                bytes.push(b'\n');
-                Some((Ok::<_, Infallible>(Bytes::from(bytes)), stream))
-            }
-            Err(error) => {
-                tracing::error!(%error, "Could not encode the EventBus stream frame");
-                None
-            }
-        }
+        Some((Ok::<_, Infallible>(frame), stream))
     });
     Ok((
         [(header::CONTENT_TYPE, NDJSON_MEDIA_TYPE)],
@@ -122,7 +116,7 @@ struct EventStream {
     revocations: watch::Receiver<u64>,
     shutdown: watch::Receiver<()>,
     budget: Budget,
-    pending: VecDeque<EventEnvelope>,
+    pending: VecDeque<Bytes>,
     pending_resync: Option<Watermarks>,
     cursor: u64,
     needs_scan: bool,
@@ -132,7 +126,7 @@ struct EventStream {
 }
 
 impl EventStream {
-    async fn next_frame(&mut self) -> Option<EventStreamFrame> {
+    async fn next_frame(&mut self) -> Option<Bytes> {
         loop {
             if self.closed || self.shutdown.has_changed().unwrap_or(true) {
                 return None;
@@ -161,18 +155,28 @@ impl EventStream {
 
             if let Some(watermarks) = self.pending_resync.take() {
                 self.closed = true;
-                return Some(EventStreamFrame::ResyncRequired {
+                let frame = EventStreamFrame::ResyncRequired {
                     oldest_available_seq: watermarks.oldest(),
                     latest_seq: watermarks.head,
                     reason: "cursor_pruned".into(),
-                });
+                };
+                return match serde_json::to_vec(&frame) {
+                    Ok(mut bytes) => {
+                        bytes.push(b'\n');
+                        Some(Bytes::from(bytes))
+                    }
+                    Err(error) => {
+                        tracing::error!(%error, "Could not encode the EventBus resync frame");
+                        None
+                    }
+                };
             }
             if now >= self.ping_at {
                 self.ping_at = now + PING_INTERVAL;
-                return Some(EventStreamFrame::Ping {});
+                return Some(Bytes::from_static(PING_FRAME));
             }
-            if let Some(event) = self.pending.pop_front() {
-                return Some(EventStreamFrame::Event { event });
+            if let Some(frame) = self.pending.pop_front() {
+                return Some(frame);
             }
             if self.needs_scan {
                 self.scan().await?;
@@ -203,15 +207,15 @@ impl EventStream {
         let next = tokio::select! {
             biased;
             _ = self.shutdown.changed() => return None,
-            next = self.reader.snapshot(Cursor::Resume(self.cursor), self.budget) => next.ok()?,
+            next = self.reader.snapshot_stream(Cursor::Resume(self.cursor), self.budget) => next.ok()?,
         };
         match next {
-            Snapshot::Page(page) => {
-                self.pending = page.items.into();
-                self.cursor = page.next_seq;
-                self.needs_scan = page.has_more;
+            StreamSnapshot::Batch(batch) => {
+                self.pending = batch.frames.into();
+                self.cursor = batch.next_seq;
+                self.needs_scan = batch.has_more;
             }
-            Snapshot::CursorLost(watermarks) => {
+            StreamSnapshot::CursorLost(watermarks) => {
                 self.pending_resync = Some(watermarks);
             }
         }

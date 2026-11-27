@@ -1,18 +1,17 @@
 use axum::body::Body;
 use cooplet_client::{IDEMPOTENCY_KEY, X_COOPLET_FILENAME, X_COOPLET_SHA256};
 use cooplet_protocol::{
-    AggregateType, AttachmentRef, BlobId, ErrorCode, EventKind, HubId, ProblemDetails,
-    ServiceScope, canonical_sha256, validate_attachment_name, validate_idempotency_key,
-    validate_media_type, validate_sha256,
+    AggregateType, AttachmentRef, BlobId, ErrorCode, EventKind, HubId, ServiceScope,
+    canonical_sha256, validate_attachment_name, validate_idempotency_key, validate_media_type,
+    validate_sha256,
 };
 use cooplet_storage::{
     BlobInput, StorageError, StoredBlob, WriteError, WriteFailure, WriteOutcome,
 };
 use http::{HeaderMap, StatusCode, header};
 use percent_encoding::percent_decode_str;
-use rusqlite::{Connection, OptionalExtension, Transaction, params};
+use rusqlite::{Connection, Transaction, params};
 use serde::{Deserialize, Serialize};
-use serde_json::json;
 use sha2::{Digest, Sha256};
 use tokio::io::AsyncReadExt;
 
@@ -21,7 +20,11 @@ use crate::{
     auth::{AuthenticatedCaller, reverify_caller_tx},
     error::HubError,
     now_ms,
-    storage::events::{EventAudience, NewEvent, append},
+    storage::{
+        events::{EventAudience, NewEvent, append, blob_event_data},
+        operations::{self, NewOperation},
+        sql::read_verified_tx,
+    },
 };
 
 use super::{
@@ -31,7 +34,6 @@ use super::{
 };
 
 const UNATTACHED_TTL_MS: i64 = 60 * 60 * 1_000;
-const RECEIPT_TTL_MS: i64 = 30 * 24 * 60 * 60 * 1_000;
 
 pub(crate) async fn upload(
     state: &AppState,
@@ -211,7 +213,12 @@ struct Receipt {
 
 struct PriorUpload {
     request_sha256: String,
-    attachment: AttachmentRef,
+    outcome: PriorOutcome,
+}
+
+enum PriorOutcome {
+    Succeeded(AttachmentRef),
+    Error(HubError),
 }
 
 async fn read_receipt(
@@ -219,18 +226,11 @@ async fn read_receipt(
     caller: &AuthenticatedCaller,
     key: &str,
 ) -> Result<Option<PriorUpload>, HubError> {
-    let caller = caller.clone();
     let key = key.to_owned();
-    state
-        .reads
-        .read(move |connection| {
-            let snapshot = connection.unchecked_transaction()?;
-            Ok((|| {
-                reverify_caller_tx(&snapshot, &caller, now_ms())?;
-                lookup_receipt(&snapshot, &caller, &key)
-            })())
-        })
-        .await?
+    read_verified_tx(&state.reads, caller, move |snapshot, caller, _| {
+        lookup_receipt(snapshot, caller, &key)
+    })
+    .await
 }
 
 fn lookup_receipt(
@@ -238,64 +238,42 @@ fn lookup_receipt(
     caller: &AuthenticatedCaller,
     key: &str,
 ) -> Result<Option<PriorUpload>, HubError> {
-    let row = conn
-        .query_row(
-            "SELECT kind, request_sha256, state, result_json, error_json
-             FROM operations WHERE actor_id = ?1 AND operation_key = ?2",
-            params![caller.actor_id(), key],
-            |row| {
-                Ok((
-                    row.get::<_, String>(0)?,
-                    row.get::<_, String>(1)?,
-                    row.get::<_, String>(2)?,
-                    row.get::<_, Option<String>>(3)?,
-                    row.get::<_, Option<String>>(4)?,
-                ))
-            },
-        )
-        .optional()?;
-    let Some((kind, request_sha256, state, result_json, error_json)) = row else {
+    let Some(saved) = operations::load(conn, caller.actor_id(), key)? else {
         return Ok(None);
     };
-    if kind != BLOB_PUT {
+    if saved.kind != BLOB_PUT {
         return Err(receipt_conflict());
     }
-    match state.as_str() {
-        "succeeded" => {}
+    let outcome = match saved.state.as_str() {
+        "succeeded" => {
+            let receipt: Receipt = serde_json::from_str(
+                saved
+                    .result_json
+                    .as_deref()
+                    .ok_or_else(|| HubError::internal("missing successful upload receipt"))?,
+            )?;
+            match lookup_blob(conn, &receipt.attachment.blob_id)? {
+                Some(blob) => blob.require_read(caller)?,
+                None if receipt.ever_attached && !caller.is_global_reader() => {
+                    return Err(blob_forbidden());
+                }
+                // The idempotency key is already scoped to this actor.
+                None => {}
+            }
+            PriorOutcome::Succeeded(receipt.attachment)
+        }
         "accepted" | "in_progress" => {
-            return Err(HubError::new(
-                ErrorCode::OperationInProgress,
-                "This upload is in progress.",
-            ));
+            PriorOutcome::Error(saved.in_progress_error("This upload is in progress.")?)
         }
-        "unknown" => {
-            return Err(HubError::new(
-                ErrorCode::DeliveryUnknown,
-                "The Hub could not confirm this upload.",
-            ));
-        }
-        "failed" => {
-            let problem =
-                error_json.ok_or_else(|| HubError::internal("missing failed upload problem"))?;
-            return Err(HubError::from_problem(serde_json::from_str::<
-                ProblemDetails,
-            >(&problem)?));
-        }
+        "unknown" => PriorOutcome::Error(
+            saved.unknown_error("The Hub could not confirm this upload.", false)?,
+        ),
+        "failed" => PriorOutcome::Error(saved.failed_error()?),
         _ => return Err(HubError::internal("invalid upload receipt state")),
-    }
-
-    let receipt: Receipt = serde_json::from_str(
-        &result_json.ok_or_else(|| HubError::internal("missing successful upload receipt"))?,
-    )?;
-    match lookup_blob(conn, &receipt.attachment.blob_id)? {
-        Some(blob) => blob.require_read(caller)?,
-        None if receipt.ever_attached && !caller.is_global_reader() => return Err(blob_forbidden()),
-        // The idempotency key is already scoped to this actor.
-        None => {}
-    }
+    };
     Ok(Some(PriorUpload {
-        request_sha256,
-        attachment: receipt.attachment,
+        request_sha256: saved.request_sha256,
+        outcome,
     }))
 }
 
@@ -307,12 +285,13 @@ async fn replay(
     receipt: PriorUpload,
     body: Body,
 ) -> Result<AttachmentRef, HubError> {
-    if request.name != receipt.attachment.name || request.mime_type != receipt.attachment.mime_type
+    if let PriorOutcome::Succeeded(attachment) = &receipt.outcome
+        && (request.name != attachment.name || request.mime_type != attachment.mime_type)
     {
         return Err(receipt_conflict());
     }
     if let (Some(length), Some(sha256)) = (request.length, request.sha256.as_deref()) {
-        return verify_receipt(&receipt, request, length, sha256);
+        return resolve_receipt(receipt, request, length, sha256);
     }
 
     let mut reader = UploadReader::new(body, state.shutdown.clone());
@@ -329,11 +308,11 @@ async fn replay(
     let fresh = read_receipt(state, caller, key)
         .await?
         .ok_or_else(receipt_conflict)?;
-    verify_receipt(&fresh, request, length, &sha256)
+    resolve_receipt(fresh, request, length, &sha256)
 }
 
-fn verify_receipt(
-    receipt: &PriorUpload,
+fn resolve_receipt(
+    receipt: PriorUpload,
     request: &UploadHeaders,
     length: u64,
     sha256: &str,
@@ -342,7 +321,10 @@ fn verify_receipt(
     if digest != receipt.request_sha256 {
         return Err(receipt_conflict());
     }
-    Ok(receipt.attachment.clone())
+    match receipt.outcome {
+        PriorOutcome::Succeeded(attachment) => Ok(attachment),
+        PriorOutcome::Error(error) => Err(error),
+    }
 }
 
 async fn hash_body(
@@ -429,54 +411,56 @@ fn register(
         if prior.request_sha256 != *digest {
             return Err(receipt_conflict().into());
         }
-        return Err(WriteError::Domain(RegistrationError::Replay(
-            prior.attachment,
-        )));
+        return match prior.outcome {
+            PriorOutcome::Succeeded(attachment) => {
+                Err(WriteError::Domain(RegistrationError::Replay(attachment)))
+            }
+            PriorOutcome::Error(error) => Err(error.into()),
+        };
     }
 
     let path = stored
         .disk_rel_path
         .to_str()
         .ok_or_else(|| HubError::internal("blob relative path is not UTF-8"))?;
-    tx.execute(
+    tx.prepare_cached(
         "INSERT INTO blobs(blob_id, sha256, size_bytes, mime_type, original_name, safe_disk_name,
                            disk_rel_path, owner_actor_id, created_at_ms, expires_at_ms)
          VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
-        params![
-            attachment.blob_id.as_str(),
-            attachment.sha256,
-            attachment.size_bytes,
-            mime_type,
-            attachment.name,
-            stored.safe_disk_name,
-            path,
-            caller.actor_id(),
-            now_ms,
-            now_ms.saturating_add(UNATTACHED_TTL_MS)
-        ],
-    )?;
+    )?
+    .execute(params![
+        attachment.blob_id.as_str(),
+        attachment.sha256,
+        attachment.size_bytes,
+        mime_type,
+        attachment.name,
+        stored.safe_disk_name,
+        path,
+        caller.actor_id(),
+        now_ms,
+        now_ms.saturating_add(UNATTACHED_TTL_MS)
+    ])?;
     if let (Some(key), Some(digest)) = (key, digest) {
         let receipt = Receipt {
             attachment: attachment.clone(),
             ever_attached: false,
         };
         let result = serde_json::to_string(&receipt).map_err(HubError::from)?;
-        tx.execute(
-            "INSERT INTO operations(operation_id, actor_id, operation_key, kind, request_sha256,
-                                    state, resource_id, result_json, created_at_ms, updated_at_ms,
-                                    expires_at_ms)
-             VALUES (?1, ?2, ?3, ?4, ?5, 'succeeded', ?6, ?7, ?8, ?8, ?9)",
-            params![
-                blob_operation_id(&attachment.blob_id)?.as_str(),
-                caller.actor_id(),
+        let operation_id = blob_operation_id(&attachment.blob_id)?;
+        operations::insert(
+            tx,
+            NewOperation {
+                operation_id: &operation_id,
+                actor_id: caller.actor_id(),
                 key,
-                BLOB_PUT,
-                digest,
-                attachment.blob_id.as_str(),
-                result,
+                kind: BLOB_PUT,
+                request_sha256: &digest,
+                target_node_id: None,
+                state: "succeeded",
+                resource_id: Some(attachment.blob_id.as_str()),
+                result_json: Some(&result),
                 now_ms,
-                now_ms.saturating_add(RECEIPT_TTL_MS),
-            ],
+            },
         )?;
     }
     let event = append(
@@ -488,13 +472,7 @@ fn register(
             aggregate_id: attachment.blob_id.as_str(),
             actor_id: Some(caller.actor_id()),
             created_at_ms: now_ms,
-            data: json!({
-                "blob_id": attachment.blob_id,
-                "original_name": attachment.name,
-                "mime_type": attachment.mime_type,
-                "size_bytes": attachment.size_bytes,
-                "sha256": attachment.sha256,
-            }),
+            data: blob_event_data(&attachment),
             audience: EventAudience::OwnerOnly {
                 actor_id: caller.actor_id().to_owned(),
             },
@@ -508,24 +486,17 @@ async fn observe_registration(
     caller: &AuthenticatedCaller,
     blob_id: BlobId,
 ) -> Result<Option<AttachmentRef>, HubError> {
-    let caller = caller.clone();
-    state
-        .reads
-        .read(move |connection| {
-            let snapshot = connection.unchecked_transaction()?;
-            Ok((|| {
-                reverify_caller_tx(&snapshot, &caller, now_ms())?;
-                let Some(blob) = lookup_blob(&snapshot, &blob_id)? else {
-                    return Ok(None);
-                };
-                if blob.owner_actor_id != caller.actor_id() {
-                    return Err(blob_forbidden());
-                }
-                blob.require_read(&caller)?;
-                Ok(Some(blob.attachment))
-            })())
-        })
-        .await?
+    read_verified_tx(&state.reads, caller, move |snapshot, caller, _| {
+        let Some(blob) = lookup_blob(snapshot, &blob_id)? else {
+            return Ok(None);
+        };
+        if blob.owner_actor_id != caller.actor_id() {
+            return Err(blob_forbidden());
+        }
+        blob.require_read(caller)?;
+        Ok(Some(blob.attachment))
+    })
+    .await
 }
 
 fn receipt_conflict() -> HubError {

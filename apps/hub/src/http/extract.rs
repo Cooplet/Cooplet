@@ -1,9 +1,7 @@
 use std::time::Duration;
 
 use axum::{
-    Json,
-    body::Body,
-    extract::{FromRequest, FromRequestParts, Path, Query, Request, rejection::JsonRejection},
+    extract::{FromRequest, FromRequestParts, Path, Query, Request},
     http::{HeaderMap, HeaderValue, StatusCode, header, request::Parts},
 };
 use bytes::Bytes;
@@ -18,6 +16,9 @@ use crate::{AppState, auth::AuthenticatedCaller, error::HubError};
 use super::admission::{header_value, payload_too_large};
 
 const JSON_READ_TIMEOUT: Duration = Duration::from_secs(15);
+
+#[derive(Clone, Copy)]
+pub(super) struct ReadTimeout(pub Duration);
 
 pub(super) struct Caller(pub AuthenticatedCaller);
 
@@ -84,7 +85,7 @@ impl<T: DeserializeOwned> FromRequest<AppState> for StrictJson<T> {
 
     async fn from_request(request: Request, state: &AppState) -> Result<Self, Self::Rejection> {
         let (content_type, bytes) = read_body(request, state).await?;
-        decode_json(content_type, bytes).await.map(Self)
+        decode_json(content_type.as_ref(), &bytes).map(Self)
     }
 }
 
@@ -100,7 +101,7 @@ impl FromRequest<AppState> for EmptyJson {
         if bytes.is_empty() {
             return Ok(Self {});
         }
-        decode_json(content_type, bytes).await
+        decode_json(content_type.as_ref(), &bytes)
     }
 }
 
@@ -110,12 +111,16 @@ async fn read_body(
 ) -> Result<(Option<HeaderValue>, Bytes), HubError> {
     let (content_type, duplicate_type) = header_value(request.headers(), &header::CONTENT_TYPE);
     let content_type = content_type.cloned();
+    let timeout = request
+        .extensions()
+        .get::<ReadTimeout>()
+        .map_or(JSON_READ_TIMEOUT, |limit| limit.0);
     let mut shutdown = state.shutdown.clone();
     let bytes = tokio::select! {
         biased;
         _ = shutdown.changed() => return Err(HubError::new(ErrorCode::Overloaded, "The Hub is shutting down.")),
         result = tokio::time::timeout(
-            JSON_READ_TIMEOUT,
+            timeout,
             Bytes::from_request(request, state),
         ) => result,
     };
@@ -134,30 +139,54 @@ async fn read_body(
     Ok((content_type, bytes))
 }
 
-async fn decode_json<T: DeserializeOwned>(
-    content_type: Option<HeaderValue>,
-    bytes: Bytes,
+fn decode_json<T: DeserializeOwned>(
+    content_type: Option<&HeaderValue>,
+    bytes: &[u8],
 ) -> Result<T, HubError> {
     if bytes.iter().find(|byte| !byte.is_ascii_whitespace()) != Some(&b'{') {
         return Err(HubError::invalid("Expected a JSON object."));
     }
-
-    // The timed, size-limited read already finished. Let Axum validate the media
-    // type and decode the buffered JSON with its usual extractor.
-    let mut request = Request::new(Body::from(bytes));
-    if let Some(value) = content_type {
-        request.headers_mut().insert(header::CONTENT_TYPE, value);
+    if !is_json_content_type(content_type) {
+        return Err(HubError::invalid("Expected Content-Type application/json."));
     }
-    Json::<T>::from_request(request, &())
-        .await
-        .map(|Json(value)| value)
-        .map_err(|error| match error {
-            JsonRejection::MissingJsonContentType(_) => {
-                HubError::invalid("Expected Content-Type application/json.")
-            }
-            error if error.status() == StatusCode::PAYLOAD_TOO_LARGE => payload_too_large(),
-            _ => HubError::invalid("The JSON body does not match the endpoint schema."),
-        })
+    serde_json::from_slice(bytes)
+        .map_err(|_| HubError::invalid("The JSON body does not match the endpoint schema."))
+}
+
+fn is_json_content_type(header: Option<&HeaderValue>) -> bool {
+    let Some(value) = header.and_then(|value| value.to_str().ok()) else {
+        return false;
+    };
+    let essence = value.split(';').next().unwrap_or("").trim();
+    let Some((ty, subtype)) = essence.split_once('/') else {
+        return false;
+    };
+    if !ty.eq_ignore_ascii_case("application") || subtype.bytes().any(|b| !is_token_char(b)) {
+        return false;
+    }
+    subtype.eq_ignore_ascii_case("json")
+        || (subtype.len() > 5 && subtype[subtype.len() - 5..].eq_ignore_ascii_case("+json"))
+}
+
+fn is_token_char(byte: u8) -> bool {
+    byte.is_ascii_alphanumeric()
+        || matches!(
+            byte,
+            b'!' | b'#'
+                | b'$'
+                | b'%'
+                | b'&'
+                | b'\''
+                | b'*'
+                | b'+'
+                | b'-'
+                | b'.'
+                | b'^'
+                | b'_'
+                | b'`'
+                | b'|'
+                | b'~'
+        )
 }
 
 pub(super) fn idempotency_key(headers: &HeaderMap) -> Result<&str, HubError> {
@@ -174,17 +203,37 @@ pub(super) fn idempotency_key(headers: &HeaderMap) -> Result<&str, HubError> {
 mod tests {
     use super::*;
 
-    #[tokio::test]
-    async fn bodyless_commands_accept_only_an_empty_json_object_when_a_body_is_supplied() {
-        let content_type = || Some(HeaderValue::from_static("application/json"));
-        assert!(
-            decode_json::<EmptyJson>(content_type(), Bytes::from_static(b"{}"))
-                .await
-                .is_ok()
-        );
+    #[test]
+    fn bodyless_commands_accept_only_an_empty_json_object_when_a_body_is_supplied() {
+        let content_type = HeaderValue::from_static("application/json");
+        assert!(decode_json::<EmptyJson>(Some(&content_type), b"{}").is_ok());
         for body in [b"[]".as_slice(), b"null", b"{\"unexpected\":1}", b"{}{}"] {
-            let result = decode_json::<EmptyJson>(content_type(), Bytes::from_static(body)).await;
+            let result = decode_json::<EmptyJson>(Some(&content_type), body);
             assert!(result.is_err_and(|error| error.problem().code == ErrorCode::InvalidRequest));
         }
+    }
+
+    #[test]
+    fn json_content_type_matches_application_json_and_structured_suffix() {
+        for valid in [
+            "application/json",
+            "APPLICATION/JSON; charset=utf-8",
+            "application/problem+json",
+            "application/vnd.cooplet+JSON; version=1",
+        ] {
+            let header = HeaderValue::from_static(valid);
+            assert!(is_json_content_type(Some(&header)), "rejected {valid}");
+        }
+        for invalid in [
+            "",
+            "text/plain",
+            "application/json+xml",
+            "application/+json",
+            "application/json extra",
+        ] {
+            let header = HeaderValue::from_static(invalid);
+            assert!(!is_json_content_type(Some(&header)), "accepted {invalid}");
+        }
+        assert!(!is_json_content_type(None));
     }
 }

@@ -13,7 +13,7 @@ use serde::Serialize;
 use crate::{
     AppState, blobs,
     error::HubError,
-    event_bus::{self, EventsQuery},
+    event_bus::{self, EventStreamQuery, EventsQuery},
     openapi::openapi_bytes,
 };
 
@@ -88,8 +88,6 @@ pub(super) async fn whoami(Caller(caller): Caller) -> Result<Response, HubError>
     ),
     params(
         ("X-Cooplet-Filename" = String, Header, description = "Percent-encoded UTF-8 filename."),
-        ("X-Cooplet-Sha256" = Option<String>, Header, description = "Lowercase SHA-256 hex digest.", pattern = "^[0-9a-f]{64}$"),
-        ("Content-Length" = Option<u64>, Header, description = "Length of the file body in bytes."),
     ),
     responses(
         (status = 200, description = "Previously stored attachment.", body = AttachmentRef),
@@ -158,7 +156,7 @@ pub(super) async fn events_page(
 #[utoipa::path(
     get, path = "/v1/events/stream", tag = "Events",
     description = "Follow an NDJSON stream of visible events and keepalive frames. A pruned cursor during the stream produces one resync frame followed by EOF.",
-    params(EventsQuery),
+    params(EventStreamQuery),
     responses(
         (status = 200, description = "One event stream frame per line.", body = EventStreamFrame, content_type = "application/x-ndjson"),
         (status = 403, description = "The credential lacks the read scope."),
@@ -168,7 +166,7 @@ pub(super) async fn events_page(
 pub(super) async fn events_stream(
     State(state): State<AppState>,
     Caller(caller): Caller,
-    StrictQuery(query): StrictQuery<EventsQuery>,
+    StrictQuery(query): StrictQuery<EventStreamQuery>,
     Revocations(revocations): Revocations,
 ) -> Result<Response, HubError> {
     event_bus::stream(&state, &caller, query, revocations).await

@@ -3,31 +3,50 @@ mod stream;
 #[cfg(test)]
 mod tests;
 
-use std::{collections::HashSet, sync::Arc};
+use std::sync::Arc;
 
 use axum::response::Response;
+use bytes::Bytes;
 use cooplet_protocol::{
-    AggregateType, ErrorCode, EventEnvelope, EventId, EventKind, EventsPage, HubId, ServiceScope,
-    SourceKind, ThreadId,
+    AggregateType, ErrorCode, EventEnvelope, EventId, EventKind, EventStreamFrame, EventsPage,
+    HubId, ServiceScope, SourceKind, ThreadId,
 };
 use cooplet_storage::ReadPool;
-use rusqlite::{Connection, Row, params};
-use serde::Deserialize;
+use rusqlite::{Connection, OptionalExtension, Row, params};
+use serde::{Deserialize, de::IgnoredAny};
 use tokio::sync::watch;
 use utoipa::IntoParams;
 
 use crate::{
     AppState,
-    auth::{self, AuthenticatedCaller},
+    auth::AuthenticatedCaller,
     error::HubError,
-    now_ms,
-    storage::events::{EventAudience, StoredEvent},
+    storage::{
+        events::{EventAudience, StoredEvent},
+        sql::{json_byte_len, read_verified_tx},
+    },
 };
 
 pub(crate) use stream::EventWake;
 
 const PAGE_SCAN_LIMIT: usize = 512;
 const MAX_PAGE_BYTES: usize = 4 * 1024 * 1024;
+const MAX_INDEXED_KINDS: usize = 8;
+
+const SELECT_ALL_EVENTS: &str = "
+    SELECT seq, event_id, kind, aggregate_type, aggregate_id, actor_id,
+           payload_json, created_at_ms
+      FROM events WHERE seq > ?1 AND seq <= ?2 ORDER BY seq LIMIT ?3";
+const SELECT_SINGLE_KIND_EVENTS: &str = "
+    SELECT seq, event_id, kind, aggregate_type, aggregate_id, actor_id,
+           payload_json, created_at_ms
+      FROM events WHERE kind = ?1 AND seq > ?2 AND seq <= ?3 ORDER BY seq LIMIT ?4";
+const SELECT_KIND_SEQS: &str = "
+    SELECT seq FROM events WHERE kind = ?1 AND seq > ?2 AND seq <= ?3 ORDER BY seq LIMIT ?4";
+const SELECT_EVENT_BY_SEQ: &str = "
+    SELECT seq, event_id, kind, aggregate_type, aggregate_id, actor_id,
+           payload_json, created_at_ms
+      FROM events WHERE seq = ?1";
 
 #[derive(Deserialize, IntoParams)]
 #[serde(deny_unknown_fields)]
@@ -37,40 +56,49 @@ pub(crate) struct EventsQuery {
     #[serde(default)]
     pub(crate) after: u64,
     /// Maximum number of events in a page.
-    #[param(minimum = 1, maximum = 500)]
+    #[param(minimum = 1, maximum = 500, default = 100)]
     pub(crate) limit: Option<u16>,
     /// Comma-separated event kinds.
     pub(crate) kinds: Option<String>,
 }
 
+#[derive(Deserialize, IntoParams)]
+#[serde(deny_unknown_fields)]
+#[into_params(parameter_in = Query)]
+pub(crate) struct EventStreamQuery {
+    /// Last scanned sequence, or zero to start at the retained floor.
+    #[serde(default)]
+    pub(crate) after: u64,
+    /// Comma-separated event kinds.
+    pub(crate) kinds: Option<String>,
+}
+
+fn parse_kinds(csv: Option<&str>) -> Result<Vec<EventKind>, HubError> {
+    let Some(csv) = csv else {
+        return Ok(Vec::new());
+    };
+    let mut kinds: Vec<EventKind> = csv
+        .split(',')
+        .map(|kind| {
+            kind.parse::<EventKind>()
+                .map_err(|_| HubError::invalid("Each event kind must be a known label."))
+        })
+        .collect::<Result<_, _>>()?;
+    kinds.sort_unstable_by_key(|kind| kind.as_str());
+    kinds.dedup();
+    Ok(kinds)
+}
+
 impl EventsQuery {
-    fn validated(&self) -> Result<Filter, HubError> {
+    fn validated(&self) -> Result<(usize, Vec<EventKind>), HubError> {
         let limit = self.limit.unwrap_or(100);
         if !(1..=500).contains(&limit) {
             return Err(HubError::invalid(
                 "The event page limit must be 1 through 500.",
             ));
         }
-        let kinds = if let Some(csv) = &self.kinds {
-            csv.split(',')
-                .map(|kind| {
-                    kind.parse::<EventKind>()
-                        .map_err(|_| HubError::invalid("Each event kind must be a known label."))
-                })
-                .collect::<Result<_, _>>()?
-        } else {
-            HashSet::new()
-        };
-        Ok(Filter {
-            limit: usize::from(limit),
-            kinds,
-        })
+        Ok((usize::from(limit), parse_kinds(self.kinds.as_deref())?))
     }
-}
-
-struct Filter {
-    limit: usize,
-    kinds: HashSet<EventKind>,
 }
 
 pub(crate) async fn page(
@@ -79,10 +107,10 @@ pub(crate) async fn page(
     query: EventsQuery,
 ) -> Result<EventsPage, HubError> {
     caller.require_scope(ServiceScope::Read)?;
-    let Filter { kinds, limit } = query.validated()?;
+    let (limit, kinds) = query.validated()?;
     let reader = Reader::new(state, caller, kinds);
     reader
-        .snapshot(
+        .snapshot_page(
             Cursor::Initial(query.after),
             Budget {
                 rows: PAGE_SCAN_LIMIT,
@@ -96,16 +124,15 @@ pub(crate) async fn page(
 pub(crate) async fn stream(
     state: &AppState,
     caller: &AuthenticatedCaller,
-    query: EventsQuery,
+    query: EventStreamQuery,
     revocations: watch::Receiver<u64>,
 ) -> Result<Response, HubError> {
     caller.require_scope(ServiceScope::Read)?;
-    let filter = query.validated()?;
-    let reader = Reader::new(state, caller, filter.kinds);
+    let kinds = parse_kinds(query.kinds.as_deref())?;
+    let reader = Reader::new(state, caller, kinds);
     stream::response(
         reader,
         query.after,
-        query.limit.map(|_| filter.limit),
         state.event_wake.subscribe(),
         revocations,
         state.shutdown.clone(),
@@ -135,11 +162,11 @@ struct Reader {
     reads: ReadPool,
     caller: AuthenticatedCaller,
     hub_id: HubId,
-    kinds: HashSet<EventKind>,
+    kinds: Vec<EventKind>,
 }
 
 impl Reader {
-    fn new(state: &AppState, caller: &AuthenticatedCaller, kinds: HashSet<EventKind>) -> Arc<Self> {
+    fn new(state: &AppState, caller: &AuthenticatedCaller, kinds: Vec<EventKind>) -> Arc<Self> {
         Arc::new(Self {
             reads: state.reads.clone(),
             caller: caller.clone(),
@@ -148,21 +175,28 @@ impl Reader {
         })
     }
 
-    async fn snapshot(
+    async fn snapshot_page(
         self: &Arc<Self>,
         cursor: Cursor,
         budget: Budget,
-    ) -> Result<Snapshot, HubError> {
+    ) -> Result<PageSnapshot, HubError> {
         let reader = Arc::clone(self);
-        self.reads
-            .read(move |connection| {
-                let tx = connection.unchecked_transaction()?;
-                let result = auth::reverify_caller_tx(&tx, &reader.caller, now_ms())
-                    .and_then(|()| read_snapshot(&tx, &reader, cursor, budget));
-                tx.commit()?;
-                Ok(result)
-            })
-            .await?
+        read_verified_tx(&self.reads, &self.caller, move |tx, _, _| {
+            read_page_snapshot(tx, &reader, cursor, budget)
+        })
+        .await
+    }
+
+    async fn snapshot_stream(
+        self: &Arc<Self>,
+        cursor: Cursor,
+        budget: Budget,
+    ) -> Result<StreamSnapshot, HubError> {
+        let reader = Arc::clone(self);
+        read_verified_tx(&self.reads, &self.caller, move |tx, _, _| {
+            read_stream_snapshot(tx, &reader, cursor, budget)
+        })
+        .await
     }
 }
 
@@ -186,16 +220,15 @@ struct Watermarks {
 
 impl Watermarks {
     fn read(db: &Connection) -> Result<Self, HubError> {
-        let value = db.query_row(
+        let mut statement = db.prepare_cached(
             "SELECT events_pruned_through_seq, events_head_seq FROM hub_meta WHERE id = 1",
-            [],
-            |row| {
-                Ok(Self {
-                    floor: row.get(0)?,
-                    head: row.get(1)?,
-                })
-            },
         )?;
+        let value = statement.query_row([], |row| {
+            Ok(Self {
+                floor: row.get(0)?,
+                head: row.get(1)?,
+            })
+        })?;
         if value.floor > value.head {
             return Err(HubError::internal("Inconsistent event watermarks"));
         }
@@ -226,12 +259,12 @@ impl Watermarks {
     }
 }
 
-enum Snapshot {
+enum PageSnapshot {
     Page(EventsPage),
     CursorLost(Watermarks),
 }
 
-impl Snapshot {
+impl PageSnapshot {
     fn into_page(self) -> Result<EventsPage, HubError> {
         match self {
             Self::Page(page) => Ok(page),
@@ -240,15 +273,26 @@ impl Snapshot {
     }
 }
 
-fn read_snapshot(
+struct StreamBatch {
+    frames: Vec<Bytes>,
+    next_seq: u64,
+    has_more: bool,
+}
+
+enum StreamSnapshot {
+    Batch(StreamBatch),
+    CursorLost(Watermarks),
+}
+
+fn read_page_snapshot(
     db: &Connection,
     reader: &Reader,
     cursor: Cursor,
     budget: Budget,
-) -> Result<Snapshot, HubError> {
+) -> Result<PageSnapshot, HubError> {
     let watermarks = Watermarks::read(db)?;
     let Some(start) = watermarks.resolve(cursor) else {
-        return Ok(Snapshot::CursorLost(watermarks));
+        return Ok(PageSnapshot::CursorLost(watermarks));
     };
     let mut page = EventsPage {
         items: Vec::new(),
@@ -259,38 +303,151 @@ fn read_snapshot(
     };
     // Reserve the maximum envelope overhead: next_seq cannot have more digits than head,
     // and false is one byte longer than true. Count every serialized item and comma below.
-    let mut page_bytes = serde_json::to_vec(&page)?.len();
-    page.next_seq = start;
-    let mut statement = db.prepare_cached(
-        "SELECT seq, event_id, kind, aggregate_type, aggregate_id, actor_id,
-                payload_json, created_at_ms
-         FROM events WHERE seq > ?1 AND seq <= ?2 ORDER BY seq LIMIT ?3",
-    )?;
-    let mut rows = statement.query(params![start, watermarks.head, budget.rows + 1])?;
-    for _ in 0..budget.rows {
-        let Some(row) = rows.next()? else {
-            page.next_seq = watermarks.head;
-            return Ok(Snapshot::Page(page));
-        };
-        let seq = row.get(0)?;
-        if let Some(event) = project(row, reader, seq)? {
-            let item_bytes =
-                serde_json::to_vec(&event)?.len() + usize::from(!page.items.is_empty());
-            if page.items.len() >= budget.items || page_bytes + item_bytes > MAX_PAGE_BYTES {
-                // Leave this event strictly after next_seq so it remains visible next time.
-                page.has_more = true;
-                return Ok(Snapshot::Page(page));
+    let mut page_bytes = json_byte_len(&page)?;
+    let (next_seq, has_more) =
+        scan_events(db, reader, start, watermarks.head, budget.rows, |event| {
+            if page.items.len() >= budget.items {
+                return Ok(false);
+            }
+            let item_bytes = json_byte_len(&event)? + usize::from(!page.items.is_empty());
+            if page_bytes + item_bytes > MAX_PAGE_BYTES {
+                return Ok(false);
             }
             page_bytes += item_bytes;
             page.items.push(event);
+            Ok(true)
+        })?;
+    page.next_seq = next_seq;
+    page.has_more = has_more;
+    Ok(PageSnapshot::Page(page))
+}
+
+fn read_stream_snapshot(
+    db: &Connection,
+    reader: &Reader,
+    cursor: Cursor,
+    budget: Budget,
+) -> Result<StreamSnapshot, HubError> {
+    let watermarks = Watermarks::read(db)?;
+    let Some(start) = watermarks.resolve(cursor) else {
+        return Ok(StreamSnapshot::CursorLost(watermarks));
+    };
+    let mut frames = Vec::new();
+    let mut buffered_bytes = 0usize;
+    let (next_seq, has_more) =
+        scan_events(db, reader, start, watermarks.head, budget.rows, |event| {
+            if frames.len() >= budget.items {
+                return Ok(false);
+            }
+            let mut encoded = serde_json::to_vec(&EventStreamFrame::Event { event })?;
+            encoded.push(b'\n');
+            if !frames.is_empty() && buffered_bytes + encoded.len() > MAX_PAGE_BYTES {
+                return Ok(false);
+            }
+            buffered_bytes += encoded.len();
+            frames.push(Bytes::from(encoded));
+            Ok(true)
+        })?;
+    Ok(StreamSnapshot::Batch(StreamBatch {
+        frames,
+        next_seq,
+        has_more,
+    }))
+}
+
+fn scan_events(
+    db: &Connection,
+    reader: &Reader,
+    start: u64,
+    head: u64,
+    row_limit: usize,
+    accept: impl FnMut(EventEnvelope) -> Result<bool, HubError>,
+) -> Result<(u64, bool), HubError> {
+    if reader.kinds.len() == 1 {
+        let mut statement = db.prepare_cached(SELECT_SINGLE_KIND_EVENTS)?;
+        let mut rows = statement.query(params![
+            reader.kinds[0].as_str(),
+            start,
+            head,
+            row_limit + 1
+        ])?;
+        return scan_rows(&mut rows, reader, start, head, row_limit, accept);
+    }
+    if (2..=MAX_INDEXED_KINDS).contains(&reader.kinds.len()) {
+        return scan_multi_kind(db, reader, start, head, row_limit, accept);
+    }
+    let mut statement = db.prepare_cached(SELECT_ALL_EVENTS)?;
+    let mut rows = statement.query(params![start, head, row_limit + 1])?;
+    scan_rows(&mut rows, reader, start, head, row_limit, accept)
+}
+
+fn scan_rows(
+    rows: &mut rusqlite::Rows<'_>,
+    reader: &Reader,
+    start: u64,
+    head: u64,
+    row_limit: usize,
+    mut accept: impl FnMut(EventEnvelope) -> Result<bool, HubError>,
+) -> Result<(u64, bool), HubError> {
+    let mut next_seq = start;
+    for _ in 0..row_limit {
+        let Some(row) = rows.next()? else {
+            return Ok((head, false));
+        };
+        let seq: u64 = row.get(0)?;
+        if let Some(event) = project(row, reader, seq)?
+            && !accept(event)?
+        {
+            // Leave this event strictly after next_seq so it remains visible next time.
+            return Ok((next_seq, true));
         }
-        page.next_seq = seq;
+        next_seq = seq;
     }
-    page.has_more = rows.next()?.is_some();
-    if !page.has_more {
-        page.next_seq = watermarks.head;
+    let has_more = rows.next()?.is_some();
+    if !has_more {
+        next_seq = head;
     }
-    Ok(Snapshot::Page(page))
+    Ok((next_seq, has_more))
+}
+
+fn scan_multi_kind(
+    db: &Connection,
+    reader: &Reader,
+    start: u64,
+    head: u64,
+    row_limit: usize,
+    mut accept: impl FnMut(EventEnvelope) -> Result<bool, HubError>,
+) -> Result<(u64, bool), HubError> {
+    let mut candidates = Vec::new();
+    let mut seq_query = db.prepare_cached(SELECT_KIND_SEQS)?;
+    for kind in &reader.kinds {
+        let mut rows = seq_query.query(params![kind.as_str(), start, head, row_limit + 1])?;
+        while let Some(row) = rows.next()? {
+            candidates.push(row.get::<_, u64>(0)?);
+        }
+    }
+    candidates.sort_unstable();
+    let more_candidates = candidates.len() > row_limit;
+    candidates.truncate(row_limit);
+
+    let mut row_query = db.prepare_cached(SELECT_EVENT_BY_SEQ)?;
+    let mut next_seq = start;
+    for seq in candidates {
+        let maybe_event = row_query
+            .query_row([seq], |row| Ok(project(row, reader, seq)))
+            .optional()?
+            .transpose()?;
+        if let Some(Some(event)) = maybe_event
+            && !accept(event)?
+        {
+            return Ok((next_seq, true));
+        }
+        next_seq = seq;
+    }
+    if !more_candidates {
+        next_seq = head;
+    }
+    Ok((next_seq, more_candidates))
 }
 
 fn project(row: &Row<'_>, reader: &Reader, seq: u64) -> Result<Option<EventEnvelope>, HubError> {
@@ -306,13 +463,16 @@ fn project(row: &Row<'_>, reader: &Reader, seq: u64) -> Result<Option<EventEnvel
         return Ok(None);
     }
     let raw = row.get_ref(6)?.as_str().map_err(HubError::internal)?;
-    // Unknown or missing stored audiences are invisible, including to archive readers.
+    // Skip building a JSON DOM for events outside the caller's audience.
+    let Ok(head) = serde_json::from_str::<StoredEvent<IgnoredAny>>(raw) else {
+        return Ok(None);
+    };
+    if !visible(&reader.caller, &head.audience) {
+        return Ok(None);
+    }
     let Ok(stored) = serde_json::from_str::<StoredEvent>(raw) else {
         return Ok(None);
     };
-    if !visible(&reader.caller, &stored.audience) {
-        return Ok(None);
-    }
     let event_id = row
         .get::<_, String>(1)?
         .parse::<EventId>()

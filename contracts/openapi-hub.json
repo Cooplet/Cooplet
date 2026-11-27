@@ -845,6 +845,7 @@
             "items": {
               "$ref": "#/components/schemas/AttachmentRef"
             },
+            "maxItems": 32,
             "type": "array"
           },
           "body": {
@@ -2210,10 +2211,7 @@
             "required": false,
             "schema": {
               "pattern": "^[0-9a-f]{64}$",
-              "type": [
-                "string",
-                "null"
-              ]
+              "type": "string"
             }
           },
           {
@@ -2222,12 +2220,8 @@
             "name": "Content-Length",
             "required": false,
             "schema": {
-              "format": "int64",
               "minimum": 0,
-              "type": [
-                "integer",
-                "null"
-              ]
+              "type": "integer"
             }
           },
           {
@@ -4013,6 +4007,7 @@
             "name": "limit",
             "required": false,
             "schema": {
+              "default": 100,
               "format": "int32",
               "maximum": 500,
               "minimum": 1,
@@ -4296,25 +4291,13 @@
         "operationId": "events_stream",
         "parameters": [
           {
-            "description": "Last scanned sequence from the previous page, or zero to start at the retained floor.",
+            "description": "Last scanned sequence, or zero to start at the retained floor.",
             "in": "query",
             "name": "after",
             "required": false,
             "schema": {
               "format": "int64",
               "minimum": 0,
-              "type": "integer"
-            }
-          },
-          {
-            "description": "Maximum number of events in a page.",
-            "in": "query",
-            "name": "limit",
-            "required": false,
-            "schema": {
-              "format": "int32",
-              "maximum": 500,
-              "minimum": 1,
               "type": "integer"
             }
           },

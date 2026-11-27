@@ -549,3 +549,169 @@ async fn canceling_the_enclosing_request_does_not_lose_the_revocation_notificati
     )?;
     fixture.stop().await
 }
+
+#[tokio::test]
+async fn invalid_enrollment_redemption_rejects_in_read_path_without_blocking_writer() -> TestResult
+{
+    let fixture = Fixture::start().await?;
+    let state = &fixture.state;
+    let admin = &fixture.admin;
+    let issued = issue_enrollment(
+        state,
+        admin,
+        "enroll-revoked-precheck",
+        IssueEnrollmentRequest {
+            name: "Precheck node".into(),
+            ttl_ms: None,
+        },
+    )
+    .await?;
+    let revoked_secret = required(issued.token)?;
+    revoke_enrollment(
+        state,
+        admin,
+        "revoke-before-redeem",
+        issued.summary.token_id,
+    )
+    .await?;
+
+    let (entered, inside) = oneshot::channel();
+    let (release, blocked) = mpsc::channel();
+    let db = state.db.clone();
+    let blocker = tokio::spawn(async move {
+        db.write_sqlite(move |_| {
+            let _ = entered.send(());
+            let _ = blocked.recv();
+            Ok(WriteOutcome::new(()))
+        })
+        .await
+    });
+    inside.await?;
+
+    for bad_token in [
+        "not-a-valid-enrollment-token".to_owned(),
+        format!("cooplet_enroll_{}_{}", TokenId::generate()?, "a".repeat(64)),
+        revoked_secret,
+    ] {
+        let result = tokio::time::timeout(
+            Duration::from_secs(2),
+            redeem_enrollment(
+                state,
+                RedeemEnrollmentRequest {
+                    token: bad_token,
+                    name: None,
+                },
+            ),
+        )
+        .await?;
+        rejected(result, ErrorCode::Unauthorized)?;
+    }
+
+    release.send(())?;
+    blocker.await??;
+    fixture.stop().await
+}
+
+#[tokio::test]
+async fn disabling_sole_admin_with_multiple_durable_tokens_is_rejected_and_participant_cursors_work()
+-> TestResult {
+    let fixture = Fixture::start().await?;
+    let state = &fixture.state;
+    let admin = &fixture.admin;
+
+    issue_token(
+        state,
+        admin,
+        "second-durable-same-admin",
+        admin.actor_id(),
+        IssueTokenRequest {
+            label: "backup admin".into(),
+            scopes: vec![ServiceScope::Manage],
+            allowed_nodes: None,
+            is_admin: true,
+            expires_at_ms: None,
+        },
+    )
+    .await?;
+    let error = rejected(
+        disable_principal(state, admin, "disable-sole-admin", admin.actor_id()).await,
+        ErrorCode::OperationConflict,
+    )?;
+    assert_eq!(error.problem().extensions["reason"], "last_durable_admin");
+
+    let active_node = NodeId::generate()?;
+    let revoked_node = NodeId::generate()?;
+    let p1 = cooplet_protocol::ParticipantId::generate()?;
+    let p2 = cooplet_protocol::ParticipantId::generate()?;
+    let p_revoked = cooplet_protocol::ParticipantId::generate()?;
+    let owner = admin.actor_id().to_owned();
+    let now = now_ms();
+    let active_for_db = active_node.clone();
+    let revoked_for_db = revoked_node.clone();
+    let p1_db = p1.clone();
+    let p2_db = p2.clone();
+    let pr_db = p_revoked.clone();
+    state
+        .db
+        .write_sqlite(move |tx| {
+            tx.execute(
+                "INSERT INTO nodes (node_id, display_name, owner_principal_id, credential_hmac, status, enrolled_at_ms)
+                 VALUES (?1, 'Active', ?2, ?1, 'online', ?3)",
+                rusqlite::params![active_for_db.as_str(), owner, now],
+            )?;
+            tx.execute(
+                "INSERT INTO nodes (node_id, display_name, owner_principal_id, credential_hmac, status, enrolled_at_ms, revoked_at_ms)
+                 VALUES (?1, 'Revoked', ?2, ?1, 'revoked', ?3, ?3)",
+                rusqlite::params![revoked_for_db.as_str(), owner, now],
+            )?;
+            for (node, part) in [
+                (active_for_db.as_str(), p1_db.as_str()),
+                (active_for_db.as_str(), p2_db.as_str()),
+                (revoked_for_db.as_str(), pr_db.as_str()),
+            ] {
+                tx.execute(
+                    "INSERT INTO node_participants (node_id, participant_id, kind, name, state, synced_epoch, updated_at_ms)
+                     VALUES (?1, ?2, 'agent', 'Agent', 'idle', 1, ?3)",
+                    rusqlite::params![node, part, now],
+                )?;
+            }
+            Ok(WriteOutcome::new(()))
+        })
+        .await?;
+
+    let first = list_participants(
+        state,
+        admin,
+        NodeCatalogQuery {
+            limit: Some(1),
+            after: None,
+            node_id: None,
+        },
+    )
+    .await?;
+    assert_eq!(first.items.len(), 1);
+    assert_eq!(first.items[0].node_id, active_node);
+    let cursor = required(first.next_after)?;
+    assert!(cursor.contains('.'));
+    let second = list_participants(
+        state,
+        admin,
+        NodeCatalogQuery {
+            limit: Some(10),
+            after: Some(cursor),
+            node_id: None,
+        },
+    )
+    .await?;
+    assert_eq!(second.items.len(), 1);
+    assert!(second.next_after.is_none());
+    let mut seen = vec![
+        first.items[0].participant_id.clone(),
+        second.items[0].participant_id.clone(),
+    ];
+    seen.sort();
+    let mut expected = vec![p1, p2];
+    expected.sort();
+    assert_eq!(seen, expected);
+    fixture.stop().await
+}
