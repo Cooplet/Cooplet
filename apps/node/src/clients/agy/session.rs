@@ -53,25 +53,29 @@ impl Session {
         };
         tokio::spawn(async move {
             let mut wire = wire;
-            let fault = tokio::select! {
+            let stopping = stop.wait_for(|stopped| *stopped);
+            tokio::pin!(stopping);
+            let mut fault = tokio::select! {
                 biased;
-                _ = stop.wait_for(|stopped| *stopped) => None,
+                _ = &mut stopping => None,
                 fault = actor.run(&mut wire, &mut requests) => Some(fault),
             };
             requests.close();
             while let Ok(request) = requests.try_recv() {
                 request.transport_closed();
             }
-            // An explicit stop owns transport teardown. Faults instead
-            // leave both descriptors open until Node can observe the ACK.
-            let faulted_wire = if fault.is_none() {
-                drop(wire);
-                None
-            } else {
-                Some(wire)
-            };
+            // A fault must keep its pipes open until submit exits. An
+            // explicit stop can take over as long as we still own the wire.
+            if fault.is_some() {
+                tokio::select! {
+                    biased;
+                    _ = &mut stopping => fault = None,
+                    () = actor.await_submit_exit() => {}
+                }
+            }
+            drop(wire);
+            // Even an explicit stop releases the event stream after submit.
             actor.await_submit_exit().await;
-            drop(faulted_wire);
             actor.finish(fault).await;
         });
         (

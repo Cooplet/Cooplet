@@ -956,46 +956,74 @@ async fn post_ack_fault_waits_for_submit_exit_before_emitting_unknown() -> TestR
 }
 
 #[tokio::test]
-async fn explicit_stop_closes_stdin_without_waiting_for_a_ready_submit_ack() -> TestResult {
-    let tree = Tree::new()?;
-    tree.mode("cancel")?;
-    let adapter = AgyAdapter::new(tree.config());
-    let owner = Arc::new(Spawner::new(tree.0.clone()));
-    let mut session = adapter
-        .create_or_resume(open_request(&tree, owner.clone(), SessionOpenMode::Create)?)
-        .await?;
-    let handle = session.handle.clone();
-    let submit = adapter.submit_turn(&handle, human("keep ACK queued")?);
-    tokio::pin!(submit);
-    let in_progress = tokio::select! {
-        biased;
-        _ = &mut submit => false,
-        _ = std::future::ready(()) => true,
-    };
-    assert!(in_progress);
-    assert!(matches!(
-        event(&mut session, 1).await?,
-        AdapterEventKind::StateChanged(ParticipantRuntimeState::Working)
-    ));
+async fn explicit_stop_closes_stdin_while_a_submit_outcome_waits() -> TestResult {
+    for mode in ["cancel", "permission"] {
+        let tree = Tree::new()?;
+        tree.mode(mode)?;
+        let mut config = tree.config();
+        config.fail_fast_window = Duration::from_secs(1);
+        let adapter = AgyAdapter::new(config);
+        let owner = Arc::new(Spawner::new(tree.0.clone()));
+        let mut session = adapter
+            .create_or_resume(open_request(&tree, owner.clone(), SessionOpenMode::Create)?)
+            .await?;
+        let handle = session.handle.clone();
+        let submit = adapter.submit_turn(&handle, human("keep submit outcome queued")?);
+        tokio::pin!(submit);
+        let in_progress = tokio::select! {
+            biased;
+            _ = &mut submit => false,
+            _ = std::future::ready(()) => true,
+        };
+        assert!(in_progress);
+        if mode == "permission" {
+            tree.wait_for(|frame| frame["fault_sent"] == true, 1)
+                .await?;
+            // The actor closes the commands channel on fault and then
+            // waits for the submit caller without closing either pipe.
+            tokio::time::timeout(WAIT, async {
+                loop {
+                    let inspection = adapter
+                        .inspect_state(handle.persisted(), Some(&handle))
+                        .await?;
+                    if matches!(inspection.state, ParticipantRuntimeState::Unknown { .. }) {
+                        return Ok::<(), cooplet_node::error::NodeError>(());
+                    }
+                    tokio::time::sleep(Duration::from_millis(10)).await;
+                }
+            })
+            .await??;
+        } else {
+            assert!(matches!(
+                event(&mut session, 1).await?,
+                AdapterEventKind::StateChanged(ParticipantRuntimeState::Working)
+            ));
+        }
 
-    assert!(matches!(
-        adapter
-            .cancel_or_stop(&handle, StopMode::StopSession)
-            .await?,
-        StopOutcome::Stopped
-    ));
-    tree.wait_for(|frame| frame["stdin_eof"] == true, 1).await?;
-    assert!(tree.frames("session/close")?.is_empty());
-    assert!(matches!(
-        session.events.try_recv(),
-        Err(tokio::sync::mpsc::error::TryRecvError::Empty)
-    ));
-    assert!(matches!(submit.await, SubmitOutcome::Accepted { .. }));
-    assert!(
-        tokio::time::timeout(WAIT, session.events.recv())
-            .await?
-            .is_none()
-    );
+        assert!(matches!(
+            adapter
+                .cancel_or_stop(&handle, StopMode::StopSession)
+                .await?,
+            StopOutcome::Stopped
+        ));
+        tree.wait_for(|frame| frame["stdin_eof"] == true, 1).await?;
+        assert!(tree.frames("session/close")?.is_empty());
+        assert!(matches!(
+            session.events.try_recv(),
+            Err(tokio::sync::mpsc::error::TryRecvError::Empty)
+        ));
+        let outcome = submit.await;
+        if mode == "permission" {
+            assert!(matches!(outcome, SubmitOutcome::Unknown(_)));
+        } else {
+            assert!(matches!(outcome, SubmitOutcome::Accepted { .. }));
+        }
+        assert!(
+            tokio::time::timeout(WAIT, session.events.recv())
+                .await?
+                .is_none()
+        );
+    }
     Ok(())
 }
 
