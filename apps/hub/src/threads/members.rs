@@ -221,7 +221,7 @@ pub(super) fn add(
         let disputed = existing.pending.is_some();
         ctx.tx.execute(
             "UPDATE thread_members SET node_id=?1, role=?2, wake_policy=?3, delivery_mode=?4, state=?5,
-             confirmed_seq=?6, last_wake_seq=0, resume_through_seq=NULL, joined_at_ms=?7, left_at_ms=NULL
+             confirmed_seq=?6, last_wake_seq=0, retry_exhausted_seq=0, resume_through_seq=NULL, joined_at_ms=?7, left_at_ms=NULL
              WHERE thread_id=?8 AND member_key=?9",
             params![address.node_id.as_ref().map(NodeId::as_str), role.as_str(), wake.as_str(), mode.as_str(),
                 if disputed { "paused_unknown" } else { "active" },
@@ -350,7 +350,7 @@ pub(crate) async fn leave(
             return Err(store::conflict("The last owner cannot leave while other members remain.", "last_owner"));
         }
         ctx.tx.execute(
-            "UPDATE thread_members SET state='left',left_at_ms=?1,resume_through_seq=NULL,last_wake_seq=0
+            "UPDATE thread_members SET state='left',left_at_ms=?1,resume_through_seq=NULL,last_wake_seq=0,retry_exhausted_seq=0
              WHERE thread_id=?2 AND member_key=?3",
             params![ctx.now, id.as_str(), key],
         )?;
@@ -398,7 +398,7 @@ pub(crate) async fn resume(
         };
         ctx.tx.execute(
             "UPDATE thread_members SET state='active',delivery_generation=?1,confirmed_seq=?2,
-             pending_delivery_id=NULL,pending_from_seq=NULL,pending_to_seq=NULL,resume_through_seq=?3,last_wake_seq=?6
+             pending_delivery_id=NULL,pending_from_seq=NULL,pending_to_seq=NULL,resume_through_seq=?3,last_wake_seq=?6,retry_exhausted_seq=0
              WHERE thread_id=?4 AND member_key=?5",
             params![generation, body.after_seq, resume_through, id.as_str(), key, last_wake],
         )?;

@@ -10,7 +10,7 @@ use cooplet_protocol::{
 };
 use cooplet_storage::{EventNotice, StorageError, WriteError, WriteFailure, WriteOutcome};
 use rusqlite::{Transaction, params};
-use tokio::{sync::watch, task::JoinSet};
+use tokio::{sync::watch, task::JoinSet, time::Instant};
 
 use crate::{
     AppState,
@@ -31,16 +31,10 @@ const MAX_RETRY: Duration = Duration::from_secs(5);
 const RETRIES: usize = 6;
 
 #[derive(Clone, Default)]
-pub(crate) struct Dispatch(Arc<Mutex<HashMap<NodeId, watch::Sender<Wake>>>>);
-
-#[derive(Default)]
-struct Wake {
-    revision: u64,
-    idle_revision: u64,
-}
+pub(crate) struct Dispatch(Arc<Mutex<HashMap<NodeId, watch::Sender<u64>>>>);
 
 impl Dispatch {
-    fn lock(&self) -> MutexGuard<'_, HashMap<NodeId, watch::Sender<Wake>>> {
+    fn lock(&self) -> MutexGuard<'_, HashMap<NodeId, watch::Sender<u64>>> {
         self.0
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
@@ -48,7 +42,7 @@ impl Dispatch {
 }
 
 pub(crate) fn wake(state: &AppState, node_id: &NodeId) {
-    signal(state, node_id, true);
+    signal(state, node_id);
 }
 
 pub(crate) fn participant_idle(
@@ -61,21 +55,21 @@ pub(crate) fn participant_idle(
          AND idle_delivery_id IS NOT NULL",
         params![node.as_str(), participant.as_str()],
     )?;
+    tx.execute(
+        "UPDATE thread_members SET retry_exhausted_seq=0 WHERE node_id=?1 AND participant_id=?2
+         AND state='active' AND retry_exhausted_seq>0",
+        params![node.as_str(), participant.as_str()],
+    )?;
     Ok(())
 }
 
-fn signal(state: &AppState, node_id: &NodeId, idle: bool) {
+fn signal(state: &AppState, node_id: &NodeId) {
     let mut nodes = state.thread_dispatch.lock();
     if let Some(wake) = nodes.get(node_id) {
-        wake.send_modify(|wake| {
-            wake.revision = wake.revision.wrapping_add(1);
-            if idle {
-                wake.idle_revision = wake.revision;
-            }
-        });
+        wake.send_modify(|revision| *revision = revision.wrapping_add(1));
         return;
     }
-    let (send, receive) = watch::channel(Wake::default());
+    let (send, receive) = watch::channel(0);
     let task = drive_queue(state.clone(), node_id.clone(), receive);
     if state.background.spawn_tracked(task).is_ok() {
         nodes.insert(node_id.clone(), send);
@@ -94,6 +88,7 @@ pub(super) async fn wake_thread(state: &AppState, thread_id: ThreadId) {
                AND p.synced_epoch=n.session_epoch AND p.kind='agent'
                AND ((m.delivery_mode='direct_now' AND m.resume_through_seq IS NULL AND m.last_wake_seq>0)
                     OR (p.state='idle' AND p.idle_delivery_id IS NULL
+                        AND MAX(COALESCE(m.resume_through_seq,0),m.last_wake_seq)>m.retry_exhausted_seq
                         AND (m.resume_through_seq IS NOT NULL
                              OR (m.delivery_mode='queue_until_idle' AND m.last_wake_seq>m.confirmed_seq
                                  AND EXISTS(SELECT 1 FROM thread_posts post WHERE post.thread_id=m.thread_id
@@ -107,7 +102,7 @@ pub(super) async fn wake_thread(state: &AppState, thread_id: ThreadId) {
     match nodes {
         Ok(nodes) => {
             for node in nodes {
-                signal(state, &node, false);
+                signal(state, &node);
             }
         }
         Err(error) => {
@@ -136,9 +131,54 @@ enum Completion {
     Ignore,
 }
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+struct RetryAttempt {
+    epoch: u64,
+    generation: u64,
+    wake_seq: u64,
+    number: usize,
+}
+
+#[derive(Clone, Copy)]
+enum RetryPhase {
+    InFlight,
+    Sleeping(Instant),
+    Ready,
+}
+
+type RetryMap = HashMap<Candidate, (RetryAttempt, RetryPhase)>;
+
+fn retry_number(
+    retries: &RetryMap,
+    candidate: &Candidate,
+    epoch: u64,
+    generation: u64,
+    wake_seq: u64,
+) -> Option<usize> {
+    match retries.get(candidate) {
+        Some((prior, phase)) if prior.epoch == epoch && prior.generation == generation => {
+            match phase {
+                RetryPhase::InFlight | RetryPhase::Sleeping(_) => None,
+                RetryPhase::Ready if prior.wake_seq == wake_seq => Some(prior.number + 1),
+                RetryPhase::Ready => Some(0),
+            }
+        }
+        _ => Some(0),
+    }
+}
+
+fn retry_delay(number: usize) -> Duration {
+    (INITIAL_RETRY * (1 << number)).min(MAX_RETRY)
+}
+
 struct Sweep {
     cursor: Option<Candidate>,
-    pending: JoinSet<Completion>,
+    pending: JoinSet<(Candidate, Option<RetryAttempt>, Completion)>,
+    // Only the serial staging transaction borrows a snapshot. It drops its
+    // reference before the writer replies, so scheduler updates mutate in place.
+    retries: Arc<RetryMap>,
+    prune_ready: bool,
+    acl_revision: u64,
 }
 
 impl Sweep {
@@ -146,6 +186,9 @@ impl Sweep {
         Self {
             cursor: None,
             pending: JoinSet::new(),
+            retries: Arc::default(),
+            prune_ready: false,
+            acl_revision: 0,
         }
     }
 
@@ -174,22 +217,42 @@ impl Sweep {
         let cursor = self.cursor.clone();
         let clock = state.wall_clock.clone();
         let acl = state.thread_acl_watch.subscribe();
+        let retries = self.retries.clone();
+        let revision = *acl.borrow();
+        let prune = self.prune_ready || revision != self.acl_revision;
         let staged = state
             .db
             .write(move |tx| {
-                Ok::<_, WriteError<HubError>>(WriteOutcome::new(stage(
+                let now = clock();
+                let retired = if prune {
+                    retired_retries(tx, &write_node, epoch, now, &retries)?
+                } else {
+                    Vec::new()
+                };
+                let job = stage(
                     tx,
                     &write_node,
-                    (epoch, clock()),
+                    (epoch, now),
                     cursor.as_ref(),
+                    &retries,
                     write_id,
-                )?))
+                )?;
+                Ok::<_, WriteError<HubError>>(WriteOutcome::new((job, retired)))
             })
             .await;
 
-        let payload = match staged {
-            Ok(Some(payload)) => payload,
-            Ok(None) => return Attempt::NoCandidate,
+        let (payload, retry) = match staged {
+            Ok((job, retired)) => {
+                self.prune_ready = false;
+                self.acl_revision = revision;
+                for candidate in retired {
+                    Arc::make_mut(&mut self.retries).remove(&candidate);
+                }
+                let Some(job) = job else {
+                    return Attempt::NoCandidate;
+                };
+                job
+            }
             Err(error) => {
                 if matches!(
                     error,
@@ -210,110 +273,184 @@ impl Sweep {
         };
         let state = state.clone();
         let node_id = node_id.clone();
-        self.pending
-            .spawn(async move { deliver(&state, &node_id, permit, payload, acl).await });
-        self.cursor = Some(candidate);
+        if let Some(attempt) = retry {
+            Arc::make_mut(&mut self.retries)
+                .insert(candidate.clone(), (attempt, RetryPhase::InFlight));
+        }
+        self.cursor = Some(candidate.clone());
+        self.pending.spawn(async move {
+            let exhausted = retry.filter(|r| r.number == RETRIES).map(|r| r.wake_seq);
+            let outcome = deliver(&state, &node_id, permit, payload, acl, exhausted).await;
+            (candidate, retry, outcome)
+        });
         Attempt::Started
     }
 
-    async fn next(&mut self) -> Option<Completion> {
+    fn deadline(&self) -> Option<Instant> {
+        self.retries
+            .values()
+            .filter_map(|(_, phase)| match phase {
+                RetryPhase::Sleeping(at) => Some(*at),
+                _ => None,
+            })
+            .min()
+    }
+
+    fn release_due(&mut self, now: Instant) {
+        for (_, phase) in Arc::make_mut(&mut self.retries).values_mut() {
+            if matches!(*phase, RetryPhase::Sleeping(at) if at <= now) {
+                *phase = RetryPhase::Ready;
+                self.prune_ready = true;
+            }
+        }
+    }
+
+    async fn next(&mut self) -> bool {
         while let Some(result) = self.pending.join_next().await {
             match result {
-                Ok(completion) => return Some(completion),
+                Ok((candidate, retry, outcome)) => {
+                    let entries = Arc::make_mut(&mut self.retries);
+                    if let Some(attempt) = retry
+                        && let Some((current, phase)) = entries.get_mut(&candidate)
+                        && *current == attempt
+                    {
+                        if matches!(outcome, Completion::Transient) && attempt.number < RETRIES {
+                            *phase =
+                                RetryPhase::Sleeping(Instant::now() + retry_delay(attempt.number));
+                        } else {
+                            entries.remove(&candidate);
+                        }
+                    }
+                    return !matches!(outcome, Completion::Ignore);
+                }
                 Err(error) => tracing::warn!(%error, "Thread delivery task ended unexpectedly"),
             }
         }
-        None
+        false
     }
 }
 
-async fn drive_queue(state: AppState, node_id: NodeId, mut wake: watch::Receiver<Wake>) {
+async fn drive_queue(state: AppState, node_id: NodeId, mut wake: watch::Receiver<u64>) {
     let mut sweep = Sweep::new();
     let mut observed = 0;
-    let mut observed_idle = 0;
     let mut scan = true;
-    let mut retry = false;
     let mut follow_up = false;
-    let mut retries = 0;
-    let mut retry_at = None;
+    let mut stage_failures = 0;
+    let mut stage_retry_at = None;
     let mut shutdown = state.shutdown.clone();
     loop {
-        {
-            let current = wake.borrow_and_update();
-            if observed != current.revision {
-                if observed_idle != current.idle_revision {
-                    observed_idle = current.idle_revision;
-                    retries = 0;
-                }
-                observed = current.revision;
-                if scan {
-                    // Finish this keyset sweep before considering new work on earlier keys.
-                    follow_up = true;
-                } else {
-                    sweep.cursor = None;
-                    scan = true;
-                }
+        let current = *wake.borrow_and_update();
+        if observed != current {
+            observed = current;
+            if stage_failures > RETRIES {
+                stage_failures = 0;
+            }
+            if scan {
+                // Finish this keyset sweep before considering new work on earlier keys.
+                follow_up = true;
+            } else {
+                sweep.cursor = None;
+                scan = true;
             }
         }
-        if scan {
+        if scan && stage_retry_at.is_none() && stage_failures <= RETRIES {
             match sweep.start(&state, &node_id).await {
-                Attempt::Started => continue,
-                Attempt::NoCandidate | Attempt::Offline => scan = false,
+                Attempt::Started => {
+                    stage_failures = 0;
+                    continue;
+                }
+                Attempt::NoCandidate => {
+                    stage_failures = 0;
+                    scan = false;
+                }
+                Attempt::Offline => {
+                    Arc::make_mut(&mut sweep.retries)
+                        .retain(|_, (_, p)| matches!(p, RetryPhase::InFlight));
+                    scan = false;
+                }
                 // A full bridge pauses this sweep mid-keyset. A new wake adds
                 // a follow-up pass and must not restart at the earliest member.
                 Attempt::Saturated => {}
                 Attempt::Retry => {
+                    if stage_failures < RETRIES {
+                        stage_retry_at = Some(Instant::now() + retry_delay(stage_failures));
+                    }
+                    stage_failures += 1;
                     scan = false;
-                    retry = true;
                 }
             }
         }
-        // Reaching the end of the keyset frees the next pass to start, even
-        // if other participants still have unacknowledged deliveries.
         if !scan && std::mem::take(&mut follow_up) {
             sweep.cursor = None;
             scan = true;
             continue;
         }
-        if std::mem::take(&mut retry) && retry_at.is_none() && retries < RETRIES {
-            let delay = (INITIAL_RETRY * (1 << retries)).min(MAX_RETRY);
-            retries += 1;
-            retry_at = Some(tokio::time::Instant::now() + delay);
-        }
-        if !sweep.pending.is_empty() || retry_at.is_some() {
+
+        let deadline = sweep.deadline().into_iter().chain(stage_retry_at).min();
+        if !sweep.pending.is_empty() || deadline.is_some() {
             tokio::select! {
                 change = wake.changed() => {
                     if change.is_err() { return; }
                 }
-                completion = sweep.next(), if !sweep.pending.is_empty() => {
-                    match completion {
-                        Some(Completion::Rescan) => follow_up = true,
-                        Some(Completion::Transient) => retry = true,
-                        Some(Completion::Ignore) | None => {}
-                    }
+                rescan = sweep.next(), if !sweep.pending.is_empty() => {
+                    follow_up |= rescan;
                     scan = true;
                 }
                 () = async {
-                    if let Some(at) = retry_at { tokio::time::sleep_until(at).await; }
-                }, if retry_at.is_some() => {
-                    retry_at = None;
-                    // On saturation keep the current keyset position. The
-                    // scheduled retry will revisit earlier keys on wraparound.
+                    if let Some(at) = deadline { tokio::time::sleep_until(at).await; }
+                }, if deadline.is_some() => {
+                    let now = Instant::now();
+                    sweep.release_due(now);
+                    if stage_retry_at.is_some_and(|at| at <= now) {
+                        stage_retry_at = None;
+                    }
                     follow_up = true;
                 }
-                _ = shutdown.changed(), if retry_at.is_some() => {
-                    retry_at = None;
-                    retries = RETRIES;
+                _ = shutdown.changed(), if deadline.is_some() => {
+                    Arc::make_mut(&mut sweep.retries).retain(|_, (_, p)| matches!(p, RetryPhase::InFlight));
+                    stage_retry_at = None;
+                    stage_failures = RETRIES + 1;
                 }
             }
             continue;
         }
         let mut nodes = state.thread_dispatch.lock();
-        if wake.borrow().revision == observed {
+        if *wake.borrow() == observed {
             nodes.remove(&node_id);
             return;
         }
     }
+}
+
+// Check deferred addresses only at their deadline or after membership changes.
+// Temporary unavailability of a slot or participant does not renew its budget.
+fn retired_retries(
+    tx: &Transaction<'_>,
+    node: &NodeId,
+    epoch: u64,
+    now: i64,
+    retries: &RetryMap,
+) -> rusqlite::Result<Vec<Candidate>> {
+    let mut retired = Vec::new();
+    for (candidate, (attempt, phase)) in retries {
+        if !matches!(phase, RetryPhase::Ready) {
+            continue;
+        }
+        let live = attempt.epoch == epoch && tx.prepare_cached(
+            "SELECT EXISTS(SELECT 1 FROM thread_members m JOIN threads t USING(thread_id)
+             JOIN thread_posts p ON p.thread_id=m.thread_id AND p.seq=?4
+             WHERE m.thread_id=?1 AND m.member_key=?2 AND m.delivery_generation=?3
+               AND t.status='open' AND m.state='active' AND m.role!='observer' AND m.wake_policy!='muted'
+               AND (m.delivery_mode='queue_until_idle' OR m.resume_through_seq IS NOT NULL)
+               AND MAX(COALESCE(m.resume_through_seq,0),m.last_wake_seq)=?4
+               AND m.confirmed_seq<?4 AND p.expires_at_ms>?5)"
+        )?.query_row(params![candidate.thread_id.as_str(), format!("{node}/{}",candidate.member_id),
+            attempt.generation, attempt.wake_seq, now], |row| row.get::<_, bool>(0))?;
+        if !live {
+            retired.push(candidate.clone());
+        }
+    }
+    Ok(retired)
 }
 
 fn stage(
@@ -321,10 +458,12 @@ fn stage(
     node_id: &NodeId,
     (epoch, now): (u64, i64),
     cursor: Option<&Candidate>,
+    retries: &RetryMap,
     delivery_id: OperationId,
-) -> Result<Option<ThreadDeliverPayload>, HubError> {
+) -> Result<Option<(ThreadDeliverPayload, Option<RetryAttempt>)>, HubError> {
     let mut candidates = tx.prepare_cached(
-        "SELECT m.participant_id,m.thread_id,m.member_key,m.resume_through_seq,m.last_wake_seq
+        "SELECT m.participant_id,m.thread_id,m.member_key,m.resume_through_seq,m.last_wake_seq,
+                m.delivery_generation,m.delivery_mode='direct_now'
          FROM thread_members m JOIN nodes n USING(node_id)
          JOIN node_participants p ON p.node_id=m.node_id AND p.participant_id=m.participant_id
          JOIN threads t USING(thread_id)
@@ -334,6 +473,7 @@ fn stage(
            AND p.synced_epoch=?2 AND p.kind='agent'
            AND ((m.delivery_mode='direct_now' AND m.resume_through_seq IS NULL AND m.last_wake_seq>0)
                 OR (p.state='idle' AND p.idle_delivery_id IS NULL
+                        AND MAX(COALESCE(m.resume_through_seq,0),m.last_wake_seq)>m.retry_exhausted_seq
                     AND m.participant_id NOT IN (
                         SELECT participant_id FROM thread_members WHERE node_id=?1
                           AND state='active' AND role!='observer' AND wake_policy!='muted'
@@ -357,6 +497,23 @@ fn stage(
         let key: String = row.get(2)?;
         let resume_through: Option<u64> = row.get(3)?;
         let last_wake: u64 = row.get(4)?;
+        let direct = row.get::<_, bool>(6)? && resume_through.is_none();
+        let retry = if direct {
+            None
+        } else {
+            let wake_seq = last_wake.max(resume_through.unwrap_or(0));
+            let generation = row.get(5)?;
+            let Some(number) = retry_number(retries, &candidate, epoch, generation, wake_seq)
+            else {
+                continue;
+            };
+            Some(RetryAttempt {
+                epoch,
+                generation,
+                wake_seq,
+                number,
+            })
+        };
         let member =
             members::member(tx, &candidate.thread_id, &key)?.ok_or_else(store::not_found)?;
         let board = store::board(tx, &candidate.thread_id, now)?;
@@ -375,7 +532,6 @@ fn stage(
         } else {
             false
         };
-        let direct = member.delivery_mode == DeliveryMode::DirectNow && resume_through.is_none();
         let through = if direct {
             posts::first_relevant_seq(
                 tx,
@@ -417,7 +573,7 @@ fn stage(
                  WHERE thread_id=?4 AND member_key=?5",
                 params![payload.delivery_id.as_str(), payload.from_seq, payload.to_seq, payload.thread_id.as_str(), key],
             )?;
-            return Ok(Some(payload));
+            return Ok(Some((payload, retry)));
         }
     }
     Ok(None)
@@ -496,11 +652,12 @@ async fn deliver(
     permit: Box<dyn ThreadPermit>,
     payload: ThreadDeliverPayload,
     acl: watch::Receiver<u64>,
+    exhausted_wake: Option<u64>,
 ) -> Completion {
     use ThreadDeliveryOutcome as Outcome;
     let epoch = permit.epoch();
     let direct = payload.delivery_mode == DeliveryMode::DirectNow;
-    let mark = Delivery::from_payload(node_id, epoch, &payload);
+    let mut mark = Delivery::from_payload(node_id, epoch, &payload);
     let result = tokio::select! {
         biased;
         () = until_ineligible(state, &mark, acl) => Err(SubmitError::Unknown),
@@ -511,6 +668,9 @@ async fn deliver(
         Ok(_) | Err(SubmitError::Unknown) => Outcome::Unknown,
         Err(SubmitError::Unavailable) => Outcome::Unavailable,
     };
+    if matches!(outcome, Outcome::Expired | Outcome::Unavailable) {
+        mark.exhausted_wake = exhausted_wake;
+    }
     let mut retry = INITIAL_RETRY;
     for attempt in 0..RETRIES {
         let copy = mark.clone();
@@ -588,6 +748,7 @@ struct Delivery {
     generation: u64,
     delivery_id: OperationId,
     to_seq: u64,
+    exhausted_wake: Option<u64>,
 }
 
 impl Delivery {
@@ -603,6 +764,7 @@ impl Delivery {
             generation: payload.delivery_generation,
             delivery_id: payload.delivery_id.clone(),
             to_seq: payload.to_seq,
+            exhausted_wake: None,
         }
     }
 
@@ -627,6 +789,7 @@ fn finish(
     let retire_covered = delivered || outcome == ThreadDeliveryOutcome::Rejected;
     let changed = tx.execute(
         "UPDATE thread_members SET state=CASE WHEN ?1 THEN 'paused_unknown' ELSE state END,
+           retry_exhausted_seq=COALESCE(?11,retry_exhausted_seq),
            last_wake_seq=CASE WHEN ?1 AND delivery_mode='direct_now' THEN 0 ELSE last_wake_seq END,
            confirmed_seq=CASE WHEN ?2 THEN MAX(confirmed_seq,?3) ELSE confirmed_seq END,
            pending_delivery_id=CASE WHEN ?1 THEN pending_delivery_id ELSE NULL END,
@@ -639,7 +802,7 @@ fn finish(
            AND EXISTS(SELECT 1 FROM nodes WHERE node_id=?6 AND session_epoch=?9)",
         params![unknown, delivered, delivery.to_seq, delivery.candidate.thread_id.as_str(),
             delivery.member_key, delivery.node_id.as_str(), delivery.generation,
-            delivery.delivery_id.as_str(), delivery.epoch, retire_covered],
+            delivery.delivery_id.as_str(), delivery.epoch, retire_covered, delivery.exhausted_wake],
     )?;
     // A leave, close or resume can retire the range while its ACK is in flight.
     // Release only this delivery's gate, even when the member CAS no longer matches.
@@ -720,6 +883,11 @@ fn pause_pending(
     tx.prepare_cached(&format!(
         "UPDATE thread_members SET last_wake_seq=0 WHERE {node_filter} AND state='active'
            AND delivery_mode='direct_now' AND last_wake_seq>0",
+    ))?
+    .execute([node_id.map(NodeId::as_str)])?;
+    tx.prepare_cached(&format!(
+        "UPDATE thread_members SET retry_exhausted_seq=0 WHERE {node_filter}
+         AND state='active' AND node_id IS NOT NULL AND retry_exhausted_seq>0",
     ))?
     .execute([node_id.map(NodeId::as_str)])?;
     let mut statement = tx.prepare_cached(if node_id.is_some() {

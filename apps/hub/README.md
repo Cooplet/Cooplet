@@ -67,6 +67,11 @@ needs a new relevant post. In `queue_until_idle` mode, a busy or approval respon
 holds queued work for that participant across threads until the Node reports
 the participant idle or sends a fresh roster with an idle state.
 
+If the Node reports a temporary delivery failure, queued work retries with
+backoff from 250 ms up to 5 s. Each recipient has its own retry budget. After
+it runs out, a new relevant post, an idle report for that participant, or a
+new session can restart delivery.
+
 ## Grant service access
 
 Use a full human administrator bearer to create a service with `POST /v1/principals`, then issue its token with `POST /v1/principals/{id}/tokens`. Set `with_participant: true` if the service sends messages. Give the token a future `expires_at_ms` in Unix milliseconds. Save the returned secret on issuance.

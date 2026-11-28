@@ -170,6 +170,8 @@ CREATE TABLE thread_members (
     confirmed_seq       INTEGER NOT NULL DEFAULT 0,
     -- Latest relevant queued post, or earliest unattempted direct post in this session.
     last_wake_seq       INTEGER NOT NULL DEFAULT 0 CHECK (last_wake_seq >= 0),
+    -- Last queued or recovery wake that exhausted its transient delivery attempts.
+    retry_exhausted_seq INTEGER NOT NULL DEFAULT 0 CHECK (retry_exhausted_seq >= 0),
     -- The head at explicit resume, extended by relevant direct wakes deferred into recovery.
     resume_through_seq  INTEGER,
     pending_delivery_id TEXT,

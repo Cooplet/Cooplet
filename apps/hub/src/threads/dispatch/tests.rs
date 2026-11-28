@@ -74,10 +74,19 @@ fn queue_coalesces_once_idle_and_cannot_accept_an_old_generation_ack() -> TestRe
             params![thread.as_str(), seq, cooplet_protocol::MessageId::generate()?.as_str(), owner.as_str(), mentions],
         )?;
     }
-    let attempt = || stage(&tx, &node, (5, 50), None, OperationId::generate()?);
+    let attempt = || {
+        stage(
+            &tx,
+            &node,
+            (5, 50),
+            None,
+            &RetryMap::new(),
+            OperationId::generate()?,
+        )
+    };
     assert!(attempt()?.is_none());
     tx.execute("UPDATE node_participants SET state='idle'", [])?;
-    let payload = attempt()?.ok_or("no delivery after idle")?;
+    let (payload, _) = attempt()?.ok_or("no delivery after idle")?;
     assert_eq!(
         (payload.from_seq, payload.to_seq, payload.posts.len()),
         (1, 5, 5)
@@ -920,6 +929,7 @@ async fn an_idle_participant_gets_one_pending_turn_across_boards() -> TestResult
                 &node,
                 (TEST_EPOCH, TEST_NOW),
                 None,
+                &RetryMap::new(),
                 OperationId::generate().map_err(HubError::from)?,
             )?;
             Ok::<_, WriteError<HubError>>(WriteOutcome::new(job))
@@ -1206,6 +1216,143 @@ async fn transient_retry_runs_after_backoff_while_a_peer_ack_is_outstanding() ->
     assert_eq!((retry.payload.from_seq, retry.payload.to_seq), (1, 1));
     retry.complete(ThreadDeliveryOutcome::Delivered)?;
     other.complete(ThreadDeliveryOutcome::Delivered)?;
+    fixture.settle().await?;
+    fixture.close().await
+}
+
+#[tokio::test(start_paused = true)]
+async fn retry_clocks_and_limits_belong_to_the_delivery_address() -> TestResult {
+    let thread = ThreadId::generate()?;
+    let alpha = Candidate {
+        member_id: ParticipantId::generate()?,
+        thread_id: thread.clone(),
+    };
+    let beta = Candidate {
+        member_id: ParticipantId::generate()?,
+        thread_id: thread,
+    };
+    let mut sweep = Sweep::new();
+    let attempt = |number| RetryAttempt {
+        epoch: TEST_EPOCH,
+        generation: 2,
+        wake_seq: 3,
+        number,
+    };
+    for number in 0..=RETRIES {
+        let retry = attempt(number);
+        assert_eq!(
+            retry_number(&sweep.retries, &alpha, TEST_EPOCH, 2, 3),
+            Some(number)
+        );
+        Arc::make_mut(&mut sweep.retries).insert(alpha.clone(), (retry, RetryPhase::InFlight));
+        let alpha_copy = alpha.clone();
+        sweep
+            .pending
+            .spawn(async move { (alpha_copy, Some(retry), Completion::Transient) });
+        // A newly committed post cannot slip between the DB finish and its JoinSet outcome.
+        assert_eq!(retry_number(&sweep.retries, &alpha, TEST_EPOCH, 2, 4), None);
+        assert!(sweep.next().await);
+        if number == RETRIES {
+            assert!(sweep.deadline().is_none());
+            break;
+        }
+
+        let due = Instant::now() + retry_delay(number);
+        assert_eq!(sweep.deadline(), Some(due));
+        assert_eq!(
+            retry_number(&sweep.retries, &beta, TEST_EPOCH, 2, 3),
+            Some(0)
+        );
+        // A replacement generation or session need not wait for the old address.
+        assert_eq!(
+            retry_number(&sweep.retries, &alpha, TEST_EPOCH, 3, 3),
+            Some(0)
+        );
+        assert_eq!(
+            retry_number(&sweep.retries, &alpha, TEST_EPOCH + 1, 2, 3),
+            Some(0)
+        );
+        tokio::time::advance(retry_delay(number) - Duration::from_millis(1)).await;
+        sweep.release_due(Instant::now());
+        assert_eq!(retry_number(&sweep.retries, &alpha, TEST_EPOCH, 2, 3), None);
+        tokio::time::advance(Duration::from_millis(1)).await;
+        sweep.release_due(Instant::now());
+    }
+    let retry = attempt(0);
+    Arc::make_mut(&mut sweep.retries).insert(beta.clone(), (retry, RetryPhase::InFlight));
+    sweep
+        .pending
+        .spawn(async move { (beta, Some(retry), Completion::Transient) });
+    assert!(sweep.next().await);
+    assert_eq!(sweep.deadline(), Some(Instant::now() + INITIAL_RETRY));
+    Ok(())
+}
+
+#[tokio::test]
+async fn peer_ack_cannot_shorten_a_live_queue_backoff() -> TestResult {
+    let mut fixture = Fixture::new(true).await?;
+    fixture.bridge.free_slot.add_permits(1);
+    let thread = fixture.board(DeliveryMode::QueueUntilIdle).await?;
+    fixture
+        .add_peer(&thread, DeliveryMode::QueueUntilIdle)
+        .await?;
+    fixture.set_worker(ParticipantState::Idle).await?;
+    fixture.settle().await?;
+    fixture
+        .post(&thread, "retry-both-members", "@all review")
+        .await?;
+    let first = fixture.attempt().await?;
+    let peer = fixture.attempt().await?;
+    let member = first.payload.member_id.clone();
+    let start = Instant::now();
+    first.complete(ThreadDeliveryOutcome::Unavailable)?;
+    peer.complete(ThreadDeliveryOutcome::Delivered)?;
+    let retry = fixture.attempt().await?;
+    assert!(start.elapsed() >= INITIAL_RETRY);
+    assert_eq!(retry.payload.member_id, member);
+    retry.complete(ThreadDeliveryOutcome::Delivered)?;
+    fixture.settle().await?;
+    fixture.close().await
+}
+
+#[tokio::test]
+async fn exhausted_member_stays_quiet_across_workers_until_its_own_idle() -> TestResult {
+    let mut fixture = Fixture::new(true).await?;
+    let thread = fixture.board(DeliveryMode::QueueUntilIdle).await?;
+    let peer = fixture
+        .add_peer(&thread, DeliveryMode::QueueUntilIdle)
+        .await?;
+    fixture.set_worker(ParticipantState::Idle).await?;
+    fixture.settle().await?;
+    fixture
+        .post(&thread, "exhaust-worker", "@worker review")
+        .await?;
+    for _ in 0..=RETRIES {
+        let wire = tokio::time::timeout(MAX_RETRY + STEP_TIMEOUT, fixture.attempts.recv())
+            .await?
+            .ok_or("wire receiver closed")?;
+        assert_eq!(wire.payload.member_id, fixture.worker);
+        assert_eq!(wire.payload.to_seq, 1);
+        wire.complete(ThreadDeliveryOutcome::Unavailable)?;
+    }
+    fixture.settle().await?;
+
+    fixture
+        .post(&thread, "exhaust-peer", "@peer review")
+        .await?;
+    let first = fixture.attempt().await?;
+    assert_eq!(first.payload.member_id, peer);
+    first.complete(ThreadDeliveryOutcome::Expired)?;
+    let retry = fixture.attempt().await?;
+    assert_eq!(retry.payload.member_id, peer);
+    retry.complete(ThreadDeliveryOutcome::Delivered)?;
+    fixture.settle().await?;
+
+    fixture.set_worker(ParticipantState::Idle).await?;
+    let fresh = fixture.attempt().await?;
+    assert_eq!(fresh.payload.member_id, fixture.worker);
+    assert_eq!((fresh.payload.from_seq, fresh.payload.to_seq), (1, 2));
+    fresh.complete(ThreadDeliveryOutcome::Delivered)?;
     fixture.settle().await?;
     fixture.close().await
 }
