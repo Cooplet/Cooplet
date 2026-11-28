@@ -1561,4 +1561,110 @@ mod tests {
         assert_eq!(queue.len(), MAX_IMMEDIATE_REPLIES);
         Ok(())
     }
+
+    #[tokio::test(start_paused = true)]
+    async fn peer_close_returns_synchronously_when_backpressured_and_flushes_reply_on_teardown()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let clock = Arc::new(Clock::default());
+        let (_stopping, stop) = watch::channel(false);
+
+        // Case 1: 4003 revocation arriving while the client->server buffer is backpressured
+        // returns Exit::Revoked in a single poll (cancel-safe) and flushes the close reply
+        // during teardown once the peer drains.
+        let (transport, peer) = tokio::io::duplex(512);
+        let socket = WebSocketStream::from_raw_socket(
+            Box::new(transport) as Box<dyn WebSocketIo>,
+            tokio_tungstenite::tungstenite::protocol::Role::Client,
+            None,
+        )
+        .await;
+        let mut wire = Wire::new(socket, clock.clone());
+        let mut server = WebSocketStream::from_raw_socket(
+            Box::new(peer) as Box<dyn WebSocketIo>,
+            tokio_tungstenite::tungstenite::protocol::Role::Server,
+            None,
+        )
+        .await;
+        wire.start_write(WriteOp::Send(Message::Text("b".repeat(600).into())));
+        {
+            let mut drive = pin!(wire.drive_write_to_completion(&stop));
+            assert!(poll_once(drive.as_mut()).await.is_pending());
+        }
+        assert!(wire.active_write.is_some());
+
+        server
+            .send(Message::Close(Some(CloseFrame {
+                code: CloseCode::from(4003),
+                reason: "node_revoked".into(),
+            })))
+            .await?;
+
+        let deadline = clock.deadline_after(ROSTER_TIMEOUT);
+        {
+            let mut next = pin!(wire.next_app(deadline, Exit::RosterTimeout, &stop));
+            assert!(matches!(
+                poll_once(next.as_mut()).await,
+                Poll::Ready(Err(Exit::Revoked))
+            ));
+        }
+        assert!(wire.close_sent);
+        assert!(wire.active_write.is_none());
+
+        let mut flush = pin!(wire.flush_peer_close());
+        assert!(poll_once(flush.as_mut()).await.is_pending());
+        let ((), close_code) = tokio::join!(flush, async {
+            let mut saw_text = false;
+            loop {
+                match server.next().await {
+                    Some(Ok(Message::Text(text))) => {
+                        if text.len() != 600 {
+                            return Err(format!("unexpected text len: {}", text.len()));
+                        }
+                        saw_text = true;
+                    }
+                    Some(Ok(Message::Close(Some(frame)))) => {
+                        return Ok((saw_text, u16::from(frame.code)));
+                    }
+                    other => return Err(format!("unexpected server frame: {other:?}")),
+                }
+            }
+        });
+        assert_eq!(close_code?, (true, 4003));
+
+        // Case 2: normal peer Close returns Exit::PeerClosed synchronously and flushes Normal.
+        let (transport2, peer2) = tokio::io::duplex(512);
+        let socket2 = WebSocketStream::from_raw_socket(
+            Box::new(transport2) as Box<dyn WebSocketIo>,
+            tokio_tungstenite::tungstenite::protocol::Role::Client,
+            None,
+        )
+        .await;
+        let mut wire2 = Wire::new(socket2, clock.clone());
+        let mut server2 = WebSocketStream::from_raw_socket(
+            Box::new(peer2) as Box<dyn WebSocketIo>,
+            tokio_tungstenite::tungstenite::protocol::Role::Server,
+            None,
+        )
+        .await;
+        server2
+            .send(Message::Close(Some(CloseFrame {
+                code: CloseCode::Normal,
+                reason: "bye".into(),
+            })))
+            .await?;
+        {
+            let mut next = pin!(wire2.next_app(deadline, Exit::RosterTimeout, &stop));
+            assert!(matches!(
+                poll_once(next.as_mut()).await,
+                Poll::Ready(Err(Exit::PeerClosed))
+            ));
+        }
+        assert!(wire2.close_sent);
+        let ((), reply) = tokio::join!(wire2.flush_peer_close(), server2.next());
+        let Some(Ok(Message::Close(Some(frame)))) = reply else {
+            return Err(format!("expected Normal close reply, got {reply:?}").into());
+        };
+        assert_eq!(frame.code, CloseCode::Normal);
+        Ok(())
+    }
 }

@@ -1156,25 +1156,42 @@ async fn early_node_event_and_revocation_close_with_active_write_behave_cleanly(
         .reserve(&hub.node_id)
         .map_err(|err| format!("reserve pong test failed: {err:?}"))?;
     let pong_cmd = tokio::spawn(pong_permit.submit(pong_cmd_payload));
-    time::sleep(Duration::from_millis(20)).await;
+    time::sleep(Duration::from_millis(50)).await;
     // Valid Pong arrives at 24_950 while the 48 KiB write is backpressured in WriteState::Flush.
     hub.clock.0.store(24_950, Ordering::Relaxed);
     bp_client
         .send(ClientMessage::Pong(hub_ping_payload))
         .await?;
-    time::sleep(Duration::from_millis(20)).await;
+    time::sleep(Duration::from_millis(50)).await;
     // Crossing the old 25_000 pong_deadline must NOT drop the healthy backpressured write.
+    // Send a probe Ping so Hub's step() wakes immediately at clock = 25_001 and re-evaluates
+    // write/heartbeat deadlines (and sleep > 50ms past the old 25_000 - 24_950 remainder).
     hub.clock.0.store(25_001, Ordering::Relaxed);
-    time::sleep(Duration::from_millis(20)).await;
-    let received_cmd: CommandReqPayload = {
-        let ClientMessage::Text(text) = time::timeout(TIMEOUT, bp_client.next())
+    bp_client
+        .send(ClientMessage::Ping(Bytes::from_static(PROBE)))
+        .await?;
+    time::sleep(Duration::from_millis(60)).await;
+    assert!(
+        !pong_cmd.is_finished(),
+        "Hub dropped healthy backpressured write across old pong deadline"
+    );
+    let mut received_cmd: Option<CommandReqPayload> = None;
+    let mut post_deadline_pong_seen = false;
+    while received_cmd.is_none() || !post_deadline_pong_seen {
+        match time::timeout(TIMEOUT, bp_client.next())
             .await?
             .ok_or("Hub dropped healthy write across old pong deadline")??
-        else {
-            return Err("expected CommandReq text frame after valid Pong".into());
-        };
-        BridgeFrame::from_json(text.as_bytes())?.decode_payload()?
-    };
+        {
+            ClientMessage::Text(text) => {
+                received_cmd = Some(BridgeFrame::from_json(text.as_bytes())?.decode_payload()?);
+            }
+            ClientMessage::Pong(bytes) if bytes == PROBE => {
+                post_deadline_pong_seen = true;
+            }
+            other => return Err(format!("unexpected frame after valid Pong: {other:?}").into()),
+        }
+    }
+    let received_cmd = received_cmd.ok_or("missing CommandReq after valid Pong")?;
     assert_eq!(received_cmd.op_id, pong_cmd_id);
     let ack_wire = String::from_utf8(BridgeFrame::encode_json(
         epoch2,
@@ -1205,6 +1222,15 @@ async fn early_node_event_and_revocation_close_with_active_write_behave_cleanly(
     }
     time::sleep(Duration::from_millis(50)).await;
     hub.registry.disconnect_revoked(&hub.node_id);
+
+    // Wait until run_ready has exited step() and dropped ready.pending/ready.incoming so Hub
+    // is deterministically inside send_close() holding `_authorized` for WriteState::Flush.
+    time::timeout(TIMEOUT, async {
+        while !submitted.iter().all(tokio::task::JoinHandle::is_finished) {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await?;
 
     // While bp_client has not drained, send_close holds `_authorized` for the buffered
     // WriteState::Flush frame, so a concurrent AuthorityTransition must remain Pending.
