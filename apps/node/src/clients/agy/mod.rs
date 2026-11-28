@@ -438,6 +438,7 @@ impl Drop for ProbeProcess {
 
 fn spawn_failure(error: SpawnManagedError) -> NodeError {
     match error {
+        SpawnManagedError::AdmissionExpired => crate::operations::admission_expired(),
         SpawnManagedError::SpawnFailed(_) => failure(ErrorCode::Overloaded, "Could not spawn Agy"),
         SpawnManagedError::CleanupPending(_) => failure(
             ErrorCode::DeliveryUnknown,

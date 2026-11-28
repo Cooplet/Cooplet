@@ -176,6 +176,7 @@ impl AgentService {
         .map_err(NodeError::internal)??;
         let plan = self
             .plan(OpenPlanInput {
+                admission,
                 id,
                 name,
                 workspace,
@@ -204,6 +205,7 @@ impl AgentService {
                 .map_err(NodeError::internal)??;
         let plan = self
             .plan(OpenPlanInput {
+                admission: None,
                 id,
                 name: previous.name.clone(),
                 workspace,
@@ -217,7 +219,7 @@ impl AgentService {
         self.open(&guard, plan, None).await
     }
 
-    async fn plan(&self, input: OpenPlanInput) -> Result<OpenPlan> {
+    async fn plan(&self, input: OpenPlanInput<'_>) -> Result<OpenPlan> {
         let has_frozen_instructions = input
             .previous
             .as_ref()
@@ -258,7 +260,11 @@ impl AgentService {
         let adapter = self.0.registry.get(&client_kind)?;
         let config = self.adapter_config();
         let report = self
-            .cancel_on_shutdown(self.0.registry.discover(&client_kind, &config))
+            .cancel_on_shutdown(self.0.registry.discover_for_open(
+                &client_kind,
+                &config,
+                input.admission,
+            ))
             .await?;
         if !report.available {
             return Err(invalid(
@@ -885,7 +891,8 @@ fn adapter_read_timeout() -> NodeError {
     .with_extension("reason", "adapter_read_timeout")
 }
 
-struct OpenPlanInput {
+struct OpenPlanInput<'a> {
+    admission: Option<&'a AdmissionGuard>,
     id: ParticipantId,
     name: String,
     workspace: PathBuf,

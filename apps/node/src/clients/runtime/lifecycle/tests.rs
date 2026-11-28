@@ -228,6 +228,7 @@ async fn launch_preflight_accepts_capabilities_made_available_by_discovery() -> 
     assert!(!adapter.capabilities().supports_create);
     let plan = service
         .plan(OpenPlanInput {
+            admission: None,
             id: ParticipantId::generate()?,
             name: "probe".into(),
             workspace: node.workspace_dir.clone(),
@@ -289,11 +290,14 @@ async fn quiesce_cancels_discovery_and_attach_for_an_unresponsive_adapter() -> T
 }
 
 #[tokio::test]
-async fn discover_retries_after_unavailable_and_sanitizes_internal_errors() -> TestResult {
+async fn cold_discovery_respects_queued_admission_and_retries_uncached_failures() -> TestResult {
     use std::sync::atomic::AtomicUsize;
+
+    use futures_util::FutureExt;
 
     struct FlakyDiscoverAdapter {
         calls: AtomicUsize,
+        release_first: Notify,
     }
 
     impl ClientAdapter for FlakyDiscoverAdapter {
@@ -308,6 +312,7 @@ async fn discover_retries_after_unavailable_and_sanitizes_internal_errors() -> T
             Box::pin(async move {
                 let attempt = self.calls.fetch_add(1, Ordering::SeqCst);
                 if attempt == 0 {
+                    self.release_first.notified().await;
                     return Ok(DiscoveryReport {
                         client_kind: self.kind().into(),
                         available: false,
@@ -396,6 +401,7 @@ async fn discover_retries_after_unavailable_and_sanitizes_internal_errors() -> T
 
     let adapter = Arc::new(FlakyDiscoverAdapter {
         calls: AtomicUsize::new(0),
+        release_first: Notify::new(),
     });
     let mut registry = AdapterRegistry::default();
     registry.register(adapter.clone())?;
@@ -405,8 +411,32 @@ async fn discover_retries_after_unavailable_and_sanitizes_internal_errors() -> T
     };
 
     // Attempt 0: unavailable -> must not be cached.
-    let first = registry.discover("flaky-probe", &config).await?;
+    let first = registry.discover("flaky-probe", &config);
+    tokio::pin!(first);
+    assert!(first.as_mut().now_or_never().is_none());
+
+    // Both delegated opens queue behind the same uncached native probe.
+    let revoked = AdmissionGuard::new(Duration::from_secs(60));
+    let queued = registry.discover_for_open("flaky-probe", &config, Some(&revoked));
+    tokio::pin!(queued);
+    assert!(queued.as_mut().now_or_never().is_none());
+    revoked.expire();
+    let short = AdmissionGuard::new(Duration::from_millis(25));
+    let timed_out = registry.discover_for_open("flaky-probe", &config, Some(&short));
+    let error = tokio::time::timeout(Duration::from_secs(2), timed_out)
+        .await?
+        .err()
+        .ok_or("Queued discovery must respect the admission deadline")?;
+    assert_eq!(error.code(), ErrorCode::BridgeUnavailable);
+
+    adapter.release_first.notify_one();
+    let first = first.await?;
     assert!(!first.available);
+    let error = queued
+        .await
+        .err()
+        .ok_or("A revoked open must skip its probe")?;
+    assert_eq!(error.0.extensions["reason"], "admission_expired");
     assert_eq!(adapter.calls.load(Ordering::SeqCst), 1);
 
     // Attempt 1: error -> must be sanitized and not cached.
