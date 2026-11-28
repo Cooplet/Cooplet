@@ -72,6 +72,10 @@ backoff from 250 ms up to 5 s. Each recipient has its own retry budget. After
 it runs out, a new relevant post, an idle report for that participant, or a
 new session can restart delivery.
 
+If the Node rejects a queued range, the Hub retires that delivery attempt
+and keeps the confirmed cursor in place. A later relevant post can wake the
+queue with the unread context.
+
 ## Grant service access
 
 Use a full human administrator bearer to create a service with `POST /v1/principals`, then issue its token with `POST /v1/principals/{id}/tokens`. Set `with_participant: true` if the service sends messages. Give the token a future `expires_at_ms` in Unix milliseconds. Save the returned secret on issuance.

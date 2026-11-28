@@ -474,14 +474,14 @@ pub(crate) async fn wait(
                 let board = store::board(ctx.tx, &id, ctx.now)?;
                 store::require_open(&board)?;
                 store::validate_cursor(&board, body.since_seq)?;
-                if let Some(policy) = body.wake_policy.map(ThreadWakePolicy::from) {
-                    member.wake_policy = policy;
-                }
+                let policy = body.wake_policy.map(ThreadWakePolicy::from).unwrap_or(member.wake_policy);
+                let policy_changed = policy != member.wake_policy;
+                member.wake_policy = policy;
                 let head_seq = board.head_seq;
                 let relevant = last_relevant_seq(ctx.tx, &id, body.since_seq, head_seq, &member)?;
                 ctx.tx.execute(
                     "UPDATE thread_members SET confirmed_seq=MAX(confirmed_seq,?1),wake_policy=?2,
-                     last_wake_seq=CASE WHEN delivery_mode='queue_until_idle' THEN ?5
+                     last_wake_seq=CASE WHEN delivery_mode='queue_until_idle' AND ?7 THEN ?5
                          WHEN ?1>=?6 THEN 0 ELSE last_wake_seq END,
                      resume_through_seq=CASE WHEN resume_through_seq<=?1 THEN NULL ELSE resume_through_seq END
                      WHERE thread_id=?3 AND member_key=?4",
@@ -491,7 +491,8 @@ pub(crate) async fn wait(
                         id.as_str(),
                         member.member_key,
                         relevant.unwrap_or(0),
-                        head_seq
+                        head_seq,
+                        policy_changed
                     ],
                 )?;
                 if body.wake_policy.is_some() {

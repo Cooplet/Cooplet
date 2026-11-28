@@ -126,9 +126,8 @@ enum Attempt {
 }
 
 enum Completion {
-    Rescan,
+    Finished,
     Transient,
-    Ignore,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -321,7 +320,8 @@ impl Sweep {
                             entries.remove(&candidate);
                         }
                     }
-                    return !matches!(outcome, Completion::Ignore);
+                    // The released slot can serve a different board on either side of the cursor.
+                    return true;
                 }
                 Err(error) => tracing::warn!(%error, "Thread delivery task ended unexpectedly"),
             }
@@ -656,7 +656,6 @@ async fn deliver(
 ) -> Completion {
     use ThreadDeliveryOutcome as Outcome;
     let epoch = permit.epoch();
-    let direct = payload.delivery_mode == DeliveryMode::DirectNow;
     let mut mark = Delivery::from_payload(node_id, epoch, &payload);
     let result = tokio::select! {
         biased;
@@ -681,18 +680,10 @@ async fn deliver(
             .write_sqlite(move |tx| finish(tx, &hub_id, &copy, outcome, clock()))
             .await
         {
-            Ok(false) => return Completion::Ignore,
-            Ok(true) => {
-                return match outcome {
-                    Outcome::Delivered | Outcome::Busy | Outcome::AwaitingApproval => {
-                        Completion::Rescan
-                    }
-                    Outcome::Unavailable | Outcome::Expired => Completion::Transient,
-                    Outcome::Rejected if direct => Completion::Rescan,
-                    Outcome::Unknown => Completion::Rescan,
-                    Outcome::Rejected => Completion::Ignore,
-                };
+            Ok(true) if matches!(outcome, Outcome::Unavailable | Outcome::Expired) => {
+                return Completion::Transient;
             }
+            Ok(_) => return Completion::Finished,
             Err(error) => {
                 tracing::warn!(%error, %node_id, "Could not finalize the thread delivery")
             }
@@ -709,7 +700,7 @@ async fn deliver(
         .db
         .write_sqlite(move |tx| finish(tx, &hub_id, &mark, Outcome::Unknown, clock()))
         .await;
-    Completion::Ignore
+    Completion::Finished
 }
 
 async fn until_ineligible(state: &AppState, delivery: &Delivery, mut acl: watch::Receiver<u64>) {
@@ -786,23 +777,25 @@ fn finish(
 ) -> rusqlite::Result<WriteOutcome<bool>> {
     let delivered = outcome == ThreadDeliveryOutcome::Delivered;
     let unknown = outcome == ThreadDeliveryOutcome::Unknown;
-    let retire_covered = delivered || outcome == ThreadDeliveryOutcome::Rejected;
+    let rejected = outcome == ThreadDeliveryOutcome::Rejected;
     let changed = tx.execute(
         "UPDATE thread_members SET state=CASE WHEN ?1 THEN 'paused_unknown' ELSE state END,
            retry_exhausted_seq=COALESCE(?11,retry_exhausted_seq),
-           last_wake_seq=CASE WHEN ?1 AND delivery_mode='direct_now' THEN 0 ELSE last_wake_seq END,
+           last_wake_seq=CASE WHEN ?1 AND delivery_mode='direct_now' THEN 0
+                              WHEN ?10 AND delivery_mode='queue_until_idle' AND last_wake_seq<=?3 THEN 0
+                              ELSE last_wake_seq END,
            confirmed_seq=CASE WHEN ?2 THEN MAX(confirmed_seq,?3) ELSE confirmed_seq END,
            pending_delivery_id=CASE WHEN ?1 THEN pending_delivery_id ELSE NULL END,
            pending_from_seq=CASE WHEN ?1 THEN pending_from_seq ELSE NULL END,
            pending_to_seq=CASE WHEN ?1 THEN pending_to_seq ELSE NULL END,
-           resume_through_seq=CASE WHEN ?1 OR (?10 AND resume_through_seq<=?3) THEN NULL
+           resume_through_seq=CASE WHEN ?1 OR ((?2 OR ?10) AND resume_through_seq<=?3) THEN NULL
                                    ELSE resume_through_seq END
          WHERE thread_id=?4 AND member_key=?5 AND node_id=?6 AND state='active' AND delivery_generation=?7
            AND pending_delivery_id=?8 AND pending_to_seq=?3
            AND EXISTS(SELECT 1 FROM nodes WHERE node_id=?6 AND session_epoch=?9)",
         params![unknown, delivered, delivery.to_seq, delivery.candidate.thread_id.as_str(),
             delivery.member_key, delivery.node_id.as_str(), delivery.generation,
-            delivery.delivery_id.as_str(), delivery.epoch, retire_covered, delivery.exhausted_wake],
+            delivery.delivery_id.as_str(), delivery.epoch, rejected, delivery.exhausted_wake],
     )?;
     // A leave, close or resume can retire the range while its ACK is in flight.
     // Release only this delivery's gate, even when the member CAS no longer matches.

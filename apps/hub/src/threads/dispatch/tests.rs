@@ -616,6 +616,75 @@ async fn direct_fanout_waits_for_bridge_capacity_but_attempts_each_recipient_onc
 }
 
 #[tokio::test]
+async fn a_rejection_retires_only_covered_work_and_releases_the_slot_for_other_boards() -> TestResult
+{
+    let mut fixture = Fixture::new(true).await?;
+    let mut boards = [
+        fixture.board(DeliveryMode::QueueUntilIdle).await?,
+        fixture.board(DeliveryMode::QueueUntilIdle).await?,
+    ];
+    boards.sort();
+    let [earlier, later] = boards;
+    fixture.set_worker(ParticipantState::Idle).await?;
+    fixture.settle().await?;
+
+    fixture
+        .post(&later, "rejected-range", "@worker later board")
+        .await?;
+    let rejected = fixture.attempt().await?;
+    fixture
+        .post(&earlier, "waiting-board", "@worker earlier board")
+        .await?;
+    rejected.complete(ThreadDeliveryOutcome::Rejected)?;
+    let next = fixture.attempt().await?;
+    assert_eq!(next.payload.thread_id, earlier);
+    next.complete(ThreadDeliveryOutcome::Delivered)?;
+    fixture.settle().await?;
+    fixture.set_worker(ParticipantState::Idle).await?;
+    fixture
+        .post(&later, "unrelated-after-rejection", "Just context")
+        .await?;
+    fixture.settle().await?;
+
+    let node = fixture.node.clone();
+    let worker = fixture.worker.clone();
+    let caller = storage::sql::read_tx(&fixture.state.reads, move |db| {
+        auth::attest_node_participant(db, &node, &worker, Some((1, TEST_EPOCH)))
+    })
+    .await?;
+    let waiting = threads::wait(
+        &fixture.state,
+        &caller,
+        later.clone(),
+        cooplet_protocol::ThreadWaitRequest {
+            since_seq: 0,
+            wake_policy: None,
+        },
+    )
+    .await?;
+    assert!(matches!(
+        waiting,
+        cooplet_protocol::ThreadWaitResponse::Ready { .. }
+    ));
+    fixture.settle().await?;
+
+    fixture
+        .post(&later, "fresh-after-rejection", "@worker new request")
+        .await?;
+    let pending = fixture.attempt().await?;
+    assert_eq!((pending.payload.from_seq, pending.payload.to_seq), (1, 3));
+    fixture
+        .post(&later, "while-rejection-pending", "@worker one more")
+        .await?;
+    pending.complete(ThreadDeliveryOutcome::Rejected)?;
+    let newer = fixture.attempt().await?;
+    assert_eq!((newer.payload.from_seq, newer.payload.to_seq), (1, 4));
+    newer.complete(ThreadDeliveryOutcome::Delivered)?;
+    fixture.settle().await?;
+    fixture.close().await
+}
+
+#[tokio::test]
 async fn a_quiet_post_skips_confirmed_busy_and_expired_queue_wakes() -> TestResult {
     let mut fixture = Fixture::new(true).await?;
     let board = fixture.board(DeliveryMode::QueueUntilIdle).await?;
