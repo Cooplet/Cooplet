@@ -21,7 +21,7 @@ case "$1" in
         IFS= read -r request
         case "$request" in *initialize*) ;; *) exit 1 ;; esac
         if [ "${COOPLET_FIXTURE_MODE:-}" = probe-timeout ]; then
-            sleep 30
+            command -p sleep 30
         else
             printf '%s\n' '{"id":1,"result":{"codexHome":"/fixture","userAgent":"codex-fixture/99.0.0"}}'
         fi
@@ -29,7 +29,7 @@ case "$1" in
     generate-json-schema)
         [ "${COOPLET_FIXTURE_MODE:-}" != no-schema ]
         [ "$2" = --out ]
-        mkdir -p "$3/v2"
+        command -p mkdir -p "$3/v2"
         printf '%s\n' '{"definitions":{"TurnToolOutput":{"properties":{"namespace":{},"name":{},"output":{},"retain":{}}}},"properties":{"toolOutput":{},"outputSchema":{}}}' > "$3/v2/TurnStartParams.json"
         ;;
     --listen)

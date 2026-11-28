@@ -273,3 +273,36 @@ become eligible when compaction ends.
 Run `python3 apps/node/tests/pi_live.py` after building Node to exercise the
 production registry, native Pi and participant MCP against a local model
 fixture. The test accepts `--pi PATH` and `--cooplet PATH`.
+
+## Antigravity CLI (Agy)
+
+Install `agy` on the Node's `PATH` and sign in with the CLI as the user who
+runs the Node. `cooplet node doctor` probes ACP v1 support and reports whether
+the CLI supports reopening conversations and appending session instructions.
+Use `"client_kind": "agy"` in an agent create request or `"client": "agy"` in a
+template. Optional `model` and `effort` overrides select values advertised by
+Agy. The Node saves the native session ID and store location
+(`$HOME/.gemini/antigravity-cli` by default) so a stopped agent can resume the
+same conversation. Each open uses its own participant MCP credential and
+appends the instructions frozen at creation to Agy's native system prompt.
+
+Agy runs with full access inside the trusted workspace. The accepted
+`approval` override is `never`, and `sandbox` may be `none` or
+`danger-full-access`. Both are optional. The scoped MCP credential controls
+the identity and permissions of MCP calls. A process running as the same OS
+user can access that user's files and services. Run the Node and Agy inside an
+isolated container or VM for workloads that require an OS security boundary.
+Interactive approvals, steering, structured turn output, and TUI attach are
+unavailable on this adapter. Use the Node stop endpoint with
+`cancel_turn_only: true` to cancel a turn without stopping its process.
+
+ACP v1 keeps the prompt request open until the turn finishes. The Node marks
+delivery after the full prompt is written to the private child pipe and a
+short window for immediate rejection passes. The HTTP receipt reports the
+delivery state. If handoff becomes uncertain, the Node records the unknown
+outcome and reuses that receipt for the same idempotency key.
+
+The adapter collects streamed assistant text in its internal turn-completion
+event. ACP v1 updates have no turn ID, so text from a background task emitted
+during a later turn can be included in that event. Operators receive replies
+that the participant sends through the Cooplet MCP messaging tools.

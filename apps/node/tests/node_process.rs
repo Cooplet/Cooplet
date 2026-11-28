@@ -25,6 +25,10 @@ use rusqlite::params;
 use serde_json::{Value, json};
 use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt};
 
+#[path = "common/doctor.rs"]
+mod doctor;
+use doctor::adapter_report;
+
 type TestResult<T = ()> = Result<T, Box<dyn Error + Send + Sync>>;
 
 const COOPLET: &str = env!("CARGO_BIN_EXE_cooplet");
@@ -125,6 +129,7 @@ fn command(state: &Path, args: &[&str]) -> TestResult<std::process::Output> {
         .arg("--state-dir")
         .arg(state)
         .args(args)
+        .env("PATH", state.join("empty-path"))
         .output()?;
     assert!(
         output.status.success(),
@@ -185,6 +190,102 @@ async fn delegated_cli_exposes_generated_key_when_the_hub_is_offline() -> TestRe
 
     let local = command(&state, &["blob", "put", source])?;
     assert!(!std::str::from_utf8(&local.stderr)?.contains("idempotency_key="));
+    command(&state, &["node", "stop"])?;
+    assert!(daemon.wait().await?.success());
+    Ok(())
+}
+
+#[tokio::test]
+async fn doctor_and_run_use_the_registered_agy_adapter() -> TestResult {
+    use std::{
+        ffi::OsStr,
+        os::unix::{ffi::OsStrExt, fs::PermissionsExt},
+    };
+
+    let directory = TestDirectory::new()?;
+    let state = directory.state();
+    let home = directory.0.join("home");
+    fs::create_dir_all(home.join(".gemini/antigravity-cli"))?;
+    let binary = directory.0.join("agy");
+    fs::write(
+        &binary,
+        r#"#!/bin/sh
+[ -z "${COOPLET_AGY_TEST_SENTINEL:-}" ] || exit 2
+IFS= read -r request || exit 1
+printf '%s\n' '{"jsonrpc":"2.0","id":1,"result":{"protocolVersion":1,"agentInfo":{"version":"2.3.4"},"agentCapabilities":{"loadSession":true,"_meta":{"antigravity":{"systemPrompt":{"append":true}}}}}}'
+if [ "$5" = "--dangerously-skip-permissions" ]; then
+    IFS= read -r request || exit 1
+    printf '%s\n' '{"jsonrpc":"2.0","id":2,"result":{"sessionId":"cli-fixture"}}'
+    while IFS= read -r request; do :; done
+fi
+"#,
+    )?;
+    fs::set_permissions(&binary, fs::Permissions::from_mode(0o755))?;
+
+    let mut daemon = Process::new(
+        Command::new(COOPLET)
+            .args(["node", "run", "--state-dir"])
+            .arg(&state)
+            .env_remove("COOPLET_CODEX_BIN")
+            .env("PATH", &directory.0)
+            .env("HOME", &home)
+            .env("COOPLET_AGY_TEST_SENTINEL", "must be removed")
+            .stdout(Stdio::piped()),
+    )?;
+    let (_reader, _) = json_line(daemon.stdout()?).await?;
+    let unavailable: Value = serde_json::from_slice(&command(&state, &["node", "doctor"])?.stdout)?;
+    let report = adapter_report(&unavailable, "agy")?;
+    assert_eq!(report["available"], false);
+    let output = Command::new(COOPLET)
+        .args(["node", "doctor", "--state-dir"])
+        .arg(&state)
+        .env_remove("COOPLET_CODEX_BIN")
+        .env("PATH", &directory.0)
+        .env("HOME", &home)
+        .env("COOPLET_AGY_TEST_SENTINEL", "must be removed")
+        .output()?;
+    assert!(output.status.success());
+    let available: Value = serde_json::from_slice(&output.stdout)?;
+    let report = adapter_report(&available, "agy")?;
+    assert_eq!(report["available"], true);
+    assert_eq!(report["capabilities"]["supports_resume"], true);
+    assert_eq!(report["capabilities"]["supports_tui_attach"], false);
+    assert_eq!(report["binary_path"], json!(binary.canonicalize()?));
+    assert_eq!(report["version"], "2.3.4");
+
+    let client = operator(&state).await?;
+    let created: Value = client
+        .post_json(
+            "/v1/agents",
+            &json!({"client_kind":"agy","name":"agy-cli"}),
+            Some("cli-create-agy"),
+        )
+        .await?;
+    let id = created["participant_id"]
+        .as_str()
+        .ok_or("Missing participant ID")?;
+    let participant: Value = client
+        .get_json(&format!("/v1/participants/{id}"), &[])
+        .await?;
+    assert_eq!(participant["state"], "idle");
+
+    let raw = directory.0.join(OsStr::from_bytes(b"bin-\xff"));
+    fs::create_dir(&raw)?;
+    fs::rename(&binary, raw.join("agy"))?;
+    let output = Command::new(COOPLET)
+        .args(["node", "doctor", "--state-dir"])
+        .arg(&state)
+        .env_remove("COOPLET_CODEX_BIN")
+        .env("PATH", &raw)
+        .output()?;
+    assert!(output.status.success());
+    let report: Value = serde_json::from_slice(&output.stdout)?;
+    assert_eq!(adapter_report(&report, "agy")?["available"], true);
+    assert_eq!(
+        adapter_report(&report, "agy")?["binary_path"],
+        raw.join("agy").display().to_string()
+    );
+
     command(&state, &["node", "stop"])?;
     assert!(daemon.wait().await?.success());
     Ok(())
@@ -269,17 +370,11 @@ async fn foreground_cli_restarts_with_same_identity_and_replays_stop_without_sto
         );
         Ok(serde_json::from_slice(&output.stdout)?)
     };
-    let report = |diagnosis: &Value, kind: &str| {
-        diagnosis["adapters"]
-            .as_array()
-            .and_then(|reports| reports.iter().find(|report| report["client_kind"] == kind))
-            .cloned()
-            .unwrap_or(Value::Null)
-    };
     let diagnosis = diagnose()?;
     assert_eq!(diagnosis["running"], true);
-    assert_eq!(report(&diagnosis, "codex")["available"], false);
-    assert_eq!(report(&diagnosis, "pi")["available"], false);
+    assert_eq!(adapter_report(&diagnosis, "agy")?["available"], false);
+    assert_eq!(adapter_report(&diagnosis, "codex")?["available"], false);
+    assert_eq!(adapter_report(&diagnosis, "pi")?["available"], false);
     assert_eq!(
         diagnosis["workspace_dir"],
         json!(std::env::current_dir()?.canonicalize()?)
@@ -296,7 +391,8 @@ esac
 "#,
     )?;
     fs::set_permissions(&pi, fs::Permissions::from_mode(0o755))?;
-    let installed = report(&diagnose()?, "pi");
+    let diagnosis = diagnose()?;
+    let installed = adapter_report(&diagnosis, "pi")?;
     assert_eq!(installed["available"], true);
     assert_eq!(installed["version"], "9.0.0");
     assert_eq!(installed["binary_path"], pi.display().to_string());
@@ -316,6 +412,7 @@ esac
         .arg("--state-dir")
         .arg(&state)
         .args(["node", "doctor", "--workspace-dir"])
+        .env("PATH", directory.0.join("empty-path"))
         .arg(&workspace)
         .output()?;
     assert!(selected.status.success());
@@ -402,6 +499,7 @@ esac
     fs::write(&master, &wrong_key)?;
     let denied_doctor = Command::new(COOPLET)
         .args(["node", "doctor", "--state-dir"])
+        .env("PATH", directory.0.join("empty-path"))
         .arg(&state)
         .output()?;
     assert!(!denied_doctor.status.success());
