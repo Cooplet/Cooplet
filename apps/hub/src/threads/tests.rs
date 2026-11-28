@@ -1153,40 +1153,48 @@ async fn hub_native_member_resolve_enforces_allowed_nodes_on_create_and_join() -
         ErrorCode::InvalidRequest
     );
     let fake_node_b_key = format!("{node_b}/{}", ParticipantId::generate()?);
-    assert_eq!(
-        create(
-            &fixture.state,
-            &svc_has_a,
-            "create-unauth-node-oracle",
-            ThreadCreateRequest {
-                title: "Unauth node".into(),
-                topic: None,
-                creator_handle: None,
-                members: vec![
-                    ThreadMemberJoinRequest {
-                        member_key: svc_only_b.actor_id().into(),
-                        handle: Some("bot_b".into()),
-                        role: None,
-                        wake_policy: None,
-                        delivery_mode: None,
-                    },
-                    ThreadMemberJoinRequest {
-                        member_key: fake_node_b_key,
-                        handle: Some("worker_b".into()),
-                        role: None,
-                        wake_policy: None,
-                        delivery_mode: None,
-                    },
-                ],
-            },
-        )
-        .await
-        .err()
-        .ok_or("expected 403 for unauthorized node before resolving hub-native member")?
-        .problem()
-        .code,
-        ErrorCode::Forbidden
-    );
+    let nonexistent_sp = ServicePrincipalId::generate()?;
+    let svc_also_a = make_scoped_service("svc_also_a", vec![node_a.clone()]).await?;
+    for (suffix, first_member) in [
+        ("existing-allows-b", svc_only_b.actor_id().to_owned()),
+        ("existing-only-a", svc_also_a.actor_id().to_owned()),
+        ("nonexistent-sp", nonexistent_sp.as_str().to_owned()),
+    ] {
+        assert_eq!(
+            create(
+                &fixture.state,
+                &svc_has_a,
+                &format!("create-unauth-node-oracle-{suffix}"),
+                ThreadCreateRequest {
+                    title: "Unauth node".into(),
+                    topic: None,
+                    creator_handle: None,
+                    members: vec![
+                        ThreadMemberJoinRequest {
+                            member_key: first_member,
+                            handle: Some("bot_probe".into()),
+                            role: None,
+                            wake_policy: None,
+                            delivery_mode: None,
+                        },
+                        ThreadMemberJoinRequest {
+                            member_key: fake_node_b_key.clone(),
+                            handle: Some("worker_b".into()),
+                            role: None,
+                            wake_policy: None,
+                            delivery_mode: None,
+                        },
+                    ],
+                },
+            )
+            .await
+            .err()
+            .ok_or("expected 403 for unauthorized node before resolving hub-native member")?
+            .problem()
+            .code,
+            ErrorCode::Forbidden
+        );
+    }
 
     // Creating with agent_a succeeds, then joining svc_only_b with invalid handle returns 400
     // (before principal lookup), valid handle returns 404, while svc_has_a succeeds.

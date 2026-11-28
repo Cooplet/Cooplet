@@ -185,6 +185,8 @@ pub(super) async fn run(
     bridge.session.send_replace(None);
     if let Some(code) = exit.close() {
         io.close(code, exit.reason()).await;
+    } else if matches!(exit, Exit::Revoked | Exit::PeerClosed) {
+        io.flush_peer_close().await;
     }
     (ready, exit)
 }
@@ -305,7 +307,7 @@ impl Attempt<'_> {
                     io.finish_write(outcome)?;
                 }
                 message = io.stream.next() => {
-                    if let Some(frame) = io.received(message).await? {
+                    if let Some(frame) = io.received(message)? {
                         return Err(if frame.epoch == epoch { Exit::Protocol } else { Exit::EpochMismatch });
                     }
                 }
@@ -369,7 +371,7 @@ impl Attempt<'_> {
             () = wait_deadline(&*self.bridge.clock, heartbeat), if heartbeat.is_some() => io.heartbeat_tick()?,
             () = wait_deadline(&*self.bridge.clock, correlation) => online.requests.expire(&*self.bridge.clock),
             socket_message = io.stream.next() => {
-                if let Some(frame) = io.received(socket_message).await? {
+                if let Some(frame) = io.received(socket_message)? {
                     self.handle(online, frame)?;
                 }
             }
@@ -878,7 +880,7 @@ impl Wire {
                     self.finish_write(outcome)?;
                 }
                 input = self.stream.next() => {
-                    if let Some(frame) = self.received(input).await? {
+                    if let Some(frame) = self.received(input)? {
                         return Ok(frame);
                     }
                 }
@@ -886,7 +888,7 @@ impl Wire {
         }
     }
 
-    async fn received(
+    fn received(
         &mut self,
         input: Option<Result<Message, WsError>>,
     ) -> SessionResult<Option<BridgeFrame>> {
@@ -906,15 +908,10 @@ impl Wire {
                 Ok(None)
             }
             Message::Close(close) => {
-                // Send the automatically queued close reply before dropping the stream.
+                // Mark close_sent synchronously so `next_app` stays cancel-safe;
+                // `run()` flushes the automatically queued close reply during teardown.
                 self.close_sent = true;
                 self.active_write = None;
-                let deadline = self.clock.deadline_after(CLOSE_TIMEOUT);
-                tokio::select! {
-                    biased;
-                    () = wait_deadline(&*self.clock, Some(deadline)) => {},
-                    _ = self.sink.flush() => {},
-                }
                 if close.is_some_and(|close| u16::from(close.code) == 4003) {
                     Err(Exit::Revoked)
                 } else {
@@ -922,6 +919,15 @@ impl Wire {
                 }
             }
             Message::Frame(_) => Err(Exit::Protocol),
+        }
+    }
+
+    async fn flush_peer_close(&mut self) {
+        let deadline = self.clock.deadline_after(CLOSE_TIMEOUT);
+        tokio::select! {
+            biased;
+            () = wait_deadline(&*self.clock, Some(deadline)) => {},
+            _ = self.sink.flush() => {},
         }
     }
 

@@ -1105,16 +1105,31 @@ async fn early_node_event_and_revocation_close_with_active_write_behave_cleanly(
     };
     let _: RosterReadyPayload = BridgeFrame::from_json(ready_txt.as_bytes())?.decode_payload()?;
 
-    // Flood 24 large (~48 KiB) CommandReq frames (>1.1 MiB) while NOT reading from bp_client
-    // so the Hub socket is backpressured mid-write (`active_write.is_some()`), then revoke.
+    // Trigger Hub's heartbeat Ping at 15_000 (pong_deadline = 25_000), then start a 48 KiB
+    // backpressured write at 24_900, answer Pong at 24_950, and cross the old 25_000 deadline
+    // before draining — proving ActiveWrite does not freeze a stale pong_deadline on Hub.
+    hub.clock.0.store(15_000, Ordering::Relaxed);
+    bp_client
+        .send(ClientMessage::Ping(Bytes::from_static(PROBE)))
+        .await?;
+    let mut hub_ping_payload = None;
+    let mut probe_pong_seen = false;
+    while hub_ping_payload.is_none() || !probe_pong_seen {
+        match time::timeout(TIMEOUT, bp_client.next())
+            .await?
+            .ok_or("bp bridge closed during ping setup")??
+        {
+            ClientMessage::Pong(bytes) if bytes == PROBE => probe_pong_seen = true,
+            ClientMessage::Ping(bytes) => hub_ping_payload = Some(bytes),
+            other => return Err(format!("unexpected control frame: {other:?}").into()),
+        }
+    }
+    let hub_ping_payload = hub_ping_payload.ok_or("missing Hub ping payload")?;
+
+    hub.clock.0.store(24_900, Ordering::Relaxed);
     let large_body = "z".repeat(48 * 1024);
-    let mut submitted = Vec::new();
-    for _ in 0..24 {
-        let permit = hub
-            .registry
-            .reserve(&hub.node_id)
-            .map_err(|err| format!("reserve failed: {err:?}"))?;
-        let payload = CommandReqPayload {
+    let make_large_cmd = || -> TestResult<CommandReqPayload> {
+        Ok(CommandReqPayload {
             op_id: OperationId::generate()?,
             actor_id: "usr_admin".into(),
             command: BridgeCommand::SendMessage {
@@ -1132,37 +1147,118 @@ async fn early_node_event_and_revocation_close_with_active_write_behave_cleanly(
             delivery_mode: DeliveryMode::DirectNow,
             admission_budget_ms: 5_000,
             ttl_ms: None,
+        })
+    };
+    let pong_cmd_payload = make_large_cmd()?;
+    let pong_cmd_id = pong_cmd_payload.op_id.clone();
+    let pong_permit = hub
+        .registry
+        .reserve(&hub.node_id)
+        .map_err(|err| format!("reserve pong test failed: {err:?}"))?;
+    let pong_cmd = tokio::spawn(pong_permit.submit(pong_cmd_payload));
+    time::sleep(Duration::from_millis(20)).await;
+    // Valid Pong arrives at 24_950 while the 48 KiB write is backpressured in WriteState::Flush.
+    hub.clock.0.store(24_950, Ordering::Relaxed);
+    bp_client
+        .send(ClientMessage::Pong(hub_ping_payload))
+        .await?;
+    time::sleep(Duration::from_millis(20)).await;
+    // Crossing the old 25_000 pong_deadline must NOT drop the healthy backpressured write.
+    hub.clock.0.store(25_001, Ordering::Relaxed);
+    time::sleep(Duration::from_millis(20)).await;
+    let received_cmd: CommandReqPayload = {
+        let ClientMessage::Text(text) = time::timeout(TIMEOUT, bp_client.next())
+            .await?
+            .ok_or("Hub dropped healthy write across old pong deadline")??
+        else {
+            return Err("expected CommandReq text frame after valid Pong".into());
         };
-        submitted.push(tokio::spawn(permit.submit(payload)));
+        BridgeFrame::from_json(text.as_bytes())?.decode_payload()?
+    };
+    assert_eq!(received_cmd.op_id, pong_cmd_id);
+    let ack_wire = String::from_utf8(BridgeFrame::encode_json(
+        epoch2,
+        &CommandResPayload {
+            op_id: pong_cmd_id.clone(),
+            outcome: CommandOutcome::Succeeded,
+            resource_id: None,
+            result: None,
+            error: None,
+        },
+    )?)?;
+    bp_client.send(ClientMessage::Text(ack_wire.into())).await?;
+    let resolved = time::timeout(TIMEOUT, pong_cmd)
+        .await??
+        .map_err(|_| "pong survival command failed")?;
+    assert_eq!(resolved.op_id, pong_cmd_id);
+
+    // Flood 24 large (~48 KiB) CommandReq frames (>1.1 MiB) while NOT reading from bp_client
+    // so the Hub socket is backpressured mid-write (`WriteState::Flush`), then revoke and verify
+    // both `_authorized` retention during close flush and delivery of RFC 6455 close code 4003.
+    let mut submitted = Vec::new();
+    for _ in 0..24 {
+        let permit = hub
+            .registry
+            .reserve(&hub.node_id)
+            .map_err(|err| format!("reserve failed: {err:?}"))?;
+        submitted.push(tokio::spawn(permit.submit(make_large_cmd()?)));
     }
     time::sleep(Duration::from_millis(50)).await;
     hub.registry.disconnect_revoked(&hub.node_id);
 
-    let mut frames_before_close = 0usize;
-    let mut saw_revoked_close = false;
-    while let Ok(Some(Ok(msg))) = time::timeout(TIMEOUT, bp_client.next()).await {
-        match msg {
-            ClientMessage::Text(_) => frames_before_close += 1,
-            ClientMessage::Pong(_) | ClientMessage::Ping(_) => {}
-            ClientMessage::Close(Some(close)) => {
-                assert_eq!(u16::from(close.code), 4003);
-                saw_revoked_close = true;
-                break;
+    // While bp_client has not drained, send_close holds `_authorized` for the buffered
+    // WriteState::Flush frame, so a concurrent AuthorityTransition must remain Pending.
+    {
+        let mut transition = std::pin::pin!(hub.registry.transition(&hub.node_id));
+        time::sleep(Duration::from_millis(20)).await;
+        let transition_blocked = std::future::poll_fn(|cx| {
+            std::task::Poll::Ready(transition.as_mut().poll(cx).is_pending())
+        })
+        .await;
+        assert!(
+            transition_blocked,
+            "AuthorityTransition must wait while send_close flushes a buffered WriteState::Flush frame"
+        );
+
+        let mut frames_before_close = 0usize;
+        let mut saw_revoked_close = false;
+        while let Ok(Some(Ok(msg))) = time::timeout(TIMEOUT, bp_client.next()).await {
+            match msg {
+                ClientMessage::Text(_) => frames_before_close += 1,
+                ClientMessage::Pong(_) | ClientMessage::Ping(_) => {}
+                ClientMessage::Close(Some(close)) => {
+                    assert_eq!(u16::from(close.code), 4003);
+                    saw_revoked_close = true;
+                    break;
+                }
+                other => return Err(format!("expected 4003 close frame, got {other:?}").into()),
             }
-            other => return Err(format!("expected 4003 close frame, got {other:?}").into()),
+        }
+        assert!(
+            saw_revoked_close,
+            "Hub must deliver 4003 close frame even when writes were backpressured"
+        );
+        assert!(
+            (1..24).contains(&frames_before_close),
+            "revocation must flush active buffered frame and interrupt the burst (saw {frames_before_close}/24)"
+        );
+        let _guard = time::timeout(TIMEOUT, transition)
+            .await
+            .map_err(|_| "AuthorityTransition stayed blocked after close flush completed")?;
+    }
+    let mut unknowns = 0usize;
+    let mut unavailables = 0usize;
+    for cmd in submitted {
+        match time::timeout(TIMEOUT, cmd).await?? {
+            Err(SubmitError::Unknown) => unknowns += 1,
+            Err(SubmitError::Unavailable) => unavailables += 1,
+            other => return Err(format!("unexpected revoked command outcome: {other:?}").into()),
         }
     }
     assert!(
-        saw_revoked_close,
-        "Hub must deliver 4003 close frame even when writes were backpressured"
+        unknowns >= 1 && unavailables >= 1,
+        "expected both started (Unknown={unknowns}) and unstarted (Unavailable={unavailables}) outcomes"
     );
-    assert!(
-        frames_before_close < 24,
-        "revocation should interrupt the backpressured burst (saw {frames_before_close}/24)"
-    );
-    for cmd in submitted {
-        let _ = time::timeout(TIMEOUT, cmd).await;
-    }
     server2.abort();
     let _ = server2.await;
     drop(bp_client);

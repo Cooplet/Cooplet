@@ -518,6 +518,15 @@ async fn delegated_approval_persists_its_ack_after_admission_expiry() -> TestRes
         .await?;
     timeout(WAIT, async {
         while events.recv().await?.kind != EventKind::ParticipantAwaitingApproval {}
+        while fixture
+            .state
+            .agents
+            .live_session(&receiver)
+            .map(|s| s.state())
+            != Some(cooplet_protocol::ParticipantState::AwaitingApproval)
+        {
+            tokio::task::yield_now().await;
+        }
         Ok::<_, tokio::sync::broadcast::error::RecvError>(())
     })
     .await??;
@@ -616,6 +625,15 @@ async fn delegated_direct_dm_with_attachments_preserves_busy_and_awaiting_approv
         .await?;
     timeout(WAIT, async {
         while events.recv().await?.kind != EventKind::ParticipantStateChanged {}
+        while fixture
+            .state
+            .agents
+            .live_session(&receiver)
+            .map(|s| s.state())
+            != Some(cooplet_protocol::ParticipantState::Working)
+        {
+            tokio::task::yield_now().await;
+        }
         Ok::<_, tokio::sync::broadcast::error::RecvError>(())
     })
     .await??;
@@ -658,6 +676,15 @@ async fn delegated_direct_dm_with_attachments_preserves_busy_and_awaiting_approv
         .await?;
     timeout(WAIT, async {
         while events.recv().await?.kind != EventKind::ParticipantAwaitingApproval {}
+        while fixture
+            .state
+            .agents
+            .live_session(&receiver)
+            .map(|s| s.state())
+            != Some(cooplet_protocol::ParticipantState::AwaitingApproval)
+        {
+            tokio::task::yield_now().await;
+        }
         Ok::<_, tokio::sync::broadcast::error::RecvError>(())
     })
     .await??;

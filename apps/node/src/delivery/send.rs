@@ -195,22 +195,43 @@ impl DeliveryService {
         if target.kind != ParticipantKind::Agent {
             return Ok(None);
         }
-        let state = self.agents.live_session(&target.id).map(|s| s.state());
-        Ok(match input.delivery_mode {
-            DeliveryMode::DirectNow => match state {
-                Some(ParticipantState::Idle) => None,
-                Some(ParticipantState::Working) => Some(SlotDenial::Busy),
-                Some(ParticipantState::AwaitingApproval) => Some(SlotDenial::AwaitingApproval),
-                _ => Some(SlotDenial::Unavailable),
-            },
-            DeliveryMode::QueueUntilIdle => match state {
-                Some(
-                    ParticipantState::Idle
+        let live_state = self
+            .agents
+            .live_session(&target.id)
+            .filter(|session| session.generation() == target.generation)
+            .map(|session| session.state());
+        let active = |state| {
+            matches!(
+                state,
+                ParticipantState::Idle
                     | ParticipantState::Working
-                    | ParticipantState::AwaitingApproval,
-                ) => None,
-                _ => Some(SlotDenial::Unavailable),
-            },
+                    | ParticipantState::AwaitingApproval
+            )
+        };
+        let Some(live_state) = live_state.filter(|state| active(*state)) else {
+            return Ok(Some(SlotDenial::Unavailable));
+        };
+        if !active(target.state) {
+            return Ok(Some(SlotDenial::Unavailable));
+        }
+        Ok(match input.delivery_mode {
+            DeliveryMode::DirectNow => {
+                if matches!(
+                    (live_state, target.state),
+                    (ParticipantState::AwaitingApproval, _)
+                        | (_, ParticipantState::AwaitingApproval)
+                ) {
+                    Some(SlotDenial::AwaitingApproval)
+                } else if matches!(
+                    (live_state, target.state),
+                    (ParticipantState::Working, _) | (_, ParticipantState::Working)
+                ) {
+                    Some(SlotDenial::Busy)
+                } else {
+                    None
+                }
+            }
+            DeliveryMode::QueueUntilIdle => None,
         })
     }
 
