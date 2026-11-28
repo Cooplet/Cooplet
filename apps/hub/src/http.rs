@@ -13,6 +13,7 @@ use tokio::sync::Semaphore;
 use crate::{AppState, error::HubError};
 
 mod admission;
+pub(crate) use admission::bridge_token;
 mod extract;
 pub(crate) mod handlers;
 pub(crate) use extract::EmptyJson;
@@ -21,6 +22,7 @@ use handlers::{admin_routes::*, command_routes::*, *};
 const JSON_BODY_LIMIT: usize = 64 * 1024;
 const ENROLLMENT_BODY_LIMIT: usize = 16 * 1024;
 const DEFAULT_ENROLLMENT_CONCURRENCY: usize = 16;
+pub(crate) const DEFAULT_BRIDGE_CONCURRENCY: usize = 128;
 pub(crate) const BEARER_CHALLENGE: &str = "Bearer realm=\"cooplet-hub\"";
 
 #[derive(Clone, Copy)]
@@ -29,6 +31,8 @@ pub(crate) struct RequestLimits {
     event_streams: usize,
     blob_transfers: usize,
     enrollments: usize,
+    bridge_handshakes: usize,
+    active_bridges: usize,
 }
 
 impl RequestLimits {
@@ -69,7 +73,31 @@ impl RequestLimits {
             event_streams: max_active_event_streams,
             blob_transfers: max_concurrent_blob_transfers,
             enrollments: max_concurrent_enrollments,
+            bridge_handshakes: DEFAULT_BRIDGE_CONCURRENCY,
+            active_bridges: DEFAULT_BRIDGE_CONCURRENCY,
         })
+    }
+
+    pub(crate) fn with_bridges(
+        mut self,
+        bridge_handshakes: usize,
+        active_bridges: usize,
+    ) -> Result<Self, HubError> {
+        if [bridge_handshakes, active_bridges]
+            .into_iter()
+            .any(|limit| !(1..=4096).contains(&limit))
+        {
+            return Err(HubError::invalid(
+                "Bridge concurrency limits must be between 1 and 4096.",
+            ));
+        }
+        self.bridge_handshakes = bridge_handshakes;
+        self.active_bridges = active_bridges;
+        Ok(self)
+    }
+
+    pub(crate) fn active_bridges(self) -> usize {
+        self.active_bridges
     }
 
     pub(crate) fn max_connections(self) -> usize {
@@ -79,6 +107,8 @@ impl RequestLimits {
             .saturating_add(self.enrollments)
             .saturating_mul(2)
             .clamp(64, 4096)
+            .saturating_add(self.bridge_handshakes)
+            .saturating_add(self.active_bridges)
     }
 }
 
@@ -89,6 +119,8 @@ impl Default for RequestLimits {
             event_streams: 64,
             blob_transfers: 32,
             enrollments: DEFAULT_ENROLLMENT_CONCURRENCY,
+            bridge_handshakes: DEFAULT_BRIDGE_CONCURRENCY,
+            active_bridges: DEFAULT_BRIDGE_CONCURRENCY,
         }
     }
 }
@@ -142,7 +174,8 @@ pub(crate) fn router(state: AppState, limits: RequestLimits) -> Router {
         )
         .route("/v1/workflows/runs", post(run_workflow))
         .route("/v1/workflows/runs/{run_id}/cancel", post(cancel_workflow))
-        .route("/v1/events", get(events_page));
+        .route("/v1/events", get(events_page))
+        .merge(handlers::thread_routes::router());
     let streams = apply_guard(
         Router::new().route("/v1/events/stream", get(events_stream)),
         &state,
@@ -176,8 +209,15 @@ pub(crate) fn router(state: AppState, limits: RequestLimits) -> Router {
     )
     .layer(DefaultBodyLimit::disable());
 
+    let bridge = Router::new()
+        .route("/v1/bridge/connect", get(crate::bridge::connect))
+        .layer(axum::Extension(Arc::new(Semaphore::new(
+            limits.bridge_handshakes,
+        ))));
+
     json.merge(enrollment)
         .merge(blobs)
+        .merge(bridge)
         .fallback(not_found)
         .method_not_allowed_fallback(method_not_allowed)
         .layer(middleware::from_fn_with_state(
@@ -284,6 +324,7 @@ mod tests {
             &hub.engine,
             hub.meta,
             hub.master,
+            hub.thread_acl_watch,
             Arc::new(OfflineBridge),
             stop_rx,
             DEFAULT_MAX_BLOB_BYTES,

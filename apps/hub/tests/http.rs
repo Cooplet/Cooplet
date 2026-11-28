@@ -1,3 +1,5 @@
+#[path = "http/bridge.rs"]
+mod bridge;
 mod support;
 
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -573,6 +575,7 @@ async fn scoped_service_access_and_stream_lifecycle() -> TestResult {
                 expected_sha256: Some(blob.sha256.clone()),
                 idempotency_key: Some("node-private-blob".into()),
                 content_length: Some(content.len() as u64),
+                participant_id: None,
             },
             PendingReader,
         ),
@@ -649,6 +652,7 @@ async fn upload_text(client: &CoopletClient, key: &str, bytes: &[u8]) -> TestRes
                 expected_sha256: None,
                 idempotency_key: Some(key.into()),
                 content_length: Some(bytes.len() as u64),
+                participant_id: None,
             },
             bytes,
         )

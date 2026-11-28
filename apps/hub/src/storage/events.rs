@@ -2,7 +2,7 @@ use std::error::Error;
 
 use cooplet_protocol::{
     AggregateType, AnswerPayload, AttachmentRef, DeliveryState, EventEnvelope, EventId, EventKind,
-    HubId, MessageId, NodeId, ParticipantId, SourceKind, ThreadId,
+    HubId, MessageId, NodeId, SourceKind, ThreadId,
 };
 use cooplet_storage::EventNotice;
 use rusqlite::{Transaction, params};
@@ -18,7 +18,7 @@ const MAX_SEQ_DIGIT_GROWTH: usize = 18;
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) enum BlobScope {
     Unattached,
-    Node(NodeId),
+    Node(NodeId, Option<NodeId>),
     Thread(ThreadId),
     GlobalArchiveOnly,
 }
@@ -27,12 +27,13 @@ impl BlobScope {
     pub(crate) fn from_columns(
         attached: Option<i64>,
         node: Option<NodeId>,
+        peer: Option<NodeId>,
         thread: Option<ThreadId>,
     ) -> Self {
-        match (attached, node, thread) {
-            (None, None, None) => Self::Unattached,
-            (Some(_), Some(node), None) => Self::Node(node),
-            (Some(_), None, Some(thread)) => Self::Thread(thread),
+        match (attached, node, peer, thread) {
+            (None, None, None, None) => Self::Unattached,
+            (Some(_), Some(node), peer, None) => Self::Node(node, peer),
+            (Some(_), None, None, Some(thread)) => Self::Thread(thread),
             _ => Self::GlobalArchiveOnly,
         }
     }
@@ -42,8 +43,8 @@ impl BlobScope {
             Self::Unattached => EventAudience::OwnerOnly {
                 actor_id: owner.to_owned(),
             },
-            Self::Node(node_id) => EventAudience::Nodes {
-                node_ids: vec![node_id],
+            Self::Node(node_id, peer) => EventAudience::Nodes {
+                node_ids: [Some(node_id), peer].into_iter().flatten().collect(),
             },
             Self::Thread(thread_id) => EventAudience::Thread { thread_id },
             Self::GlobalArchiveOnly => EventAudience::GlobalArchiveOnly,
@@ -223,15 +224,20 @@ pub(crate) fn message_delivery_updated_data(
 pub(crate) fn question_answered_data(
     question_message_id: &MessageId,
     answer_message_id: &MessageId,
-    answered_by: &ParticipantId,
+    answered_by: &str,
     answer: &AnswerPayload,
+    thread_id: Option<&ThreadId>,
 ) -> Value {
-    json!({
+    let mut data = json!({
         "question_message_id": question_message_id,
         "answer_message_id": answer_message_id,
         "answered_by": answered_by,
         "answer": answer,
-    })
+    });
+    if let Some(thread_id) = thread_id {
+        data["thread_id"] = json!(thread_id);
+    }
+    data
 }
 
 pub(super) fn encode_error(error: impl Error + Send + Sync + 'static) -> rusqlite::Error {

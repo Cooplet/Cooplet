@@ -100,7 +100,8 @@ async fn admit(gate: Gate, mut request: Request, next: Next) -> Result<Response,
     }
 
     let read_only = request.method() == Method::GET || request.method() == Method::HEAD;
-    check_body_headers(request.headers(), read_only, gate.access)?;
+    let bodyless = read_only || request.method() == Method::DELETE;
+    check_body_headers(request.headers(), bodyless, gate.access)?;
     let mut response = next.run(request).await;
     if response.status().is_success()
         && (gate.access == Access::EventStream || gate.access == Access::Blob && read_only)
@@ -135,6 +136,15 @@ fn check_pin(headers: &HeaderMap, hub_id: &HubId, access: Access) -> Result<(), 
         "The Hub identity pin is missing or does not match.",
     )
     .with_extension("actual_hub_id", hub_id.as_str()))
+}
+
+pub(crate) fn bridge_token<'a>(
+    headers: &'a HeaderMap,
+    hub_id: &HubId,
+) -> Result<&'a str, HubError> {
+    check_pin(headers, hub_id, Access::Bearer)?;
+    check_body_headers(headers, true, Access::Bearer)?;
+    bearer(single_authorization(headers)?)
 }
 
 fn single_authorization(headers: &HeaderMap) -> Result<Option<&axum::http::HeaderValue>, HubError> {

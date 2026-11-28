@@ -1,11 +1,14 @@
 use std::{
     fs,
-    sync::atomic::{AtomicBool, Ordering},
+    sync::{
+        Mutex,
+        atomic::{AtomicBool, Ordering},
+    },
 };
 
 use cooplet_protocol::RequestId;
 use futures_util::future::BoxFuture;
-use tokio::sync::Notify;
+use tokio::sync::{Notify, oneshot};
 
 use super::*;
 use crate::{
@@ -26,6 +29,32 @@ struct ProbeAdapter {
     hang: bool,
     probing: Notify,
     attaching: Notify,
+    opening: Mutex<Option<TimedOpenProbe>>,
+}
+
+struct TimedOpenProbe {
+    mode: OpenStall,
+    entered: oneshot::Sender<()>,
+    cancelled: oneshot::Sender<()>,
+}
+
+enum OpenStall {
+    Preparation {
+        reservation: PathBuf,
+        release: oneshot::Receiver<()>,
+    },
+    ManagedProcess,
+    AttachedEffect(PathBuf),
+}
+
+struct WatchOpenCancellation(Option<oneshot::Sender<()>>);
+
+impl Drop for WatchOpenCancellation {
+    fn drop(&mut self) {
+        if let Some(cancelled) = self.0.take() {
+            let _ = cancelled.send(());
+        }
+    }
 }
 
 impl ClientAdapter for ProbeAdapter {
@@ -63,9 +92,56 @@ impl ClientAdapter for ProbeAdapter {
 
     fn create_or_resume(
         &self,
-        _request: SessionOpenRequest,
+        request: SessionOpenRequest,
     ) -> BoxFuture<'_, Result<OpenedSession>> {
-        Box::pin(async { Err(NodeError::internal("Preflight must not open a session")) })
+        let probe = self
+            .opening
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .take();
+        Box::pin(async move {
+            let Some(TimedOpenProbe {
+                mode,
+                entered,
+                cancelled,
+            }) = probe
+            else {
+                return Err(NodeError::internal("Preflight must not open a session"));
+            };
+            let _cancelled = WatchOpenCancellation(Some(cancelled));
+            match mode {
+                OpenStall::Preparation {
+                    reservation,
+                    release,
+                } => {
+                    request
+                        .preparation
+                        .run_before_managed_launch(move |rollback| {
+                            fs::write(&reservation, b"reserved")?;
+                            *rollback = Some(Box::new(move || fs::remove_file(reservation)));
+                            let _ = entered.send(());
+                            release.blocking_recv().map_err(NodeError::internal)?;
+                            Ok(())
+                        })
+                        .await?;
+                }
+                OpenStall::ManagedProcess => {
+                    let mut process = std::process::Command::new("sleep");
+                    process.arg("120");
+                    request
+                        .spawner
+                        .spawn(process)
+                        .await
+                        .map_err(NodeError::internal)?;
+                    let _ = entered.send(());
+                }
+                OpenStall::AttachedEffect(marker) => {
+                    fs::write(marker, b"native effect")?;
+                    let _ = entered.send(());
+                }
+            }
+            std::future::pending().await
+        })
     }
 
     fn inspect_state<'a>(
@@ -152,6 +228,7 @@ async fn launch_preflight_accepts_capabilities_made_available_by_discovery() -> 
     assert!(!adapter.capabilities().supports_create);
     let plan = service
         .plan(OpenPlanInput {
+            admission: None,
             id: ParticipantId::generate()?,
             name: "probe".into(),
             workspace: node.workspace_dir.clone(),
@@ -213,11 +290,14 @@ async fn quiesce_cancels_discovery_and_attach_for_an_unresponsive_adapter() -> T
 }
 
 #[tokio::test]
-async fn discover_retries_after_unavailable_and_sanitizes_internal_errors() -> TestResult {
+async fn cold_discovery_respects_queued_admission_and_retries_uncached_failures() -> TestResult {
     use std::sync::atomic::AtomicUsize;
+
+    use futures_util::FutureExt;
 
     struct FlakyDiscoverAdapter {
         calls: AtomicUsize,
+        release_first: Notify,
     }
 
     impl ClientAdapter for FlakyDiscoverAdapter {
@@ -232,6 +312,7 @@ async fn discover_retries_after_unavailable_and_sanitizes_internal_errors() -> T
             Box::pin(async move {
                 let attempt = self.calls.fetch_add(1, Ordering::SeqCst);
                 if attempt == 0 {
+                    self.release_first.notified().await;
                     return Ok(DiscoveryReport {
                         client_kind: self.kind().into(),
                         available: false,
@@ -320,6 +401,7 @@ async fn discover_retries_after_unavailable_and_sanitizes_internal_errors() -> T
 
     let adapter = Arc::new(FlakyDiscoverAdapter {
         calls: AtomicUsize::new(0),
+        release_first: Notify::new(),
     });
     let mut registry = AdapterRegistry::default();
     registry.register(adapter.clone())?;
@@ -329,8 +411,32 @@ async fn discover_retries_after_unavailable_and_sanitizes_internal_errors() -> T
     };
 
     // Attempt 0: unavailable -> must not be cached.
-    let first = registry.discover("flaky-probe", &config).await?;
+    let first = registry.discover("flaky-probe", &config);
+    tokio::pin!(first);
+    assert!(first.as_mut().now_or_never().is_none());
+
+    // Both delegated opens queue behind the same uncached native probe.
+    let revoked = AdmissionGuard::new(Duration::from_secs(60));
+    let queued = registry.discover_for_open("flaky-probe", &config, Some(&revoked));
+    tokio::pin!(queued);
+    assert!(queued.as_mut().now_or_never().is_none());
+    revoked.expire();
+    let short = AdmissionGuard::new(Duration::from_millis(25));
+    let timed_out = registry.discover_for_open("flaky-probe", &config, Some(&short));
+    let error = tokio::time::timeout(Duration::from_secs(2), timed_out)
+        .await?
+        .err()
+        .ok_or("Queued discovery must respect the admission deadline")?;
+    assert_eq!(error.code(), ErrorCode::BridgeUnavailable);
+
+    adapter.release_first.notify_one();
+    let first = first.await?;
     assert!(!first.available);
+    let error = queued
+        .await
+        .err()
+        .ok_or("A revoked open must skip its probe")?;
+    assert_eq!(error.0.extensions["reason"], "admission_expired");
     assert_eq!(adapter.calls.load(Ordering::SeqCst), 1);
 
     // Attempt 1: error -> must be sanitized and not cached.
@@ -383,6 +489,268 @@ async fn resume_rejects_ephemeral_workflow_participant() -> TestResult {
         .ok_or("Ephemeral workflow participant should not be resumable")?;
     assert_eq!(error.code(), ErrorCode::InvalidRequest);
     assert_eq!(error.0.extensions["reason"], "ephemeral_participant");
+    node.engine.shutdown().await?;
+    Ok(())
+}
+
+#[tokio::test]
+async fn open_timeout_uses_the_admission_state_and_native_progress_at_cancellation() -> TestResult {
+    use std::sync::atomic::AtomicU64;
+
+    use cooplet_platform::{MonoClock, MonoInstant};
+    use cooplet_protocol::HubId;
+
+    #[derive(Default)]
+    struct Clock(AtomicU64);
+
+    impl MonoClock for Clock {
+        fn now(&self) -> MonoInstant {
+            MonoInstant::from_millis(self.0.load(Ordering::SeqCst))
+        }
+    }
+
+    #[derive(Clone, Copy)]
+    enum Case {
+        ExpiredPreparation,
+        OpenAdmission,
+        Standalone,
+        ManagedProcess,
+        AttachedEffect,
+    }
+
+    for case in [
+        Case::ExpiredPreparation,
+        Case::OpenAdmission,
+        Case::Standalone,
+        Case::ManagedProcess,
+        Case::AttachedEffect,
+    ] {
+        let adapter = Arc::new(ProbeAdapter::default());
+        let (service, node, scratch) = service(adapter.clone()).await?;
+        let marker = scratch.0.join("open-marker");
+        let (entered, reached) = oneshot::channel();
+        let (cancelled, dropped) = oneshot::channel();
+        let (release, mode) = match case {
+            Case::ManagedProcess => (None, OpenStall::ManagedProcess),
+            Case::AttachedEffect => (None, OpenStall::AttachedEffect(marker.clone())),
+            _ => {
+                let (release, wait) = oneshot::channel();
+                (
+                    Some(release),
+                    OpenStall::Preparation {
+                        reservation: marker.clone(),
+                        release: wait,
+                    },
+                )
+            }
+        };
+        *adapter
+            .opening
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(TimedOpenProbe {
+            mode,
+            entered,
+            cancelled,
+        });
+        let clock = Arc::new(Clock::default());
+        let budget = AdmissionGuard::with_clock(Duration::from_secs(30), clock.clone());
+        let operation_id = OperationId::generate()?;
+        let key = operation_id.clone();
+        let actor = node.operator.participant_id.to_string();
+        let origin = format!("{}/{}", HubId::generate()?, node.info.node_id);
+        let worker = tokio::spawn(async move {
+            let request = CreateAgentRequest {
+                client_kind: Some("probe-test".into()),
+                name: Some("open-timeout".into()),
+                ..Default::default()
+            };
+            if matches!(case, Case::Standalone) {
+                service.create(&actor, key.as_str(), request, None).await
+            } else {
+                service
+                    .create_delegated(
+                        &DelegatedOperation {
+                            id: key,
+                            actor_id: actor,
+                            origin,
+                            admission: budget,
+                        },
+                        request,
+                    )
+                    .await
+            }
+        });
+
+        let wait = Duration::from_secs(5);
+        tokio::time::timeout(wait, reached).await??;
+        let before_timeout: (bool, Option<i64>) = node.engine.reads().read(|db| {
+            Ok(db.query_row(
+                "SELECT state = 'starting', runtime_pid FROM participants WHERE name = 'open-timeout'",
+                [], |row| Ok((row.get(0)?, row.get(1)?)),
+            )?)
+        }).await?;
+        assert!(before_timeout.0);
+        assert_eq!(
+            before_timeout.1.is_some(),
+            matches!(case, Case::ManagedProcess)
+        );
+        assert_eq!(marker.exists(), !matches!(case, Case::ManagedProcess));
+
+        if !matches!(case, Case::OpenAdmission | Case::Standalone) {
+            clock.0.store(30_001, Ordering::SeqCst);
+        }
+        tokio::time::pause();
+        tokio::time::advance(OPEN_REQUEST_TIMEOUT + Duration::from_millis(1)).await;
+        dropped.await?;
+        tokio::time::resume();
+        // Expiry during the cleanup wait must not rewrite the timer's verdict.
+        clock.0.store(30_001, Ordering::SeqCst);
+        if let Some(release) = release {
+            release.send(()).map_err(|_| "preparation worker stopped")?;
+        }
+
+        let error = tokio::time::timeout(wait, worker)
+            .await??
+            .err()
+            .ok_or("open must have failed")?;
+        let expiry = matches!(case, Case::ExpiredPreparation);
+        let (code, reason, status) = if expiry {
+            (ErrorCode::BridgeUnavailable, "admission_expired", "failed")
+        } else {
+            (
+                ErrorCode::DeliveryUnknown,
+                "native_open_timed_out",
+                "unknown",
+            )
+        };
+        assert_eq!(error.code(), code);
+        assert_eq!(error.0.extensions["reason"], reason);
+        let (recorded, participant, stopped, no_process, revoked): (String, String, bool, bool, bool) =
+            node.engine.reads().read(move |db| {
+                Ok(db.query_row(
+                    "SELECT o.state, p.participant_id, p.state = 'stopped', p.runtime_pid IS NULL,
+                            NOT EXISTS (SELECT 1 FROM participant_credentials c
+                                WHERE c.participant_id = p.participant_id AND c.revoked_at_ms IS NULL)
+                     FROM operations o JOIN participants p ON p.participant_id = o.resource_id
+                     WHERE o.operation_key = ?1",
+                    [operation_id.as_str()],
+                    |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?, row.get(4)?)),
+                )?)
+            }).await?;
+        assert_eq!(recorded, status);
+        assert!(stopped && no_process && revoked);
+        assert!(
+            !node
+                .state_dir
+                .join(CREDS_DIR)
+                .join(credential_filename(&(participant.parse()?, 1)))
+                .exists()
+        );
+        assert_eq!(marker.exists(), matches!(case, Case::AttachedEffect));
+        node.engine.shutdown().await?;
+    }
+    Ok(())
+}
+
+#[tokio::test]
+async fn completed_blocking_preparation_remains_pending_until_the_adapter_polls_it() -> TestResult {
+    use std::{
+        future::{Future, poll_fn},
+        task::Poll,
+    };
+
+    let preparation = OpenPreparation::default();
+    let (release, wait) = oneshot::channel();
+    let mut running = Box::pin(
+        preparation
+            .run_before_managed_launch(move |_| wait.blocking_recv().map_err(NodeError::internal)),
+    );
+    assert!(poll_fn(|cx| Poll::Ready(running.as_mut().poll(cx).is_pending())).await);
+    release.send(()).map_err(|_| "preparation worker stopped")?;
+    preparation.wait().await;
+    assert!(preparation.awaiting_managed_preparation());
+    drop(running);
+    assert!(!preparation.awaiting_managed_preparation());
+    Ok(())
+}
+
+#[tokio::test]
+async fn respond_approval_after_recovery_unknown_returns_delivery_unknown_for_both_actions()
+-> TestResult {
+    use cooplet_protocol::{ApprovalAction, canonical_sha256};
+
+    let adapter = Arc::new(ProbeAdapter::default());
+    let (service, node, _scratch) = service(adapter).await?;
+    let participant_id = ParticipantId::generate()?;
+    let recovered_op_id = OperationId::generate()?;
+    let approval_id = "apr_recovered_1";
+    let fingerprint = canonical_sha256(&(
+        &participant_id,
+        ApprovalDecision {
+            approval_id: approval_id.into(),
+            action: ApprovalAction::Approve,
+        },
+    ))?;
+    let pid = participant_id.clone();
+    let op_id = recovered_op_id.clone();
+    node.engine
+        .db()
+        .write_sqlite(move |tx| {
+            tx.execute(
+                "INSERT INTO participants(participant_id, kind, name, state, created_at_ms, updated_at_ms)
+                 VALUES (?1, 'agent', 'recovered', 'unknown', 1, 1)",
+                rusqlite::params![pid.as_str()],
+            )?;
+            tx.execute(
+                "INSERT INTO operations(operation_id, actor_id, operation_key, kind, request_sha256,
+                                        state, resource_id, created_at_ms, updated_at_ms, expires_at_ms)
+                 VALUES (?1, 'operator', 'prior-apr-key', 'approval.respond', ?2, 'unknown', ?3, 1, 1, 9999999999999)",
+                rusqlite::params![op_id.as_str(), fingerprint, pid.as_str()],
+            )?;
+            Ok(WriteOutcome::new(()))
+        })
+        .await?;
+
+    let actor = node.operator.participant_id.as_str();
+    for (idx, action) in [ApprovalAction::Approve, ApprovalAction::Deny]
+        .into_iter()
+        .enumerate()
+    {
+        let err = service
+            .respond_approval(
+                actor,
+                &format!("retry-apr-{idx}"),
+                participant_id.clone(),
+                ApprovalDecision {
+                    approval_id: approval_id.into(),
+                    action,
+                },
+            )
+            .await
+            .err()
+            .ok_or("expected delivery_unknown for recovered unknown approval")?;
+        assert_eq!(err.code(), ErrorCode::DeliveryUnknown);
+        assert_eq!(err.0.extensions["reason"], "approval_outcome_unconfirmed");
+        assert_eq!(err.0.extensions["operation_id"], recovered_op_id.as_str());
+        assert_eq!(err.0.extensions["approval_id"], approval_id);
+    }
+
+    let stale = service
+        .respond_approval(
+            actor,
+            "unrelated-apr",
+            participant_id,
+            ApprovalDecision {
+                approval_id: "apr_other".into(),
+                action: ApprovalAction::Approve,
+            },
+        )
+        .await
+        .err()
+        .ok_or("expected approval_stale for unrelated approval")?;
+    assert_eq!(stale.code(), ErrorCode::InvalidRequest);
+    assert_eq!(stale.0.extensions["reason"], "approval_stale");
+
     node.engine.shutdown().await?;
     Ok(())
 }

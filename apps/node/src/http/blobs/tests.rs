@@ -43,6 +43,28 @@ async fn aborted_body_is_not_a_successful_eof() {
 }
 
 #[tokio::test]
+async fn relay_reader_rejects_over_limit_chunked_uploads_as_an_error() -> TestResult {
+    let body = Body::from_stream(futures_util::stream::iter([
+        Ok::<_, io::Error>(Bytes::from_static(b"abc")),
+        Ok(Bytes::from_static(b"de")),
+    ]));
+    let (_shutdown, stopping) = watch::channel(false);
+    let mut bytes = Vec::new();
+    let result = BodyReader::new(upload_chunks(body, stopping))
+        .with_limit(4)
+        .read_to_end(&mut bytes)
+        .await;
+    let Err(error) = result else {
+        return Err(io::Error::other("The over-limit relay reached a successful EOF").into());
+    };
+    let error = body_error(&error);
+    assert_eq!(error.code(), ErrorCode::BlobTooLarge);
+    assert_eq!(error.0.extensions["limit_bytes"], 4);
+    assert_eq!(bytes, b"abc");
+    Ok(())
+}
+
+#[tokio::test]
 async fn shutdown_cancels_an_upload_waiting_for_a_body_frame() -> TestResult {
     let body = Body::from_stream(futures_util::stream::pending::<io::Result<Bytes>>());
     let (shutdown, stopping) = watch::channel(false);
@@ -55,7 +77,7 @@ async fn shutdown_cancels_an_upload_waiting_for_a_body_frame() -> TestResult {
         .ok_or_else(|| io::Error::other("shutdown produced a successful EOF"))?;
     assert!(
         failure
-            .map_err(body_error)
+            .map_err(|error| body_error(&error))
             .is_err_and(|error| error.code() == ErrorCode::Overloaded)
     );
     Ok(())
@@ -75,7 +97,7 @@ async fn trickle_upload_exceeding_total_timeout_is_aborted() -> TestResult {
     let error = loop {
         match chunks.next().await {
             Some(Ok(_)) => received += 1,
-            Some(Err(err)) => break body_error(err),
+            Some(Err(err)) => break body_error(&err),
             None => return Err(io::Error::other("trickle stream ended without timeout").into()),
         }
     };
@@ -122,6 +144,7 @@ async fn client_replays_an_upload_at_full_quota_without_reading_the_body() -> Te
             expected_sha256: None,
             idempotency_key: Some("blob-replay-key".into()),
             content_length: None,
+            participant_id: None,
         };
         let BlobUploadOutcome::VerifiedLocal(attachment) = client.upload_blob(first.clone(), bytes.as_slice()).await? else {
             return Err(io::Error::other("First upload did not reach verified EOF").into());
@@ -157,6 +180,7 @@ async fn client_replays_an_upload_at_full_quota_without_reading_the_body() -> Te
             expected_sha256: None,
             idempotency_key: None,
             content_length: None,
+            participant_id: None,
         };
         let result = client.upload_blob(large, [0u8; 33].as_slice()).await;
         assert_problem(result, ErrorCode::BlobTooLarge)?;
@@ -247,6 +271,7 @@ async fn concurrent_same_key_cross_kind_receipts_and_slot_limit_are_enforced() -
             expected_sha256: None,
             idempotency_key: Some("cross-kind-key".into()),
             content_length: None,
+            participant_id: None,
         };
         let cross = tokio::time::timeout(
             Duration::from_secs(5),
@@ -263,6 +288,7 @@ async fn concurrent_same_key_cross_kind_receipts_and_slot_limit_are_enforced() -
             expected_sha256: None,
             idempotency_key: Some(key.into()),
             content_length: None,
+            participant_id: None,
         };
         assert_problem(
             client
@@ -300,6 +326,7 @@ async fn concurrent_same_key_cross_kind_receipts_and_slot_limit_are_enforced() -
             expected_sha256: None,
             idempotency_key: Some("live-same-key".into()),
             content_length: Some(11),
+            participant_id: None,
         };
         let first_task = tokio::spawn({
             let spec = same_key_spec.clone();
@@ -347,6 +374,7 @@ async fn concurrent_same_key_cross_kind_receipts_and_slot_limit_are_enforced() -
                 expected_sha256: None,
                 idempotency_key: None,
                 content_length: Some(2),
+                participant_id: None,
             };
             upload_tasks.push(tokio::spawn(async move { c.upload_blob(spec, reader).await }));
         }
@@ -363,6 +391,7 @@ async fn concurrent_same_key_cross_kind_receipts_and_slot_limit_are_enforced() -
             expected_sha256: None,
             idempotency_key: None,
             content_length: None,
+            participant_id: None,
         };
         assert_problem(
             client.upload_blob(overflow_spec, b"z".as_slice()).await,

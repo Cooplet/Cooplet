@@ -1,6 +1,6 @@
 use cooplet_protocol::{
-    HubId, IntakeState, NodeId, ParticipantId, ParticipantKind, ParticipantState, ServiceScope,
-    TokenId,
+    ApprovalWaitKind, HubId, IntakeState, NodeId, ParticipantId, ParticipantKind, ParticipantState,
+    ServiceScope, TemplateSummary, TokenId, WorkflowSummary,
 };
 use serde::{Deserialize, Deserializer, Serialize};
 use serde_json::Value;
@@ -260,6 +260,8 @@ pub(crate) struct NodeSummary {
     pub generation: u64,
     pub session_epoch: u64,
     pub capabilities: Value,
+    pub templates: Vec<TemplateSummary>,
+    pub workflows: Vec<WorkflowSummary>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub last_seen_at_ms: Option<i64>,
     pub enrolled_at_ms: i64,
@@ -280,6 +282,16 @@ pub(crate) struct HubParticipantSummary {
     pub state: ParticipantState,
     pub intake_state: IntakeState,
     pub capabilities: Value,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub wait_kind: Option<ApprovalWaitKind>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub approval_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub action_hint: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub summary: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub can_respond_remotely: Option<bool>,
     pub synced_epoch: u64,
     pub updated_at_ms: i64,
 }

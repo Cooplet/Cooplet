@@ -115,6 +115,12 @@ pub fn list_templates(workspace_dir: &Path) -> Result<Vec<TemplateSummary>> {
     list_with_config(workspace_dir, user_config_dir())
 }
 
+/// The bridge lists manifest metadata without opening template instructions.
+/// A broken template still shadows a fallback entry with the same name.
+pub(crate) fn list_template_summaries(workspace_dir: &Path) -> Result<Vec<TemplateSummary>> {
+    list_with_mode(workspace_dir, user_config_dir(), ListMode::Roster)
+}
+
 fn user_config_dir() -> Option<PathBuf> {
     xdg_dir("XDG_CONFIG_HOME", ".config").ok()
 }
@@ -165,15 +171,29 @@ fn list_with_config(
     workspace_dir: &Path,
     config_dir: Option<PathBuf>,
 ) -> Result<Vec<TemplateSummary>> {
+    list_with_mode(workspace_dir, config_dir, ListMode::Strict)
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum ListMode {
+    Strict,
+    Roster,
+}
+
+fn list_with_mode(
+    workspace_dir: &Path,
+    config_dir: Option<PathBuf>,
+    mode: ListMode,
+) -> Result<Vec<TemplateSummary>> {
     let mut templates = BTreeMap::new();
     let workspace = workspace_root(workspace_dir)?;
     if let Some(root) = template_root(&workspace, [".cooplet", "agents"])? {
-        list_in_root(&workspace, &root, &mut templates)?;
+        list_in_root(&workspace, &root, &mut templates, mode)?;
     }
     if let Some(config) = config_root(config_dir)?
         && let Some(root) = template_root(&config, ["cooplet", "agents"])?
     {
-        list_in_root(&config, &root, &mut templates)?;
+        list_in_root(&config, &root, &mut templates, mode)?;
     }
     Ok(templates.into_values().flatten().collect())
 }
@@ -339,6 +359,7 @@ fn list_in_root(
     base: &Path,
     root: &Path,
     templates: &mut BTreeMap<String, Option<TemplateSummary>>,
+    mode: ListMode,
 ) -> Result<()> {
     for entry in fs::read_dir(root).map_err(|error| {
         invalid_labeled(root, "agents", "could not read template directory", error)
@@ -362,18 +383,31 @@ fn list_in_root(
             templates.insert(id, None);
             continue;
         }
-        let Some(template) = load_in_root(base, root, &id, true)? else {
-            continue;
+        let template = match load_in_root(base, root, &id, mode == ListMode::Strict) {
+            Ok(Some(template)) => template,
+            Ok(None) => continue,
+            Err(error) if mode == ListMode::Roster => {
+                tracing::warn!(template_id = id, code = %error.code(), "Skipping an invalid agent template in the Hub roster");
+                templates.insert(id, None);
+                continue;
+            }
+            Err(error) => return Err(error),
         };
-        templates.insert(
-            id.clone(),
-            Some(TemplateSummary {
-                template_id: id.clone(),
-                title: template.title.unwrap_or(id),
-                description: template.description,
-                client_kind: template.client,
-            }),
-        );
+        let summary = TemplateSummary {
+            template_id: id.clone(),
+            title: template.title.unwrap_or_else(|| id.clone()),
+            description: template.description,
+            client_kind: template.client,
+        };
+        if mode == ListMode::Roster && summary.validate().is_err() {
+            tracing::warn!(
+                template_id = id,
+                "Skipping invalid metadata in the Hub roster"
+            );
+            templates.insert(id, None);
+        } else {
+            templates.insert(id, Some(summary));
+        }
     }
     Ok(())
 }

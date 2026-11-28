@@ -2,7 +2,7 @@ use std::collections::BTreeMap;
 
 use serde_json::Value;
 
-use crate::RequestId;
+use crate::{MessageId, OperationId, RequestId, ThreadId};
 
 pub const PROBLEM_JSON_MEDIA_TYPE: &str = "application/problem+json";
 
@@ -105,6 +105,37 @@ impl ProblemDetails {
         }
     }
 
+    /// Typed identifiers, cursors, and reasons that a client can show when recovering from an error.
+    pub fn recovery_fields(&self) -> impl Iterator<Item = (&'static str, &Value)> {
+        [
+            "operation_id",
+            "message_id",
+            "existing_answer_id",
+            "thread_id",
+            "floor_seq",
+            "head_seq",
+            "current_version",
+            "reason",
+        ]
+        .into_iter()
+        .filter_map(|key| {
+            let value = self.extensions.get(key)?;
+            let valid = match key {
+                "operation_id" => value
+                    .as_str()
+                    .is_some_and(|id| OperationId::parse(id).is_ok()),
+                "message_id" | "existing_answer_id" => value
+                    .as_str()
+                    .is_some_and(|id| MessageId::parse(id).is_ok()),
+                "thread_id" => value.as_str().is_some_and(|id| ThreadId::parse(id).is_ok()),
+                "current_version" => value.is_null() || value.is_u64(),
+                "reason" => value.as_str().is_some_and(is_valid_error_reason),
+                _ => value.is_u64(),
+            };
+            valid.then_some((key, value))
+        })
+    }
+
     pub fn with_instance(mut self, instance: impl Into<String>) -> Self {
         self.instance = Some(instance.into());
         self
@@ -123,5 +154,62 @@ impl ProblemDetails {
     pub fn with_extension(mut self, key: impl Into<String>, value: impl Into<Value>) -> Self {
         self.extensions.insert(key.into(), value.into());
         self
+    }
+}
+
+/// Validates a machine-readable snake_case error reason extension.
+pub fn is_valid_error_reason(reason: &str) -> bool {
+    !reason.is_empty()
+        && reason.len() <= 64
+        && reason.contains('_')
+        && reason
+            .bytes()
+            .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit() || byte == b'_')
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn recovery_fields_accepts_valid_reason_and_filters_invalid_values()
+    -> Result<(), crate::IdError> {
+        let op_id = OperationId::generate()?;
+        let thread_id = ThreadId::generate()?;
+        let problem = ProblemDetails::new(ErrorCode::ResyncRequired, "Cursor pruned")
+            .with_extension("operation_id", op_id.as_str())
+            .with_extension("thread_id", thread_id.as_str())
+            .with_extension("floor_seq", 5_u64)
+            .with_extension("head_seq", 10_u64)
+            .with_extension("reason", "cursor_pruned");
+        let fields: BTreeMap<&str, Value> = problem
+            .recovery_fields()
+            .map(|(k, v)| (k, v.clone()))
+            .collect();
+        assert_eq!(
+            fields.get("operation_id"),
+            Some(&Value::from(op_id.as_str()))
+        );
+        assert_eq!(
+            fields.get("thread_id"),
+            Some(&Value::from(thread_id.as_str()))
+        );
+        assert_eq!(fields.get("floor_seq"), Some(&Value::from(5_u64)));
+        assert_eq!(fields.get("head_seq"), Some(&Value::from(10_u64)));
+        assert_eq!(fields.get("reason"), Some(&Value::from("cursor_pruned")));
+
+        for invalid in [
+            "",
+            "nounderscore",
+            "Bad_Case",
+            "has space",
+            &"a_".repeat(33),
+        ] {
+            assert!(!is_valid_error_reason(invalid));
+            let rejected = ProblemDetails::new(ErrorCode::InvalidRequest, "bad")
+                .with_extension("reason", invalid);
+            assert!(rejected.recovery_fields().next().is_none());
+        }
+        Ok(())
     }
 }

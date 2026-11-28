@@ -1,4 +1,4 @@
-use cooplet_protocol::{ErrorCode, OperationId, ProblemDetails};
+use cooplet_protocol::{ErrorCode, NodeId, OperationId, ProblemDetails};
 use rusqlite::{Connection, OptionalExtension, Transaction, params};
 use serde_json::Value;
 
@@ -159,6 +159,31 @@ pub(crate) fn finish(tx: &Transaction<'_>, op: FinishOperation<'_>) -> rusqlite:
         op.result_json,
         op.error_json,
         op.now_ms,
+    ])?;
+    Ok(changed == 1)
+}
+
+/// A reconnect receipt can settle an operation that live finalization already
+/// marked unknown, but only for the original destination and before expiry.
+pub(crate) fn reconcile(
+    tx: &Transaction<'_>,
+    node_id: &NodeId,
+    op: FinishOperation<'_>,
+) -> rusqlite::Result<bool> {
+    let mut statement = tx.prepare_cached(
+        "UPDATE operations
+            SET state = ?2, resource_id = ?3, result_json = ?4, error_json = ?5, updated_at_ms = ?6
+          WHERE operation_id = ?1 AND target_node_id = ?7 AND expires_at_ms > ?6
+            AND state IN ('accepted', 'in_progress', 'unknown')",
+    )?;
+    let changed = statement.execute(params![
+        op.operation_id.as_str(),
+        op.state,
+        op.resource_id,
+        op.result_json,
+        op.error_json,
+        op.now_ms,
+        node_id.as_str(),
     ])?;
     Ok(changed == 1)
 }

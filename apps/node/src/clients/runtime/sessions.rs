@@ -230,7 +230,29 @@ impl LiveSession {
     }
 
     pub fn try_submit(self: &Arc<Self>, operation_key: &str) -> Result<SubmitSlot, SlotDenial> {
+        self.reserve_submit(operation_key, SlotDenial::Busy)
+    }
+
+    pub(crate) fn try_thread_submit(
+        self: &Arc<Self>,
+        operation_key: &str,
+    ) -> Result<SubmitSlot, SlotDenial> {
+        // Hub waits for a new Idle event after Busy. An Idle event may already
+        // have committed while the runtime applies it or settles its last ACK.
+        self.reserve_submit(operation_key, SlotDenial::Unavailable)
+    }
+
+    fn reserve_submit(
+        self: &Arc<Self>,
+        operation_key: &str,
+        idle_conflict: SlotDenial,
+    ) -> Result<SubmitSlot, SlotDenial> {
         let mut state = lock(&self.state);
+        if idle_conflict == SlotDenial::Unavailable
+            && state.latest_runtime_event_seq > state.last_event_seq
+        {
+            return Err(SlotDenial::Unavailable);
+        }
         match state.current {
             ParticipantState::Working => return Err(SlotDenial::Busy),
             ParticipantState::AwaitingApproval => return Err(SlotDenial::AwaitingApproval),
@@ -238,7 +260,7 @@ impl LiveSession {
             _ => return Err(SlotDenial::Unavailable),
         }
         if state.waiting_for_idle || !matches!(state.phase, Phase::Open) {
-            return Err(SlotDenial::Busy);
+            return Err(idle_conflict);
         }
         let slot_id = state.next_slot;
         state.next_slot = state.next_slot.wrapping_add(1);
@@ -445,6 +467,9 @@ impl SubmitSlot {
         let admission = request.admission.clone();
         let started = AtomicBool::new(false);
         let acknowledged = async {
+            if admission.is_expired() {
+                return Ok(SubmitOutcome::Expired);
+            }
             started.store(true, Ordering::Relaxed);
             tokio::time::timeout(
                 SUBMIT_ACK_TIMEOUT,
@@ -1087,6 +1112,104 @@ mod tests {
             ParticipantState::Idle,
             None,
         )))
+    }
+
+    #[test]
+    fn thread_can_retry_if_the_durable_idle_event_outruns_the_live_slot() -> SessionTestResult {
+        let live = live_session()?;
+        live.record(1, Some(ParticipantState::Working), SlotEvent::Working, None);
+        assert!(matches!(
+            live.try_thread_submit("working"),
+            Err(super::SlotDenial::Busy)
+        ));
+
+        assert!(live.observe(2, true));
+        assert!(matches!(
+            live.try_thread_submit("idle-committing"),
+            Err(super::SlotDenial::Unavailable)
+        ));
+        assert!(matches!(
+            live.try_submit("local"),
+            Err(super::SlotDenial::Busy)
+        ));
+
+        live.record(2, Some(ParticipantState::Idle), SlotEvent::Idle, None);
+        let slot = live
+            .try_thread_submit("idle")
+            .map_err(|error| format!("{error:?}"))?;
+        assert!(matches!(
+            live.try_thread_submit("already-projected-idle"),
+            Err(super::SlotDenial::Unavailable)
+        ));
+        drop(slot);
+        assert!(live.try_thread_submit("retry").is_ok());
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn expired_admission_stops_before_adapter_but_late_ack_survives() -> SessionTestResult {
+        use cooplet_platform::{AdmissionGuard, MonoClock, MonoInstant};
+        use std::{
+            future::Future,
+            sync::{
+                Arc,
+                atomic::{AtomicU64, Ordering},
+            },
+            task::{Context, Poll, Waker},
+            time::Duration,
+        };
+
+        struct Clock(AtomicU64);
+        impl MonoClock for Clock {
+            fn now(&self) -> MonoInstant {
+                MonoInstant::from_millis(self.0.load(Ordering::Relaxed))
+            }
+        }
+        let clock = Arc::new(Clock(AtomicU64::new(0)));
+        let (ack, receiver) = tokio::sync::oneshot::channel();
+        let live = live_session_with(StubAck::new(Some(receiver)))?;
+        let make = |operation_key: &str, admission: AdmissionGuard| -> SessionTestResult<_> {
+            Ok(super::SubmitTurnRequest {
+                operation_key: operation_key.into(),
+                message_id: None,
+                input: test_turn_input()?,
+                output_schema: None,
+                steer: false,
+                admission,
+            })
+        };
+        let expired = AdmissionGuard::with_clock(Duration::from_millis(5), clock.clone());
+        clock.0.store(5, Ordering::Relaxed);
+        let mut slot = live
+            .try_submit("expired")
+            .map_err(|error| format!("{error:?}"))?;
+        let outcome = slot.submit(make("expired", expired)?).await;
+        assert!(matches!(outcome, super::SubmitOutcome::Expired));
+        slot.finish(&outcome, false).await;
+
+        let admitting = AdmissionGuard::with_clock(Duration::from_millis(5), clock.clone());
+        let mut slot = live
+            .try_submit("admitted")
+            .map_err(|error| format!("{error:?}"))?;
+        let submit = slot.submit(make("admitted", admitting.clone())?);
+        tokio::pin!(submit);
+        assert!(matches!(
+            submit
+                .as_mut()
+                .poll(&mut Context::from_waker(Waker::noop())),
+            Poll::Pending
+        ));
+        clock.0.store(11, Ordering::Relaxed);
+        assert!(admitting.is_expired());
+        ack.send(super::SubmitOutcome::Accepted {
+            native_turn_id: Some("accepted".into()),
+        })
+        .map_err(|_| "adapter was not called within admission")?;
+        assert!(matches!(
+            submit.await,
+            super::SubmitOutcome::Accepted { .. }
+        ));
+        Ok(())
     }
 
     #[tokio::test]

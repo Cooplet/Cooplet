@@ -7,9 +7,8 @@ mod integration;
 use std::path::PathBuf;
 
 use axum::{body::Body, response::Response};
-use cooplet_protocol::{
-    AttachmentRef, BlobId, ErrorCode, NodeId, OperationId, ServiceScope, ThreadId,
-};
+use cooplet_protocol::{AttachmentRef, BlobId, ErrorCode, NodeId, OperationId, ServiceScope};
+use cooplet_storage::StorageError;
 use http::{HeaderValue, header};
 use percent_encoding::{NON_ALPHANUMERIC, utf8_percent_encode};
 use rusqlite::{Connection, OptionalExtension, Transaction, params};
@@ -18,10 +17,9 @@ use crate::{
     AppState,
     auth::AuthenticatedCaller,
     error::HubError,
-    event_bus::can_access_thread_scope,
     storage::{
         events::BlobScope,
-        sql::{parse_opt_col, read_verified_tx},
+        sql::{parse_opt_col, read_verified_tx_with_clock},
     },
 };
 
@@ -37,19 +35,41 @@ pub(crate) async fn download(
 ) -> Result<Response, HubError> {
     require_blob_scope(caller, ServiceScope::Read)?;
     let lookup_id = blob_id.clone();
-    let metadata = read_verified_tx(&state.reads, caller, move |snapshot, caller, now_ms| {
-        let blob = lookup_blob(snapshot, &lookup_id)?
-            .filter(|blob| blob.is_live(now_ms))
-            .ok_or_else(blob_not_found)?;
-        blob.require_read(caller)?;
-        Ok(blob)
-    })
+    let bridge = state.bridge.clone();
+    let metadata = read_verified_tx_with_clock(
+        &state.reads,
+        caller,
+        state.wall_clock.clone(),
+        move |snapshot, caller, now_ms| {
+            let blob = lookup_blob(snapshot, &lookup_id)?
+                .filter(|blob| blob.is_live(now_ms))
+                .ok_or_else(blob_not_found)?;
+            if let (BlobScope::Thread(thread_id), Some((node_id, _))) =
+                (&blob.scope, caller.node_bridge_identity())
+            {
+                if !bridge.is_online(node_id)
+                    || !thread_delivery_contains_blob(
+                        snapshot, thread_id, node_id, &lookup_id, now_ms,
+                    )?
+                {
+                    return Err(blob_not_found());
+                }
+            } else {
+                blob.require_read(snapshot, caller, now_ms)?;
+            }
+            Ok(blob)
+        },
+    )
     .await?;
 
     let (record, file) = state
         .blobs
         .open_blob(&blob_id)
-        .await?
+        .await
+        .map_err(|error| match error {
+            StorageError::BlobMissing(_) => blob_not_found(),
+            error => error.into(),
+        })?
         .ok_or_else(blob_not_found)?;
     if record.blob_id != blob_id
         || record.size_bytes != metadata.attachment.size_bytes
@@ -79,6 +99,7 @@ pub(crate) fn preflight_node_attachments(
     conn: &Connection,
     caller: &AuthenticatedCaller,
     node_id: &NodeId,
+    peer_node_id: Option<&NodeId>,
     attachments: &[AttachmentRef],
     now_ms: i64,
 ) -> Result<(), HubError> {
@@ -86,11 +107,8 @@ pub(crate) fn preflight_node_attachments(
         return Ok(());
     }
     require_blob_scope(caller, ServiceScope::Collaborate)?;
-    if !caller.allows_node(node_id) {
-        return Err(blob_forbidden());
-    }
     for attachment in attachments {
-        let _ = validate_node_attachment(conn, caller, node_id, attachment, now_ms)?;
+        let _ = validate_node_attachment(conn, caller, node_id, peer_node_id, attachment, now_ms)?;
     }
     Ok(())
 }
@@ -99,6 +117,7 @@ pub(crate) fn attach_to_node(
     tx: &Transaction<'_>,
     caller: &AuthenticatedCaller,
     node_id: &NodeId,
+    peer_node_id: Option<&NodeId>,
     attachments: &[AttachmentRef],
     now_ms: i64,
 ) -> Result<(), HubError> {
@@ -106,35 +125,39 @@ pub(crate) fn attach_to_node(
         return Ok(());
     }
     require_blob_scope(caller, ServiceScope::Collaborate)?;
-    if !caller.allows_node(node_id) {
-        return Err(blob_forbidden());
-    }
     let mut update_blob = tx.prepare_cached(
-        "UPDATE blobs SET scope_node_id = ?1, attached_at_ms = ?2, expires_at_ms = ?3
-         WHERE blob_id = ?4 AND attached_at_ms IS NULL",
-    )?;
-    let mut mark_receipt = tx.prepare_cached(
-        "UPDATE operations SET result_json = json_set(result_json, '$.ever_attached', json('true'))
-         WHERE operation_id = ?1 AND kind = ?2 AND resource_id = ?3",
+        "UPDATE blobs SET scope_node_id = ?1, scope_peer_node_id = ?2,
+                          attached_at_ms = ?3, expires_at_ms = ?4
+         WHERE blob_id = ?5 AND attached_at_ms IS NULL",
     )?;
     for attachment in attachments {
-        let blob = validate_node_attachment(tx, caller, node_id, attachment, now_ms)?;
+        let blob = validate_node_attachment(tx, caller, node_id, peer_node_id, attachment, now_ms)?;
         if matches!(blob.scope, BlobScope::Unattached) {
             update_blob.execute(params![
                 node_id.as_str(),
+                peer_node_id.map(NodeId::as_str),
                 now_ms,
                 now_ms.saturating_add(ATTACHED_TTL_MS),
                 attachment.blob_id.as_str()
             ])?;
             // Remember the first attachment in any still-retained put receipt. Once
             // the blob row disappears, a scoped caller needs current ACL evidence.
-            mark_receipt.execute(params![
-                blob_operation_id(&attachment.blob_id)?.as_str(),
-                BLOB_PUT,
-                attachment.blob_id.as_str()
-            ])?;
+            mark_blob_attached(tx, &attachment.blob_id)?;
         }
     }
+    Ok(())
+}
+
+pub(crate) fn mark_blob_attached(tx: &Transaction<'_>, blob_id: &BlobId) -> Result<(), HubError> {
+    tx.prepare_cached(
+        "UPDATE operations SET result_json = json_set(result_json, '$.ever_attached', json('true'))
+         WHERE operation_id = ?1 AND kind = ?2 AND resource_id = ?3",
+    )?
+    .execute(params![
+        blob_operation_id(blob_id)?.as_str(),
+        BLOB_PUT,
+        blob_id.as_str()
+    ])?;
     Ok(())
 }
 
@@ -142,15 +165,33 @@ fn validate_node_attachment(
     conn: &Connection,
     caller: &AuthenticatedCaller,
     node_id: &NodeId,
+    peer_node_id: Option<&NodeId>,
     attachment: &AttachmentRef,
     now_ms: i64,
 ) -> Result<BlobRow, HubError> {
+    if let Some(source) = caller.source_node_id() {
+        if source != node_id && Some(source) != peer_node_id {
+            return Err(blob_forbidden());
+        }
+    } else if !caller.allows_node(node_id)
+        || peer_node_id.is_some_and(|peer| !caller.allows_node(peer))
+    {
+        return Err(blob_forbidden());
+    }
     let blob = lookup_blob(conn, &attachment.blob_id)?
         .filter(|blob| blob.is_live(now_ms))
         .ok_or_else(blob_not_found)?;
+    if matches!(blob.scope, BlobScope::Thread(_)) {
+        return Err(blob_not_found());
+    }
+    if caller.source_node_id().is_some() && blob.owner_actor_id != caller.actor_id() {
+        return Err(blob_forbidden());
+    }
     match &blob.scope {
         BlobScope::Unattached if blob.owner_actor_id == caller.actor_id() || caller.is_admin() => {}
-        BlobScope::Node(current) if current == node_id => blob.require_read(caller)?,
+        BlobScope::Node(current, peer)
+            if (current == node_id && peer.as_ref() == peer_node_id)
+                || (Some(current) == peer_node_id && peer.as_ref() == Some(node_id)) => {}
         _ => return Err(blob_forbidden()),
     }
     if blob.attachment != *attachment {
@@ -167,6 +208,50 @@ fn blob_operation_id(blob_id: &BlobId) -> Result<OperationId, HubError> {
     OperationId::parse(&format!("op_{suffix}")).map_err(HubError::internal)
 }
 
+fn thread_delivery_contains_blob(
+    conn: &Connection,
+    thread_id: &cooplet_protocol::ThreadId,
+    node_id: &NodeId,
+    blob_id: &BlobId,
+    now: i64,
+) -> rusqlite::Result<bool> {
+    let mut ranges = conn.prepare_cached(
+        "SELECT m.pending_from_seq, m.pending_to_seq
+         FROM thread_members m
+         JOIN threads t ON t.thread_id = m.thread_id
+         JOIN nodes n ON n.node_id = m.node_id
+         WHERE m.thread_id = ?1 AND m.node_id = ?2 AND m.state = 'active'
+           AND m.role != 'observer' AND m.wake_policy != 'muted'
+           AND m.pending_delivery_id IS NOT NULL
+           AND n.status = 'online' AND n.revoked_at_ms IS NULL
+           AND t.status = 'open'
+           AND (t.expires_at_ms IS NULL OR (t.expires_at_ms != 0 AND t.expires_at_ms > ?3))
+         LIMIT 16",
+    )?;
+    let mut ranges = ranges.query(params![thread_id.as_str(), node_id.as_str(), now])?;
+    let mut contains = conn.prepare_cached(
+        "SELECT EXISTS (
+            SELECT 1 FROM (
+                SELECT attachments_json, expires_at_ms FROM thread_posts
+                WHERE thread_id = ?1 AND seq BETWEEN ?2 AND ?3 ORDER BY seq DESC LIMIT 20
+            ) p WHERE p.expires_at_ms > ?4 AND EXISTS (
+                SELECT 1 FROM json_each(p.attachments_json) a
+                WHERE json_extract(a.value, '$.blob_id') = ?5
+            )
+         )",
+    )?;
+    while let Some(range) = ranges.next()? {
+        let (from, to): (i64, i64) = (range.get(0)?, range.get(1)?);
+        if contains.query_row(
+            params![thread_id.as_str(), from, to, now, blob_id.as_str()],
+            |row| row.get::<_, bool>(0),
+        )? {
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+
 fn scope_allows_read(
     scope: &BlobScope,
     caller: &AuthenticatedCaller,
@@ -177,8 +262,16 @@ fn scope_allows_read(
     }
     match scope {
         BlobScope::Unattached => caller.actor_id() == owner_actor_id,
-        BlobScope::Node(node_id) => caller.allows_node(node_id),
-        BlobScope::Thread(thread_id) => can_access_thread_scope(caller, thread_id),
+        BlobScope::Node(..) if caller.source_node_id().is_some() => {
+            caller.actor_id() == owner_actor_id
+        }
+        BlobScope::Node(node_id, peer) => match caller.node_bridge_identity() {
+            Some((id, _)) => id == node_id || Some(id) == peer.as_ref(),
+            None => {
+                caller.allows_node(node_id) && peer.as_ref().is_none_or(|id| caller.allows_node(id))
+            }
+        },
+        BlobScope::Thread(_) => false,
         BlobScope::GlobalArchiveOnly => false,
     }
 }
@@ -198,7 +291,19 @@ impl BlobRow {
         self.deleted_at_ms.is_none() && self.expires_at_ms > now_ms
     }
 
-    fn require_read(&self, caller: &AuthenticatedCaller) -> Result<(), HubError> {
+    fn require_read(
+        &self,
+        conn: &Connection,
+        caller: &AuthenticatedCaller,
+        now: i64,
+    ) -> Result<(), HubError> {
+        if let BlobScope::Thread(thread_id) = &self.scope {
+            return if crate::threads::can_access_thread_scope(conn, caller, thread_id, now)? {
+                Ok(())
+            } else {
+                Err(blob_not_found())
+            };
+        }
         if scope_allows_read(&self.scope, caller, &self.owner_actor_id) {
             Ok(())
         } else {
@@ -210,14 +315,12 @@ impl BlobRow {
 fn lookup_blob(conn: &Connection, blob_id: &BlobId) -> rusqlite::Result<Option<BlobRow>> {
     let mut statement = conn.prepare_cached(
         "SELECT original_name, mime_type, size_bytes, sha256, safe_disk_name, disk_rel_path,
-                owner_actor_id, attached_at_ms, scope_node_id, scope_thread_id,
+                owner_actor_id, attached_at_ms, scope_node_id, scope_peer_node_id, scope_thread_id,
                 expires_at_ms, deleted_at_ms
          FROM blobs WHERE blob_id = ?1",
     )?;
     statement
         .query_row([blob_id.as_str()], |row| {
-            let node: Option<NodeId> = parse_opt_col(row, 8)?;
-            let thread: Option<ThreadId> = parse_opt_col(row, 9)?;
             Ok(BlobRow {
                 attachment: AttachmentRef {
                     blob_id: blob_id.clone(),
@@ -229,9 +332,14 @@ fn lookup_blob(conn: &Connection, blob_id: &BlobId) -> rusqlite::Result<Option<B
                 safe_disk_name: row.get(4)?,
                 disk_rel_path: PathBuf::from(row.get::<_, String>(5)?),
                 owner_actor_id: row.get(6)?,
-                scope: BlobScope::from_columns(row.get(7)?, node, thread),
-                expires_at_ms: row.get(10)?,
-                deleted_at_ms: row.get(11)?,
+                scope: BlobScope::from_columns(
+                    row.get(7)?,
+                    parse_opt_col(row, 8)?,
+                    parse_opt_col(row, 9)?,
+                    parse_opt_col(row, 10)?,
+                ),
+                expires_at_ms: row.get(11)?,
+                deleted_at_ms: row.get(12)?,
             })
         })
         .optional()
@@ -256,7 +364,7 @@ fn disposition(safe_disk_name: &str, original_name: &str) -> Result<HeaderValue,
 }
 
 fn require_blob_scope(caller: &AuthenticatedCaller, scope: ServiceScope) -> Result<(), HubError> {
-    if caller.node_id().is_some() {
+    if caller.node_bridge_identity().is_some() {
         Ok(())
     } else {
         caller.require_scope(scope)
@@ -295,15 +403,15 @@ mod tests {
     #[test]
     fn orphaned_attachment_has_no_owner_scope() {
         assert_eq!(
-            BlobScope::from_columns(Some(1), None, None),
+            BlobScope::from_columns(Some(1), None, None, None),
             BlobScope::GlobalArchiveOnly
         );
         assert_eq!(
-            BlobScope::from_columns(None, None, None),
+            BlobScope::from_columns(None, None, None, None),
             BlobScope::Unattached
         );
         assert_eq!(
-            BlobScope::from_columns(None, NodeId::generate().ok(), None),
+            BlobScope::from_columns(None, NodeId::generate().ok(), None, None),
             BlobScope::GlobalArchiveOnly
         );
     }

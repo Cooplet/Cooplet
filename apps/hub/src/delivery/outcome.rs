@@ -1,12 +1,12 @@
 use cooplet_protocol::{
-    CommandOutcome, CommandResPayload, DeliveryMode, DeliveryState, ErrorCode, MessageId,
-    ParticipantId, ProblemDetails, RunId,
+    ApprovalWaitKind, CommandOutcome, CommandResPayload, DeliveryMode, DeliveryState, ErrorCode,
+    MessageId, ParticipantId, ProblemDetails, RunId,
 };
 use serde_json::Value;
 
 use crate::{bridge::SubmitError, error::HubError, storage::sql::json_byte_len};
 
-use super::{CommandReceipt, Kind, Reply, Request, Success};
+use super::{CommandReceipt, Kind, ReceiptContext, Reply, Success};
 
 pub(super) const UNKNOWN_DETAIL: &str =
     "The Hub could not confirm whether the command was delivered.";
@@ -37,6 +37,7 @@ pub(super) struct Terminal {
     pub(super) delivery: Option<DeliveryState>,
     pub(super) delivery_detail: Option<String>,
     pub(super) resource_id: Option<String>,
+    pub(super) release_key: bool,
 }
 
 impl Terminal {
@@ -52,24 +53,26 @@ impl Terminal {
 }
 
 pub(super) fn classify(
-    request: &Request,
+    request: &ReceiptContext<'_>,
     response: Result<CommandResPayload, SubmitError>,
 ) -> Result<Terminal, HubError> {
     let response = match response {
         Ok(response) => response,
         Err(SubmitError::Unavailable) => {
-            return failure(
+            let mut terminal = failure(
                 request,
                 DeliveryState::Unavailable,
                 ProblemDetails::new(
                     ErrorCode::BridgeUnavailable,
                     "The node could not deliver the command.",
                 ),
-            );
+            )?;
+            terminal.release_key = !request.is_answer();
+            return Ok(terminal);
         }
         Err(SubmitError::Unknown) => return unknown_terminal(request),
     };
-    if response.op_id != request.id {
+    if &response.op_id != request.id {
         tracing::warn!(
             operation_id = %request.id,
             received_operation_id = %response.op_id,
@@ -77,14 +80,13 @@ pub(super) fn classify(
         );
         return unknown_terminal(request);
     }
-    let addresses_message = request.message_id().is_some();
+    let addresses_message = request.message_id.is_some();
     match response.outcome {
         CommandOutcome::Delivered if addresses_message => {
             message_success(request, DeliveryState::Delivered)
         }
         CommandOutcome::Queued
-            if addresses_message
-                && request.delivery_mode() == Some(DeliveryMode::QueueUntilIdle) =>
+            if addresses_message && request.delivery_mode == Some(DeliveryMode::QueueUntilIdle) =>
         {
             message_success(request, DeliveryState::Queued)
         }
@@ -125,17 +127,21 @@ pub(super) fn classify(
                 delivery: None,
                 delivery_detail: None,
                 resource_id: response.resource_id,
+                release_key: false,
             })
         }
         CommandOutcome::Unknown
         | CommandOutcome::Delivered
         | CommandOutcome::Queued
         | CommandOutcome::Succeeded => unknown_terminal(request),
-        CommandOutcome::Busy => failure(
-            request,
-            DeliveryState::Busy,
-            ProblemDetails::new(ErrorCode::ParticipantBusy, "The participant is busy."),
-        ),
+        CommandOutcome::Busy => {
+            let mut problem =
+                ProblemDetails::new(ErrorCode::ParticipantBusy, "The participant is busy.");
+            if let Some(remote) = response.error.as_ref() {
+                copy_extensions(&mut problem, remote);
+            }
+            failure(request, DeliveryState::Busy, problem)
+        }
         CommandOutcome::AwaitingApproval => {
             let mut problem = ProblemDetails::new(
                 ErrorCode::AwaitingApproval,
@@ -154,11 +160,22 @@ pub(super) fn classify(
                 "The node could not deliver the command.",
             ),
         ),
-        CommandOutcome::Rejected => failure(
-            request,
-            DeliveryState::Unavailable,
-            rejected(response.error.as_ref()),
-        ),
+        CommandOutcome::Rejected => {
+            if response
+                .error
+                .as_ref()
+                .is_some_and(|error| error.code == ErrorCode::DeliveryUnknown)
+            {
+                return unknown_terminal(request);
+            }
+            let problem = rejected(response.error.as_ref());
+            let delivery = if problem.code == ErrorCode::AwaitingApproval {
+                DeliveryState::AwaitingApproval
+            } else {
+                DeliveryState::Unavailable
+            };
+            failure(request, delivery, problem)
+        }
         CommandOutcome::Expired => failure(
             request,
             DeliveryState::Expired,
@@ -185,14 +202,14 @@ fn valid_resource_id(kind: Kind, value: &str) -> bool {
     }
 }
 
-pub(super) fn unknown(request: &Request) -> HubError {
+pub(super) fn unknown(request: &ReceiptContext<'_>) -> HubError {
     HubError::from_problem(correlate(
         request,
         ProblemDetails::new(ErrorCode::DeliveryUnknown, UNKNOWN_DETAIL),
     ))
 }
 
-pub(super) fn unknown_terminal(request: &Request) -> Result<Terminal, HubError> {
+pub(super) fn unknown_terminal(request: &ReceiptContext<'_>) -> Result<Terminal, HubError> {
     let problem = unknown(request);
     Ok(Terminal {
         state: TerminalState::Unknown,
@@ -201,13 +218,17 @@ pub(super) fn unknown_terminal(request: &Request) -> Result<Terminal, HubError> 
             .then(|| request.message_reply(DeliveryState::Unknown))
             .transpose()?,
         problem: Some(problem.problem().clone()),
-        delivery: request.message_id().map(|_| DeliveryState::Unknown),
+        delivery: request.message_id.map(|_| DeliveryState::Unknown),
         delivery_detail: Some(UNKNOWN_DETAIL.into()),
         resource_id: None,
+        release_key: false,
     })
 }
 
-fn message_success(request: &Request, delivery: DeliveryState) -> Result<Terminal, HubError> {
+fn message_success(
+    request: &ReceiptContext<'_>,
+    delivery: DeliveryState,
+) -> Result<Terminal, HubError> {
     Ok(Terminal {
         state: TerminalState::Succeeded,
         success: Some(request.message_reply(delivery)?),
@@ -215,16 +236,17 @@ fn message_success(request: &Request, delivery: DeliveryState) -> Result<Termina
         delivery: Some(delivery),
         delivery_detail: None,
         resource_id: None,
+        release_key: false,
     })
 }
 
 fn failure(
-    request: &Request,
+    request: &ReceiptContext<'_>,
     delivery: DeliveryState,
     problem: ProblemDetails,
 ) -> Result<Terminal, HubError> {
     let problem = correlate(request, problem);
-    let delivery_detail = request.message_id().map(|_| clean_text(&problem.detail));
+    let delivery_detail = request.message_id.map(|_| clean_text(&problem.detail));
     let (state, success, problem) = if request.is_answer() {
         (
             TerminalState::Succeeded,
@@ -238,17 +260,18 @@ fn failure(
         state,
         success,
         problem,
-        delivery: request.message_id().map(|_| delivery),
+        delivery: request.message_id.map(|_| delivery),
         delivery_detail,
         resource_id: None,
+        release_key: false,
     })
 }
 
-fn correlate(request: &Request, mut problem: ProblemDetails) -> ProblemDetails {
+fn correlate(request: &ReceiptContext<'_>, mut problem: ProblemDetails) -> ProblemDetails {
     problem
         .extensions
         .insert("operation_id".into(), Value::from(request.id.as_str()));
-    if let Some(id) = request.message_id() {
+    if let Some(id) = request.message_id {
         problem
             .extensions
             .insert("message_id".into(), Value::from(id.as_str()));
@@ -274,7 +297,11 @@ fn rejected(remote: Option<&ProblemDetails>) -> ProblemDetails {
     ) {
         return rejection;
     }
-    let detail = clean_text(&remote.detail);
+    let detail = if remote.code == ErrorCode::AwaitingApproval {
+        "The participant is waiting for an approval decision.".to_owned()
+    } else {
+        clean_text(&remote.detail)
+    };
     let mut problem = ProblemDetails::new(
         remote.code,
         if detail.trim().is_empty() {
@@ -311,6 +338,28 @@ fn copy_extensions(local: &mut ProblemDetails, remote: &ProblemDetails) {
                     .insert("action_hint".into(), Value::from(action_hint));
             }
         }
+        if let Some(summary) = value("summary") {
+            local
+                .extensions
+                .insert("summary".into(), Value::from(clean_text(summary)));
+        }
+        if let Some(wait_kind) =
+            value("wait_kind").and_then(|kind| kind.parse::<ApprovalWaitKind>().ok())
+        {
+            local
+                .extensions
+                .insert("wait_kind".into(), Value::from(wait_kind.as_str()));
+        }
+        if let Some(can_respond) = remote
+            .extensions
+            .get("can_respond_remotely")
+            .and_then(Value::as_bool)
+        {
+            let can_respond = can_respond && local.extensions.contains_key("approval_id");
+            local
+                .extensions
+                .insert("can_respond_remotely".into(), Value::from(can_respond));
+        }
     }
     if local.code == ErrorCode::QuestionAlreadyAnswered
         && let Some(id) = value("existing_answer_id").filter(|id| MessageId::parse(id).is_ok())
@@ -319,6 +368,25 @@ fn copy_extensions(local: &mut ProblemDetails, remote: &ProblemDetails) {
             .extensions
             .insert("existing_answer_id".into(), Value::from(id));
     }
+    if let Some(reason) = value("reason").filter(|r| cooplet_protocol::is_valid_error_reason(r)) {
+        local
+            .extensions
+            .insert("reason".into(), Value::from(reason));
+    }
+}
+
+pub(super) fn redact_error(error: HubError, can_manage: bool) -> HubError {
+    if can_manage || error.problem().code != ErrorCode::AwaitingApproval {
+        return error;
+    }
+    let mut problem = error.into_problem();
+    let fields = std::mem::take(&mut problem.extensions);
+    let mut object = Value::Object(fields.into_iter().collect());
+    crate::bridge::redact_approval_value(&mut object);
+    if let Value::Object(fields) = object {
+        problem.extensions = fields.into_iter().collect();
+    }
+    HubError::from_problem(problem)
 }
 
 fn clean_text(text: &str) -> String {

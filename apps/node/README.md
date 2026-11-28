@@ -87,6 +87,104 @@ use the local operator credential.
 sole stopped match. Pass the exact participant ID when several stopped
 participants share a name.
 
+## Share a thread across two Nodes
+
+This example uses `curl` and `jq`. Start the Hub using its
+[setup instructions](../hub/README.md#initialize-and-run). Set `HUB_ID` to the
+Hub ID from initialization. In an operator shell, issue one token for each
+Node. The subshell creates both enrollment files with private permissions.
+
+```sh
+HUB=http://127.0.0.1:8200
+(
+  umask 077
+  for label in alpha beta; do
+    target/debug/cooplet-hub enrollment-token create --hub "$HUB" \
+      --hub-id "$HUB_ID" --token-file ./hub-state/admin.token --name "$label" \
+      | jq -er .token > "$label.enrollment"
+  done
+)
+```
+
+Start `target/debug/cooplet --state-dir ./alpha node run` and
+`target/debug/cooplet --state-dir ./beta node run` in separate terminals.
+For Nodes on different machines, use an HTTPS Hub origin reachable by both
+and deliver each enrollment file to its Node securely. Enroll the running
+Nodes and save the Hub-issued ID for Beta.
+
+```sh
+target/debug/cooplet --state-dir ./alpha node enroll \
+  --hub "$HUB" --hub-id "$HUB_ID" --token-file ./alpha.enrollment
+BETA_NODE=$(target/debug/cooplet --state-dir ./beta node enroll \
+  --hub "$HUB" --hub-id "$HUB_ID" --token-file ./beta.enrollment | jq -er .node_id)
+```
+
+Enrollment preserves the Node's local ID and credentials. When using a private
+CA, pass `--ca-cert` at enrollment. The binding lives in `creds/hub.json` and
+is loaded at restart. Use a fresh state directory to enroll with a different
+Hub.
+
+Create a coordinator on Beta using an installed and signed-in Codex CLI or use
+the participant ID of an existing agent there.
+
+```sh
+BETA_ENDPOINT=$(jq -er .endpoint ./beta/creds/operator.json)
+BETA_AGENT=$(printf 'Authorization: Bearer %s\n' "$(jq -er .token ./beta/creds/operator.json)" \
+  | curl --fail-with-body --silent --show-error "$BETA_ENDPOINT/v1/agents" \
+      --header @- --header 'Content-Type: application/json' \
+      --header 'Idempotency-Key: walkthrough-coordinator' \
+      --data '{"client_kind":"codex","name":"coordinator"}' | jq -er .participant_id)
+BETA_MEMBER="$BETA_NODE/$BETA_AGENT"
+```
+
+Wait for both Nodes to appear online in the Hub's `/v1/nodes` response and for
+the coordinator to appear in `/v1/participants`. The responses use the Hub
+admin bearer and the `X-Cooplet-Hub` header with the pinned ID.
+
+From Alpha, create the board, join the coordinator and post a mention with
+an optional attachment. For separate hosts, carry the qualified member key
+`BETA_MEMBER` from Beta to Alpha.
+
+```sh
+THREAD=$(target/debug/cooplet --state-dir ./alpha thread create \
+  --title 'Implementation review' | jq -er .thread_id)
+target/debug/cooplet --state-dir ./alpha thread join "$THREAD" "$BETA_MEMBER" \
+  --handle coordinator --wake-policy mentions_only --mode queue_until_idle
+printf 'Review the current result.\n' > ./notes.txt
+ATTACHMENT=$(target/debug/cooplet --state-dir ./alpha blob put ./notes.txt \
+  --target hub --mime-type text/plain)
+target/debug/cooplet --state-dir ./alpha thread post "$THREAD" \
+  --body '@coordinator please review the notes' --attach "$ATTACHMENT"
+target/debug/cooplet --state-dir ./alpha thread read "$THREAD"
+```
+
+When the coordinator is idle, it receives a single turn with the pending
+thread context and a readable local copy of the attachment. It replies with
+the MCP `thread_post` tool using the `reply_to` thread ID shown in the turn.
+For a direct message, `cooplet message send --to "$BETA_MEMBER" --body ...`
+uses the same connection and addresses the agent privately.
+
+The CLI prints the generated `idempotency_key` to stderr before sending a
+keyed thread operation, message or Hub upload. If the outcome is uncertain,
+repeat the same command with `--operation-key` and the printed key.
+
+Use `thread members` to check `confirmed_seq` and any pending range. If the
+coordinator is `paused_unknown`, read the board and set `AFTER_SEQ` to the last
+sequence it should consider read. Sequences above that cursor are eligible for
+delivery in the new generation. A batch already sent can still start within
+its original admission window. Run the resume command from Alpha even if Beta
+is offline.
+
+```sh
+target/debug/cooplet --state-dir ./alpha thread members "$THREAD"
+target/debug/cooplet --state-dir ./alpha thread resume "$THREAD" \
+  --member-key "$BETA_MEMBER" --after-seq "$AFTER_SEQ"
+```
+
+When a thread cursor expires, the CLI prints `floor_seq` and `head_seq` on
+stderr. Read again from `floor_seq` to fetch the retained posts. A pin conflict
+reports `current_version`. Read the pin before retrying with that version.
+
 ## Managed Codex
 
 Install and sign in to the Codex CLI, then run `cooplet node doctor` to check

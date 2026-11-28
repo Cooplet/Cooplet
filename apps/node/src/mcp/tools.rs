@@ -10,9 +10,9 @@ use cooplet_client::{
     BlobUploadOutcome, BlobUploadSpec, ClientError, CoopletClient, UploadVerification, api_path,
 };
 use cooplet_protocol::{
-    AnswerPayload, AttachmentRef, DeliveryMode, ErrorCode, MessageId, NodeId, OperationId,
-    ParticipantId, ParticipantKind, PrincipalKind, ProblemDetails, QuestionPayload, RunId,
-    ServicePrincipalId, UserId, WhoamiResponse, validate_attachment_name, validate_idempotency_key,
+    AnswerPayload, AttachmentRef, DeliveryMode, ErrorCode, MessageId, NodeId, ParticipantId,
+    ParticipantKind, PrincipalKind, ProblemDetails, QuestionPayload, RunId, ServicePrincipalId,
+    UserId, WhoamiResponse, validate_attachment_name, validate_idempotency_key,
 };
 use cooplet_storage::DEFAULT_MAX_BLOB_BYTES;
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
@@ -20,6 +20,8 @@ use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 
 use crate::delivery::{SendMessageRequest, SendMessageResponse};
+
+mod threads;
 
 #[derive(Debug, Serialize)]
 pub(super) struct ToolError {
@@ -51,27 +53,11 @@ impl ToolError {
         let mut error = Self::new(problem.code, problem.code.title());
         error.status = Some(problem.status);
         error.retryable = problem.retryable;
-        // Return typed correlation IDs. Arbitrary strings from an HTTP error
-        // can contain local paths or credentials.
-        for field in ["message_id", "existing_answer_id"] {
-            if let Some(value) = problem.extensions.get(field).and_then(Value::as_str)
-                && MessageId::parse(value).is_ok()
-            {
-                error
-                    .extensions
-                    .insert(field, Value::String(value.to_owned()));
-            }
-        }
-        if let Some(value) = problem
-            .extensions
-            .get("operation_id")
-            .and_then(Value::as_str)
-            && OperationId::parse(value).is_ok()
-        {
-            error
-                .extensions
-                .insert("operation_id", Value::String(value.to_owned()));
-        }
+        error.extensions.extend(
+            problem
+                .recovery_fields()
+                .map(|(key, value)| (key, value.clone())),
+        );
         error
     }
 
@@ -111,15 +97,22 @@ enum Tool {
     SendMessage,
     AskUser,
     BlobPut,
+    Thread(threads::ThreadTool),
 }
 
 impl Tool {
-    const ALL: [Self; 5] = [
+    const ALL: [Self; 11] = [
         Self::Whoami,
         Self::ListParticipants,
         Self::SendMessage,
         Self::AskUser,
         Self::BlobPut,
+        Self::Thread(threads::ThreadTool::Create),
+        Self::Thread(threads::ThreadTool::Post),
+        Self::Thread(threads::ThreadTool::Read),
+        Self::Thread(threads::ThreadTool::Pin),
+        Self::Thread(threads::ThreadTool::Wait),
+        Self::Thread(threads::ThreadTool::Members),
     ];
 
     fn name(self) -> &'static str {
@@ -129,6 +122,7 @@ impl Tool {
             Self::SendMessage => "send_message",
             Self::AskUser => "ask_user",
             Self::BlobPut => "blob_put",
+            Self::Thread(tool) => tool.name(),
         }
     }
 
@@ -161,11 +155,13 @@ impl Tool {
                 object(
                     json!({
                         "path": {"type":"string", "minLength":1, "description":"Path relative to the participant workspace."},
+                        "target": {"type":"string", "enum":["local", "hub"], "default":"local"},
                         "operation_key": operation_key_schema(),
                     }),
                     &["path", "operation_key"],
                 ),
             ),
+            Self::Thread(tool) => tool.definition(),
         };
         json!({"name": self.name(), "description": description, "inputSchema": schema})
     }
@@ -188,7 +184,7 @@ fn operation_key_schema() -> Value {
     json!({"type":"string", "minLength":8, "maxLength":128, "pattern": "^[!-~]+$"})
 }
 
-fn message_schema(question: bool) -> Value {
+fn attachments_schema() -> Value {
     let attachments = object(
         json!({
             "blob_id": {"type":"string", "pattern": cooplet_protocol::BlobId::PATTERN},
@@ -199,11 +195,46 @@ fn message_schema(question: bool) -> Value {
         }),
         &["blob_id", "name", "mime_type", "size_bytes", "sha256"],
     );
+    json!({"type":"array", "items": attachments, "maxItems":64})
+}
+
+fn question_schema() -> Value {
+    let option = object(
+        json!({
+            "id": {"type":"string", "minLength":1, "maxLength":64},
+            "label": {"type":"string", "minLength":1, "maxLength":64},
+            "description": {"type":"string", "maxLength":256},
+        }),
+        &["id", "label"],
+    );
+    object(
+        json!({
+            "prompt": {"type":"string", "minLength":1, "maxLength":2000},
+            "mode": {"type":"string", "enum":["single", "multi", "text"]},
+            "options": {"type":"array", "items": option, "maxItems":16},
+            "allow_free_text": {"type":"boolean"},
+            "expires_at_ms": {"type":"integer", "minimum":1},
+        }),
+        &["prompt", "mode"],
+    )
+}
+
+fn answer_schema() -> Value {
+    object(
+        json!({
+            "selected_option_ids": {"type":"array", "items":{"type":"string"}, "maxItems":16},
+            "text": {"type":"string", "minLength":1, "maxLength":8000},
+        }),
+        &[],
+    )
+}
+
+fn message_schema(question: bool) -> Value {
     let mut schema = object(
         json!({
             "operation_key": operation_key_schema(),
             "body": {"type":"string"},
-            "attachments": {"type":"array", "items": attachments},
+            "attachments": attachments_schema(),
             "delivery_mode": {"type":"string", "enum":["direct_now", "queue_until_idle"], "default":"direct_now"},
             "queue_ttl_ms": {
                 "type":"integer", "minimum":300000, "maximum":3600000,
@@ -214,44 +245,25 @@ fn message_schema(question: bool) -> Value {
     );
     let props = &mut schema["properties"];
     if question {
-        let option = object(
-            json!({
-                "id": {"type":"string", "minLength":1, "maxLength":64},
-                "label": {"type":"string", "minLength":1, "maxLength":64},
-                "description": {"type":"string", "maxLength":256},
-            }),
-            &["id", "label"],
-        );
-        props["question"] = object(
-            json!({
-                "prompt": {"type":"string", "minLength":1, "maxLength":2000},
-                "mode": {"type":"string", "enum":["single", "multi", "text"]},
-                "options": {"type":"array", "items": option, "maxItems":16},
-                "allow_free_text": {"type":"boolean"},
-                "expires_at_ms": {"type":"integer", "minimum":1},
-            }),
-            &["prompt", "mode"],
-        );
+        props["question"] = question_schema();
         schema["required"] = json!(["question", "operation_key"]);
     } else {
         props["to"] = json!({
             "type":"string",
-            "description":"Participant or actor ID.",
+            "description":"Local actor ID or a qualified <node_id>/<participant_id> or <hub_id>/<participant_id> address.",
             "anyOf":[
                 {"pattern":ParticipantId::PATTERN},
                 {"pattern":UserId::PATTERN},
                 {"pattern":ServicePrincipalId::PATTERN},
                 {"pattern":RunId::PATTERN},
+                {"pattern":format!("{}{}",
+                    cooplet_protocol::SourceId::PATTERN.trim_end_matches('$'),
+                    ParticipantId::PATTERN.replacen('^', "/", 1)
+                )},
             ],
         });
         props["in_reply_to"] = json!({"type":"string", "pattern": MessageId::PATTERN});
-        props["answer"] = object(
-            json!({
-                "selected_option_ids": {"type":"array", "items":{"type":"string"}, "maxItems":16},
-                "text": {"type":"string", "minLength":1, "maxLength":8000},
-            }),
-            &[],
-        );
+        props["answer"] = answer_schema();
         schema["required"] = json!(["to", "body", "operation_key"]);
     }
     schema
@@ -300,6 +312,16 @@ struct AskArgs {
 struct BlobArgs {
     path: PathBuf,
     operation_key: String,
+    #[serde(default)]
+    target: BlobTarget,
+}
+
+#[derive(Clone, Copy, Default, Deserialize)]
+#[serde(rename_all = "snake_case")]
+enum BlobTarget {
+    #[default]
+    Local,
+    Hub,
 }
 
 #[derive(Deserialize)]
@@ -357,6 +379,7 @@ impl ToolContext {
             Tool::SendMessage => self.send_message(decode(input)?).await,
             Tool::AskUser => self.ask_user(decode(input)?).await,
             Tool::BlobPut => self.blob_put(decode(input)?).await,
+            Tool::Thread(tool) => tool.call(&self.client, input).await,
         }
     }
 
@@ -491,33 +514,42 @@ impl ToolContext {
         })?;
         let private = self.private_tree.clone();
         let mime_type = mime_type(&args.path).to_string();
-        let file =
-            tokio::task::spawn_blocking(move || prepare_file(&workspace, &args.path, &private))
-                .await
-                .map_err(|_| {
-                    ToolError::new(ErrorCode::InternalError, "Could not prepare the upload")
-                })??;
-        let result = self
-            .client
-            .upload_blob(
-                BlobUploadSpec {
-                    filename,
-                    mime_type,
-                    verification: UploadVerification::LocalSha256,
-                    expected_sha256: Some(file.sha256),
-                    idempotency_key: Some(args.operation_key),
-                    content_length: Some(file.bytes),
-                },
-                tokio::fs::File::from_std(file.file),
+        let target = args.target;
+        let file = tokio::task::spawn_blocking(move || {
+            prepare_file(&workspace, &args.path, &private, target)
+        })
+        .await
+        .map_err(|_| ToolError::new(ErrorCode::InternalError, "Could not prepare the upload"))??;
+        let spec = BlobUploadSpec {
+            filename,
+            mime_type,
+            verification: match target {
+                BlobTarget::Local => UploadVerification::LocalSha256,
+                BlobTarget::Hub => UploadVerification::HubReceipt,
+            },
+            expected_sha256: file.sha256,
+            idempotency_key: Some(args.operation_key),
+            content_length: Some(file.bytes),
+            participant_id: None,
+        };
+        let reader = tokio::fs::File::from_std(file.file);
+        let result = match target {
+            BlobTarget::Local => self.client.upload_blob(spec, reader).await,
+            BlobTarget::Hub => self.client.upload_bridge_blob(spec, reader).await,
+        }
+        .map_err(|err| ToolError::from_client(err, true))?;
+        match (target, result) {
+            (
+                BlobTarget::Local,
+                BlobUploadOutcome::VerifiedLocal(receipt)
+                | BlobUploadOutcome::AcknowledgedWithoutLocalVerification(receipt),
             )
-            .await
-            .map_err(|err| ToolError::from_client(err, true))?;
-        match result {
-            BlobUploadOutcome::VerifiedLocal(receipt)
-            | BlobUploadOutcome::AcknowledgedWithoutLocalVerification(receipt) => to_value(receipt),
-            BlobUploadOutcome::CompleteWithHubDigest(_) => Err(ToolError::new(
+            | (BlobTarget::Hub, BlobUploadOutcome::CompleteWithHubDigest(receipt)) => {
+                to_value(receipt)
+            }
+            _ => Err(ToolError::new(
                 ErrorCode::DeliveryUnknown,
-                "The Node did not return a locally verified upload receipt",
+                "The Node did not return the expected upload receipt",
             )),
         }
     }
@@ -574,10 +606,15 @@ pub(super) fn private_tree(credential: &Path) -> io::Result<PathBuf> {
 struct UploadFile {
     file: File,
     bytes: u64,
-    sha256: String,
+    sha256: Option<String>,
 }
 
-fn prepare_file(workspace: &Path, relative: &Path, private: &Path) -> ToolResult<UploadFile> {
+fn prepare_file(
+    workspace: &Path,
+    relative: &Path,
+    private: &Path,
+    target: BlobTarget,
+) -> ToolResult<UploadFile> {
     let invalid_path = || ToolError::invalid("path must refer to a regular workspace file");
     let read_error = || ToolError::invalid("Could not read the workspace file");
     let forbidden = || {
@@ -632,6 +669,13 @@ fn prepare_file(workspace: &Path, relative: &Path, private: &Path) -> ToolResult
     if opened.len() > DEFAULT_MAX_BLOB_BYTES {
         return Err(too_large());
     }
+    if matches!(target, BlobTarget::Hub) {
+        return Ok(UploadFile {
+            file,
+            bytes: opened.len(),
+            sha256: None,
+        });
+    }
     let mut hasher = Sha256::new();
     let bytes = io::copy(
         &mut (&mut file).take(DEFAULT_MAX_BLOB_BYTES + 1),
@@ -651,7 +695,7 @@ fn prepare_file(workspace: &Path, relative: &Path, private: &Path) -> ToolResult
     Ok(UploadFile {
         file,
         bytes,
-        sha256: format!("{:x}", hasher.finalize()),
+        sha256: Some(format!("{:x}", hasher.finalize())),
     })
 }
 
@@ -733,28 +777,50 @@ mod tests {
             "outside-link.txt",
             "shared-copy.txt",
         ] {
-            let rejected = prepare_file(&workspace, Path::new(candidate), &protected);
+            let rejected = prepare_file(
+                &workspace,
+                Path::new(candidate),
+                &protected,
+                BlobTarget::Hub,
+            );
             assert_eq!(
                 rejected.err().map(|error| error.code),
                 Some(ErrorCode::Forbidden)
             );
         }
         for candidate in [&workspace.join("upload.TXT"), Path::new("node-state/..")] {
-            assert!(prepare_file(&workspace, candidate, &protected).is_err());
+            assert!(prepare_file(&workspace, candidate, &protected, BlobTarget::Local).is_err());
         }
         for candidate in ["upload.TXT", "inside-link.txt"] {
-            let result = prepare_file(&workspace, Path::new(candidate), &protected)
-                .map_err(|error| io::Error::other(error.detail))?;
+            let result = prepare_file(
+                &workspace,
+                Path::new(candidate),
+                &protected,
+                BlobTarget::Local,
+            )
+            .map_err(|error| io::Error::other(error.detail))?;
             let mut bytes = Vec::new();
             (&result.file).read_to_end(&mut bytes)?;
             assert_eq!(bytes, b"hello");
             assert_eq!(result.bytes, 5);
             assert_eq!(
-                result.sha256,
-                "2cf24dba5fb0a30e26e83b2ac5b9e29e1b161e5c1fa7425e73043362938b9824"
+                result.sha256.as_deref(),
+                Some("2cf24dba5fb0a30e26e83b2ac5b9e29e1b161e5c1fa7425e73043362938b9824")
             );
             assert_eq!(mime_type(Path::new(candidate)), "text/plain");
         }
+        let relay = prepare_file(
+            &workspace,
+            Path::new("upload.TXT"),
+            &protected,
+            BlobTarget::Hub,
+        )
+        .map_err(|error| io::Error::other(error.detail))?;
+        assert_eq!(relay.bytes, 5);
+        assert!(relay.sha256.is_none());
+        let mut bytes = Vec::new();
+        (&relay.file).read_to_end(&mut bytes)?;
+        assert_eq!(bytes, b"hello");
         Ok(())
     }
 
@@ -784,5 +850,30 @@ mod tests {
         );
         assert!(!serde_json::to_string(&error)?.contains("very-sensitive-value"));
         Ok(())
+    }
+
+    #[test]
+    fn thread_problem_keeps_safe_resync_and_pin_extensions() {
+        let thread = "thr_00000000000000000000000000";
+        let resync =
+            ProblemDetails::new(ErrorCode::ResyncRequired, "The thread history was pruned")
+                .with_extension("thread_id", thread)
+                .with_extension("floor_seq", 12)
+                .with_extension("head_seq", 15)
+                .with_extension("reason", "cursor_pruned");
+        let error = ToolError::from_problem(resync);
+        assert_eq!(error.status, Some(410));
+        assert_eq!(error.extensions["thread_id"], thread);
+        assert_eq!(error.extensions["floor_seq"], 12);
+        assert_eq!(error.extensions["head_seq"], 15);
+        assert_eq!(error.extensions["reason"], "cursor_pruned");
+
+        let conflict = ProblemDetails::new(ErrorCode::PinConflict, "The pin changed")
+            .with_extension("current_version", Value::Null)
+            .with_extension("reason", "internal/path");
+        let error = ToolError::from_problem(conflict);
+        assert_eq!(error.status, Some(409));
+        assert_eq!(error.extensions["current_version"], Value::Null);
+        assert!(!error.extensions.contains_key("reason"));
     }
 }

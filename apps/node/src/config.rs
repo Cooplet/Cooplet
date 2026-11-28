@@ -16,6 +16,7 @@ use crate::{
     auth::{
         Auth, Credential, MASTER_FILE, OPERATOR_FILE, platform_io, publish_master, read_master,
     },
+    bridge::HUB_FILE,
     now_ms,
     storage::{MIGRATIONS, NodeGcHooks, recover},
 };
@@ -135,6 +136,11 @@ impl OpenNode {
                 .await?;
             let sweep_dir = state_dir.clone();
             tokio::task::spawn_blocking(move || {
+                if PrivateFs::clean_interrupted_writes(&sweep_dir.join(CREDS_DIR), HUB_FILE)
+                    .is_err()
+                {
+                    tracing::warn!("Could not clean interrupted Hub credential writes");
+                }
                 sweep_startup_artifacts(&sweep_dir, &retained_runtime)
             })
             .await?;
@@ -227,6 +233,7 @@ fn preflight(
     if version == 0 {
         return Ok(());
     }
+    check_v1_schema(conn)?;
     let Some(info) = read_info(conn)? else {
         return Ok(());
     };
@@ -250,6 +257,7 @@ pub async fn check_offline_state(dir: &Path) -> Result<Credential, StorageError>
                     "The Node database has not been initialized".into(),
                 ));
             }
+            check_v1_schema(conn)?;
             let info = read_info(conn)?.ok_or_else(|| {
                 StorageError::IncompatibleDatabase(
                     "The Node does not have a committed identity".into(),
@@ -259,6 +267,26 @@ pub async fn check_offline_state(dir: &Path) -> Result<Credential, StorageError>
         },
     )
     .await
+}
+
+fn check_v1_schema(conn: &Connection) -> Result<(), StorageError> {
+    fn objects(conn: &Connection) -> rusqlite::Result<Vec<(String, String, String)>> {
+        conn.prepare(
+            "SELECT type, name, sql FROM main.sqlite_schema
+             WHERE substr(name, 1, 7) <> 'sqlite_' ORDER BY type, name",
+        )?
+        .query_map([], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)))?
+        .collect()
+    }
+
+    let reference = Connection::open_in_memory()?;
+    reference.execute_batch(MIGRATIONS[0].sql)?;
+    if objects(conn)? != objects(&reference)? {
+        return Err(StorageError::IncompatibleDatabase(
+            "The Node schema does not match migration v1".into(),
+        ));
+    }
+    Ok(())
 }
 
 fn verified_operator_with_auth(
@@ -519,4 +547,22 @@ fn hostname() -> String {
         .map(|name| name.trim().to_string())
         .filter(|name| !name.is_empty())
         .unwrap_or_else(|| "cooplet-node".into())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn pre_release_node_schema_must_match_the_initial_ddl() -> Result<(), StorageError> {
+        let conn = Connection::open_in_memory()?;
+        conn.execute_batch(MIGRATIONS[0].sql)?;
+        check_v1_schema(&conn)?;
+        conn.execute_batch("ALTER TABLE messages DROP COLUMN hub_parent_message_id;")?;
+        assert!(matches!(
+            check_v1_schema(&conn),
+            Err(StorageError::IncompatibleDatabase(_))
+        ));
+        Ok(())
+    }
 }

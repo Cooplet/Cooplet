@@ -1,12 +1,13 @@
 use std::{path::Path, sync::Arc, time::Duration};
 
+use cooplet_client::CoopletClient;
 use cooplet_platform::AdmissionGuard;
 use cooplet_protocol::{
-    AttachmentRef, AuthorKind, DeliveryMode, DeliveryState, ErrorCode, MessageId, ParticipantId,
+    AttachmentRef, DeliveryMode, DeliveryState, ErrorCode, MessageId, ParticipantId,
     ParticipantKind, ParticipantState,
 };
 use cooplet_storage::{EventNotice, StorageError, WriteError, WriteFailure, WriteOutcome};
-use rusqlite::Transaction;
+use rusqlite::{OptionalExtension, Transaction, params};
 use serde_json::json;
 
 use super::{
@@ -14,24 +15,32 @@ use super::{
     envelope::{VerifiedAttachments, encode_queue_envelope},
     model::invalid,
     queries::{
-        Recipient, check_message_frame_fields, committed_pending_answer, recipient, sql_error,
-        store_message, update_delivery,
+        HubProjection, Recipient, check_message_frame_fields, committed_pending_answer, recipient,
+        sql_error, store_message, update_delivery,
     },
     questions::{answer_denial, answered_event, validate_reply},
     queue::{ATTACHMENT_UNAVAILABLE, enqueue, expire_for_recipient, queue_has_room},
+    relay::{HubAttachment, cache_changed, refresh_hub_attachments},
 };
 use crate::{
     auth::Principal,
     clients::{
-        PendingApprovalRecord, SlotDenial, SubmitOutcome, SubmitSlot, SubmitTurnRequest, TurnInput,
-        apply_submit_outcome,
+        InboundMessage, PendingApprovalRecord, SlotDenial, SubmitOutcome, SubmitSlot,
+        SubmitTurnRequest, TurnInput, VerifiedAuthor, apply_submit_outcome,
     },
     error::{NodeError, Result},
-    operations::{Operation, ReceiptLookup},
+    operations::{DelegatedOperation, Operation, OperationGuard, ReceiptLookup, admission_expired},
     storage::{reconcile_pending_message, retry_recovery_write},
 };
 
 const DIRECT_ADMISSION: Duration = Duration::from_secs(5);
+
+pub(crate) struct InboundHubMessage {
+    pub message_id: MessageId,
+    pub sender_id: String,
+    pub author: VerifiedAuthor,
+    pub input: SendMessageRequest,
+}
 
 impl DeliveryService {
     pub async fn send(
@@ -79,47 +88,207 @@ impl DeliveryService {
         let guard = self
             .operations
             .guard(caller.actor_id(), key, "message.send", &input)?;
-        let operation = guard.operation.clone();
-        match self.operations.lookup_state(&operation).await? {
-            ReceiptLookup::Missing => {}
-            ReceiptLookup::Succeeded(receipt) => return SendMessageResponse::decode(receipt),
-            ReceiptLookup::Failed(stored) => return Err(stored),
+        if let Some(receipt) = self
+            .existing_receipt(&guard.operation, input.answer.is_some())
+            .await?
+        {
+            return Ok(receipt);
+        }
+        let attempt = Attempt {
+            message_id: MessageId::generate()?,
+            operation: guard.operation.clone(),
+            can_read_all: caller.can_read_all(),
+            sender_id: caller.actor_id().to_owned(),
+            author: VerifiedAuthor {
+                kind: caller.author_kind(),
+                actor_id: caller.actor_id().to_owned(),
+                name: caller.identity.name,
+                source_node_id: None,
+            },
+            hub: None,
+            input,
+        };
+        self.send_new(&guard, attempt, None).await
+    }
+
+    pub(crate) async fn send_delegated(
+        self: &Arc<Self>,
+        delegated: &DelegatedOperation,
+        hub: &CoopletClient,
+        max_blob_bytes: u64,
+        mut message: InboundHubMessage,
+    ) -> Result<SendMessageResponse> {
+        self.ensure_accepting()?;
+        let _activity = self.activity.read().await;
+        self.ensure_accepting()?;
+        message.input.normalize()?;
+        let guard = self.operations.guard_delegated(
+            delegated,
+            "message.send",
+            &(&message.message_id, &message.input),
+        )?;
+        if let Some(receipt) = self
+            .existing_receipt(&guard.operation, message.input.answer.is_some())
+            .await?
+        {
+            return Ok(receipt);
+        }
+        let message_id = MessageId::generate()?;
+        let build_attempt = |attachments| Attempt {
+            message_id: message_id.clone(),
+            operation: guard.operation.clone(),
+            can_read_all: false,
+            sender_id: message.sender_id.clone(),
+            author: message.author.clone(),
+            hub: Some(InboundProjection {
+                message_id: message.message_id.clone(),
+                attachments,
+            }),
+            input: message.input.clone(),
+        };
+        let materialize = || {
+            self.load_hub_attachments(
+                hub,
+                &message.input.attachments,
+                &delegated.admission,
+                max_blob_bytes,
+            )
+        };
+        for attempt_idx in 0..2 {
+            if let Some(denial) = self.preflight_delegated_attachments(&message.input).await? {
+                let attempt = build_attempt(Vec::new());
+                return self
+                    .send_new_with_preflight(
+                        &guard,
+                        attempt,
+                        Some(&delegated.admission),
+                        Some(denial),
+                    )
+                    .await;
+            }
+            let attempt = build_attempt(materialize().await?);
+            match self
+                .send_new(&guard, attempt, Some(&delegated.admission))
+                .await
+            {
+                Err(error) if attempt_idx == 0 && cache_changed(&error) => continue,
+                result => return result,
+            }
+        }
+        Err(NodeError::internal(
+            "Delegated message attachment retry loop exited unexpectedly",
+        ))
+    }
+
+    async fn preflight_delegated_attachments(
+        &self,
+        input: &SendMessageRequest,
+    ) -> Result<Option<SlotDenial>> {
+        if input.attachments.is_empty() || input.answer.is_some() {
+            return Ok(None);
+        }
+        let to = input.to.clone();
+        let target = self
+            .reads
+            .read(move |conn| Ok(recipient(conn, &to)))
+            .await??;
+        if target.kind != ParticipantKind::Agent {
+            return Ok(None);
+        }
+        let live_state = self
+            .agents
+            .live_session(&target.id)
+            .filter(|session| session.generation() == target.generation)
+            .map(|session| session.state());
+        let active = |state| {
+            matches!(
+                state,
+                ParticipantState::Idle
+                    | ParticipantState::Working
+                    | ParticipantState::AwaitingApproval
+            )
+        };
+        let Some(live_state) = live_state.filter(|state| active(*state)) else {
+            return Ok(Some(SlotDenial::Unavailable));
+        };
+        if !active(target.state) {
+            return Ok(Some(SlotDenial::Unavailable));
+        }
+        Ok(match input.delivery_mode {
+            DeliveryMode::DirectNow => {
+                if matches!(
+                    (live_state, target.state),
+                    (ParticipantState::AwaitingApproval, _)
+                        | (_, ParticipantState::AwaitingApproval)
+                ) {
+                    Some(SlotDenial::AwaitingApproval)
+                } else if matches!(
+                    (live_state, target.state),
+                    (ParticipantState::Working, _) | (_, ParticipantState::Working)
+                ) {
+                    Some(SlotDenial::Busy)
+                } else {
+                    None
+                }
+            }
+            DeliveryMode::QueueUntilIdle => None,
+        })
+    }
+
+    async fn existing_receipt(
+        &self,
+        operation: &Operation,
+        is_answer: bool,
+    ) -> Result<Option<SendMessageResponse>> {
+        match self.operations.lookup_state(operation).await? {
+            ReceiptLookup::Missing => Ok(None),
+            ReceiptLookup::Succeeded(receipt) => SendMessageResponse::decode(receipt).map(Some),
+            ReceiptLookup::Failed(stored) => Err(stored),
             ReceiptLookup::Unknown {
                 id,
                 problem,
                 resource_id,
-            } => return Err(unknown_receipt(id, problem, resource_id)),
-            ReceiptLookup::Pending { id, resource_id } => {
-                return self
-                    .reconcile_pending(
-                        &operation,
-                        &id,
-                        resource_id.as_deref(),
-                        input.answer.is_some(),
-                    )
-                    .await;
-            }
+            } => Err(unknown_receipt(id, problem, resource_id)),
+            ReceiptLookup::Pending { id, resource_id } => self
+                .reconcile_pending(operation, &id, resource_id.as_deref(), is_answer)
+                .await
+                .map(Some),
         }
+    }
 
-        let attempt = Attempt {
-            message_id: MessageId::generate()?,
-            operation: operation.clone(),
-            can_read_all: caller.can_read_all(),
-            sender_kind: caller.author_kind(),
-            sender_name: caller.identity.name,
-            input,
-        };
+    async fn send_new(
+        self: &Arc<Self>,
+        guard: &OperationGuard,
+        attempt: Attempt,
+        external_admission: Option<&AdmissionGuard>,
+    ) -> Result<SendMessageResponse> {
+        self.send_new_with_preflight(guard, attempt, external_admission, None)
+            .await
+    }
+
+    async fn send_new_with_preflight(
+        self: &Arc<Self>,
+        guard: &OperationGuard,
+        attempt: Attempt,
+        external_admission: Option<&AdmissionGuard>,
+        forced_denial: Option<SlotDenial>,
+    ) -> Result<SendMessageResponse> {
+        let operation = guard.operation.clone();
         // Validate reply authority before looking at the local recipient or taking its slot.
         let (attempt, target) = self
             .reads
             .read(move |conn| {
-                let result = validate_reply(
-                    conn,
-                    &attempt.input,
-                    &attempt.operation.actor_id,
-                    attempt.can_read_all,
-                )
-                .and_then(|_| recipient(conn, &attempt.input.to));
+                let result = if attempt.hub.is_none() {
+                    validate_reply(
+                        conn,
+                        &attempt.input,
+                        &attempt.sender_id,
+                        attempt.can_read_all,
+                    )
+                    .and_then(|_| recipient(conn, &attempt.input.to))
+                } else {
+                    recipient(conn, &attempt.input.to)
+                };
                 Ok((attempt, result))
             })
             .await?;
@@ -133,11 +302,21 @@ impl DeliveryService {
                     | ParticipantState::AwaitingApproval,
             )
         });
-        let live_generation = live.as_ref().map(|session| session.generation());
+        let live_generation = if matches!(forced_denial, Some(SlotDenial::Unavailable))
+            || (forced_denial.is_some()
+                && attempt.input.delivery_mode == DeliveryMode::QueueUntilIdle)
+        {
+            None
+        } else {
+            live.as_ref().map(|session| session.generation())
+        };
         let mut slot = None;
-        let mut direct_denial = SlotDenial::Unavailable;
-        let admission = AdmissionGuard::new(DIRECT_ADMISSION);
-        if attempt.input.delivery_mode == DeliveryMode::DirectNow
+        let mut direct_denial = forced_denial.unwrap_or(SlotDenial::Unavailable);
+        let admission = external_admission
+            .cloned()
+            .unwrap_or_else(|| AdmissionGuard::new(DIRECT_ADMISSION));
+        if forced_denial.is_none()
+            && attempt.input.delivery_mode == DeliveryMode::DirectNow
             && target.kind == ParticipantKind::Agent
             && let Some(session) = &live
         {
@@ -158,9 +337,12 @@ impl DeliveryService {
         let is_answer = attempt.input.answer.is_some();
         let blob_root = self.blob_root.clone();
         let clock = self.clock.clone();
+        let write_admission = external_admission.cloned();
         let prepared = self
             .db
-            .write(move |tx| attempt.prepare(tx, &blob_root, &clock, live))
+            .write(move |tx| {
+                attempt.prepare(tx, &blob_root, &clock, live, write_admission.as_ref())
+            })
             .await;
         match prepared {
             Ok(Prepared::Direct(work)) => {
@@ -600,10 +782,16 @@ struct DirectWork {
 struct Attempt {
     message_id: MessageId,
     operation: Operation,
-    sender_kind: AuthorKind,
-    sender_name: String,
+    sender_id: String,
+    author: VerifiedAuthor,
     can_read_all: bool,
     input: SendMessageRequest,
+    hub: Option<InboundProjection>,
+}
+
+struct InboundProjection {
+    message_id: MessageId,
+    attachments: Vec<HubAttachment>,
 }
 
 struct AttemptAdmission {
@@ -623,6 +811,7 @@ impl Attempt {
         blob_root: &Path,
         clock: &Arc<Clock>,
         live: AttemptAdmission,
+        admission: Option<&AdmissionGuard>,
     ) -> std::result::Result<WriteOutcome<Prepared>, WriteError<NodeError>> {
         if let Some(previous) = replay_in_writer(tx, &self.operation, clock.as_ref(), false)? {
             return Ok(WriteOutcome::with_events(
@@ -632,8 +821,11 @@ impl Attempt {
         }
         let now = clock().map_err(NodeError::from)?;
         let input = &self.input;
-        let actor = &self.operation.actor_id;
-        let question = validate_reply(tx, input, actor, self.can_read_all)?;
+        let question = if self.hub.is_none() {
+            validate_reply(tx, input, &self.sender_id, self.can_read_all)?
+        } else {
+            None
+        };
         let recipient = recipient(tx, &input.to)?;
         if input
             .question
@@ -643,7 +835,14 @@ impl Attempt {
         {
             return Err(invalid("The question expiry must be in the future").into());
         }
-        let attachments = VerifiedAttachments::load(tx, &input.attachments, actor, now)?;
+        let local_attachments = self
+            .hub
+            .is_none()
+            .then(|| VerifiedAttachments::load(tx, &input.attachments, &self.sender_id, now))
+            .transpose()?;
+        if let Some(hub) = &self.hub {
+            refresh_hub_attachments(tx, &hub.attachments, now)?;
+        }
         if let (Some(question), Some(question_id)) = (&question, &input.in_reply_to)
             && let Some(error) = answer_denial(tx, question_id, question, now)?
         {
@@ -652,6 +851,9 @@ impl Attempt {
         }
 
         let mut events = Vec::new();
+        if admission.is_some_and(AdmissionGuard::is_expired) {
+            return Err(admission_expired().into());
+        }
         let mut state = self.initial_state(tx, &recipient, &live, now, &mut events)?;
         if state == DeliveryState::Queued && !queue_has_room(tx, &recipient.id)? {
             if input.answer.is_some() {
@@ -698,7 +900,12 @@ impl Attempt {
                 _ => {}
             }
         }
-        let receipt = self.receipt(Some(self.message_id.clone()), state);
+        let local_parent = match &self.hub {
+            Some(_) => hub_parent(tx, input.in_reply_to.as_ref(), &input.to, now)?,
+            None => input.in_reply_to.clone(),
+        };
+        let mut receipt = self.receipt(Some(self.message_id.clone()), state);
+        receipt.in_reply_to.clone_from(&local_parent);
         let ttl = if state == DeliveryState::Queued {
             Some(
                 self.input
@@ -710,14 +917,22 @@ impl Attempt {
             None
         };
         let operation = self.operation.clone();
-        let sender_name = self.sender_name;
+        let hub_parent = self.input.in_reply_to.clone();
+        let attachments = match &self.hub {
+            Some(hub) => hub
+                .attachments
+                .iter()
+                .map(|attachment| attachment.local.clone())
+                .collect(),
+            None => self.input.attachments,
+        };
         let view = MessageView {
             message_id: self.message_id,
-            sender_id: operation.actor_id.clone(),
+            sender_id: self.sender_id,
             recipient_id: self.input.to,
-            in_reply_to: self.input.in_reply_to,
+            in_reply_to: local_parent,
             body: self.input.body,
-            attachments: self.input.attachments,
+            attachments,
             question: self.input.question,
             answer: self.input.answer,
             delivery_mode: self.input.delivery_mode,
@@ -729,20 +944,51 @@ impl Attempt {
         };
         operation.reserve(tx, now, Some(view.message_id.as_str()))?;
         let attachments_json = serde_json::to_string(&view.attachments).map_err(sql_error)?;
-        events.push(store_message(tx, &view, &attachments_json)?);
-        VerifiedAttachments::attach(tx, &view.attachments, now)?;
+        let projection = self.hub.as_ref().map(|hub| HubProjection {
+            message: &hub.message_id,
+            parent: hub_parent.as_ref(),
+        });
+        events.push(store_message(tx, &view, &attachments_json, projection)?);
+        if local_attachments.is_some() {
+            VerifiedAttachments::attach(tx, &view.attachments, now)?;
+        }
         if let (Some(id), Some(answer)) = (&view.in_reply_to, &view.answer) {
             events.push(answered_event(
                 tx,
                 now,
                 id,
                 &view.message_id,
-                &operation.actor_id,
+                &view.sender_id,
                 answer,
             )?);
         }
+        let turn = || -> Result<TurnInput> {
+            match (&self.hub, local_attachments) {
+                (Some(hub), _) => Ok(TurnInput::direct(InboundMessage {
+                    message_id: view.message_id.clone(),
+                    author: self.author,
+                    in_reply_to: view.in_reply_to.clone().or(hub_parent),
+                    body: view.body.clone(),
+                    attachments: hub
+                        .attachments
+                        .iter()
+                        .map(HubAttachment::resolved)
+                        .collect(),
+                    question: view.question.clone(),
+                    answer: view.answer.clone(),
+                    expect_mcp_reply: true,
+                })),
+                (None, Some(attachments)) => Ok(attachments.turn_input(
+                    &view,
+                    self.author.kind,
+                    &self.author.name,
+                    blob_root,
+                )),
+                _ => Err(NodeError::internal("Message attachment source is missing")),
+            }
+        };
         if state == DeliveryState::Accepted {
-            let input = attachments.turn_input(&view, self.sender_kind, &sender_name, blob_root);
+            let input = turn()?;
             let work = DirectWork {
                 receipt,
                 message_id: view.message_id,
@@ -757,8 +1003,11 @@ impl Attempt {
             ));
         }
         if let Some(ttl) = ttl {
-            let input = attachments.turn_input(&view, self.sender_kind, &sender_name, blob_root);
+            let input = turn()?;
             let envelope = encode_queue_envelope(&input)?;
+            if admission.is_some_and(AdmissionGuard::is_expired) {
+                return Err(admission_expired().into());
+            }
             enqueue(
                 tx,
                 &recipient.id,
@@ -849,11 +1098,30 @@ impl Attempt {
             tx,
             now,
             &self.message_id,
-            &self.operation.actor_id,
+            &self.sender_id,
             &self.input,
             delivery_state,
         )
     }
+}
+
+fn hub_parent(
+    tx: &Transaction<'_>,
+    hub_id: Option<&MessageId>,
+    recipient: &str,
+    now: i64,
+) -> Result<Option<MessageId>> {
+    let Some(hub_id) = hub_id else {
+        return Ok(None);
+    };
+    tx.query_row(
+        "SELECT message_id FROM messages WHERE hub_message_id = ?1 AND expires_at_ms > ?2
+         AND (sender_id = ?3 OR recipient_id = ?3)",
+        params![hub_id.as_str(), now, recipient],
+        |row| row.get::<_, String>(0)?.parse().map_err(sql_error),
+    )
+    .optional()
+    .map_err(Into::into)
 }
 
 pub(super) fn submit_state(outcome: &SubmitOutcome) -> DeliveryState {
@@ -893,6 +1161,7 @@ fn awaiting_approval(approval: Option<&PendingApprovalRecord>) -> NodeError {
     if let Some(approval) = approval {
         error = error
             .with_extension("approval_id", approval.public_id.clone())
+            .with_extension("wait_kind", approval.kind.as_str())
             .with_extension("can_respond_remotely", approval.can_respond_remotely);
         if let Some(summary) = &approval.summary {
             error = error.with_extension("summary", summary.clone());

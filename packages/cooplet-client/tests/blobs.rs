@@ -35,7 +35,42 @@ fn spec(length: Option<u64>) -> BlobUploadSpec {
         expected_sha256: None,
         idempotency_key: None,
         content_length: length,
+        participant_id: None,
     }
+}
+
+#[tokio::test]
+async fn bridge_upload_uses_the_relay_and_leaves_digest_verification_to_hub() -> TestResult {
+    let server = Server::bind().await?;
+    let client = CoopletClient::new(settings(&server))?;
+    let mut relay = spec(Some(5));
+    relay.verification = UploadVerification::HubReceipt;
+    assert!(matches!(
+        client.upload_blob(relay.clone(), b"hello".as_slice()).await,
+        Err(ClientError::InvalidInput(_))
+    ));
+    let serve = async {
+        let (head, mut peer) = server.accept().await?;
+        assert_eq!(head.request, "POST /v1/bridge/blobs HTTP/1.1");
+        assert_eq!(head.count("x-cooplet-participant"), 0);
+        assert_eq!(head.count("x-cooplet-hub"), 0);
+        assert_eq!(peer.read_body(&head).await?, b"hello");
+        // A different digest proves that this hop did not hash and compare the body.
+        peer.respond(
+            "201 Created",
+            &[("content-type", "application/json")],
+            receipt(5, EMPTY_SHA).as_bytes(),
+        )
+        .await
+    };
+    let (outcome, served) =
+        tokio::join!(client.upload_bridge_blob(relay, b"hello".as_slice()), serve);
+    served?;
+    assert!(matches!(
+        outcome?,
+        BlobUploadOutcome::CompleteWithHubDigest(blob) if blob.sha256 == EMPTY_SHA
+    ));
+    Ok(())
 }
 
 #[tokio::test]

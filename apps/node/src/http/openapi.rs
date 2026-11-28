@@ -11,7 +11,7 @@ use utoipa::{
     },
 };
 
-use super::{blobs, events, routes};
+use super::{blobs, bridge, events, routes, threads};
 
 #[derive(OpenApi)]
 #[openapi(
@@ -22,6 +22,9 @@ use super::{blobs, events, routes};
         routes::resume_agent, routes::stop_agent, routes::approval, routes::attach_plan,
         routes::messages_list, routes::message_get, routes::send_message,
         events::list, events::stream, blobs::put, blobs::get, routes::stop_node,
+        bridge::enroll, blobs::relay, threads::create, threads::list, threads::get,
+        threads::close, threads::post, threads::read, threads::pin_set, threads::pin_delete,
+        threads::wait, threads::members, threads::join, threads::leave, threads::resume,
     ),
     components(schemas(ProblemDetails)),
     modifiers(&HttpResponses)
@@ -43,7 +46,12 @@ impl Modify for HttpResponses {
         // All mounted operations use the bounded request readers. Authentication
         // and write admission add further responses before the domain handler.
         for (path, item) in &mut openapi.paths.paths {
-            for (operation, write) in [(&mut item.get, false), (&mut item.post, true)] {
+            for (operation, write) in [
+                (&mut item.get, false),
+                (&mut item.post, true),
+                (&mut item.put, true),
+                (&mut item.delete, true),
+            ] {
                 let Some(operation) = operation else { continue };
                 let authenticated = operation
                     .security
@@ -78,7 +86,7 @@ impl Modify for HttpResponses {
                         .entry("507".into())
                         .or_insert_with(|| problem("Storage capacity exhausted"));
                 }
-                if path.contains("{id}") {
+                if path.contains("{") {
                     responses
                         .entry("404".into())
                         .or_insert_with(|| problem("Resource not found"));

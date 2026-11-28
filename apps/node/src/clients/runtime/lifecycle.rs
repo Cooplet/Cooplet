@@ -1,9 +1,9 @@
 use std::{path::PathBuf, sync::Arc, time::Duration};
 
-use cooplet_platform::PrivateFs;
+use cooplet_platform::{AdmissionGuard, PrivateFs};
 use cooplet_protocol::{
-    ErrorCode, EventKind, NodeId, OperationId, ParticipantId, ParticipantKind, ParticipantState,
-    PrincipalKind, RunId,
+    ApprovalWait, ErrorCode, EventKind, IntakeState, NodeId, OperationId, ParticipantId,
+    ParticipantKind, ParticipantState, PrincipalKind, RunId,
 };
 use cooplet_storage::{WriteError, WriteOutcome};
 use rusqlite::params;
@@ -22,7 +22,7 @@ use crate::{
     config::CREDS_DIR,
     error::{NodeError, Result},
     now_ms,
-    operations::{Operation, OperationGuard},
+    operations::{DelegatedOperation, Operation, OperationGuard, admission_expired},
     storage::revoke_participant_credentials,
 };
 
@@ -31,7 +31,7 @@ use super::{
     approvals::abandon_inflight_approval,
     bad_data, busy, invalid, lock, not_found,
     participants::{ParticipantRow, load_participant, runtime_dir},
-    processes::OpeningSpawner,
+    processes::{LaunchOutcome, OpeningSpawner},
     sessions::{LiveSession, run_events},
     state::{ApprovalSource, enter_awaiting_approval, participant_event},
     stop::{StopUpdate, finish_stop},
@@ -61,6 +61,15 @@ pub struct AgentResponse {
     pub node_id: NodeId,
 }
 
+#[derive(Serialize)]
+pub(crate) struct AgentInspectionView {
+    participant_id: ParticipantId,
+    state: ParticipantState,
+    intake_state: IntakeState,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    approval: Option<ApprovalWait>,
+}
+
 struct OpenPlan {
     id: ParticipantId,
     name: String,
@@ -82,6 +91,11 @@ pub(super) enum Reservation<T> {
     New(T),
 }
 
+struct NativeOpenTimeout {
+    admission_closed: bool,
+    awaiting_managed_preparation: bool,
+}
+
 impl AgentService {
     pub async fn discover_all(&self) -> Result<Vec<DiscoveryReport>> {
         self.cancel_on_shutdown(self.0.registry.discover_all(&self.adapter_config()))
@@ -99,18 +113,42 @@ impl AgentService {
         &self,
         actor: &str,
         key: &str,
-        mut request: CreateAgentRequest,
+        request: CreateAgentRequest,
         ephemeral_for_run_id: Option<RunId>,
     ) -> Result<AgentResponse> {
-        request.overrides = request
-            .overrides
-            .filter(|overrides| overrides != &AgentOverrides::default());
+        let request = normalized_request(request);
         let guard = self.0.operations.guard(
             actor,
             key,
             "agent.create",
             &(request.clone(), &ephemeral_for_run_id),
         )?;
+        self.create_guarded(guard, request, ephemeral_for_run_id, None)
+            .await
+    }
+
+    pub(crate) async fn create_delegated(
+        &self,
+        delegated: &DelegatedOperation,
+        request: CreateAgentRequest,
+    ) -> Result<AgentResponse> {
+        let request = normalized_request(request);
+        let guard = self.0.operations.guard_delegated(
+            delegated,
+            "agent.create",
+            &(&request, Option::<RunId>::None),
+        )?;
+        self.create_guarded(guard, request, None, Some(&delegated.admission))
+            .await
+    }
+
+    async fn create_guarded(
+        &self,
+        guard: OperationGuard,
+        request: CreateAgentRequest,
+        ephemeral_for_run_id: Option<RunId>,
+        admission: Option<&AdmissionGuard>,
+    ) -> Result<AgentResponse> {
         if let Some(value) = self.0.operations.lookup(&guard.operation).await? {
             return decode(value);
         }
@@ -138,6 +176,7 @@ impl AgentService {
         .map_err(NodeError::internal)??;
         let plan = self
             .plan(OpenPlanInput {
+                admission,
                 id,
                 name,
                 workspace,
@@ -148,7 +187,7 @@ impl AgentService {
                 ephemeral_for_run_id,
             })
             .await?;
-        self.open(&guard, plan).await
+        self.open(&guard, plan, admission).await
     }
 
     pub async fn resume(&self, actor: &str, key: &str, id: ParticipantId) -> Result<AgentResponse> {
@@ -166,6 +205,7 @@ impl AgentService {
                 .map_err(NodeError::internal)??;
         let plan = self
             .plan(OpenPlanInput {
+                admission: None,
                 id,
                 name: previous.name.clone(),
                 workspace,
@@ -176,10 +216,10 @@ impl AgentService {
                 ephemeral_for_run_id: None,
             })
             .await?;
-        self.open(&guard, plan).await
+        self.open(&guard, plan, None).await
     }
 
-    async fn plan(&self, input: OpenPlanInput) -> Result<OpenPlan> {
+    async fn plan(&self, input: OpenPlanInput<'_>) -> Result<OpenPlan> {
         let has_frozen_instructions = input
             .previous
             .as_ref()
@@ -220,7 +260,11 @@ impl AgentService {
         let adapter = self.0.registry.get(&client_kind)?;
         let config = self.adapter_config();
         let report = self
-            .cancel_on_shutdown(self.0.registry.discover(&client_kind, &config))
+            .cancel_on_shutdown(self.0.registry.discover_for_open(
+                &client_kind,
+                &config,
+                input.admission,
+            ))
             .await?;
         if !report.available {
             return Err(invalid(
@@ -271,7 +315,12 @@ impl AgentService {
         })
     }
 
-    async fn open(&self, guard: &OperationGuard, plan: OpenPlan) -> Result<AgentResponse> {
+    async fn open(
+        &self,
+        guard: &OperationGuard,
+        plan: OpenPlan,
+        admission: Option<&AdmissionGuard>,
+    ) -> Result<AgentResponse> {
         let op = &guard.operation;
         let generation = match &plan.previous {
             Some(previous) => previous
@@ -288,7 +337,14 @@ impl AgentService {
         )?;
         let boot_id = self.0.boot.current();
         let reservation = self
-            .reserve_open(op, &plan, generation, credential.clone(), boot_id.clone())
+            .reserve_open(
+                op,
+                &plan,
+                generation,
+                credential.clone(),
+                boot_id.clone(),
+                admission.cloned(),
+            )
             .await?;
         if let Reservation::Replay(value) = reservation {
             return decode(value);
@@ -302,7 +358,7 @@ impl AgentService {
         let previous_ownership = plan.previous.as_ref().map(|previous| previous.ownership);
         let preparation = OpenPreparation::default();
         let result = self
-            .start_open(&plan, &key, &credential, &preparation)
+            .start_open(&plan, &key, &credential, &preparation, admission)
             .await;
         let (opened, mode) = match result {
             Ok(opened) => opened,
@@ -380,6 +436,7 @@ impl AgentService {
         generation: u64,
         credential: Credential,
         boot_id: Option<String>,
+        admission: Option<AdmissionGuard>,
     ) -> Result<Reservation<()>> {
         let now = now_ms()?;
         let id = plan.id.clone();
@@ -413,6 +470,9 @@ impl AgentService {
             )?;
             if conflicts {
                 return Err(busy("name_in_use", false).into());
+            }
+            if admission.as_ref().is_some_and(AdmissionGuard::is_expired) {
+                return Err(admission_expired().into());
             }
             let core = CoreBinding {
                 overrides,
@@ -458,6 +518,7 @@ impl AgentService {
         key: &SessionKey,
         credential: &Credential,
         preparation: &OpenPreparation,
+        admission: Option<&AdmissionGuard>,
     ) -> Result<(OpenedSession, ParticipantState)> {
         let state_dir = self.0.config.state_dir.clone();
         let prep_key = key.clone();
@@ -483,7 +544,11 @@ impl AgentService {
             },
             None => SessionOpenMode::Create,
         };
-        let spawner = Arc::new(OpeningSpawner::new(self.clone(), key.clone()));
+        let spawner = Arc::new(OpeningSpawner::new(
+            self.clone(),
+            key.clone(),
+            admission.cloned(),
+        ));
         let request = SessionOpenRequest {
             preparation: preparation.clone(),
             participant_id: key.0.clone(),
@@ -499,22 +564,51 @@ impl AgentService {
         };
         let result = self
             .cancel_on_shutdown(async {
-                tokio::time::timeout(OPEN_REQUEST_TIMEOUT, plan.adapter.create_or_resume(request))
+                if admission.is_some_and(AdmissionGuard::is_expired) {
+                    return Err(admission_expired());
+                }
+                let mut opening = plan.adapter.create_or_resume(request);
+                // Keep the adapter future alive until we sample what it was
+                // awaiting. Its preparation worker may have completed without
+                // returning control to the adapter before the timed-out poll.
+                let outcome = tokio::time::timeout(OPEN_REQUEST_TIMEOUT, opening.as_mut())
                     .await
-                    .map_err(|_| unknown("native_open_timed_out"))?
-                    // Adapter-controlled diagnostics can contain credentials.
-                    .map_err(|error| {
-                        NodeError::new(
-                            error.code(),
-                            "The adapter could not open its native session",
-                        )
-                        .with_extension("reason", "native_open_failed")
-                    })
+                    .map_err(|_| NativeOpenTimeout {
+                        admission_closed: admission.is_some_and(AdmissionGuard::is_expired),
+                        awaiting_managed_preparation: preparation.awaiting_managed_preparation(),
+                    });
+                Ok(outcome)
             })
             .await;
         // A detached spawn may still be publishing its process identity.
         // Rollback needs ownership settled before it checks for the child.
-        spawner.seal().await;
+        let launch = spawner.seal().await;
+        let result = match result {
+            Ok(Ok(result)) => result.map_err(|error| {
+                // Adapter-controlled diagnostics can contain credentials.
+                NodeError::new(
+                    error.code(),
+                    "The adapter could not open its native session",
+                )
+                .with_extension("reason", "native_open_failed")
+            }),
+            Ok(Err(NativeOpenTimeout {
+                admission_closed,
+                awaiting_managed_preparation,
+            })) => {
+                if admission_closed
+                    && (launch == LaunchOutcome::AdmissionExpired
+                        || (launch == LaunchOutcome::Unused && awaiting_managed_preparation))
+                {
+                    return Err(admission_expired());
+                }
+                return Err(unknown("native_open_timed_out"));
+            }
+            Err(error) => Err(error),
+        };
+        if launch == LaunchOutcome::AdmissionExpired && result.is_err() {
+            return Err(admission_expired());
+        }
         let opened = result?;
         opened.native_key.validate(&plan.client_kind)?;
         if let Some(previous) = &plan.previous
@@ -618,7 +712,7 @@ impl AgentService {
             } else {
                 participant_event(tx, now,
                     if creating { EventKind::ParticipantCreated } else { EventKind::ParticipantStateChanged },
-                    &key.0, Some(&op.actor_id), json!({}), &mut events,
+                    &key.0, Some(&op.actor_id), if creating { json!({}) } else { json!({"reason": "resumed"}) }, &mut events,
                 )?;
             }
             op.succeed(tx, now, &response)?;
@@ -756,6 +850,37 @@ impl AgentService {
         })
         .await
     }
+
+    pub(crate) async fn inspect_delegated(&self, id: ParticipantId) -> Result<AgentInspectionView> {
+        let row = self.participant_row(&id).await?;
+        if row.kind != ParticipantKind::Agent {
+            return Err(invalid(
+                "not_an_agent",
+                "The participant has no client adapter",
+            ));
+        }
+        let approval = (row.state == ParticipantState::AwaitingApproval)
+            .then(|| {
+                row.binding
+                    .core
+                    .pending_approval
+                    .map(|pending| pending.as_wait())
+            })
+            .flatten();
+        Ok(AgentInspectionView {
+            participant_id: id,
+            state: row.state,
+            intake_state: row.state.intake_state(),
+            approval,
+        })
+    }
+}
+
+fn normalized_request(mut request: CreateAgentRequest) -> CreateAgentRequest {
+    request.overrides = request
+        .overrides
+        .filter(|overrides| overrides != &AgentOverrides::default());
+    request
 }
 
 fn adapter_read_timeout() -> NodeError {
@@ -766,7 +891,8 @@ fn adapter_read_timeout() -> NodeError {
     .with_extension("reason", "adapter_read_timeout")
 }
 
-struct OpenPlanInput {
+struct OpenPlanInput<'a> {
+    admission: Option<&'a AdmissionGuard>,
     id: ParticipantId,
     name: String,
     workspace: PathBuf,

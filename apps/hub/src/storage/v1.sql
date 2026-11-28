@@ -56,6 +56,7 @@ CREATE TABLE nodes (
     session_epoch       INTEGER NOT NULL DEFAULT 0,
     status              TEXT    NOT NULL CHECK (status IN ('online','offline','revoked')),
     capabilities_json   TEXT    NOT NULL DEFAULT '{}',
+    roster_catalog_json TEXT,
     last_seen_at_ms     INTEGER,
     enrolled_at_ms      INTEGER NOT NULL,
     revoked_at_ms       INTEGER
@@ -73,6 +74,9 @@ CREATE TABLE node_participants (
                             'stopping','stopped','unavailable','unknown'
                         )),
     capabilities_json   TEXT    NOT NULL DEFAULT '{}',
+    approval_json       TEXT,
+    -- An idle-scheduled delivery owns this gate until its ACK or a fresh Idle.
+    idle_delivery_id    TEXT,
     synced_epoch        INTEGER NOT NULL,
     updated_at_ms       INTEGER NOT NULL,
     PRIMARY KEY (node_id, participant_id)
@@ -106,6 +110,7 @@ CREATE TABLE hub_messages (
     sender_node_id        TEXT    REFERENCES nodes(node_id) ON DELETE SET NULL,
     target_node_id        TEXT    REFERENCES nodes(node_id) ON DELETE SET NULL,
     target_participant_id TEXT    NOT NULL,
+    required_node_ids_json TEXT   NOT NULL,
     in_reply_to           TEXT    REFERENCES hub_messages(message_id) ON DELETE SET NULL,
     body                  TEXT    NOT NULL,
     attachments_json      TEXT    NOT NULL DEFAULT '[]',
@@ -121,7 +126,6 @@ CREATE TABLE hub_messages (
     created_at_ms         INTEGER NOT NULL,
     delivered_at_ms       INTEGER,
     expires_at_ms         INTEGER NOT NULL,
-    CHECK (sender_node_id IS NOT NULL OR target_node_id IS NOT NULL OR answer_json IS NOT NULL),
     CHECK (NOT (question_json IS NOT NULL AND answer_json IS NOT NULL))
 );
 CREATE UNIQUE INDEX idx_hub_messages_single_answer
@@ -141,6 +145,7 @@ CREATE TABLE threads (
     status              TEXT    NOT NULL CHECK (status IN ('open','closed')),
     head_seq            INTEGER NOT NULL DEFAULT 0,
     floor_seq           INTEGER NOT NULL DEFAULT 0,
+    pin_version_clock   INTEGER NOT NULL DEFAULT 0 CHECK (pin_version_clock >= 0),
     created_at_ms       INTEGER NOT NULL,
     updated_at_ms       INTEGER NOT NULL,
     closed_at_ms        INTEGER,
@@ -151,6 +156,7 @@ CREATE INDEX idx_threads_expires ON threads(expires_at_ms) WHERE expires_at_ms I
 
 CREATE TABLE thread_members (
     thread_id           TEXT    NOT NULL REFERENCES threads(thread_id) ON DELETE CASCADE,
+    member_key          TEXT    NOT NULL,
     participant_id      TEXT    NOT NULL,
     node_id             TEXT    REFERENCES nodes(node_id) ON DELETE SET NULL,
     handle              TEXT    NOT NULL,
@@ -160,7 +166,16 @@ CREATE TABLE thread_members (
                         CHECK (delivery_mode IN ('direct_now','queue_until_idle')),
     state               TEXT    NOT NULL DEFAULT 'active'
                         CHECK (state IN ('active','paused_unknown','left')),
+    delivery_generation INTEGER NOT NULL DEFAULT 0 CHECK (delivery_generation >= 0),
     confirmed_seq       INTEGER NOT NULL DEFAULT 0,
+    -- Latest relevant post awaiting a queued delivery (queue_until_idle only).
+    last_wake_seq       INTEGER NOT NULL DEFAULT 0 CHECK (last_wake_seq >= 0),
+    -- Earliest unattempted relevant post in this online session (direct_now only).
+    direct_wake_seq     INTEGER NOT NULL DEFAULT 0 CHECK (direct_wake_seq >= 0),
+    -- Last queued or recovery wake that exhausted its transient delivery attempts.
+    retry_exhausted_seq INTEGER NOT NULL DEFAULT 0 CHECK (retry_exhausted_seq >= 0),
+    -- The head at explicit resume, extended by relevant direct wakes deferred into recovery.
+    resume_through_seq  INTEGER,
     pending_delivery_id TEXT,
     pending_from_seq    INTEGER,
     pending_to_seq      INTEGER,
@@ -169,11 +184,21 @@ CREATE TABLE thread_members (
     CHECK ((pending_delivery_id IS NULL AND pending_from_seq IS NULL AND pending_to_seq IS NULL)
         OR (pending_delivery_id IS NOT NULL AND pending_from_seq IS NOT NULL AND pending_to_seq IS NOT NULL
             AND pending_from_seq >= 1 AND pending_to_seq >= pending_from_seq)),
-    PRIMARY KEY (thread_id, participant_id),
+    CHECK (last_wake_seq = 0 OR delivery_mode = 'queue_until_idle'),
+    CHECK (direct_wake_seq = 0 OR delivery_mode = 'direct_now'),
+    CHECK (resume_through_seq IS NULL OR (resume_through_seq > confirmed_seq AND delivery_mode = 'direct_now' AND state = 'active')),
+    PRIMARY KEY (thread_id, member_key),
     UNIQUE (thread_id, handle)
 );
-CREATE INDEX idx_thread_members_pending ON thread_members(node_id, thread_id)
+CREATE INDEX idx_thread_members_pending ON thread_members(node_id, participant_id, thread_id)
     WHERE state = 'active' AND node_id IS NOT NULL;
+CREATE INDEX idx_thread_members_stage ON thread_members(node_id, participant_id, thread_id)
+    WHERE state = 'active' AND node_id IS NOT NULL AND pending_delivery_id IS NULL
+      AND role != 'observer' AND wake_policy != 'muted'
+      AND (direct_wake_seq > 0 OR last_wake_seq > confirmed_seq OR resume_through_seq IS NOT NULL);
+CREATE INDEX idx_thread_members_member_key ON thread_members(member_key, thread_id);
+CREATE INDEX idx_thread_members_pending_blobs ON thread_members(node_id, thread_id)
+    WHERE state = 'active' AND pending_delivery_id IS NOT NULL;
 
 CREATE TABLE thread_posts (
     thread_id           TEXT    NOT NULL REFERENCES threads(thread_id) ON DELETE CASCADE,
@@ -198,6 +223,7 @@ CREATE UNIQUE INDEX idx_thread_posts_single_answer
     ON thread_posts(in_reply_to_post_id)
     WHERE answer_json IS NOT NULL AND in_reply_to_post_id IS NOT NULL;
 CREATE INDEX idx_thread_posts_expires ON thread_posts(expires_at_ms);
+CREATE INDEX idx_thread_posts_expiry_seq ON thread_posts(thread_id, expires_at_ms, seq);
 CREATE INDEX idx_thread_posts_operation_fk ON thread_posts(operation_id);
 
 CREATE TABLE thread_pins (
@@ -221,6 +247,7 @@ CREATE TABLE blobs (
     disk_rel_path       TEXT    NOT NULL,
     owner_actor_id      TEXT    NOT NULL,
     scope_node_id       TEXT    REFERENCES nodes(node_id) ON DELETE SET NULL,
+    scope_peer_node_id  TEXT,
     scope_thread_id     TEXT    REFERENCES threads(thread_id) ON DELETE SET NULL,
     attached_at_ms      INTEGER,
     created_at_ms       INTEGER NOT NULL,

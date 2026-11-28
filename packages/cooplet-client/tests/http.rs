@@ -104,6 +104,7 @@ async fn bad_hub_info_never_serializes_or_sends_secrets() -> TestResult {
     let fixtures = [
         (Some(BearerToken::new("test-secret")?), other_hub.as_bytes(), true),
         (None, NODE_INFO, true),
+        (None, br#"{"hub_id":"hub_00000000000000000000000001","display_name":"Hub","protocol_version":2}"#.as_slice(), false),
         (None, br#"{"hub_id":"hub_00000000000000000000000001","node_id":"node_00000000000000000000000001","display_name":"Bad","protocol_version":1}"#.as_slice(), false),
         (None, br#"{"display_name":"Bad","protocol_version":1}"#.as_slice(), false),
         (None, br#"{"hub_id":"hub_00000000000000000000000001","display_name":"Bad","protocol_version":1,"extra":1}"#.as_slice(), false),
@@ -142,6 +143,75 @@ async fn bad_hub_info_never_serializes_or_sends_secrets() -> TestResult {
             assert!(matches!(result, Err(ClientError::Protocol(_))));
         }
     }
+    Ok(())
+}
+
+#[tokio::test]
+async fn enrollment_sends_one_pinned_anonymous_post_without_following_redirects() -> TestResult {
+    let server = Server::bind().await?;
+    let redirected = Server::bind().await?;
+    let hub_id = HUB_ID.parse()?;
+    let serialized = AtomicUsize::new(0);
+    let body = SecretBody(&serialized);
+    let request =
+        CoopletClient::enroll::<_, Value>(&server.url, &hub_id, &[], Duration::from_secs(1), &body);
+    let serve = async {
+        let (head, mut peer) = server.accept().await?;
+        assert_eq!(head.request, "POST /v1/enrollment/token HTTP/1.1");
+        assert_eq!(head.count("authorization"), 0);
+        assert_eq!(head.count("x-cooplet-hub"), 1);
+        assert_eq!(head.header("x-cooplet-hub"), Some(HUB_ID));
+        assert_eq!(peer.read_body(&head).await?, br#""one-shot-token""#);
+        peer.respond(
+            "307 Temporary Redirect",
+            &[("location", redirected.url.as_str())],
+            &[],
+        )
+        .await?;
+        Ok::<_, Box<dyn std::error::Error + Send + Sync>>(())
+    };
+    let (response, served) = tokio::join!(request, serve);
+    served?;
+    assert!(matches!(
+        response,
+        Err(ClientError::UnexpectedStatus { status: 307 })
+    ));
+    assert_eq!(serialized.load(Ordering::Relaxed), 1);
+    assert!(
+        tokio::time::timeout(Duration::from_millis(20), redirected.listener.accept())
+            .await
+            .is_err()
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn separate_transport_checks_the_pin_even_when_http_has_cached_it() -> TestResult {
+    let server = Server::bind().await?;
+    let client = pinned(server.url.clone(), Some(BearerToken::new("test-secret")?))?;
+    let serve = async {
+        for body in [HUB_INFO, NODE_INFO] {
+            let (head, peer) = server.accept().await?;
+            assert_eq!(head.request, "GET /v1/info HTTP/1.1");
+            assert_eq!(head.count("authorization"), 0);
+            assert_eq!(head.count("x-cooplet-hub"), 0);
+            peer.respond("200 OK", &[], body).await?;
+        }
+        Ok::<_, Box<dyn std::error::Error + Send + Sync>>(())
+    };
+    let check = async {
+        client.verify_hub_identity().await?;
+        client
+            .verify_hub_identity_with_timeout(Duration::from_secs(2))
+            .await
+    };
+    let (checked, served) =
+        tokio::time::timeout(Duration::from_secs(3), async { tokio::join!(check, serve) }).await?;
+    served?;
+    assert!(matches!(
+        checked,
+        Err(ClientError::HubIdentityMismatch { .. })
+    ));
     Ok(())
 }
 

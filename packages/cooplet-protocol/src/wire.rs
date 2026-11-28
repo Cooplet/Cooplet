@@ -149,6 +149,17 @@ macro_rules! object_serde {
 }
 
 macro_rules! wire_object {
+    ($(#[$attr:meta])* pub struct $name:ident $fields:tt schema_fields) => {
+        #[derive(Clone, Debug, PartialEq, Eq, utoipa::ToSchema)]
+        $(#[$attr])*
+        pub struct $name $fields
+
+        // The remote Serde record needs to recognize field-level schema attributes.
+        $crate::wire::object_serde! {
+            #[derive(utoipa::ToSchema)]
+            $(#[$attr])* struct $name $fields
+        }
+    };
     ($(#[$attr:meta])* pub struct $name:ident $fields:tt) => {
         #[derive(Clone, Debug, PartialEq, Eq, utoipa::ToSchema)]
         $(#[$attr])*

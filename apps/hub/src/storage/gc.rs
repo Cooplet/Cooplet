@@ -3,7 +3,7 @@ use std::{
     io,
     sync::{
         Mutex,
-        atomic::{AtomicUsize, Ordering},
+        atomic::{AtomicBool, AtomicUsize, Ordering},
     },
 };
 
@@ -12,6 +12,7 @@ use cooplet_storage::{BlobRecord, BlobState, BlobTombstone, EventNotice, GcBatch
 use rusqlite::{
     Connection, ErrorCode as SqliteErrorCode, OptionalExtension, Row, Transaction, params,
 };
+use tokio::sync::watch;
 
 use super::{
     events::{BlobScope, NewEvent, advance_head, blob_event_data, encode_error, record},
@@ -22,12 +23,27 @@ use super::{
 const DAY_MS: i64 = 86_400_000;
 const EVENT_RETENTION: i64 = 14 * DAY_MS;
 const EVENT_CAP: u64 = 500_000;
-const PHASES: usize = 5;
+const PHASES: usize = 7;
 
 pub(super) const PENDING_BLOB_TOMBSTONES: &str =
     "SELECT blob_id, disk_rel_path, size_bytes, deleted_at_ms FROM blobs
      WHERE deleted_at_ms IS NOT NULL AND (deleted_at_ms, blob_id) > (?1, ?2)
      ORDER BY deleted_at_ms, blob_id LIMIT ?3";
+pub(super) const EXPIRED_POST_THREAD: &str =
+    "SELECT thread_id FROM thread_posts WHERE expires_at_ms <= ?1 ORDER BY expires_at_ms LIMIT 1";
+// Post expiry is monotone within a board. This index order picks the same
+// oldest prefix without sorting the entire expired range for each GC batch.
+pub(super) const EXPIRED_POST_PREFIX: &str = "SELECT MAX(seq) FROM (
+    SELECT seq FROM thread_posts WHERE thread_id=?1 AND expires_at_ms<=?2
+    ORDER BY expires_at_ms,seq LIMIT ?3
+)";
+pub(super) const TOMBSTONED_CLOSED_THREAD: &str = "SELECT thread_id FROM threads
+     WHERE expires_at_ms IS NOT NULL AND expires_at_ms = 0 AND +status = 'closed'
+     LIMIT 1";
+pub(super) const EXPIRED_CLOSED_THREAD: &str = "SELECT thread_id FROM threads
+     WHERE expires_at_ms IS NOT NULL AND expires_at_ms > 0 AND expires_at_ms <= ?1
+       AND +status = 'closed'
+     ORDER BY expires_at_ms LIMIT 1";
 pub(super) const DELETE_EXPIRED_TOKENS: &str = "DELETE FROM auth_tokens WHERE token_id IN (
          SELECT token_id FROM auth_tokens
          WHERE expires_at_ms <= ?1 OR revoked_at_ms <= ?1 OR consumed_at_ms <= ?1
@@ -43,9 +59,20 @@ struct EventCountCache {
 }
 
 #[derive(Default)]
-pub(super) struct HubGcHooks {
+pub(crate) struct HubGcHooks {
     next_phase: AtomicUsize,
     event_count_cache: Mutex<Option<EventCountCache>>,
+    acl_dirty: AtomicBool,
+    thread_acl_watch: Option<watch::Sender<u64>>,
+}
+
+impl HubGcHooks {
+    pub(crate) fn with_acl_watch(thread_acl_watch: watch::Sender<u64>) -> Self {
+        Self {
+            thread_acl_watch: Some(thread_acl_watch),
+            ..Self::default()
+        }
+    }
 }
 
 impl GcHooks for HubGcHooks {
@@ -55,6 +82,7 @@ impl GcHooks for HubGcHooks {
         now_ms: i64,
         limit: usize,
     ) -> rusqlite::Result<GcBatchOutcome> {
+        self.acl_dirty.store(false, Ordering::Relaxed);
         let first = self.next_phase.load(Ordering::Relaxed);
         for offset in 0..PHASES {
             let phase = (first + offset) % PHASES;
@@ -93,7 +121,9 @@ impl GcHooks for HubGcHooks {
                         }
                     }
                 }
-                _ => self.prune_events_cached(tx, now_ms, limit.saturating_sub(1), EVENT_CAP)?,
+                4 => self.prune_events_cached(tx, now_ms, limit.saturating_sub(1), EVENT_CAP)?,
+                5 => prune_thread_posts(tx, now_ms, limit.saturating_sub(1))?,
+                _ => prune_closed_threads(tx, now_ms, limit, &self.acl_dirty)?,
             };
             if changed > 0 {
                 return Ok(GcBatchOutcome {
@@ -103,6 +133,14 @@ impl GcHooks for HubGcHooks {
             }
         }
         Ok(GcBatchOutcome::default())
+    }
+
+    fn after_prune_commit(&self) {
+        if self.acl_dirty.swap(false, Ordering::AcqRel)
+            && let Some(watch) = &self.thread_acl_watch
+        {
+            watch.send_modify(|revision| *revision = revision.wrapping_add(1));
+        }
     }
 
     fn fetch_pending_blob_tombstones(
@@ -236,6 +274,75 @@ fn prune_messages(tx: &Transaction<'_>, now: i64, limit: usize) -> rusqlite::Res
     Ok(detached + removed)
 }
 
+fn prune_thread_posts(tx: &Transaction<'_>, now: i64, limit: usize) -> rusqlite::Result<usize> {
+    let candidate: Option<ThreadId> = tx
+        .prepare_cached(EXPIRED_POST_THREAD)?
+        .query_row([now], |row| parse_col(row, 0))
+        .optional()?;
+    let Some(id) = candidate else { return Ok(0) };
+    let through: Option<u64> = tx
+        .prepare_cached(EXPIRED_POST_PREFIX)?
+        .query_row(params![id.as_str(), now, limit], |row| row.get(0))?;
+    let Some(through) = through else {
+        return Ok(0);
+    };
+    let removed = tx.execute(
+        "DELETE FROM thread_posts WHERE thread_id=?1 AND seq<=?2",
+        params![id.as_str(), through],
+    )?;
+    tx.execute(
+        "UPDATE threads SET floor_seq=MAX(floor_seq,?1) WHERE thread_id=?2",
+        params![through, id.as_str()],
+    )?;
+    Ok(removed + 1)
+}
+
+fn prune_closed_threads(
+    tx: &Transaction<'_>,
+    now: i64,
+    limit: usize,
+    acl_dirty: &AtomicBool,
+) -> rusqlite::Result<usize> {
+    if limit == 0 {
+        return Ok(0);
+    }
+    let tombstoned: Option<ThreadId> = tx
+        .prepare_cached(TOMBSTONED_CLOSED_THREAD)?
+        .query_row([], |row| parse_col(row, 0))
+        .optional()?;
+    let Some(id) = tombstoned else {
+        let expired: Option<ThreadId> = tx
+            .prepare_cached(EXPIRED_CLOSED_THREAD)?
+            .query_row([now], |row| parse_col(row, 0))
+            .optional()?;
+        let Some(id) = expired else {
+            return Ok(0);
+        };
+        // A durable tombstone keeps removed historical membership from restoring access
+        // after a wall-clock step backwards during a later cleanup batch.
+        let updated = tx.execute(
+            "UPDATE threads SET expires_at_ms=0 WHERE thread_id=?1",
+            [id.as_str()],
+        )?;
+        if updated != 0 {
+            acl_dirty.store(true, Ordering::Release);
+        }
+        return Ok(updated);
+    };
+    for sql in [
+        "DELETE FROM thread_posts WHERE rowid IN (SELECT rowid FROM thread_posts WHERE thread_id=?1 LIMIT ?2)",
+        "DELETE FROM thread_pins WHERE rowid IN (SELECT rowid FROM thread_pins WHERE thread_id=?1 LIMIT ?2)",
+        "UPDATE blobs SET scope_thread_id=NULL WHERE rowid IN (SELECT rowid FROM blobs WHERE scope_thread_id=?1 LIMIT ?2)",
+        "DELETE FROM thread_members WHERE rowid IN (SELECT rowid FROM thread_members WHERE thread_id=?1 LIMIT ?2)",
+    ] {
+        let touched = tx.execute(sql, params![id.as_str(), limit])?;
+        if touched != 0 {
+            return Ok(touched);
+        }
+    }
+    tx.execute("DELETE FROM threads WHERE thread_id=?1", [id.as_str()])
+}
+
 struct ExpiredBlob {
     attachment: AttachmentRef,
     owner: String,
@@ -245,7 +352,7 @@ struct ExpiredBlob {
 fn prune_blobs(tx: &Transaction<'_>, now: i64, limit: usize) -> rusqlite::Result<Vec<EventNotice>> {
     let mut statement = tx.prepare_cached(
         "SELECT blob_id, original_name, mime_type, size_bytes, sha256, owner_actor_id,
-                scope_node_id, scope_thread_id, attached_at_ms
+                scope_node_id, scope_peer_node_id, scope_thread_id, attached_at_ms
          FROM blobs WHERE deleted_at_ms IS NULL AND expires_at_ms <= ?1
          ORDER BY expires_at_ms LIMIT ?2",
     )?;
@@ -253,8 +360,9 @@ fn prune_blobs(tx: &Transaction<'_>, now: i64, limit: usize) -> rusqlite::Result
         .query_map(params![now, limit], |row| {
             let blob_id: BlobId = parse_col(row, 0)?;
             let node_id: Option<NodeId> = parse_opt_col(row, 6)?;
-            let thread_id: Option<ThreadId> = parse_opt_col(row, 7)?;
-            let attached_at_ms: Option<i64> = row.get(8)?;
+            let peer_id: Option<NodeId> = parse_opt_col(row, 7)?;
+            let thread_id: Option<ThreadId> = parse_opt_col(row, 8)?;
+            let attached_at_ms: Option<i64> = row.get(9)?;
             Ok(ExpiredBlob {
                 attachment: AttachmentRef {
                     blob_id,
@@ -264,7 +372,7 @@ fn prune_blobs(tx: &Transaction<'_>, now: i64, limit: usize) -> rusqlite::Result
                     sha256: row.get(4)?,
                 },
                 owner: row.get(5)?,
-                scope: BlobScope::from_columns(attached_at_ms, node_id, thread_id),
+                scope: BlobScope::from_columns(attached_at_ms, node_id, peer_id, thread_id),
             })
         })?
         .collect::<rusqlite::Result<Vec<_>>>()?;
@@ -378,6 +486,48 @@ fn prune_events(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn closed_thread_tombstone_survives_a_wall_clock_step_back_between_batches()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let mut db = Connection::open_in_memory()?;
+        db.execute_batch(include_str!("v1.sql"))?;
+        let id = ThreadId::generate()?;
+        db.execute(
+            "INSERT INTO threads(thread_id,title,created_by_actor_id,status,head_seq,created_at_ms,
+              updated_at_ms,closed_at_ms,expires_at_ms) VALUES(?1,'Closed','owner','closed',1,10,20,20,100)",
+            [id.as_str()],
+        )?;
+        db.execute(
+            "INSERT INTO thread_members(thread_id,member_key,participant_id,handle,role,wake_policy,joined_at_ms)
+             VALUES(?1,'owner','owner','owner','owner','mentions_only',10)",
+            [id.as_str()],
+        )?;
+        db.execute(
+            "INSERT INTO thread_posts(thread_id,seq,post_id,author_actor_id,author_kind,author_handle,
+             body,created_at_ms,expires_at_ms) VALUES(?1,1,'post','owner','human','owner','body',10,90)",
+            [id.as_str()],
+        )?;
+        let acl_dirty = AtomicBool::new(false);
+        let tx = db.transaction()?;
+        assert_eq!(prune_closed_threads(&tx, 101, 1, &acl_dirty)?, 1);
+        assert!(acl_dirty.load(Ordering::Acquire));
+        tx.commit()?;
+        let before: (i64, u64) = db.query_row(
+            "SELECT expires_at_ms,(SELECT count(*) FROM thread_members) FROM threads",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )?;
+        assert_eq!(before, (0, 1));
+        for _ in 0..3 {
+            let tx = db.transaction()?;
+            assert_eq!(prune_closed_threads(&tx, 5, 1, &acl_dirty)?, 1);
+            tx.commit()?;
+        }
+        let remaining: u64 = db.query_row("SELECT count(*) FROM threads", [], |row| row.get(0))?;
+        assert_eq!(remaining, 0);
+        Ok(())
+    }
 
     #[test]
     fn event_cap_prunes_only_excess_rows_even_with_sequence_gaps() -> rusqlite::Result<()> {

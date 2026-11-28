@@ -4,6 +4,7 @@ use std::{
     time::Duration,
 };
 
+use cooplet_platform::AdmissionGuard;
 use cooplet_protocol::{
     ErrorCode, OperationId, ProblemDetails, canonical_sha256, validate_idempotency_key,
 };
@@ -73,6 +74,25 @@ pub struct Operation {
     pub key: String,
     pub kind: &'static str,
     pub hash: String,
+    pub(crate) bridge_origin: Option<String>,
+}
+
+/// An operation authenticated by the Node's currently bound Hub session.
+pub(crate) struct DelegatedOperation {
+    pub id: OperationId,
+    pub actor_id: String,
+    pub origin: String,
+    pub admission: AdmissionGuard,
+}
+
+pub(crate) const ADMISSION_EXPIRED: &str = "admission_expired";
+
+pub(crate) fn admission_expired() -> NodeError {
+    NodeError::new(
+        ErrorCode::BridgeUnavailable,
+        "The command admission deadline expired",
+    )
+    .with_extension("reason", ADMISSION_EXPIRED)
 }
 
 pub struct OperationGuard {
@@ -120,7 +140,23 @@ impl OperationBook {
         request: &(impl Serialize + ?Sized),
     ) -> Result<OperationGuard> {
         let hash = canonical_sha256(request).map_err(NodeError::internal)?;
-        self.guard_with_hash(actor_id, key, kind, Some(hash))
+        self.guard_with_hash(actor_id, key, kind, Some(hash), None)
+    }
+
+    pub(crate) fn guard_delegated(
+        &self,
+        delegated: &DelegatedOperation,
+        kind: &'static str,
+        request: &(impl Serialize + ?Sized),
+    ) -> Result<OperationGuard> {
+        let hash = canonical_sha256(request).map_err(NodeError::internal)?;
+        self.guard_with_hash(
+            &delegated.actor_id,
+            delegated.id.as_str(),
+            kind,
+            Some(hash),
+            Some(delegated),
+        )
     }
 
     /// Guard an operation whose request hash is only known after streaming
@@ -132,7 +168,7 @@ impl OperationBook {
         key: &str,
         kind: &'static str,
     ) -> Result<OperationGuard> {
-        self.guard_with_hash(actor_id, key, kind, None)
+        self.guard_with_hash(actor_id, key, kind, None, None)
     }
 
     fn guard_with_hash(
@@ -141,15 +177,20 @@ impl OperationBook {
         key: &str,
         kind: &'static str,
         hash: Option<String>,
+        delegated: Option<&DelegatedOperation>,
     ) -> Result<OperationGuard> {
         validate_idempotency_key(key)
             .map_err(|_| NodeError::new(ErrorCode::InvalidRequest, "Invalid Idempotency-Key"))?;
         let operation = Operation {
-            id: OperationId::generate()?,
+            id: match delegated {
+                Some(delegated) => delegated.id.clone(),
+                None => OperationId::generate()?,
+            },
             actor_id: actor_id.into(),
             key: key.into(),
             kind,
             hash: hash.clone().unwrap_or_default(),
+            bridge_origin: delegated.map(|delegated| delegated.origin.clone()),
         };
         match lock_active(&self.active).entry((actor_id.into(), key.into())) {
             Entry::Vacant(entry) => {
@@ -271,7 +312,7 @@ impl Operation {
     pub(crate) fn lookup_state(&self, conn: &Connection) -> Result<ReceiptLookup> {
         let entry = conn
             .query_row(
-                "SELECT operation_id, kind, request_sha256, state, result_json, error_json, resource_id
+                "SELECT operation_id, kind, request_sha256, state, result_json, error_json, resource_id, bridge_origin
              FROM operations WHERE actor_id = ?1 AND operation_key = ?2",
                 params![self.actor_id, self.key],
                 |row| {
@@ -283,14 +324,19 @@ impl Operation {
                         row.get::<_, Option<String>>(4)?,
                         row.get::<_, Option<String>>(5)?,
                         row.get::<_, Option<String>>(6)?,
+                        row.get::<_, Option<String>>(7)?,
                     ))
                 },
             )
             .optional()?;
-        let Some((id, kind, hash, state, value, error, resource_id)) = entry else {
+        let Some((id, kind, hash, state, value, error, resource_id, origin)) = entry else {
             return Ok(ReceiptLookup::Missing);
         };
-        if kind != self.kind || hash != self.hash {
+        if kind != self.kind
+            || hash != self.hash
+            || origin != self.bridge_origin
+            || (origin.is_some() && id != self.id.as_str())
+        {
             return Err(conflict());
         }
         match state.as_str() {
@@ -319,10 +365,10 @@ impl Operation {
     ) -> rusqlite::Result<()> {
         tx.execute(
             "INSERT INTO operations
-             (operation_id,actor_id,operation_key,kind,request_sha256,state,resource_id,created_at_ms,updated_at_ms,expires_at_ms)
-             VALUES (?1,?2,?3,?4,?5,'in_progress',?6,?7,?7,?8)",
+             (operation_id,actor_id,operation_key,kind,request_sha256,state,resource_id,created_at_ms,updated_at_ms,expires_at_ms,bridge_origin)
+             VALUES (?1,?2,?3,?4,?5,'in_progress',?6,?7,?7,?8,?9)",
             params![self.id.as_str(), self.actor_id, self.key, self.kind, self.hash,
-                    resource_id, now, now.saturating_add(RECEIPT_TTL_MS)],
+                    resource_id, now, now.saturating_add(RECEIPT_TTL_MS), self.bridge_origin],
         )?;
         Ok(())
     }
@@ -431,6 +477,11 @@ fn is_preserved_extension(name: &str) -> bool {
             | "oldest_available_seq"
             | "latest_seq"
             | "limit_bytes"
+            | "floor_seq"
+            | "head_seq"
+            | "current_version"
+            | "thread_id"
+            | "reason"
     )
 }
 

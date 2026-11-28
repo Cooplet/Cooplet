@@ -7,6 +7,7 @@ mod hash;
 mod id;
 mod problem;
 mod question;
+mod thread;
 mod wire;
 
 pub use bridge::*;
@@ -16,6 +17,7 @@ pub use hash::*;
 pub use id::*;
 pub use problem::*;
 pub use question::*;
+pub use thread::*;
 
 #[derive(Debug, thiserror::Error)]
 pub enum ProtocolError {

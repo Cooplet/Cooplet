@@ -141,7 +141,8 @@ fn recover_delivery(tx: &Transaction<'_>, now: i64) -> rusqlite::Result<Vec<Even
     )?;
     events.extend(expire_queued(tx, now, -1)?);
     tx.execute(
-        "UPDATE thread_inject_fences SET state = 'unknown', updated_at_ms = ?1 WHERE state = 'injecting'",
+        "UPDATE thread_inject_fences SET state = 'unknown', updated_at_ms = ?1
+         WHERE state = 'injecting' AND state IN ('injecting', 'unknown')",
         [now],
     )?;
     Ok(events)
@@ -192,6 +193,7 @@ fn finish_unconfirmed_answers(
              )
          FROM messages AS m
          WHERE o.state IN ('accepted', 'in_progress') AND o.kind = 'message.send'
+           AND o.bridge_origin IS NULL
            AND m.operation_id = o.operation_id AND m.answer_json IS NOT NULL
            AND m.delivery_state = 'unknown'";
     match operation_id {

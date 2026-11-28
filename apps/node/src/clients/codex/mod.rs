@@ -15,7 +15,7 @@ use std::{
     time::Duration,
 };
 
-use cooplet_platform::{PrivateFs, ProcessProbe};
+use cooplet_platform::{AdmissionGuard, PrivateFs, ProcessProbe};
 use cooplet_protocol::{AuthorKind, ErrorCode};
 use futures_util::future::BoxFuture;
 use serde_json::{Value, json};
@@ -345,21 +345,23 @@ impl ClientAdapter for CodexAdapter {
         decision: ApprovalDecision,
     ) -> BoxFuture<'a, ApprovalRespondOutcome> {
         Box::pin(async move {
-            let Some(live) = handle.downcast_ref::<Live>() else {
-                return ApprovalRespondOutcome::Unavailable("Codex session is not live".into());
-            };
-            match live.session.request(Operation::Approval(decision)).await {
-                Err(Failure::Stale) => {
-                    ApprovalRespondOutcome::Stale("Codex approval is no longer current".into())
-                }
-                Err(Failure::Unsupported) => {
-                    ApprovalRespondOutcome::Unsupported("Use the Codex TUI to respond".into())
-                }
-                Err(Failure::NotSent(reason)) => ApprovalRespondOutcome::Unavailable(reason.into()),
-                Err(Failure::Uncertain(reason)) => ApprovalRespondOutcome::Unknown(reason.into()),
-                _ => ApprovalRespondOutcome::Unknown("Codex did not confirm the response".into()),
-            }
+            approval_response(handle, decision, None)
+                .await
+                .unwrap_or_else(|| {
+                    ApprovalRespondOutcome::Unavailable(
+                        "Codex approval could not be admitted".into(),
+                    )
+                })
         })
+    }
+
+    fn respond_approval_with_admission<'a>(
+        &'a self,
+        handle: &'a SessionHandle,
+        decision: ApprovalDecision,
+        admission: &'a AdmissionGuard,
+    ) -> BoxFuture<'a, Option<ApprovalRespondOutcome>> {
+        Box::pin(approval_response(handle, decision, Some(admission.clone())))
     }
 
     fn cancel_or_stop<'a>(
@@ -454,6 +456,39 @@ impl ClientAdapter for CodexAdapter {
             })
         })
     }
+}
+
+async fn approval_response(
+    handle: &SessionHandle,
+    decision: ApprovalDecision,
+    admission: Option<AdmissionGuard>,
+) -> Option<ApprovalRespondOutcome> {
+    let Some(live) = handle.downcast_ref::<Live>() else {
+        return Some(ApprovalRespondOutcome::Unavailable(
+            "Codex session is not live".into(),
+        ));
+    };
+    Some(
+        match live
+            .session
+            .request(Operation::Approval {
+                decision,
+                admission,
+            })
+            .await
+        {
+            Err(Failure::Expired) => return None,
+            Err(Failure::Stale) => {
+                ApprovalRespondOutcome::Stale("Codex approval is no longer current".into())
+            }
+            Err(Failure::Unsupported) => {
+                ApprovalRespondOutcome::Unsupported("Use the Codex TUI to respond".into())
+            }
+            Err(Failure::NotSent(reason)) => ApprovalRespondOutcome::Unavailable(reason.into()),
+            Err(Failure::Uncertain(reason)) => ApprovalRespondOutcome::Unknown(reason.into()),
+            _ => ApprovalRespondOutcome::Unknown("Codex did not confirm the response".into()),
+        },
+    )
 }
 
 impl Live {

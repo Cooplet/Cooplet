@@ -65,6 +65,10 @@ pub trait GcHooks: Send + Sync + 'static {
         connection: &Connection,
         blob_ids: &[BlobId],
     ) -> rusqlite::Result<BTreeMap<BlobId, BlobState>>;
+
+    /// Called after a `prune_batch` transaction commits (or its commit outcome
+    /// is uncertain) so hooks can publish post-commit in-process invalidations.
+    fn after_prune_commit(&self) {}
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]

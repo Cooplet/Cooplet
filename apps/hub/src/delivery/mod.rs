@@ -2,6 +2,8 @@ mod dto;
 mod journal;
 mod message;
 mod outcome;
+mod reconcile;
+mod rpc;
 #[cfg(test)]
 mod tests;
 
@@ -20,7 +22,7 @@ use cooplet_protocol::{
 };
 use cooplet_storage::{StorageError, WriteFailure, WriteOutcome};
 use http::StatusCode;
-use rusqlite::{Connection, Transaction};
+use rusqlite::{Connection, Transaction, params};
 use serde::{Deserialize, Serialize};
 use tokio::{
     sync::{oneshot, watch},
@@ -30,10 +32,10 @@ use tokio::{
 use crate::{
     AppState,
     auth::{AuthenticatedCaller, reverify_caller_tx},
-    bridge::{CommandPermit, ReserveError, SubmitError},
+    bridge::{CommandPermit, CommandSession, ReserveError, SubmitError},
     error::HubError,
     now_ms,
-    storage::sql::read_verified_tx,
+    storage::sql::read_verified_tx_with_clock,
 };
 
 pub(crate) use dto::{
@@ -41,6 +43,8 @@ pub(crate) use dto::{
     MessageRequest, RespondApprovalRequest, RunWorkflowRequest, StopAgentRequest,
 };
 pub(crate) use message::get_message;
+pub(crate) use reconcile::{pending_op_ids, reconcile_receipts};
+pub(crate) use rpc::dispatch_node_request;
 
 const ANSWER_KIND: &str = "answer_question";
 const FINALIZATION_REPLY_TIMEOUT: Duration = Duration::from_secs(2);
@@ -64,7 +68,7 @@ pub(crate) async fn send_message(
     let sender_kind = caller.author_kind().ok_or_else(|| {
         HubError::new(
             ErrorCode::Forbidden,
-            "Sending a message requires a human or service identity.",
+            "Sending a message requires a verified author identity.",
         )
     })?;
     let sender_name = caller.display_name().to_owned();
@@ -257,6 +261,19 @@ enum Kind {
 }
 
 impl Kind {
+    fn from_operation(kind: &str) -> Option<Self> {
+        match kind {
+            "agent.create" => Some(Self::CreateAgent),
+            "agent.stop" => Some(Self::StopAgent),
+            "participant.approval" => Some(Self::RespondApproval),
+            "workflow.run" => Some(Self::RunWorkflow),
+            "workflow.cancel" => Some(Self::CancelWorkflow),
+            "message.send" => Some(Self::Message),
+            ANSWER_KIND => Some(Self::Answer),
+            _ => None,
+        }
+    }
+
     fn as_str(self) -> &'static str {
         match self {
             Self::CreateAgent => "agent.create",
@@ -402,6 +419,7 @@ impl Request {
                     notify: Some(node.clone()),
                     required_nodes: vec![node.clone()],
                     attachment_node: None,
+                    attachment_peer: None,
                     message_expires_at_ms: 0,
                 })
             }
@@ -424,7 +442,12 @@ impl Request {
                 input,
             } => (
                 sender.as_str(),
-                input.bridge_command(message_id, *sender_kind, sender_name),
+                input.bridge_command(
+                    message_id,
+                    *sender_kind,
+                    sender_name,
+                    self.caller.source_node_id().cloned(),
+                ),
                 input.delivery_mode.unwrap_or(DeliveryMode::DirectNow),
                 input.queue_ttl_ms,
             ),
@@ -434,14 +457,53 @@ impl Request {
             actor_id: actor_id.into(),
             command,
             delivery_mode,
-            admission_budget_ms: self.kind.admission_budget_ms(),
+            admission_budget_ms: match &self.action {
+                Action::Message { input, .. } if !input.attachments.is_empty() => 30_000,
+                _ => self.kind.admission_budget_ms(),
+            },
             ttl_ms,
         }
     }
 
     fn message_reply(&self, state: DeliveryState) -> Result<Success, HubError> {
+        self.receipt().message_reply(state)
+    }
+
+    fn receipt(&self) -> ReceiptContext<'_> {
+        ReceiptContext {
+            id: &self.id,
+            kind: self.kind,
+            message_id: self.message_id(),
+            in_reply_to: self.in_reply_to(),
+            delivery_mode: self.delivery_mode(),
+        }
+    }
+
+    fn unconfirmed_delivery(&self) -> Result<Success, HubError> {
+        if self.is_answer() {
+            self.message_reply(DeliveryState::Unknown)
+        } else {
+            Err(outcome::unknown(&self.receipt()))
+        }
+    }
+}
+
+struct ReceiptContext<'a> {
+    id: &'a OperationId,
+    kind: Kind,
+    message_id: Option<&'a MessageId>,
+    in_reply_to: Option<&'a MessageId>,
+    delivery_mode: Option<DeliveryMode>,
+}
+
+impl ReceiptContext<'_> {
+    fn is_answer(&self) -> bool {
+        matches!(self.kind, Kind::Answer)
+    }
+
+    fn message_reply(&self, state: DeliveryState) -> Result<Success, HubError> {
         let message_id = self
-            .message_id()
+            .message_id
             .ok_or_else(|| HubError::internal("expected a message ID"))?;
         let status = if state == DeliveryState::Queued && !self.is_answer() {
             StatusCode::ACCEPTED
@@ -453,18 +515,10 @@ impl Request {
             body: Reply::Message(MessageReceipt {
                 operation_id: self.id.clone(),
                 message_id: message_id.clone(),
-                in_reply_to: self.in_reply_to().cloned(),
+                in_reply_to: self.in_reply_to.cloned(),
                 delivery_state: state,
             }),
         })
-    }
-
-    fn unconfirmed_delivery(&self) -> Result<Success, HubError> {
-        if self.is_answer() {
-            self.message_reply(DeliveryState::Unknown)
-        } else {
-            Err(outcome::unknown(self))
-        }
     }
 }
 
@@ -472,6 +526,7 @@ struct Target {
     notify: Option<NodeId>,
     required_nodes: Vec<NodeId>,
     attachment_node: Option<NodeId>,
+    attachment_peer: Option<NodeId>,
     message_expires_at_ms: i64,
 }
 
@@ -511,7 +566,9 @@ fn participant_kind(
 }
 
 fn check_node_access(caller: &AuthenticatedCaller, nodes: &[NodeId]) -> Result<(), HubError> {
-    if nodes.iter().all(|node| caller.allows_node(node)) {
+    // Node participants can send across nodes. Reply preflight checks both
+    // qualified parties and replay is scoped by the qualified actor key.
+    if caller.source_node_id().is_some() || nodes.iter().all(|node| caller.allows_node(node)) {
         Ok(())
     } else {
         Err(HubError::new(
@@ -527,6 +584,21 @@ enum Probe {
 }
 
 async fn execute(
+    state: &AppState,
+    caller: &AuthenticatedCaller,
+    key: &str,
+    action: Action,
+) -> Result<Success, HubError> {
+    let can_manage = action
+        .target_node()
+        .is_some_and(|node| caller.allows_node(node))
+        && caller.require_scope(ServiceScope::Manage).is_ok();
+    execute_inner(state, caller, key, action)
+        .await
+        .map_err(|error| outcome::redact_error(error, can_manage))
+}
+
+async fn execute_inner(
     state: &AppState,
     caller: &AuthenticatedCaller,
     key: &str,
@@ -593,9 +665,10 @@ struct Reservation {
 
 async fn probe(state: &AppState, request: Arc<Request>) -> Result<Probe, HubError> {
     let caller = request.caller.clone();
-    read_verified_tx(
+    read_verified_tx_with_clock(
         &state.reads,
         &caller,
+        state.wall_clock.clone(),
         move |tx, _, now| match journal::replay(tx, &request)? {
             Some(reply) => Ok(Probe::Replay(reply)),
             None => request.preflight(tx, now).map(Probe::New),
@@ -606,9 +679,12 @@ async fn probe(state: &AppState, request: Arc<Request>) -> Result<Probe, HubErro
 
 async fn replay_only(state: &AppState, request: Arc<Request>) -> Result<Option<Success>, HubError> {
     let caller = request.caller.clone();
-    read_verified_tx(&state.reads, &caller, move |tx, _, _| {
-        journal::replay(tx, &request)
-    })
+    read_verified_tx_with_clock(
+        &state.reads,
+        &caller,
+        state.wall_clock.clone(),
+        move |tx, _, _| journal::replay(tx, &request),
+    )
     .await
 }
 
@@ -652,17 +728,17 @@ async fn deliver_owned(
             "The Hub is shutting down.",
         ));
     }
-    let reserved_node = reservation
+    let reserved = reservation
         .as_ref()
-        .map(|reservation| reservation.node.clone());
-    match accept_request(state, request.clone(), reserved_node).await {
+        .map(|reservation| (reservation.node.clone(), reservation.permit.session()));
+    match accept_request(state, request.clone(), reserved).await {
         Ok(Accepted::Done(reply)) => Ok(reply),
         Ok(Accepted::Dispatch(target)) => {
             let response = match reservation {
                 Some(reservation) => reservation.permit.submit(request.payload()).await,
                 None => Err(SubmitError::Unknown),
             };
-            let terminal = outcome::classify(&request, response)?;
+            let terminal = outcome::classify(&request.receipt(), response)?;
             finish(state, request, target.required_nodes, terminal, client).await
         }
         Err(WriteFailure::Storage(
@@ -679,19 +755,32 @@ async fn deliver_owned(
 async fn accept_request(
     state: &AppState,
     request: Arc<Request>,
-    reserved_node: Option<NodeId>,
+    reserved: Option<(NodeId, CommandSession)>,
 ) -> Result<Accepted, WriteFailure<HubError>> {
     let hub_id = state.meta.hub_id.clone();
+    let wall_clock = state.wall_clock.clone();
     state
         .db
         .write(move |tx| {
-            let now = now_ms();
+            let now = wall_clock();
             if let Some(reply) = authorized_replay(tx, &request, now)? {
                 return Ok(WriteOutcome::new(Accepted::Done(reply)));
             }
             let target = request.preflight(tx, now)?;
-            let can_dispatch = target.notify.is_some() && target.notify == reserved_node;
-            if !can_dispatch && !request.is_answer() {
+            let can_dispatch = if let Some((node, session)) = &reserved
+                && target.notify.as_ref() == Some(node)
+            {
+                tx.query_row(
+                    "SELECT EXISTS(SELECT 1 FROM nodes
+                         WHERE node_id = ?1 AND generation = ?2 AND session_epoch = ?3
+                           AND revoked_at_ms IS NULL AND status = 'online')",
+                    params![node.as_str(), session.generation, session.epoch],
+                    |row| row.get::<_, bool>(0),
+                )?
+            } else {
+                false
+            };
+            if !can_dispatch && !request.is_answer() && request.action.target_node().is_some() {
                 return Err(reserve_error(ReserveError::Offline).into());
             }
             let local = if can_dispatch {
@@ -754,10 +843,10 @@ async fn recover_acceptance(
     match observed {
         Ok(Ok(journal::Observed::Terminal(reply))) => reply,
         Ok(Ok(journal::Observed::Accepted(required_nodes))) => {
-            let terminal = outcome::unknown_terminal(&request)?;
+            let terminal = outcome::unknown_terminal(&request.receipt())?;
             finish(state, request, required_nodes, terminal, client).await
         }
-        _ => Err(outcome::unknown(&request)),
+        _ => Err(outcome::unknown(&request.receipt())),
     }
 }
 
@@ -818,7 +907,9 @@ async fn persist_terminal(
                     terminal.response()
                 };
             }
-            Err(error) if is_storage_full(&error) && !storage_full_fallback => {
+            Err(error)
+                if is_storage_full(&error) && !storage_full_fallback && !terminal.release_key =>
+            {
                 // Immediately attempt an in-place shrinking transition to `unknown`
                 // so the receipt does not stay stranded in `accepted` (409).
                 storage_full_fallback = true;
@@ -842,6 +933,9 @@ async fn persist_terminal(
                     .await;
                 match observed {
                     Ok(Ok(journal::Observed::Terminal(result))) => return result,
+                    Ok(Ok(journal::Observed::Missing)) if terminal.release_key => {
+                        return terminal.response();
+                    }
                     Ok(Ok(journal::Observed::Accepted(_))) if ambiguous => {}
                     _ => {
                         tracing::warn!(operation_id = %request.id, ?result, "Could not confirm a delivery receipt");
@@ -880,14 +974,19 @@ async fn write_terminal(
     terminal: &Arc<outcome::Terminal>,
 ) -> Result<bool, WriteFailure<HubError>> {
     let hub_id = state.meta.hub_id.clone();
+    let wall_clock = state.wall_clock.clone();
     let tx_request = request.clone();
     let tx_terminal = terminal.clone();
     let required_nodes = required_nodes.to_vec();
     state
         .db
         .write(move |tx| {
-            let now = now_ms();
-            let receipt = journal::finish(tx, &tx_request, &required_nodes, &tx_terminal, now)?;
+            let now = wall_clock();
+            let receipt = if tx_terminal.release_key {
+                journal::release_unsubmitted(tx, &tx_request)?
+            } else {
+                journal::finish(tx, &tx_request, &required_nodes, &tx_terminal, now)?
+            };
             if !receipt {
                 return Ok::<_, cooplet_storage::WriteError<HubError>>(WriteOutcome::new(false));
             }
@@ -919,10 +1018,11 @@ async fn write_compact_unknown(
 ) -> Result<bool, WriteFailure<HubError>> {
     let tx_request = request.clone();
     let required_nodes = required_nodes.to_vec();
+    let wall_clock = state.wall_clock.clone();
     state
         .db
         .write(move |tx| {
-            let now = now_ms();
+            let now = wall_clock();
             let receipt = journal::finish_compact_unknown(tx, &tx_request, &required_nodes, now)?;
             if !receipt {
                 return Ok::<_, cooplet_storage::WriteError<HubError>>(WriteOutcome::new(false));

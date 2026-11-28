@@ -1,4 +1,4 @@
-use std::{collections::BTreeSet, error::Error, io, str::FromStr};
+use std::{error::Error, io, str::FromStr, sync::Arc};
 
 use cooplet_protocol::NodeId;
 use cooplet_storage::ReadPool;
@@ -8,7 +8,6 @@ use serde::{Serialize, de::DeserializeOwned};
 use crate::{
     auth::{AuthenticatedCaller, reverify_caller_tx},
     error::HubError,
-    now_ms,
 };
 
 use super::events::EventAudience;
@@ -99,9 +98,10 @@ where
         .await?
 }
 
-pub(crate) async fn read_verified_tx<T, F>(
+pub(crate) async fn read_verified_tx_with_clock<T, F>(
     reads: &ReadPool,
     caller: &AuthenticatedCaller,
+    clock: Arc<dyn Fn() -> i64 + Send + Sync>,
     read: F,
 ) -> Result<T, HubError>
 where
@@ -110,29 +110,11 @@ where
 {
     let caller = caller.clone();
     read_tx(reads, move |tx| {
-        let now = now_ms();
+        let now = clock();
         reverify_caller_tx(tx, &caller, now)?;
         read(tx, &caller, now)
     })
     .await
-}
-
-pub(crate) fn dialog_node_ids(
-    sender_node: Option<NodeId>,
-    target_node: Option<NodeId>,
-    parent_sender_node: Option<NodeId>,
-    parent_target_node: Option<NodeId>,
-) -> Vec<NodeId> {
-    let nodes: BTreeSet<NodeId> = [
-        sender_node,
-        target_node,
-        parent_sender_node,
-        parent_target_node,
-    ]
-    .into_iter()
-    .flatten()
-    .collect();
-    nodes.into_iter().collect()
 }
 
 pub(crate) fn nodes_audience(nodes: &[NodeId]) -> EventAudience {

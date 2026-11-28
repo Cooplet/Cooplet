@@ -1,4 +1,4 @@
-use cooplet_protocol::{DeliveryState, MessageId, NodeId};
+use cooplet_protocol::{DeliveryMode, DeliveryState, MessageId, NodeId};
 use http::StatusCode;
 use rusqlite::{Connection, Transaction};
 use serde::{Deserialize, Serialize};
@@ -14,9 +14,11 @@ use super::{
 };
 
 #[derive(Deserialize, Serialize)]
-struct RecordedResult {
-    required_node_ids: Vec<NodeId>,
-    in_reply_to: Option<MessageId>,
+pub(super) struct RecordedResult {
+    pub(super) required_node_ids: Vec<NodeId>,
+    pub(super) in_reply_to: Option<MessageId>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(super) delivery_mode: Option<DeliveryMode>,
     #[serde(skip_serializing_if = "Option::is_none")]
     http_status: Option<u16>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -25,12 +27,20 @@ struct RecordedResult {
 
 impl RecordedResult {
     fn new(request: &Request, required_node_ids: &[NodeId], result: Option<&Success>) -> Self {
-        Self {
+        let mut record = Self {
             required_node_ids: required_node_ids.to_vec(),
             in_reply_to: request.in_reply_to().cloned(),
-            http_status: result.map(|reply| reply.status.as_u16()),
-            body: result.map(|reply| reply.body.clone()),
-        }
+            delivery_mode: request.delivery_mode(),
+            http_status: None,
+            body: None,
+        };
+        record.set_success(result);
+        record
+    }
+
+    pub(super) fn set_success(&mut self, result: Option<&Success>) {
+        self.http_status = result.map(|reply| reply.status.as_u16());
+        self.body = result.map(|reply| reply.body.clone());
     }
 
     fn into_success(self) -> Result<Success, HubError> {
@@ -54,8 +64,8 @@ pub(super) fn replay(db: &Connection, request: &Request) -> Result<Option<Succes
         let node_id = NodeId::parse(node_id).map_err(HubError::internal)?;
         check_node_access(&request.caller, std::slice::from_ref(&node_id))?;
     }
-    // A locally accepted answer can cover two nodes, or have no WS target.
-    if saved.kind == ANSWER_KIND {
+    // A direct message or answer can involve two nodes or have no WS target.
+    if matches!(saved.kind.as_str(), "message.send" | ANSWER_KIND) {
         check_node_access(&request.caller, &recorded_result(&saved)?.required_node_ids)?;
     }
     saved.check_match(request.kind.as_str(), &request.fingerprint)?;
@@ -166,14 +176,7 @@ pub(super) fn finish(
         required_nodes,
         terminal.success.as_ref(),
     ))?;
-    let problem = terminal
-        .problem
-        .as_ref()
-        .map(bounded_problem_json)
-        .transpose()?
-        .map(String::from_utf8)
-        .transpose()
-        .map_err(HubError::internal)?;
+    let problem = encode_problem(terminal)?;
     let resource_id = request
         .message_id()
         .map(MessageId::as_str)
@@ -189,6 +192,26 @@ pub(super) fn finish(
             now_ms: now,
         },
     )?)
+}
+
+pub(super) fn encode_problem(terminal: &Terminal) -> Result<Option<String>, HubError> {
+    terminal
+        .problem
+        .as_ref()
+        .map(bounded_problem_json)
+        .transpose()?
+        .map(String::from_utf8)
+        .transpose()
+        .map_err(HubError::internal)
+}
+
+pub(super) fn release_unsubmitted(
+    tx: &Transaction<'_>,
+    request: &Request,
+) -> Result<bool, HubError> {
+    Ok(tx.prepare_cached(
+        "DELETE FROM operations WHERE operation_id = ?1 AND state IN ('accepted', 'in_progress')",
+    )?.execute([request.id.as_str()])? == 1)
 }
 
 /// Compact in-place transition to `unknown` when SQLITE_FULL prevents writing a

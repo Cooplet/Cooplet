@@ -549,6 +549,7 @@ pub(crate) async fn revoke_node(
                     },
                 )?);
             }
+            crate::threads::pause_node_pending(tx, &hub_id, &node_id, now, &mut events)?;
         }
         let resource_id = node_id.to_string();
         let mut commit = AdminCommit::new(
@@ -770,6 +771,10 @@ where
     T: Serialize + DeserializeOwned + Send + 'static,
     F: FnOnce(&Transaction<'_>, i64) -> Result<AdminCommit<T>, HubError> + Send + 'static,
 {
+    let _transition = match (&operation.notify, state.bridge.live()) {
+        (Notify::Node(node_id), Some(bridge)) => Some(bridge.transition(node_id).await),
+        _ => None,
+    };
     let actor_id = caller.actor_id().to_owned();
     let write_actor = actor_id.clone();
     let write_operation = operation.clone();
@@ -885,6 +890,7 @@ async fn notify_revocation(state: &AppState, notify: &Notify, verify: bool) {
                 Ok(false) => return,
                 Err(error) => {
                     tracing::warn!(%error, %node_id, "Could not confirm node revocation");
+                    state.bridge.disconnect_transient(node_id);
                     return;
                 }
             }

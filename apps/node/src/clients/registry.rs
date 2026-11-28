@@ -4,11 +4,13 @@ use std::{
     time::Duration,
 };
 
+use cooplet_platform::AdmissionGuard;
 use cooplet_protocol::ErrorCode;
 use tokio::sync::Mutex;
 
 use super::{AdapterConfig, ClientAdapter, DiscoveryReport};
 use crate::error::{NodeError, Result};
+use crate::operations::admission_expired;
 
 const DISCOVERY_TIMEOUT: Duration = Duration::from_secs(10);
 
@@ -56,19 +58,28 @@ impl AdapterRegistry {
     /// Cache only positive availability results so installing or fixing a native
     /// CLI takes effect without restarting the Node.
     pub async fn discover(&self, kind: &str, cfg: &AdapterConfig) -> Result<DiscoveryReport> {
+        self.discover_for_open(kind, cfg, None).await
+    }
+
+    pub(crate) async fn discover_for_open(
+        &self,
+        kind: &str,
+        cfg: &AdapterConfig,
+        admission: Option<&AdmissionGuard>,
+    ) -> Result<DiscoveryReport> {
         let entry = self.lookup(kind)?;
-        if let Some(report) = entry.available_discovery.get() {
-            return Ok(report.clone());
+        let discovery = entry.discover(cfg, admission);
+        let Some(guard) = admission else {
+            return discovery.await;
+        };
+        let budget = guard.remaining_ms().ok_or_else(admission_expired)?;
+        let result = tokio::time::timeout(Duration::from_millis(budget), discovery)
+            .await
+            .map_err(|_| admission_expired())?;
+        if guard.is_expired() {
+            return Err(admission_expired());
         }
-        let _guard = entry.probe_lock.lock().await;
-        if let Some(report) = entry.available_discovery.get() {
-            return Ok(report.clone());
-        }
-        let report = probe(entry.adapter.as_ref(), cfg).await?;
-        if report.available {
-            let _ = entry.available_discovery.set(report.clone());
-        }
-        Ok(report)
+        result
     }
 
     /// Explicit diagnostics probe each adapter afresh. Launches share a separate
@@ -86,6 +97,31 @@ impl AdapterRegistry {
             NodeError::new(ErrorCode::InvalidRequest, "Unknown client kind")
                 .with_extension("reason", "unknown_client_kind")
         })
+    }
+}
+
+impl RegisteredAdapter {
+    async fn discover(
+        &self,
+        cfg: &AdapterConfig,
+        admission: Option<&AdmissionGuard>,
+    ) -> Result<DiscoveryReport> {
+        if let Some(report) = self.available_discovery.get() {
+            return Ok(report.clone());
+        }
+        let _guard = self.probe_lock.lock().await;
+        // The bridge epoch can close while a previous cold probe holds the lock.
+        if admission.is_some_and(AdmissionGuard::is_expired) {
+            return Err(admission_expired());
+        }
+        if let Some(report) = self.available_discovery.get() {
+            return Ok(report.clone());
+        }
+        let report = probe(self.adapter.as_ref(), cfg).await?;
+        if report.available {
+            let _ = self.available_discovery.set(report.clone());
+        }
+        Ok(report)
     }
 }
 

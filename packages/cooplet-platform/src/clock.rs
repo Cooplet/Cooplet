@@ -1,4 +1,5 @@
 use std::{
+    fmt,
     sync::{
         Arc,
         atomic::{AtomicBool, Ordering},
@@ -16,8 +17,18 @@ pub struct MonoInstant(Option<u128>);
 impl MonoInstant {
     pub const INVALID: Self = Self(None);
 
+    pub const fn from_millis(millis: u64) -> Self {
+        Self(Some(millis as u128 * 1_000_000))
+    }
+
     pub const fn is_valid(self) -> bool {
         self.0.is_some()
+    }
+
+    /// Compare deadlines from the same clock. An invalid instant must expire
+    /// before a valid deadline.
+    pub fn is_earlier_than(self, other: Self) -> bool {
+        self.0 < other.0
     }
 
     pub fn as_millis(self) -> Option<u64> {
@@ -35,7 +46,32 @@ impl MonoInstant {
     }
 }
 
+/// Continuous time source. Every instant used with one deadline must come
+/// from the same clock.
+pub trait MonoClock: Send + Sync {
+    fn now(&self) -> MonoInstant;
+
+    fn deadline_after(&self, ttl: Duration) -> MonoInstant {
+        self.now().after(ttl)
+    }
+
+    fn remaining_ms(&self, deadline: MonoInstant) -> Option<u64> {
+        deadline.remaining_ms_at(self.now())
+    }
+
+    fn is_expired(&self, deadline: MonoInstant) -> bool {
+        self.remaining_ms(deadline).is_none()
+    }
+}
+
+#[derive(Clone, Copy, Debug, Default)]
 pub struct MonotonicClock;
+
+impl MonoClock for MonotonicClock {
+    fn now(&self) -> MonoInstant {
+        Self::now()
+    }
+}
 
 impl MonotonicClock {
     pub fn try_now() -> Result<MonoInstant, PlatformError> {
@@ -108,27 +144,42 @@ fn continuous_nanos() -> Result<u128, PlatformError> {
     Ok(u128::from(ticks) * u128::from(numer) / u128::from(denom))
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone)]
 pub struct AdmissionGuard {
     state: Arc<AdmissionState>,
 }
 
-#[derive(Debug)]
 struct AdmissionState {
     deadline: MonoInstant,
     expired: AtomicBool,
+    clock: Option<Arc<dyn MonoClock>>,
+}
+
+impl fmt::Debug for AdmissionGuard {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("AdmissionGuard")
+            .field("deadline", &self.state.deadline)
+            .field("expired", &self.state.expired)
+            .finish_non_exhaustive()
+    }
 }
 
 impl AdmissionGuard {
     pub fn new(ttl: Duration) -> Self {
-        Self::starting_at(MonotonicClock::now(), ttl)
+        Self::starting_at(MonotonicClock::now(), ttl, None)
     }
 
-    fn starting_at(now: MonoInstant, ttl: Duration) -> Self {
+    pub fn with_clock(ttl: Duration, clock: Arc<dyn MonoClock>) -> Self {
+        Self::starting_at(clock.now(), ttl, Some(clock))
+    }
+
+    fn starting_at(now: MonoInstant, ttl: Duration, clock: Option<Arc<dyn MonoClock>>) -> Self {
         Self {
             state: Arc::new(AdmissionState {
                 deadline: now.after(ttl),
                 expired: AtomicBool::new(ttl.is_zero() || now == MonoInstant::INVALID),
+                clock,
             }),
         }
     }
@@ -146,7 +197,12 @@ impl AdmissionGuard {
         if self.state.expired.load(Ordering::Acquire) {
             return None;
         }
-        self.remaining_at(MonotonicClock::now())
+        let now = self
+            .state
+            .clock
+            .as_ref()
+            .map_or_else(MonotonicClock::now, |clock| clock.now());
+        self.remaining_at(now)
     }
 
     fn remaining_at(&self, now: MonoInstant) -> Option<u64> {
@@ -164,19 +220,42 @@ impl AdmissionGuard {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::atomic::AtomicU64;
+
+    struct TestClock(AtomicU64);
+
+    impl MonoClock for TestClock {
+        fn now(&self) -> MonoInstant {
+            MonoInstant::from_millis(self.0.load(Ordering::Acquire))
+        }
+    }
+
+    #[test]
+    fn injected_clock_and_explicit_expiration_are_shared() {
+        let clock = Arc::new(TestClock(AtomicU64::new(10)));
+        let guard = AdmissionGuard::with_clock(Duration::from_millis(5), clock.clone());
+        clock.0.store(13, Ordering::Release);
+        assert_eq!(guard.remaining_ms(), Some(2));
+        guard.clone().expire();
+        assert!(guard.is_expired());
+
+        let guard = AdmissionGuard::with_clock(Duration::from_millis(5), clock.clone());
+        clock.0.store(18, Ordering::Release);
+        assert!(guard.is_expired());
+    }
 
     #[test]
     fn elapsed_sleep_and_clock_errors_latch_all_clones() {
         let start = MonoInstant(Some(100_000_000));
         let ttl = Duration::from_millis(10);
-        let guard = AdmissionGuard::starting_at(start, ttl);
+        let guard = AdmissionGuard::starting_at(start, ttl, None);
         let clone = guard.clone();
         assert_eq!(guard.remaining_at(start), Some(10));
         assert_eq!(guard.remaining_at(MonoInstant(Some(109_900_000))), Some(1));
         assert_eq!(clone.remaining_at(MonoInstant(Some(110_000_000))), None);
         assert_eq!(guard.remaining_at(start), None);
 
-        let guard = AdmissionGuard::starting_at(start, ttl);
+        let guard = AdmissionGuard::starting_at(start, ttl, None);
         assert_eq!(guard.clone().remaining_at(MonoInstant::INVALID), None);
         assert_eq!(guard.remaining_at(start), None);
         assert!(AdmissionGuard::new(Duration::ZERO).is_expired());

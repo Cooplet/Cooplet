@@ -456,7 +456,7 @@ mod tests {
         let tools = lines[5]["result"]["tools"]
             .as_array()
             .ok_or_else(|| io::Error::other("missing tools"))?;
-        assert_eq!(tools.len(), 5);
+        assert_eq!(tools.len(), 11);
         assert_eq!(
             tools
                 .iter()
@@ -467,7 +467,13 @@ mod tests {
                 Some("list_participants"),
                 Some("send_message"),
                 Some("ask_user"),
-                Some("blob_put")
+                Some("blob_put"),
+                Some("thread_create"),
+                Some("thread_post"),
+                Some("thread_read"),
+                Some("thread_pin"),
+                Some("thread_wait"),
+                Some("thread_members"),
             ]
         );
         for tool in tools {

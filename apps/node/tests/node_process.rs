@@ -17,7 +17,9 @@ use cooplet_node::{
     http::openapi_json,
     now_ms,
 };
-use cooplet_protocol::{ErrorCode, MessageId, ParticipantId, PrincipalKind, RequestId};
+use cooplet_protocol::{
+    ErrorCode, MessageId, ParticipantId, PrincipalKind, RequestId, validate_idempotency_key,
+};
 use cooplet_storage::WriteOutcome;
 use rusqlite::params;
 use serde_json::{Value, json};
@@ -135,6 +137,62 @@ fn command(state: &Path, args: &[&str]) -> TestResult<std::process::Output> {
         String::from_utf8_lossy(&output.stderr)
     );
     Ok(output)
+}
+
+#[tokio::test]
+async fn delegated_cli_exposes_generated_key_when_the_hub_is_offline() -> TestResult {
+    let directory = TestDirectory::new()?;
+    let state = directory.state();
+    let (mut daemon, _) = run_process(&state).await?;
+    let source = directory.0.join("relay.txt");
+    fs::write(&source, "test upload")?;
+    let source = source.to_str().ok_or("Expected a UTF-8 test path")?;
+    let qualified_recipient = "node_00000000000000000000000000/part_00000000000000000000000000";
+    let run = |args: &[&str]| {
+        Command::new(COOPLET)
+            .arg("--state-dir")
+            .arg(&state)
+            .args(args)
+            .output()
+    };
+
+    for mut args in [
+        vec!["thread", "create", "--title", "Offline thread"],
+        vec![
+            "message",
+            "send",
+            "--to",
+            qualified_recipient,
+            "--body",
+            "Offline message",
+        ],
+        vec!["blob", "put", source, "--target", "hub"],
+    ] {
+        let first = run(&args)?;
+        assert!(!first.status.success());
+        assert!(first.stdout.is_empty());
+        let stderr = std::str::from_utf8(&first.stderr)?;
+        let mut lines = stderr.lines();
+        let key = lines
+            .next()
+            .and_then(|line| line.strip_prefix("idempotency_key="))
+            .ok_or("The first stderr line must report the retry key")?;
+        validate_idempotency_key(key)?;
+        assert!(lines.any(|line| line.contains("502")), "{stderr}");
+
+        args.extend(["--operation-key", key]);
+        let retry = run(&args)?;
+        assert!(!retry.status.success());
+        let stderr = std::str::from_utf8(&retry.stderr)?;
+        assert!(stderr.contains("502"), "{stderr}");
+        assert!(!stderr.contains("idempotency_key="), "{stderr}");
+    }
+
+    let local = command(&state, &["blob", "put", source])?;
+    assert!(!std::str::from_utf8(&local.stderr)?.contains("idempotency_key="));
+    command(&state, &["node", "stop"])?;
+    assert!(daemon.wait().await?.success());
+    Ok(())
 }
 
 #[tokio::test]
@@ -617,7 +675,7 @@ async fn real_stdio_mcp_preserves_author_and_operator_can_answer() -> TestResult
     )?;
     let (output, reply) = json_line(output).await?;
     let tools = reply["result"]["tools"].as_array().ok_or("Missing tools")?;
-    assert_eq!(tools.len(), 5);
+    assert_eq!(tools.len(), 11);
     assert!(tools.iter().all(|tool| tool["name"] != "respond_approval"));
 
     send_tool(&mut input, 3, "whoami", json!({}))?;
@@ -816,6 +874,27 @@ async fn http_rejections_use_problems_and_auth_reads_leave_wal_unchanged() -> Te
             "400",
             "invalid_request",
         ),
+        (
+            "POST /v1/threads/thr_00000000000000000000000000/close",
+            "Idempotency-Key: empty-close\r\n",
+            "",
+            "502",
+            "bridge_unavailable",
+        ),
+        (
+            "POST /v1/threads/thr_00000000000000000000000000/close",
+            "Idempotency-Key: object-close\r\n",
+            "{}",
+            "502",
+            "bridge_unavailable",
+        ),
+        (
+            "POST /v1/threads/thr_00000000000000000000000000/wait",
+            "",
+            r#"{"since_seq":0,"wake_policy":"muted"}"#,
+            "400",
+            "invalid_request",
+        ),
     ];
     for (request, extra_headers, payload, status, code) in cases {
         let headers = format!(
@@ -843,9 +922,20 @@ async fn http_rejections_use_problems_and_auth_reads_leave_wal_unchanged() -> Te
             "payload_too_large",
         )?;
     }
-    for extra in ["Content-Length: 5\r\n", "Transfer-Encoding: chunked\r\n"] {
+    for (request, extra) in [
+        ("GET /v1/health", "Content-Length: 5\r\n"),
+        ("GET /v1/health", "Transfer-Encoding: chunked\r\n"),
+        (
+            "DELETE /v1/threads/thr_00000000000000000000000000/pins/plan",
+            "Idempotency-Key: delete-sized-body\r\nContent-Type: application/json\r\nContent-Length: 19\r\n",
+        ),
+        (
+            "DELETE /v1/threads/thr_00000000000000000000000000/pins/plan",
+            "Idempotency-Key: delete-chunked-body\r\nContent-Type: application/json\r\nTransfer-Encoding: chunked\r\n",
+        ),
+    ] {
         let headers = format!(
-            "GET /v1/health HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\nAuthorization: Bearer {token}\r\n{extra}\r\n"
+            "{request} HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\nAuthorization: Bearer {token}\r\n{extra}\r\n"
         );
         assert_problem(
             &raw_http(address, &headers, &[]).await?,

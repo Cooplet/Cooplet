@@ -2,6 +2,7 @@ use std::{
     io,
     net::{Ipv4Addr, SocketAddrV4},
     path::Path,
+    time::Duration,
 };
 
 use cooplet_client::{BearerToken, ClientConfig, CoopletClient, Destination};
@@ -21,6 +22,7 @@ use crate::error::{NodeError, Result};
 pub const MASTER_FILE: &str = "node.master.key";
 pub const OPERATOR_FILE: &str = "operator.json";
 const MAX_CREDENTIAL_BYTES: u64 = 4096;
+const DELEGATED_REQUEST_TIMEOUT: Duration = Duration::from_secs(80);
 const DOMAIN: &[u8] = b"cooplet.node.v0";
 const PRINCIPALS: [PrincipalKind; 4] = [
     PrincipalKind::Participant,
@@ -107,6 +109,22 @@ impl Credential {
         &self,
         expected: PrincipalKind,
     ) -> Result<(CoopletClient, WhoamiResponse)> {
+        self.connect_with_timeout(expected, None).await
+    }
+
+    pub async fn connect_for_delegation(
+        &self,
+        expected: PrincipalKind,
+    ) -> Result<(CoopletClient, WhoamiResponse)> {
+        self.connect_with_timeout(expected, Some(DELEGATED_REQUEST_TIMEOUT))
+            .await
+    }
+
+    async fn connect_with_timeout(
+        &self,
+        expected: PrincipalKind,
+        request_timeout: Option<Duration>,
+    ) -> Result<(CoopletClient, WhoamiResponse)> {
         self.address().map_err(NodeError::internal)?;
         let origin = self.endpoint.parse().map_err(NodeError::internal)?;
         let info = CoopletClient::discover_info(&origin)
@@ -120,12 +138,11 @@ impl Credential {
             ));
         }
         let token = BearerToken::new(&self.token).map_err(client_error)?;
-        let client = CoopletClient::new(ClientConfig::new(
-            origin,
-            Destination::LocalNode,
-            Some(token),
-        ))
-        .map_err(client_error)?;
+        let mut config = ClientConfig::new(origin, Destination::LocalNode, Some(token));
+        if let Some(request_timeout) = request_timeout {
+            config.request_timeout = request_timeout;
+        }
+        let client = CoopletClient::new(config).map_err(client_error)?;
         let identity = client.whoami().await.map_err(client_error)?;
         if identity.node_id.as_ref() != Some(&self.node_id)
             || identity.participant_id.as_ref() != Some(&self.participant_id)

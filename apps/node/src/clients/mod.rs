@@ -14,6 +14,7 @@ pub use cooplet_protocol::{ApprovalAction, ApprovalDecision, ApprovalWait, Appro
 pub use pi::PiAdapter;
 pub use registry::AdapterRegistry;
 pub use runtime::*;
+pub(crate) use templates::list_template_summaries;
 pub use templates::{
     AgentOverrides, AgentTemplate, EffectiveAgentOptions, list_templates, load_template,
     load_template_options,
@@ -26,7 +27,10 @@ use std::{
     path::{Path, PathBuf},
     process::{ChildStderr, ChildStdin, ChildStdout, Command},
     str::FromStr,
-    sync::Arc,
+    sync::{
+        Arc,
+        atomic::{AtomicBool, Ordering},
+    },
 };
 
 use cooplet_platform::{AdmissionGuard, ProcessIdentity};
@@ -141,6 +145,8 @@ pub struct SpawnedManagedProcess {
 pub enum SpawnManagedError {
     #[error("The managed process was already spawned for this open")]
     AlreadySpawned,
+    #[error("Admission expired before launching the managed process")]
+    AdmissionExpired,
     #[error("Could not spawn the managed process: {0}")]
     SpawnFailed(String),
     #[error("The managed process could not be verified clean: {0}")]
@@ -171,6 +177,7 @@ pub enum SessionOpenMode {
 #[derive(Clone, Default)]
 pub struct OpenPreparation {
     rollback: Arc<tokio::sync::Mutex<Option<OpenRollback>>>,
+    before_managed_launch: Arc<AtomicBool>,
 }
 
 pub type OpenRollback = Box<dyn FnOnce() -> std::io::Result<()> + Send>;
@@ -184,6 +191,29 @@ impl OpenPreparation {
         tokio::task::spawn_blocking(move || job(&mut rollback))
             .await
             .map_err(NodeError::internal)?
+    }
+
+    /// The adapter awaits this preparation directly, before it can request a
+    /// managed launch or cause any other native effect in this open attempt.
+    pub(crate) async fn run_before_managed_launch<T: Send + 'static>(
+        &self,
+        job: impl FnOnce(&mut Option<OpenRollback>) -> Result<T> + Send + 'static,
+    ) -> Result<T> {
+        struct Waiting<'a>(&'a AtomicBool);
+
+        impl Drop for Waiting<'_> {
+            fn drop(&mut self) {
+                self.0.store(false, Ordering::Release);
+            }
+        }
+
+        self.before_managed_launch.store(true, Ordering::Release);
+        let _waiting = Waiting(&self.before_managed_launch);
+        self.run(job).await
+    }
+
+    fn awaiting_managed_preparation(&self) -> bool {
+        self.before_managed_launch.load(Ordering::Acquire)
     }
 
     async fn wait(&self) {
@@ -436,6 +466,25 @@ pub trait ClientAdapter: Send + Sync {
         handle: &'a SessionHandle,
         decision: ApprovalDecision,
     ) -> BoxFuture<'a, ApprovalRespondOutcome>;
+
+    /// Admit a delegated approval immediately before the first possible native
+    /// write. Return `None` only when expiry prevented that write. An operation
+    /// that may have written must report its outcome even after expiry.
+    /// Adapters that queue a response override this method and carry the guard
+    /// to the task that owns the writer.
+    fn respond_approval_with_admission<'a>(
+        &'a self,
+        handle: &'a SessionHandle,
+        decision: ApprovalDecision,
+        admission: &'a AdmissionGuard,
+    ) -> BoxFuture<'a, Option<ApprovalRespondOutcome>> {
+        Box::pin(async move {
+            if admission.is_expired() {
+                return None;
+            }
+            Some(self.respond_approval(handle, decision).await)
+        })
+    }
 
     fn cancel_or_stop<'a>(
         &'a self,

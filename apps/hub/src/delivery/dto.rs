@@ -1,6 +1,7 @@
 use cooplet_protocol::{
-    AnswerPayload, ApprovalAction, AttachmentRef, DeliveryMode, DeliveryState, MessageId, NodeId,
-    OperationId, ParticipantId, QuestionPayload,
+    AnswerPayload, ApprovalAction, AttachmentRef, DeliveryMode, DeliveryState,
+    DirectMessageReceipt, DirectMessageRequest, MessageId, NodeId, OperationId, ParticipantId,
+    QuestionPayload,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -15,7 +16,7 @@ pub(crate) struct MessageRequest {
     pub(super) delivery_mode: Option<DeliveryMode>,
     pub(super) queue_ttl_ms: Option<u64>,
     #[serde(default)]
-    #[schema(max_items = 32)]
+    #[schema(max_items = 64)]
     pub(super) attachments: Vec<AttachmentRef>,
     pub(super) question: Option<QuestionPayload>,
     pub(super) in_reply_to: Option<MessageId>,
@@ -30,6 +31,33 @@ pub(crate) struct MessageReceipt {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(super) in_reply_to: Option<MessageId>,
     pub(super) delivery_state: DeliveryState,
+}
+
+impl From<DirectMessageRequest> for MessageRequest {
+    fn from(input: DirectMessageRequest) -> Self {
+        Self {
+            target_node_id: input.target_node_id,
+            target_participant_id: input.target_participant_id,
+            body: input.body,
+            delivery_mode: input.delivery_mode,
+            queue_ttl_ms: input.queue_ttl_ms,
+            attachments: input.attachments,
+            question: input.question,
+            in_reply_to: input.in_reply_to,
+            answer: input.answer,
+        }
+    }
+}
+
+impl From<MessageReceipt> for DirectMessageReceipt {
+    fn from(receipt: MessageReceipt) -> Self {
+        Self {
+            operation_id: receipt.operation_id,
+            message_id: receipt.message_id,
+            in_reply_to: receipt.in_reply_to,
+            delivery_state: receipt.delivery_state,
+        }
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Deserialize, Serialize, ToSchema)]

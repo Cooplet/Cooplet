@@ -6,7 +6,7 @@ use axum::{
 };
 use cooplet_protocol::{
     AttachmentRef, BlobId, EventStreamFrame, EventsPage, HealthResponse, HubInfoResponse,
-    WhoamiResponse,
+    ParticipantId, WhoamiResponse,
 };
 use serde::Serialize;
 
@@ -21,6 +21,7 @@ use super::extract::{Caller, Revocations, StrictPath, StrictQuery};
 
 pub(crate) mod admin_routes;
 pub(crate) mod command_routes;
+pub(crate) mod thread_routes;
 
 pub(super) fn json<T: Serialize>(status: StatusCode, data: T) -> Result<Response, HubError> {
     Ok((
@@ -88,6 +89,8 @@ pub(super) async fn whoami(Caller(caller): Caller) -> Result<Response, HubError>
     ),
     params(
         ("X-Cooplet-Filename" = String, Header, description = "Percent-encoded UTF-8 filename."),
+        ("X-Cooplet-Participant" = Option<ParticipantId>, Header,
+            description = "Participant attributed by the enrolled Node credential."),
     ),
     responses(
         (status = 200, description = "Previously stored attachment.", body = AttachmentRef),

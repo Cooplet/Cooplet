@@ -13,12 +13,26 @@ use crate::{
     validate_actor_handle, validate_actor_id, validate_display_name, validate_step_key,
 };
 
+mod rpc;
+pub use rpc::*;
+
 pub const BRIDGE_PROTOCOL_VERSION: u8 = 1;
+pub const BRIDGE_SUBPROTOCOL: &str = "cooplet.v1";
+pub const BRIDGE_ERROR_HEADER: &str = "x-cooplet-bridge-error";
 pub const MAX_WS_FRAME_BYTES: usize = 256 * 1024;
 pub const MAX_ROSTER_BYTES: usize = 8 * 1024 * 1024;
 pub const MAX_ROSTER_FRAMES: u32 = 512;
 pub const ROSTER_TIMEOUT: Duration = Duration::from_secs(30);
 pub const MAX_PENDING_OP_IDS: usize = 512;
+pub const MAX_ROSTER_PARTICIPANT_BYTES: usize = 16 * 1024;
+pub const MAX_ROSTER_TEMPLATE_BYTES: usize = 8 * 1024;
+pub const MAX_ROSTER_WORKFLOW_BYTES: usize = 4 * 1024;
+pub const MAX_ROSTER_FENCE_BYTES: usize = 1024;
+pub const MAX_ROSTER_TEMPLATES: usize = 256;
+pub const MAX_ROSTER_WORKFLOWS: usize = 256;
+pub const MAX_ROSTER_FENCES: usize = 4096;
+pub const MAX_ROSTER_CATALOG_BYTES: usize = 1024 * 1024;
+pub const MAX_THREAD_DELIVERY_POSTS: usize = 20;
 
 fn default_empty_object() -> Value {
     Value::Object(Map::new())
@@ -30,9 +44,12 @@ crate::wire::wire_string_enum! {
         CommandReq => "command_req",
         ThreadDeliver => "thread_deliver",
         RosterSync => "roster_sync",
+        RosterReady => "roster_ready",
         CommandRes => "command_res",
         ThreadAck => "thread_ack",
         NodeEvent => "node_event",
+        NodeRequest => "node_request",
+        NodeResponse => "node_response",
     }
 }
 
@@ -213,6 +230,9 @@ fn validate_message_extras(
             "message cannot carry both question and answer",
         ));
     }
+    if attachments.len() > 64 {
+        return Err(ValidationError("message attachment count"));
+    }
     for attachment in attachments {
         attachment.validate()?;
     }
@@ -251,12 +271,20 @@ impl BridgePayload for HelloAckPayload {
         if self.pending_op_ids.len() > MAX_PENDING_OP_IDS {
             return Err(ValidationError("pending operation count"));
         }
+        if self.max_inflight_commands == 0 || self.max_inflight_threads == 0 {
+            return Err(ValidationError("bridge inflight limit"));
+        }
         let mut seen = HashSet::with_capacity(self.pending_op_ids.len());
         if !self.pending_op_ids.iter().all(|id| seen.insert(id)) {
             return Err(ValidationError("duplicate pending operation ID"));
         }
         Ok(())
     }
+}
+
+crate::wire::wire_object! {
+    #[serde(deny_unknown_fields)]
+    pub struct RosterReadyPayload {}
 }
 
 crate::wire::wire_object! {
@@ -277,6 +305,12 @@ impl BridgePayload for CommandReqPayload {
 
     fn validate(&self) -> Result<(), ValidationError> {
         validate_actor_id(&self.actor_id).map_err(|_| ValidationError("command actor ID"))?;
+        if self.admission_budget_ms == 0 {
+            return Err(ValidationError("command admission budget"));
+        }
+        if self.delivery_mode == DeliveryMode::DirectNow && self.ttl_ms.is_some() {
+            return Err(ValidationError("direct command queue TTL"));
+        }
         self.command.validate()
     }
 }
@@ -288,6 +322,8 @@ crate::wire::wire_object! {
             message_id: MessageId,
             sender_kind: AuthorKind,
             sender_name: String,
+            #[serde(skip_serializing_if = "Option::is_none")]
+            sender_node_id: Option<NodeId>,
             recipient_id: ParticipantId,
             #[serde(skip_serializing_if = "Option::is_none")]
             in_reply_to: Option<MessageId>,
@@ -402,9 +438,40 @@ crate::wire::wire_object! {
     }
 }
 
+impl BridgePayload for CommandResPayload {
+    const KIND: FrameKind = FrameKind::CommandRes;
+
+    fn validate(&self) -> Result<(), ValidationError> {
+        match self.outcome {
+            CommandOutcome::Delivered | CommandOutcome::Succeeded | CommandOutcome::Queued => {
+                if self.error.is_some() {
+                    return Err(ValidationError("error in successful command response"));
+                }
+            }
+            _ => {
+                if self.result.is_some() {
+                    return Err(ValidationError("result in failed command response"));
+                }
+                if self.outcome == CommandOutcome::Rejected && self.error.is_none() {
+                    return Err(ValidationError("rejected command response without error"));
+                }
+            }
+        }
+        if self
+            .error
+            .as_ref()
+            .is_some_and(|error| !(400..=599).contains(&error.status))
+        {
+            return Err(ValidationError("command response problem status"));
+        }
+        Ok(())
+    }
+}
+
 crate::wire::wire_object! {
     #[serde(deny_unknown_fields)]
     pub struct ThreadDeliverPayload {
+        pub delivery_generation: u64,
         pub delivery_id: OperationId,
         pub thread_id: ThreadId,
         pub member_id: ParticipantId,
@@ -422,15 +489,25 @@ impl BridgePayload for ThreadDeliverPayload {
     const KIND: FrameKind = FrameKind::ThreadDeliver;
 
     fn validate(&self) -> Result<(), ValidationError> {
+        if self.admission_budget_ms == 0 {
+            return Err(ValidationError("thread admission budget"));
+        }
         if self.from_seq == 0 || self.from_seq > self.to_seq {
             return Err(ValidationError("thread delivery sequence range"));
         }
+        let Some(first) = self.posts.first() else {
+            return Err(ValidationError("empty thread delivery"));
+        };
+        if self.posts.len() > MAX_THREAD_DELIVERY_POSTS
+            || first.seq < self.from_seq
+            || (!self.truncated_earlier && first.seq != self.from_seq)
+            || self.posts.last().is_none_or(|last| last.seq != self.to_seq)
+        {
+            return Err(ValidationError("thread delivery suffix"));
+        }
         let mut previous = None;
         for post in &self.posts {
-            if post.seq < self.from_seq || post.seq > self.to_seq {
-                return Err(ValidationError("thread post sequence out of range"));
-            }
-            if previous.is_some_and(|prev| post.seq <= prev) {
+            if previous.is_some_and(|prev: u64| prev.checked_add(1) != Some(post.seq)) {
                 return Err(ValidationError("thread post sequence order"));
             }
             previous = Some(post.seq);
@@ -469,6 +546,9 @@ impl ThreadPostWire {
             .map_err(|_| ValidationError("thread post author actor ID"))?;
         validate_actor_handle(&self.author_handle)
             .map_err(|_| ValidationError("thread post author handle"))?;
+        for mention in &self.mentions {
+            validate_actor_handle(mention).map_err(|_| ValidationError("thread post mention"))?;
+        }
         validate_message_extras(
             &self.attachments,
             self.question.as_ref(),
@@ -492,6 +572,7 @@ crate::wire::wire_string_enum! {
 crate::wire::wire_object! {
     #[serde(deny_unknown_fields)]
     pub struct ThreadAckPayload {
+        pub delivery_generation: u64,
         pub delivery_id: OperationId,
         pub thread_id: ThreadId,
         pub member_id: ParticipantId,
@@ -524,20 +605,69 @@ impl BridgePayload for RosterSyncPayload {
         {
             return Err(ValidationError("roster chunk index"));
         }
+        if self.templates.len() > MAX_ROSTER_TEMPLATES
+            || self.workflows.len() > MAX_ROSTER_WORKFLOWS
+        {
+            return Err(ValidationError("roster catalog count"));
+        }
+        if self.unresolved_thread_fences.len() > MAX_ROSTER_FENCES {
+            return Err(ValidationError("roster fence count"));
+        }
         for participant in &self.participants {
-            if !participant.capabilities.is_object() {
-                return Err(ValidationError("participant capabilities object"));
+            participant.validate()?;
+        }
+        for template in &self.templates {
+            template.validate()?;
+        }
+        for workflow in &self.workflows {
+            workflow.validate()?;
+        }
+        for fence in &self.unresolved_thread_fences {
+            fence.validate()?;
+        }
+        for receipt in &self.resolved_op_receipts {
+            receipt.validate()?;
+            if receipt.outcome == CommandOutcome::Unknown {
+                return Err(ValidationError("unknown roster receipt"));
             }
-            validate_approval_fields(
-                participant.state,
-                participant.can_respond_remotely,
-                participant.approval_id.as_deref(),
-                participant.wait_kind.is_some()
-                    || participant.action_hint.is_some()
-                    || participant.summary.is_some(),
-            )?;
         }
         Ok(())
+    }
+}
+
+fn validate_record_size<T: Serialize>(
+    record: &T,
+    maximum: usize,
+    name: &'static str,
+) -> Result<(), ValidationError> {
+    serialize_bounded(record, BoundedWriter::counting(maximum))
+        .map(|_| ())
+        .map_err(|_| ValidationError(name))
+}
+
+impl ParticipantWire {
+    pub fn validate(&self) -> Result<(), ValidationError> {
+        validate_display_name(&self.name)?;
+        if self.kind == ParticipantKind::Agent {
+            validate_actor_handle(&self.name)?;
+            if self.name.eq_ignore_ascii_case("operator") {
+                return Err(ValidationError("reserved agent name"));
+            }
+        }
+        if !self.capabilities.is_object() {
+            return Err(ValidationError("participant capabilities object"));
+        }
+        validate_approval_fields(
+            self.state,
+            self.can_respond_remotely,
+            self.approval_id.as_deref(),
+            self.wait_kind.is_some() || self.action_hint.is_some() || self.summary.is_some(),
+        )?;
+        validate_record_size(
+            self,
+            MAX_ROSTER_PARTICIPANT_BYTES,
+            "roster participant size",
+        )
     }
 }
 
@@ -567,6 +697,15 @@ crate::wire::wire_object! {
     }
 }
 
+impl TemplateSummary {
+    pub fn validate(&self) -> Result<(), ValidationError> {
+        validate_actor_handle(&self.template_id)?;
+        validate_display_name(&self.title)?;
+        validate_actor_handle(&self.client_kind)?;
+        validate_record_size(self, MAX_ROSTER_TEMPLATE_BYTES, "roster template size")
+    }
+}
+
 crate::wire::wire_object! {
     #[serde(deny_unknown_fields)]
     pub struct TemplateSummary {
@@ -575,6 +714,13 @@ crate::wire::wire_object! {
         #[serde(skip_serializing_if = "Option::is_none")]
         pub description: Option<String>,
         pub client_kind: String,
+    }
+}
+
+impl WorkflowSummary {
+    pub fn validate(&self) -> Result<(), ValidationError> {
+        validate_display_name(&self.workflow_name)?;
+        validate_record_size(self, MAX_ROSTER_WORKFLOW_BYTES, "roster workflow size")
     }
 }
 
@@ -594,13 +740,35 @@ crate::wire::wire_object! {
     pub struct ThreadFenceReport {
         pub thread_id: ThreadId,
         pub participant_id: ParticipantId,
+        pub delivery_generation: u64,
         pub highest_dispatched_seq: u64,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        pub last_delivery_id: Option<OperationId>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        pub last_from_seq: Option<u64>,
+    }
+}
+
+impl ThreadFenceReport {
+    pub fn validate(&self) -> Result<(), ValidationError> {
+        let valid_origin = match (&self.last_delivery_id, self.last_from_seq) {
+            (None, None) => true,
+            (Some(_), Some(from)) => from > 0 && from <= self.highest_dispatched_seq,
+            _ => false,
+        };
+        if self.highest_dispatched_seq == 0 || !valid_origin {
+            return Err(ValidationError("roster thread fence"));
+        }
+        validate_record_size(self, MAX_ROSTER_FENCE_BYTES, "roster thread fence size")
     }
 }
 
 crate::wire::wire_object! {
     #[serde(tag = "type", rename_all = "snake_case", deny_unknown_fields)]
     pub enum NodeEventPayload {
+        ParticipantDeclared {
+            participant: ParticipantWire,
+        },
         ParticipantStateChanged {
             participant_id: ParticipantId,
             state: ParticipantState,
@@ -614,20 +782,6 @@ crate::wire::wire_object! {
             wait_kind: Option<ApprovalWaitKind>,
             #[serde(skip_serializing_if = "Option::is_none")]
             can_respond_remotely: Option<bool>,
-        },
-        AgentReplyCreated {
-            message_id: MessageId,
-            sender_id: ParticipantId,
-            recipient_id: String,
-            #[serde(skip_serializing_if = "Option::is_none")]
-            in_reply_to: Option<MessageId>,
-            body: String,
-            #[serde(default)]
-            attachments: Vec<AttachmentRef>,
-            #[serde(skip_serializing_if = "Option::is_none")]
-            question: Option<QuestionPayload>,
-            #[serde(skip_serializing_if = "Option::is_none")]
-            answer: Option<AnswerPayload>,
         },
         WorkflowRunStarted {
             run_id: RunId,
@@ -664,6 +818,7 @@ impl BridgePayload for NodeEventPayload {
 
     fn validate(&self) -> Result<(), ValidationError> {
         match self {
+            Self::ParticipantDeclared { participant } => participant.validate(),
             Self::ParticipantStateChanged {
                 state,
                 can_respond_remotely,
@@ -678,18 +833,6 @@ impl BridgePayload for NodeEventPayload {
                 approval_id.as_deref(),
                 wait_kind.is_some() || action_hint.is_some() || summary.is_some(),
             ),
-            Self::AgentReplyCreated {
-                recipient_id,
-                attachments,
-                question,
-                answer,
-                ..
-            } => {
-                if recipient_id.trim().is_empty() {
-                    return Err(ValidationError("agent reply recipient ID"));
-                }
-                validate_message_extras(attachments, question.as_ref(), answer.as_ref())
-            }
             Self::WorkflowRunStarted { workflow_name, .. } => {
                 if workflow_name.trim().is_empty() {
                     return Err(ValidationError("workflow name"));
@@ -717,6 +860,6 @@ impl BridgePayload for NodeEventPayload {
 }
 
 payload_kind!(
-    CommandResPayload => CommandRes,
+    RosterReadyPayload => RosterReady,
     ThreadAckPayload => ThreadAck,
 );

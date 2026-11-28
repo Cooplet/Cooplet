@@ -56,6 +56,7 @@ impl Fixture {
             &storage.engine,
             storage.meta,
             storage.master,
+            storage.thread_acl_watch,
             Arc::new(OfflineBridge),
             signal,
             DEFAULT_MAX_BLOB_BYTES,
@@ -423,12 +424,13 @@ fn event_filter_requires_valid_nonempty_csv_and_deduplicates_labels() -> TestRes
 async fn quiet_stream_reconciles_a_durable_commit_without_a_wake() -> TestResult {
     let fixture = Fixture::new().await?;
     // Isolate the stream from broadcasts while using the real writer and reader.
-    let (_silent, wake) = watch::channel((0, 0));
+    let (_silent, wake) = watch::channel(super::stream::Watermark::default());
     let mut body = super::stream::response(
         Reader::new(&fixture.state, &fixture.admin, Vec::new()),
         0,
         wake,
         fixture.state.revocations.subscribe(),
+        fixture.state.thread_acl_watch.subscribe(),
         fixture.state.shutdown.clone(),
     )
     .await?
@@ -493,20 +495,13 @@ fn event_stream_query_rejects_limit_and_kind_queries_use_index() -> TestResult {
     assert!(single.contains("idx_hub_events_kind_seq"), "{single}");
     assert!(!single.contains("USE TEMP B-TREE"), "{single}");
 
-    let rare_multi = explain(
-        SELECT_KIND_SEQS,
-        &[&"blob.stored", &0u64, &5000u64, &101usize],
+    let multi_sql = multi_kind_query_sql(2);
+    let multi = explain(
+        &multi_sql,
+        &[&0u64, &5000u64, &"blob.stored", &"node.status", &101usize],
     )?;
-    assert!(
-        rare_multi.contains("COVERING INDEX idx_hub_events_kind_seq"),
-        "{rare_multi}"
-    );
-    assert!(!rare_multi.contains("USE TEMP B-TREE"), "{rare_multi}");
-    let dense_multi = explain(
-        SELECT_KIND_SEQS,
-        &[&"node.status", &0u64, &5000u64, &101usize],
-    )?;
-    assert!(!dense_multi.contains("USE TEMP B-TREE"), "{dense_multi}");
+    assert!(multi.contains("idx_hub_events_kind_seq"), "{multi}");
+    assert!(!multi.contains("USE TEMP B-TREE"), "{multi}");
     Ok(())
 }
 
@@ -604,12 +599,17 @@ async fn single_and_multi_kind_queries_return_ordered_events_and_advance_waterma
 
 #[tokio::test]
 async fn stream_closes_naturally_when_token_ttl_expires_without_revocation_bump() -> TestResult {
-    let fixture = Fixture::new().await?;
+    use std::sync::atomic::{AtomicI64, Ordering};
+
+    let mut fixture = Fixture::new().await?;
     let principal = ServicePrincipalId::generate()?;
     let token_id = TokenId::generate()?;
     let token = mint_service(&fixture.state.master, &principal)?;
     let verifier = token.verifier;
     let now = now_ms();
+    let wall = Arc::new(AtomicI64::new(now));
+    let injected = wall.clone();
+    fixture.state.wall_clock = Arc::new(move || injected.load(Ordering::Relaxed));
     fixture
         .state
         .db
@@ -628,7 +628,7 @@ async fn stream_closes_naturally_when_token_ttl_expires_without_revocation_bump(
                     token_id.as_str(),
                     principal.as_str(),
                     verifier,
-                    now + 150,
+                    now + 5_000,
                     now
                 ],
             )?;
@@ -641,7 +641,796 @@ async fn stream_closes_naturally_when_token_ttl_expires_without_revocation_bump(
         token.secret.as_str(),
     )
     .await?;
+    tokio::time::pause();
     let mut body = fixture.stream(&caller, 0).await?;
-    assert_eq!(next_frame(&mut body).await?, None);
+    let mut next_fut = std::pin::pin!(body.next());
+    // First poll enters next_frame() and parks on sleep_until(expiry) well before PING_INTERVAL (15s).
+    let pending =
+        std::future::poll_fn(|cx| std::task::Poll::Ready(next_fut.as_mut().poll(cx).is_pending()))
+            .await;
+    assert!(pending, "stream must park waiting for token expiry");
+    tokio::time::advance(Duration::from_millis(4_999)).await;
+    let still_pending =
+        std::future::poll_fn(|cx| std::task::Poll::Ready(next_fut.as_mut().poll(cx).is_pending()))
+            .await;
+    assert!(still_pending, "stream must not close before token expiry");
+    wall.store(now + 5_001, Ordering::Relaxed);
+    tokio::time::advance(Duration::from_millis(2)).await;
+    let ended = tokio::time::timeout(Duration::from_millis(100), next_fut.as_mut()).await?;
+    assert!(
+        ended.is_none(),
+        "stream must close promptly at token expiry"
+    );
+    tokio::time::resume();
+    fixture.close().await
+}
+
+#[tokio::test]
+async fn filtered_event_stream_tracks_thread_updated_and_ignores_unrelated_kinds() -> TestResult {
+    use crate::threads;
+    use cooplet_protocol::{ThreadCreateRequest, ThreadMemberJoinRequest};
+
+    let fixture = Fixture::new().await?;
+    let (service, _) = fixture.service(&[]).await?;
+    let board = threads::create(
+        &fixture.state,
+        &fixture.admin,
+        "thread-updated-acl-board",
+        ThreadCreateRequest {
+            title: "ACL Filter".into(),
+            topic: None,
+            creator_handle: None,
+            members: vec![ThreadMemberJoinRequest {
+                member_key: service.actor_id().into(),
+                handle: Some("watcher".into()),
+                role: None,
+                wake_policy: None,
+                delivery_mode: None,
+            }],
+        },
+    )
+    .await?;
+
+    // Filtered stream subscribing only to `thread.updated` must still watch thread ACL changes
+    // and skip SQLite scans on unrelated `node.status` broadcasts via `Watermark::by_kind`.
+    let mut filtered = stream(
+        &fixture.state,
+        &service,
+        EventStreamQuery {
+            after: 0,
+            kinds: Some("thread.updated".into()),
+        },
+        fixture.state.revocations.subscribe(),
+    )
+    .await?
+    .into_body()
+    .into_data_stream();
+
+    // Commit a `thread.updated` row silently (`WriteOutcome::new(())`, no broadcast so
+    // `by_kind[ThreadUpdated]` stays 0). Then broadcast an unrelated `node.status` event.
+    // Because `by_kind` filters out `node.status`, the filtered stream must NOT scan SQLite
+    // and therefore must NOT see the silent `thread.updated` row yet.
+    let hub = fixture.state.meta.hub_id.clone();
+    let tid = board.thread_id.clone();
+    fixture
+        .state
+        .db
+        .write_sqlite(move |tx| {
+            let _ = append(
+                tx,
+                &hub,
+                NewEvent {
+                    kind: EventKind::ThreadUpdated,
+                    aggregate_type: AggregateType::Thread,
+                    aggregate_id: tid.as_str(),
+                    actor_id: None,
+                    created_at_ms: now_ms(),
+                    data: json!({"thread_id": tid.as_str(), "title": "Silent"}),
+                    audience: EventAudience::Thread {
+                        thread_id: tid.clone(),
+                    },
+                },
+            )?;
+            Ok(WriteOutcome::new(()))
+        })
+        .await?;
+    fixture
+        .publish(vec![(
+            EventAudience::OwnerOnly {
+                actor_id: service.actor_id().into(),
+            },
+            json!({"ignored": true}),
+        )])
+        .await?;
+    assert!(
+        tokio::time::timeout(Duration::from_millis(80), filtered.next())
+            .await
+            .is_err(),
+        "unrelated node.status wake must skip SQLite scan on thread.updated filtered stream"
+    );
+
+    // Mutate thread ACL by joining a second member (bumps `thread_acl_watch` while only
+    // broadcasting `thread.member.updated`, so `by_kind[ThreadUpdated]` stays 0). Because
+    // `watch_thread_acl` is enabled for `kinds=thread.updated`, the ACL watch wakes the
+    // stream and its rescan delivers the silent `thread.updated` row.
+    let (other, _) = fixture.service(&[]).await?;
+    threads::join(
+        &fixture.state,
+        &fixture.admin,
+        board.thread_id.clone(),
+        "acl-watch-join-other",
+        ThreadMemberJoinRequest {
+            member_key: other.actor_id().into(),
+            handle: Some("peer".into()),
+            role: None,
+            wake_policy: None,
+            delivery_mode: None,
+        },
+    )
+    .await?;
+    let silent_frame = next_frame(&mut filtered)
+        .await?
+        .ok_or("expected silent thread.updated after ACL watch wake")?;
+    let EventStreamFrame::Event { event } = silent_frame else {
+        return Err("expected Event frame for silent thread.updated".into());
+    };
+    assert_eq!(event.kind, EventKind::ThreadUpdated);
+    assert_eq!(event.payload["title"], "Silent");
+
+    // Verify a broadcast `thread.updated` wakes the filtered stream directly, and that after
+    // removing `service` from the board a subsequent `thread.updated` is hidden.
+    let hub = fixture.state.meta.hub_id.clone();
+    let tid = board.thread_id.clone();
+    fixture
+        .state
+        .db
+        .write_sqlite(move |tx| {
+            let ev = append(
+                tx,
+                &hub,
+                NewEvent {
+                    kind: EventKind::ThreadUpdated,
+                    aggregate_type: AggregateType::Thread,
+                    aggregate_id: tid.as_str(),
+                    actor_id: None,
+                    created_at_ms: now_ms(),
+                    data: json!({"thread_id": tid.as_str(), "title": "Renamed"}),
+                    audience: EventAudience::Thread {
+                        thread_id: tid.clone(),
+                    },
+                },
+            )?;
+            Ok(WriteOutcome::with_events((), vec![ev]))
+        })
+        .await?;
+    let frame = next_frame(&mut filtered)
+        .await?
+        .ok_or("expected thread.updated frame")?;
+    let EventStreamFrame::Event { event } = frame else {
+        return Err("expected Event frame for thread.updated".into());
+    };
+    assert_eq!(event.kind, EventKind::ThreadUpdated);
+    assert_eq!(event.payload["title"], "Renamed");
+
+    threads::leave(
+        &fixture.state,
+        &fixture.admin,
+        board.thread_id.clone(),
+        "acl-watch-leave",
+        cooplet_protocol::ThreadMemberLeaveRequest {
+            member_key: Some(service.actor_id().into()),
+        },
+    )
+    .await?;
+    let hub = fixture.state.meta.hub_id.clone();
+    let tid = board.thread_id.clone();
+    fixture
+        .state
+        .db
+        .write_sqlite(move |tx| {
+            let ev = append(
+                tx,
+                &hub,
+                NewEvent {
+                    kind: EventKind::ThreadUpdated,
+                    aggregate_type: AggregateType::Thread,
+                    aggregate_id: tid.as_str(),
+                    actor_id: None,
+                    created_at_ms: now_ms(),
+                    data: json!({"thread_id": tid.as_str(), "title": "SecretAfterLeave"}),
+                    audience: EventAudience::Thread {
+                        thread_id: tid.clone(),
+                    },
+                },
+            )?;
+            Ok(WriteOutcome::with_events((), vec![ev]))
+        })
+        .await?;
+    assert!(
+        tokio::time::timeout(Duration::from_millis(80), filtered.next())
+            .await
+            .is_err(),
+        "departed member must not receive thread.updated after leave"
+    );
+    assert!(super::stream::is_thread_event_kind(
+        EventKind::ThreadUpdated
+    ));
+    drop(filtered);
+    fixture.close().await
+}
+
+#[tokio::test]
+async fn thread_retention_hides_logically_expired_posts_before_collection() -> TestResult {
+    use std::sync::atomic::{AtomicI64, Ordering};
+
+    use axum::body::{Body, to_bytes};
+    use cooplet_client::X_COOPLET_FILENAME;
+    use http::{HeaderMap, HeaderValue, header};
+
+    use crate::{blobs, threads};
+    use cooplet_protocol::{
+        ThreadCreateRequest, ThreadPinSetRequest, ThreadPostRequest, ThreadReadQuery,
+    };
+
+    let mut fixture = Fixture::new().await?;
+    let initial = now_ms();
+    let wall = Arc::new(AtomicI64::new(initial));
+    let injected = wall.clone();
+    fixture.state.wall_clock = Arc::new(move || injected.load(Ordering::Relaxed));
+    let board = threads::create(
+        &fixture.state,
+        &fixture.admin,
+        "thread-test-create",
+        ThreadCreateRequest {
+            title: "Retention".into(),
+            topic: None,
+            creator_handle: None,
+            members: Vec::new(),
+        },
+    )
+    .await?;
+    let mut headers = HeaderMap::new();
+    headers.insert(header::CONTENT_TYPE, HeaderValue::from_static("text/plain"));
+    headers.insert(X_COOPLET_FILENAME, HeaderValue::from_static("report.txt"));
+    let (_, attachment) = blobs::upload(
+        &fixture.state,
+        &fixture.admin,
+        &headers,
+        Body::from("retained attachment"),
+    )
+    .await?;
+    let mut receipts = Vec::new();
+    for (index, time) in [
+        (1, initial),
+        (2, initial - 1000),
+        (3, initial + 86_400_000),
+        (4, initial + threads::RETENTION_MS + 1),
+    ] {
+        wall.store(time, Ordering::Relaxed);
+        receipts.push(
+            threads::post(
+                &fixture.state,
+                &fixture.admin,
+                board.thread_id.clone(),
+                &format!("thread-test-post-{index}"),
+                ThreadPostRequest {
+                    body: format!("post {index}"),
+                    mentions: vec![],
+                    attachments: if matches!(index, 1 | 3) {
+                        vec![attachment.clone()]
+                    } else {
+                        vec![]
+                    },
+                    question: None,
+                    answer: None,
+                    in_reply_to: None,
+                },
+            )
+            .await?,
+        );
+    }
+    assert_eq!(receipts[0].created_at_ms, receipts[1].created_at_ms);
+    let live = threads::read(
+        &fixture.state,
+        &fixture.admin,
+        board.thread_id.clone(),
+        ThreadReadQuery::default(),
+    )
+    .await?;
+    assert_eq!((live.floor_seq, live.head_seq), (2, 4));
+    assert_eq!(live.posts[0].post_id, receipts[2].post_id);
+    assert_eq!(
+        live.posts[0].attachments.as_slice(),
+        std::slice::from_ref(&attachment)
+    );
+    let file = blobs::download(&fixture.state, &fixture.admin, attachment.blob_id.clone()).await?;
+    assert_eq!(
+        to_bytes(file.into_body(), 64).await?.as_ref(),
+        b"retained attachment"
+    );
+
+    let error = threads::read(
+        &fixture.state,
+        &fixture.admin,
+        board.thread_id.clone(),
+        ThreadReadQuery {
+            since_seq: Some(1),
+            ..ThreadReadQuery::default()
+        },
+    )
+    .await
+    .err()
+    .ok_or("obsolete cursor was accepted")?;
+    assert_eq!(error.problem().code, ErrorCode::ResyncRequired);
+    assert_eq!(error.problem().extensions["floor_seq"], 2);
+    assert_eq!(error.problem().extensions["head_seq"], 4);
+    let error = threads::set_pin(
+        &fixture.state,
+        &fixture.admin,
+        board.thread_id,
+        "old".into(),
+        "thread-test-old-pin",
+        ThreadPinSetRequest {
+            value_json: json!("keep"),
+            post_id: Some(receipts[0].post_id.clone()),
+            expected_version: Some(0),
+        },
+    )
+    .await
+    .err()
+    .ok_or("logically expired post was pinnable")?;
+    assert_eq!(error.problem().code, ErrorCode::NotFound);
+    fixture.close().await
+}
+
+#[tokio::test]
+async fn thread_acl_change_discards_initial_frames_at_the_retained_event_floor() -> TestResult {
+    use crate::threads;
+    use cooplet_protocol::{
+        ThreadCreateRequest, ThreadMemberJoinRequest, ThreadMemberLeaveRequest, ThreadRole,
+        ThreadWaitRequest,
+    };
+
+    let fixture = Fixture::new().await?;
+    let (service, _) = fixture.service(&[]).await?;
+    let board = threads::create(
+        &fixture.state,
+        &fixture.admin,
+        "acl-board-create",
+        ThreadCreateRequest {
+            title: "Scoped board".into(),
+            topic: None,
+            creator_handle: None,
+            members: vec![ThreadMemberJoinRequest {
+                member_key: service.actor_id().into(),
+                handle: Some("reader".into()),
+                role: Some(ThreadRole::Observer),
+                wake_policy: None,
+                delivery_mode: None,
+            }],
+        },
+    )
+    .await?;
+    let denied = threads::wait(
+        &fixture.state,
+        &service,
+        board.thread_id.clone(),
+        ThreadWaitRequest {
+            since_seq: u64::MAX,
+            wake_policy: None,
+        },
+    )
+    .await;
+    assert!(denied.is_err_and(|error| error.problem().code == ErrorCode::Forbidden));
+    fixture
+        .state
+        .db
+        .write_sqlite(|tx| {
+            tx.execute(
+                "UPDATE hub_meta SET events_pruned_through_seq=1 WHERE id=1",
+                [],
+            )?;
+            tx.execute("DELETE FROM events WHERE seq=1", [])?;
+            Ok(WriteOutcome::new(()))
+        })
+        .await?;
+
+    let mut body = fixture.stream(&service, 0).await?;
+    threads::leave(
+        &fixture.state,
+        &fixture.admin,
+        board.thread_id,
+        "acl-board-leave",
+        ThreadMemberLeaveRequest {
+            member_key: Some(service.actor_id().into()),
+        },
+    )
+    .await?;
+    fixture
+        .publish(vec![(
+            EventAudience::OwnerOnly {
+                actor_id: service.actor_id().into(),
+            },
+            json!({"visible":true}),
+        )])
+        .await?;
+
+    let response = tokio::time::timeout(Duration::from_secs(2), body.next())
+        .await?
+        .ok_or("stream ended before the visible event")??;
+    let EventStreamFrame::Event { event } = serde_json::from_slice(&response)? else {
+        return Err("expected the visible event, not a resync frame".into());
+    };
+    assert_eq!(event.payload["visible"], true);
+    drop(body);
+    fixture.close().await
+}
+
+#[tokio::test]
+async fn closed_thread_expiry_and_gc_discard_buffered_frames_for_members() -> TestResult {
+    use std::sync::atomic::{AtomicI64, Ordering};
+
+    use crate::threads;
+    use cooplet_protocol::{ThreadCreateRequest, ThreadMemberJoinRequest};
+
+    let mut fixture = Fixture::new().await?;
+    let (service, _) = fixture.service(&[]).await?;
+    let now = now_ms();
+    let wall = Arc::new(AtomicI64::new(now));
+    let injected = wall.clone();
+    fixture.state.wall_clock = Arc::new(move || injected.load(Ordering::Relaxed));
+    let board = threads::create(
+        &fixture.state,
+        &fixture.admin,
+        "expiry-board-create",
+        ThreadCreateRequest {
+            title: "Expiring board".into(),
+            topic: None,
+            creator_handle: None,
+            members: vec![ThreadMemberJoinRequest {
+                member_key: service.actor_id().into(),
+                handle: Some("reader".into()),
+                role: None,
+                wake_policy: None,
+                delivery_mode: None,
+            }],
+        },
+    )
+    .await?;
+    threads::close(
+        &fixture.state,
+        &fixture.admin,
+        board.thread_id.clone(),
+        "expiry-board-close",
+    )
+    .await?;
+    let thread = board.thread_id.clone();
+    fixture
+        .state
+        .db
+        .write_sqlite(move |tx| {
+            tx.execute(
+                "UPDATE threads SET expires_at_ms=?1 WHERE thread_id=?2",
+                params![now + 50, thread.as_str()],
+            )?;
+            Ok(WriteOutcome::new(()))
+        })
+        .await?;
+
+    let mut member_stream = fixture.stream(&service, 0).await?;
+    let mut rollback_stream = fixture.stream(&service, 0).await?;
+    let mut archive = fixture.stream(&fixture.admin, 0).await?;
+    wall.store(now + 51, Ordering::Relaxed);
+    fixture
+        .publish(vec![(
+            EventAudience::OwnerOnly {
+                actor_id: service.actor_id().into(),
+            },
+            json!({"after_expiry":true}),
+        )])
+        .await?;
+    let first = tokio::time::timeout(Duration::from_secs(2), member_stream.next())
+        .await?
+        .ok_or("member stream ended early")??;
+    let EventStreamFrame::Event { event } = serde_json::from_slice(&first)? else {
+        return Err("expected an event after expiry".into());
+    };
+    assert_eq!(event.payload["after_expiry"], true);
+
+    // Keep the intermediate state from the first committed GC batch (tombstoning
+    // sets expires_at_ms=0 and bumps thread_acl_watch post-commit). The second
+    // member stream is still holding frames from before this write.
+    let hooks = Arc::new(crate::storage::gc::HubGcHooks::with_acl_watch(
+        fixture.state.thread_acl_watch.clone(),
+    ));
+    let hooks_tx = hooks.clone();
+    fixture
+        .state
+        .db
+        .write_sqlite(move |tx| {
+            let batch = cooplet_storage::GcHooks::prune_batch(hooks_tx.as_ref(), tx, now + 51, 1)?;
+            assert!(batch.has_more);
+            Ok(WriteOutcome::with_events((), batch.events))
+        })
+        .await?;
+    cooplet_storage::GcHooks::after_prune_commit(hooks.as_ref());
+    let tombstoned: i64 = fixture
+        .state
+        .reads
+        .read({
+            let thread = board.thread_id.clone();
+            move |db| {
+                Ok(db.query_row(
+                    "SELECT expires_at_ms FROM threads WHERE thread_id=?1",
+                    [thread.as_str()],
+                    |row| row.get(0),
+                )?)
+            }
+        })
+        .await?;
+    assert_eq!(tombstoned, 0);
+    wall.store(now, Ordering::Relaxed);
+    let first = tokio::time::timeout(Duration::from_secs(2), rollback_stream.next())
+        .await?
+        .ok_or("member stream ended on the clock rollback")??;
+    let EventStreamFrame::Event { event } = serde_json::from_slice(&first)? else {
+        return Err("expected a visible event after rollback".into());
+    };
+    assert_eq!(event.payload["after_expiry"], true);
+
+    let first = tokio::time::timeout(Duration::from_secs(2), archive.next())
+        .await?
+        .ok_or("archive stream ended early")??;
+    let EventStreamFrame::Event { event } = serde_json::from_slice(&first)? else {
+        return Err("expected a retained archive event".into());
+    };
+    assert_eq!(event.kind, EventKind::ThreadCreated);
+    assert_eq!(event.aggregate_id, board.thread_id.as_str());
+    drop(member_stream);
+    drop(rollback_stream);
+    drop(archive);
+    fixture.close().await
+}
+
+#[tokio::test]
+async fn a_nodes_departure_does_not_remove_it_from_historical_thread_acl() -> TestResult {
+    use crate::threads;
+    use cooplet_protocol::{
+        ParticipantId, ThreadCreateRequest, ThreadListQuery, ThreadMemberJoinRequest,
+        ThreadMemberLeaveRequest,
+    };
+
+    let fixture = Fixture::new().await?;
+    let (service, _) = fixture.service(&[]).await?;
+    let board = threads::create(
+        &fixture.state,
+        &fixture.admin,
+        "history-board-create",
+        ThreadCreateRequest {
+            title: "Historical scopes".into(),
+            topic: None,
+            creator_handle: None,
+            members: vec![ThreadMemberJoinRequest {
+                member_key: service.actor_id().into(),
+                handle: Some("reader".into()),
+                role: None,
+                wake_policy: None,
+                delivery_mode: None,
+            }],
+        },
+    )
+    .await?;
+    assert_eq!(
+        threads::list(&fixture.state, &service, ThreadListQuery::default())
+            .await?
+            .items
+            .len(),
+        1
+    );
+
+    let node = NodeId::generate()?;
+    let agent = ParticipantId::generate()?;
+    let key = format!("{node}/{agent}");
+    let node_for_write = node.clone();
+    let owner = fixture.admin.actor_id().to_owned();
+    fixture.state.db.write_sqlite(move |tx| {
+        tx.execute(
+            "INSERT INTO nodes(node_id,display_name,owner_principal_id,credential_hmac,status,enrolled_at_ms)
+             VALUES(?1,'Worker',?2,'worker credential','online',1)",
+            params![node_for_write.as_str(), owner],
+        )?;
+        tx.execute(
+            "INSERT INTO node_participants(node_id,participant_id,kind,name,state,synced_epoch,updated_at_ms)
+             VALUES(?1,?2,'agent','Worker','idle',0,1)",
+            params![node_for_write.as_str(), agent.as_str()],
+        )?;
+        Ok(WriteOutcome::new(()))
+    }).await?;
+
+    let mut buffered = fixture.stream(&service, 0).await?;
+    threads::join(
+        &fixture.state,
+        &fixture.admin,
+        board.thread_id.clone(),
+        "history-board-join",
+        ThreadMemberJoinRequest {
+            member_key: key.clone(),
+            handle: Some("worker".into()),
+            role: None,
+            wake_policy: None,
+            delivery_mode: None,
+        },
+    )
+    .await?;
+    threads::leave(
+        &fixture.state,
+        &fixture.admin,
+        board.thread_id.clone(),
+        "history-board-leave",
+        ThreadMemberLeaveRequest {
+            member_key: Some(key),
+        },
+    )
+    .await?;
+    fixture
+        .state
+        .db
+        .write_sqlite(move |tx| {
+            tx.execute("DELETE FROM nodes WHERE node_id=?1", [node.as_str()])?;
+            Ok(WriteOutcome::new(()))
+        })
+        .await?;
+    let hidden = threads::get(&fixture.state, &service, board.thread_id).await;
+    assert!(hidden.is_err_and(|error| error.problem().code == ErrorCode::NotFound));
+    assert!(
+        threads::list(&fixture.state, &service, ThreadListQuery::default())
+            .await?
+            .items
+            .is_empty()
+    );
+
+    fixture
+        .publish(vec![(
+            EventAudience::OwnerOnly {
+                actor_id: service.actor_id().into(),
+            },
+            json!({"outside":true}),
+        )])
+        .await?;
+    let bytes = tokio::time::timeout(Duration::from_secs(2), buffered.next())
+        .await?
+        .ok_or("missing visible event")??;
+    let EventStreamFrame::Event { event } = serde_json::from_slice(&bytes)? else {
+        return Err("expected the outside event".into());
+    };
+    assert_eq!(event.payload["outside"], true);
+    drop(buffered);
+    fixture.close().await
+}
+
+#[tokio::test]
+async fn participant_created_redacts_approval_for_non_manage_and_gc_once_bumps_acl_watch()
+-> TestResult {
+    use std::sync::atomic::{AtomicI64, Ordering};
+
+    use crate::threads;
+    use cooplet_protocol::{ThreadCreateRequest, ThreadMemberJoinRequest};
+
+    let mut fixture = Fixture::new().await?;
+    let node = NodeId::generate()?;
+    let (read_svc, _) = fixture.service(std::slice::from_ref(&node)).await?;
+    let hub = fixture.state.meta.hub_id.clone();
+    let node_for_event = node.clone();
+    fixture
+        .state
+        .db
+        .write_sqlite(move |tx| {
+            let ev = append(
+                tx,
+                &hub,
+                NewEvent {
+                    kind: EventKind::ParticipantCreated,
+                    aggregate_type: AggregateType::Participant,
+                    aggregate_id: "part_01",
+                    actor_id: None,
+                    created_at_ms: now_ms(),
+                    data: json!({
+                        "participant_id": "part_01",
+                        "state": "awaiting_approval",
+                        "approval_id": "apr_secret",
+                        "can_respond_remotely": true,
+                        "summary": "Run build"
+                    }),
+                    audience: EventAudience::Nodes {
+                        node_ids: vec![node_for_event],
+                    },
+                },
+            )?;
+            Ok(WriteOutcome::with_events((), vec![ev]))
+        })
+        .await?;
+
+    let read_page = page(&fixture.state, &read_svc, query(0)).await?;
+    assert_eq!(read_page.items.len(), 1);
+    assert!(read_page.items[0].payload.get("approval_id").is_none());
+    assert_eq!(read_page.items[0].payload["can_respond_remotely"], false);
+
+    let admin_page = page(&fixture.state, &fixture.admin, query(0)).await?;
+    assert_eq!(admin_page.items[0].payload["approval_id"], "apr_secret");
+    assert_eq!(admin_page.items[0].payload["can_respond_remotely"], true);
+
+    // End-to-end StorageEngine::gc_once() bumps thread_acl_watch post-commit and invalidates
+    // buffered closed-thread frames for a member even after a clock rollback, while global
+    // archive reader keeps its stream unaffected.
+    let now = now_ms();
+    let wall = Arc::new(AtomicI64::new(now));
+    let injected = wall.clone();
+    fixture.state.wall_clock = Arc::new(move || injected.load(Ordering::Relaxed));
+    let (member_svc, _) = fixture.service(&[]).await?;
+    let board = threads::create(
+        &fixture.state,
+        &fixture.admin,
+        "gc-once-acl-board",
+        ThreadCreateRequest {
+            title: "GC ACL".into(),
+            topic: None,
+            creator_handle: None,
+            members: vec![ThreadMemberJoinRequest {
+                member_key: member_svc.actor_id().into(),
+                handle: Some("gc-reader".into()),
+                role: None,
+                wake_policy: None,
+                delivery_mode: None,
+            }],
+        },
+    )
+    .await?;
+    threads::close(
+        &fixture.state,
+        &fixture.admin,
+        board.thread_id.clone(),
+        "gc-once-acl-close",
+    )
+    .await?;
+    let tid = board.thread_id.clone();
+    fixture
+        .state
+        .db
+        .write_sqlite(move |tx| {
+            tx.execute(
+                "UPDATE threads SET expires_at_ms = ?1 WHERE thread_id = ?2",
+                params![now + 100, tid.as_str()],
+            )?;
+            Ok(WriteOutcome::new(()))
+        })
+        .await?;
+    let mut member_stream = fixture.stream(&member_svc, 0).await?;
+    let mut admin_stream = fixture.stream(&fixture.admin, 0).await?;
+    let acl_before = *fixture.state.thread_acl_watch.borrow();
+    fixture.engine.gc_once(now + 101).await?;
+    assert_ne!(*fixture.state.thread_acl_watch.borrow(), acl_before);
+    wall.store(now, Ordering::Relaxed);
+    fixture
+        .publish(vec![(
+            EventAudience::OwnerOnly {
+                actor_id: member_svc.actor_id().into(),
+            },
+            json!({"sentinel": true}),
+        )])
+        .await?;
+    let frame = next_frame(&mut member_stream)
+        .await?
+        .ok_or("member stream ended early")?;
+    let EventStreamFrame::Event { event } = frame else {
+        return Err("expected sentinel event after gc_once invalidation".into());
+    };
+    assert_eq!(event.payload["sentinel"], true);
+    // Admin archive stream still emits buffered historical events without discarding them.
+    let first_admin = next_frame(&mut admin_stream)
+        .await?
+        .ok_or("admin stream ended early")?;
+    assert!(matches!(first_admin, EventStreamFrame::Event { .. }));
+    drop(member_stream);
+    drop(admin_stream);
     fixture.close().await
 }

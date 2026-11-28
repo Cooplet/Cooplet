@@ -1,7 +1,7 @@
 use std::{
     error::Error,
     fs, io,
-    io::Write,
+    io::{Read, Write},
     os::unix::{ffi::OsStrExt, process::CommandExt},
     path::{Path, PathBuf},
     process::Command,
@@ -9,14 +9,15 @@ use std::{
     time::Duration,
 };
 
-use clap::{Args, Parser, Subcommand};
+use clap::{Args, Parser, Subcommand, ValueEnum};
 use cooplet_client::{
     BlobUploadOutcome, BlobUploadSpec, CoopletClient, UploadVerification, api_path,
 };
 use cooplet_platform::{FileLock, LockProbe, PrivateFs};
 use cooplet_protocol::{
-    ApprovalAction, ApprovalDecision, BlobId, EventKind, ParticipantId, ParticipantState,
-    PrincipalKind, RequestId, validate_idempotency_key,
+    AnswerPayload, ApprovalAction, ApprovalDecision, AttachmentRef, BlobId, DeliveryMode,
+    EventKind, HubId, MessageId, ParticipantId, ParticipantState, PrincipalKind, QuestionPayload,
+    RequestId, validate_idempotency_key,
 };
 use cooplet_storage::DEFAULT_MAX_BLOB_BYTES;
 use serde::Serialize;
@@ -25,6 +26,7 @@ use tokio::signal::unix::{SignalKind, signal};
 
 use cooplet_node::{
     auth::{Credential, read_master},
+    bridge::EnrollRequest,
     clients::{
         AdapterConfig, AdapterRegistry, ParticipantPage, ParticipantView, PiAdapter, TuiAttachPlan,
         agy::{AgyAdapter, AgyAdapterConfig},
@@ -33,9 +35,12 @@ use cooplet_node::{
     },
     config::{NodeConfig, check_offline_state, default_state_dir, operator_path},
     daemon::Node,
+    delivery::{SendMessageRequest, SendMessageResponse},
     http::openapi_json,
     mcp,
 };
+
+mod threads;
 
 type CliResult<T = ()> = Result<T, Box<dyn Error + Send + Sync>>;
 
@@ -67,10 +72,20 @@ enum TopCommand {
         #[arg(long, value_delimiter = ',')]
         kinds: Vec<EventKind>,
     },
-    /// Upload or download a local Node attachment
+    /// Upload or download an attachment
     Blob {
         #[command(subcommand)]
         command: BlobCommand,
+    },
+    /// Create, read and manage shared Threads
+    Thread {
+        #[command(subcommand)]
+        command: threads::ThreadCommand,
+    },
+    /// Send a direct message
+    Message {
+        #[command(subcommand)]
+        command: MessageCommand,
     },
     /// Print the Node API schema
     Openapi,
@@ -101,6 +116,8 @@ enum NodeCommand {
         #[arg(long)]
         operation_key: Option<String>,
     },
+    /// Enroll the running Node at a pinned Hub
+    Enroll(EnrollArgs),
     /// Approve a pending native request
     Approve(ApprovalArgs),
     /// Deny a pending native request
@@ -127,6 +144,58 @@ struct ApprovalArgs {
     operation_key: Option<String>,
 }
 
+#[derive(Args)]
+struct EnrollArgs {
+    /// Hub HTTP(S) origin
+    #[arg(long)]
+    hub: String,
+    #[arg(long)]
+    hub_id: HubId,
+    /// Private file containing the one-shot token
+    #[arg(long, conflicts_with = "token")]
+    token_file: Option<PathBuf>,
+    /// One-shot enrollment token
+    #[arg(long, required_unless_present = "token_file")]
+    token: Option<String>,
+    #[arg(long)]
+    name: Option<String>,
+    /// Additional CA certificates in PEM format
+    #[arg(long)]
+    ca_cert: Option<PathBuf>,
+}
+
+#[derive(Subcommand)]
+enum MessageCommand {
+    /// Send to a local ID, <node_id>/<participant_id> or <hub_id>/<participant_id>
+    Send {
+        #[arg(long)]
+        to: String,
+        #[arg(long)]
+        body: String,
+        #[arg(long)]
+        in_reply_to: Option<MessageId>,
+        /// Attachment reference returned by blob put, as JSON. Repeat for multiple files.
+        #[arg(long, value_parser = json_arg::<AttachmentRef>)]
+        attach: Vec<AttachmentRef>,
+        #[arg(long, conflicts_with = "answer", value_parser = json_arg::<QuestionPayload>)]
+        question: Option<QuestionPayload>,
+        #[arg(long, value_parser = json_arg::<AnswerPayload>)]
+        answer: Option<AnswerPayload>,
+        #[arg(long, default_value = "direct_now")]
+        mode: DeliveryMode,
+        #[arg(long)]
+        ttl_ms: Option<u64>,
+        #[arg(long)]
+        operation_key: Option<String>,
+    },
+}
+
+#[derive(Clone, Copy, ValueEnum)]
+enum BlobTarget {
+    Local,
+    Hub,
+}
+
 #[derive(Subcommand)]
 enum BlobCommand {
     /// Upload a regular file and print its attachment reference
@@ -138,6 +207,8 @@ enum BlobCommand {
         mime_type: Option<String>,
         #[arg(long)]
         operation_key: Option<String>,
+        #[arg(long, value_enum, default_value = "local")]
+        target: BlobTarget,
     },
     /// Download and verify an attachment before publishing it to disk
     Get {
@@ -197,6 +268,8 @@ async fn run_local(command: TopCommand, dir: &Path) -> CliResult {
             Ok(())
         }
         TopCommand::Blob { command } => run_blob(command, dir).await,
+        TopCommand::Thread { command } => threads::run(dir, command).await,
+        TopCommand::Message { command } => run_message(command, dir).await,
         TopCommand::Openapi => Err(io::Error::other("Unexpected local command").into()),
     }
 }
@@ -214,6 +287,7 @@ async fn run_local_node(command: NodeCommand, dir: &Path) -> CliResult {
         }
         NodeCommand::Doctor { workspace_dir } => doctor(dir, workspace_dir.as_deref()).await,
         NodeCommand::Stop { operation_key } => stop(dir, operation_key).await,
+        NodeCommand::Enroll(args) => enroll(dir, args).await,
         NodeCommand::Approve(args) => approval(dir, args, ApprovalAction::Approve).await,
         NodeCommand::Deny(args) => approval(dir, args, ApprovalAction::Deny).await,
         NodeCommand::Attach { name } => attach(dir, &name).await,
@@ -275,15 +349,105 @@ async fn run_daemon(
 }
 
 async fn operator(dir: &Path) -> CliResult<CoopletClient> {
+    let (client, _) = operator_credential(dir)?
+        .connect(PrincipalKind::Operator)
+        .await?;
+    Ok(client)
+}
+
+async fn operator_for_delegation(dir: &Path) -> CliResult<CoopletClient> {
+    let (client, _) = operator_credential(dir)?
+        .connect_for_delegation(PrincipalKind::Operator)
+        .await?;
+    Ok(client)
+}
+
+fn operator_credential(dir: &Path) -> CliResult<Credential> {
     let lock = FileLock::probe_owner_state(&dir.join("node.lock"))?;
     if lock != LockProbe::OwnedByLiveProcess {
         return Err(
             io::Error::new(io::ErrorKind::NotConnected, "The local Node is not running").into(),
         );
     }
-    let credential = Credential::read(&operator_path(dir))?;
-    let (client, _) = credential.connect(PrincipalKind::Operator).await?;
-    Ok(client)
+    Ok(Credential::read(&operator_path(dir))?)
+}
+
+async fn enroll(dir: &Path, args: EnrollArgs) -> CliResult {
+    let client = operator_for_delegation(dir).await?;
+    let token = if let Some(path) = args.token_file {
+        let bytes = PrivateFs::read_private_file(&path, 4096)
+            .map_err(|_| io::Error::other("Could not read the private enrollment token file"))?;
+        String::from_utf8(bytes)
+            .map_err(|_| io::Error::other("The enrollment token file must be UTF-8"))?
+            .trim()
+            .to_owned()
+    } else {
+        args.token
+            .ok_or_else(|| io::Error::other("An enrollment token is required"))?
+    };
+    let ca_cert_pem = args.ca_cert.as_deref().map(read_ca_cert).transpose()?;
+    let response: Value = client
+        .post_json(
+            "/v1/bridge/enroll",
+            &EnrollRequest {
+                hub_url: args.hub,
+                hub_id: args.hub_id,
+                token,
+                name: args.name,
+                ca_cert_pem,
+            },
+            None,
+        )
+        .await?;
+    print_json(&response)
+}
+
+fn read_ca_cert(path: &Path) -> io::Result<String> {
+    const MAX_CA_BYTES: u64 = 64 * 1024;
+    let mut pem = String::new();
+    fs::File::open(path)?
+        .take(MAX_CA_BYTES + 1)
+        .read_to_string(&mut pem)?;
+    if pem.len() as u64 > MAX_CA_BYTES {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "The CA bundle exceeds 64 KiB",
+        ));
+    }
+    Ok(pem)
+}
+
+async fn run_message(command: MessageCommand, dir: &Path) -> CliResult {
+    let MessageCommand::Send {
+        to,
+        body,
+        in_reply_to,
+        attach: attachments,
+        question,
+        answer,
+        mode: delivery_mode,
+        ttl_ms: queue_ttl_ms,
+        operation_key,
+    } = command;
+    let key = delegated_operation_key(operation_key)?;
+    let client = operator_for_delegation(dir).await?;
+    let receipt: SendMessageResponse = client
+        .post_json(
+            "/v1/messages",
+            &SendMessageRequest {
+                to,
+                body,
+                in_reply_to,
+                attachments,
+                question,
+                answer,
+                delivery_mode,
+                queue_ttl_ms,
+            },
+            Some(&key),
+        )
+        .await?;
+    print_json(&receipt)
 }
 
 async fn doctor(dir: &Path, workspace_dir: Option<&Path>) -> CliResult {
@@ -402,7 +566,7 @@ async fn participant_by_name(
 }
 
 async fn approval(dir: &Path, args: ApprovalArgs, action: ApprovalAction) -> CliResult {
-    let client = operator(dir).await?;
+    let client = operator_for_delegation(dir).await?;
     let operation_key = operation_key_or_generate(args.operation_key)?;
     let (participant_id, approval_id) = if let Some(approval_id) = args.approval_id {
         (args.name.parse::<ParticipantId>()?, approval_id)
@@ -460,14 +624,21 @@ async fn attach(dir: &Path, name: &str) -> CliResult {
 }
 
 async fn run_blob(command: BlobCommand, dir: &Path) -> CliResult {
-    let client = operator(dir).await?;
     match command {
         BlobCommand::Put {
             path,
             name,
             mime_type,
             operation_key,
+            target,
         } => {
+            let (client, operation_key) = match target {
+                BlobTarget::Local => (operator(dir).await?, operation_key),
+                BlobTarget::Hub => {
+                    let key = delegated_operation_key(operation_key)?;
+                    (operator_for_delegation(dir).await?, Some(key))
+                }
+            };
             let name = match name {
                 Some(value) => value,
                 None => path
@@ -500,19 +671,29 @@ async fn run_blob(command: BlobCommand, dir: &Path) -> CliResult {
             let spec = BlobUploadSpec {
                 filename: name,
                 mime_type: mime_type.unwrap_or_else(|| "application/octet-stream".into()),
-                verification: UploadVerification::LocalSha256,
+                verification: match target {
+                    BlobTarget::Local => UploadVerification::LocalSha256,
+                    BlobTarget::Hub => UploadVerification::HubReceipt,
+                },
                 expected_sha256: None,
                 idempotency_key: operation_key,
                 content_length: Some(metadata.len()),
+                participant_id: None,
             };
-            let attachment = match client.upload_blob(spec, file).await? {
+            let outcome = match target {
+                BlobTarget::Local => client.upload_blob(spec, file).await?,
+                BlobTarget::Hub => client.upload_bridge_blob(spec, file).await?,
+            };
+            let attachment = match outcome {
                 BlobUploadOutcome::VerifiedLocal(attachment)
                 | BlobUploadOutcome::CompleteWithHubDigest(attachment)
                 | BlobUploadOutcome::AcknowledgedWithoutLocalVerification(attachment) => attachment,
             };
             print_json(&attachment)
         }
-        BlobCommand::Get { output, blob_id } => download(&client, &blob_id, &output).await,
+        BlobCommand::Get { output, blob_id } => {
+            download(&operator(dir).await?, &blob_id, &output).await
+        }
     }
 }
 
@@ -553,6 +734,19 @@ fn operation_key_or_generate(key: Option<String>) -> CliResult<String> {
     };
     validate_idempotency_key(&key)?;
     Ok(key)
+}
+
+fn delegated_operation_key(key: Option<String>) -> CliResult<String> {
+    let generated = key.is_none();
+    let key = operation_key_or_generate(key)?;
+    if generated {
+        writeln!(io::stderr().lock(), "idempotency_key={key}")?;
+    }
+    Ok(key)
+}
+
+fn json_arg<T: serde::de::DeserializeOwned>(value: &str) -> Result<T, String> {
+    serde_json::from_str(value).map_err(|_| "Expected a JSON value of the documented shape".into())
 }
 
 fn print_json(value: &impl Serialize) -> CliResult {

@@ -7,7 +7,7 @@ mod lock;
 mod process;
 mod publish;
 
-pub use clock::{AdmissionGuard, MonoInstant, MonotonicClock};
+pub use clock::{AdmissionGuard, MonoClock, MonoInstant, MonotonicClock};
 pub use error::{PlatformError, PublishStage};
 pub use fs::PrivateFs;
 pub use lock::{FileLock, LockProbe};

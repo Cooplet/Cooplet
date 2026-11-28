@@ -1,9 +1,10 @@
-use std::{io, sync::Arc};
+use std::{io, path::PathBuf, sync::Arc};
 
 use cooplet_storage::StorageEngine;
 use tokio::{net::TcpListener, sync::watch};
 
 use crate::{
+    bridge::NodeBridge,
     clients::{AdapterRegistry, AgentConfig, AgentService},
     config::{NodeConfig, OpenNode},
     delivery::DeliveryService,
@@ -14,6 +15,7 @@ use crate::{
 pub struct Node {
     engine: StorageEngine,
     listener: TcpListener,
+    workspace_dir: PathBuf,
     pub state: NodeState,
 }
 
@@ -35,7 +37,7 @@ impl Node {
         let config = AgentConfig {
             node_id: open.info.node_id.clone(),
             endpoint: open.operator.address()?,
-            workspace_dir: open.workspace_dir,
+            workspace_dir: open.workspace_dir.clone(),
             state_dir: open.state_dir.clone(),
         };
         let agents = Arc::new(AgentService::new(
@@ -54,6 +56,13 @@ impl Node {
             agents.clone(),
             operations.clone(),
         )?;
+        let bridge = NodeBridge::load(
+            open.info.node_id.clone(),
+            open.state_dir,
+            db.clone(),
+            reads.clone(),
+        )
+        .await;
         let (shutdown, _) = watch::channel(false);
         let state = NodeState {
             info: open.info,
@@ -65,12 +74,14 @@ impl Node {
             operations,
             agents,
             delivery,
+            bridge,
             shutdown,
             tasks: Arc::default(),
         };
         Ok(Self {
             engine: open.engine,
             listener: open.listener,
+            workspace_dir: open.workspace_dir,
             state,
         })
     }
@@ -80,6 +91,9 @@ impl Node {
     }
 
     pub async fn serve(self) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        let bridge = self.state.bridge.clone();
+        let _shutdown_bridge = ShutdownBridge(bridge.clone());
+        bridge.start(self.state.clone(), self.workspace_dir);
         let mut stopping = self.state.shutdown.subscribe();
         let state = self.state.clone();
         let listener = NodeListener::new(self.listener, stopping.clone());
@@ -91,6 +105,7 @@ impl Node {
         let result = server.await;
         self.state.shutdown.send_replace(true);
         quiesce(&self.state);
+        bridge.drain().await;
         self.state.tasks.wait().await;
         let sessions = self.state.agents.shutdown().await;
         self.state.delivery.shutdown().await;
@@ -106,7 +121,16 @@ impl Node {
     }
 }
 
+struct ShutdownBridge(Arc<NodeBridge>);
+
+impl Drop for ShutdownBridge {
+    fn drop(&mut self) {
+        self.0.shutdown();
+    }
+}
+
 fn quiesce(state: &NodeState) {
+    state.bridge.shutdown();
     state.tasks.close();
     state.delivery.stop_admission();
     state.agents.quiesce();

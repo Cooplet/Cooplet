@@ -39,8 +39,17 @@ struct Fixture {
 
 impl Fixture {
     fn new() -> Test<Self> {
-        let root = env::temp_dir().join(format!("cx-{}", &RequestId::generate()?.as_str()[4..16]));
-        fs::create_dir(&root)?;
+        // Keep the Unix socket path short and use the random end of the ULID.
+        let root = loop {
+            let id = RequestId::generate()?;
+            let id = id.as_str();
+            let path = env::temp_dir().join(format!("cx-{}", &id[id.len() - 12..]));
+            match fs::create_dir(&path) {
+                Ok(()) => break path,
+                Err(error) if error.kind() == io::ErrorKind::AlreadyExists => continue,
+                Err(error) => return Err(error.into()),
+            }
+        };
         for dir in ["work", "home"] {
             fs::create_dir(root.join(dir))?;
         }

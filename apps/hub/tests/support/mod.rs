@@ -5,7 +5,7 @@ use std::{
     net::SocketAddr,
     os::unix::fs::{DirBuilderExt, PermissionsExt},
     path::PathBuf,
-    process::{Child, Command, Stdio},
+    process::{Child, Command, ExitStatus, Stdio},
     time::Duration,
 };
 
@@ -33,6 +33,10 @@ pub struct Hub {
 
 impl Hub {
     pub async fn start() -> TestResult<Self> {
+        Self::start_with_args(&[]).await
+    }
+
+    pub async fn start_with_args(server_args: &[&str]) -> TestResult<Self> {
         let _ = rustls::crypto::ring::default_provider().install_default();
         let state = Scratch::new()?;
         let init = hub_command()
@@ -72,6 +76,7 @@ impl Hub {
                 .arg("127.0.0.1:0")
                 .arg("--public-origin")
                 .arg("http://127.0.0.1:0")
+                .args(server_args)
                 .stdout(Stdio::null())
                 .stderr(Stdio::piped())
                 .spawn()?,
@@ -241,7 +246,11 @@ impl Hub {
         })
     }
 
-    pub async fn stop_gracefully(&mut self) -> TestResult {
+    pub fn database_path(&self) -> PathBuf {
+        self.state.0.join("hub.sqlite3")
+    }
+
+    pub async fn stop(&mut self) -> TestResult<ExitStatus> {
         let status = Command::new("sh")
             .args([
                 "-c",
@@ -254,15 +263,18 @@ impl Hub {
         let deadline = Instant::now() + Duration::from_secs(4);
         loop {
             if let Some(status) = self.child.0.try_wait()? {
-                assert!(status.success(), "unexpected Hub shutdown status {status}");
-                break;
+                return Ok(status);
             }
             if Instant::now() >= deadline {
                 return Err("Hub did not drain after SIGTERM".into());
             }
             sleep(Duration::from_millis(15)).await;
         }
+    }
 
+    pub async fn stop_gracefully(&mut self) -> TestResult {
+        let status = self.stop().await?;
+        assert!(status.success(), "unexpected Hub shutdown status {status}");
         let reopened = hub_command()
             .arg("init")
             .arg("--state-dir")

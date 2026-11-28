@@ -76,10 +76,19 @@ impl Fixture {
             engine,
             meta,
             master,
+            thread_acl_watch,
         } = storage::open(&root.0, 4 * 1024 * 1024, 20 * 1024 * 1024, 16_384).await?;
         let (shutdown, stop) = watch::channel(());
         let bridge = Arc::new(RecordedBridge::default());
-        let state = AppState::new(&engine, meta, master, bridge.clone(), stop, 4 * 1024 * 1024)?;
+        let state = AppState::new(
+            &engine,
+            meta,
+            master,
+            thread_acl_watch,
+            bridge.clone(),
+            stop,
+            4 * 1024 * 1024,
+        )?;
         let admin = authenticate(&state.reads, &state.master, master_token.trim()).await?;
         let admin_token = state
             .reads
@@ -531,7 +540,7 @@ async fn canceling_the_enclosing_request_does_not_lose_the_revocation_notificati
         .await
     });
     tokio::time::timeout(Duration::from_secs(5), async {
-        while state.background.0.borrow().active == 0 {
+        while state.background.tasks.borrow().active == 0 {
             tokio::task::yield_now().await;
         }
     })

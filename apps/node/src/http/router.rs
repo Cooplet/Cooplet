@@ -15,20 +15,47 @@ use http::{
 use crate::error::{NodeError, Result};
 
 use super::{
-    NodeState, blobs, events,
+    NodeState, blobs, bridge, events,
     extract::{BodyLimit, buffer},
     problem::{invalid_request, payload_too_large},
     routes::*,
+    threads,
 };
 
 const CONTROL_BODY_LIMIT: usize = 64 * 1024;
+const ENROLL_BODY_LIMIT: usize = 128 * 1024;
 const MESSAGE_BODY_LIMIT: usize = 2 * 1024 * 1024;
+const THREAD_BODY_LIMIT: usize = 64 * 1024;
 
 pub fn router(state: NodeState) -> Router {
     let messages = Router::new()
         .route("/v1/messages", post(send_message))
         .layer(DefaultBodyLimit::max(MESSAGE_BODY_LIMIT))
         .layer(Extension(BodyLimit(MESSAGE_BODY_LIMIT)));
+    let enrollment = Router::new()
+        .route("/v1/bridge/enroll", post(bridge::enroll))
+        .layer(DefaultBodyLimit::max(ENROLL_BODY_LIMIT))
+        .layer(Extension(BodyLimit(ENROLL_BODY_LIMIT)));
+    let threads = Router::new()
+        .route("/v1/threads", get(threads::list).post(threads::create))
+        .route("/v1/threads/{id}", get(threads::get))
+        .route("/v1/threads/{id}/close", post(threads::close))
+        .route(
+            "/v1/threads/{id}/posts",
+            get(threads::read).post(threads::post),
+        )
+        .route(
+            "/v1/threads/{id}/pins/{pin_key}",
+            axum::routing::put(threads::pin_set).delete(threads::pin_delete),
+        )
+        .route("/v1/threads/{id}/wait", post(threads::wait))
+        .route("/v1/threads/{id}/members", get(threads::members))
+        .route("/v1/threads/{id}/members/join", post(threads::join))
+        .route("/v1/threads/{id}/members/leave", post(threads::leave))
+        .route("/v1/threads/{id}/members/resume", post(threads::resume))
+        .layer(middleware::from_fn_with_state(state.clone(), bound_get))
+        .layer(DefaultBodyLimit::max(THREAD_BODY_LIMIT))
+        .layer(Extension(BodyLimit(THREAD_BODY_LIMIT)));
     let control = Router::new()
         .route("/v1/info", get(info))
         .route("/v1/openapi.json", get(openapi))
@@ -53,8 +80,11 @@ pub fn router(state: NodeState) -> Router {
         .merge(messages);
     let blobs = Router::new()
         .route("/v1/blobs", post(blobs::put))
+        .route("/v1/bridge/blobs", post(blobs::relay))
         .layer(DefaultBodyLimit::disable());
     control
+        .merge(enrollment)
+        .merge(threads)
         .merge(blobs)
         .fallback(not_found)
         .method_not_allowed_fallback(method_not_allowed)
@@ -67,7 +97,10 @@ async fn bound_get(
     request: Request,
     next: Next,
 ) -> Result<Response> {
-    if !matches!(*request.method(), Method::GET | Method::HEAD) {
+    if !matches!(
+        *request.method(),
+        Method::GET | Method::HEAD | Method::DELETE
+    ) {
         return Ok(next.run(request).await);
     }
     let limit = request
@@ -85,7 +118,7 @@ async fn bound_get(
     };
     if request.headers().contains_key(TRANSFER_ENCODING) || non_empty_length {
         return Err(invalid_request(
-            "GET and HEAD requests must not include a body",
+            "GET, HEAD, and DELETE requests must not include a body",
         ));
     }
     let (parts, body) = request.into_parts();
@@ -93,7 +126,7 @@ async fn bound_get(
     let bytes = buffer(bounded, &state).await?;
     if !bytes.is_empty() {
         return Err(invalid_request(
-            "GET and HEAD requests must not include a body",
+            "GET, HEAD, and DELETE requests must not include a body",
         ));
     }
     Ok(next.run(Request::from_parts(parts, Body::empty())).await)

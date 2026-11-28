@@ -75,9 +75,32 @@ async fn gate_sqlite_hygiene() -> TestResult {
         assert_eq!(read_pragma("max_page_count")?, 1_048_576);
         let journal: String = tx.pragma_query_value(None, "journal_mode", |row| row.get(0))?;
         assert_eq!(journal, "wal");
+        assert!(tx.query_row("SELECT NOT EXISTS(SELECT 1 FROM pragma_foreign_key_check)", [], |row| row.get::<_, bool>(0))?);
+        assert!(tx.query_row(
+            "SELECT COUNT(*)=3 FROM sqlite_schema WHERE type='index' AND name IN (
+               'idx_thread_posts_expiry_seq',
+               'idx_thread_members_pending_blobs',
+               'idx_thread_members_stage'
+             )",
+            [],
+            |row| row.get::<_, bool>(0),
+        )?);
         Ok(WriteOutcome::new(()))
     }).await?;
     hub.engine.shutdown().await?;
+    let reopened = open_default(&scratch.0).await?;
+    assert!(
+        reopened
+            .engine
+            .reads()
+            .read(|db| Ok(db.query_row(
+                "SELECT NOT EXISTS(SELECT 1 FROM pragma_foreign_key_check)",
+                [],
+                |row| row.get::<_, bool>(0),
+            )?))
+            .await?
+    );
+    reopened.engine.shutdown().await?;
     Ok(())
 }
 
@@ -369,17 +392,17 @@ async fn restart_preserves_terminal_facts_and_atomically_recovers_interrupted_de
         )?;
         tx.execute(
             "INSERT INTO hub_messages (message_id, sender_actor_id, target_participant_id, sender_node_id,
-                                       target_node_id, body, delivery_mode, delivery_state, created_at_ms, expires_at_ms)
-             VALUES ('msg_00000000000000000000000001', 'sender', 'target', ?1, ?2, 'parent', 'direct_now', 'delivered', 0, 9999999999999),
-                    ('msg_00000000000000000000000003', 'sender', 'target', NULL, ?2, 'queued', 'queue_until_idle', 'queued', 0, 9999999999999)",
+                                       target_node_id, body, delivery_mode, delivery_state, created_at_ms, expires_at_ms, required_node_ids_json)
+             VALUES ('msg_00000000000000000000000001', 'sender', 'target', ?1, ?2, 'parent', 'direct_now', 'delivered', 0, 9999999999999, json_array(?1, ?2)),
+                    ('msg_00000000000000000000000003', 'sender', 'target', NULL, ?2, 'queued', 'queue_until_idle', 'queued', 0, 9999999999999, json_array(?2))",
             params![node_a_for_write.as_str(), node_b_for_write.as_str()],
         )?;
         tx.execute(
             "INSERT INTO hub_messages (message_id, sender_actor_id, target_participant_id, target_node_id,
-                                       in_reply_to, body, answer_json, delivery_mode, delivery_state, created_at_ms, expires_at_ms)
+                                       in_reply_to, body, answer_json, delivery_mode, delivery_state, created_at_ms, expires_at_ms, required_node_ids_json)
              VALUES ('msg_00000000000000000000000002', 'sender', 'target', ?1,
-                     'msg_00000000000000000000000001', 'answer', '{}', 'direct_now', 'dispatched', 0, 9999999999999)",
-            [node_a_for_write.as_str()],
+                     NULL, 'answer', '{}', 'direct_now', 'dispatched', 0, 9999999999999, json_array(?1, ?2))",
+            params![node_a_for_write.as_str(), node_b_for_write.as_str()],
         )?;
         Ok(WriteOutcome::new(()))
     }).await?;
@@ -596,15 +619,15 @@ async fn gc_preserves_single_answer_after_receipt_expiry_and_bounds_reply_detach
                                      created_at_ms, updated_at_ms, expires_at_ms)
              VALUES ('receipt', 'actor', 'key', 'answer_question', 'hash', 'succeeded', 0, 0, 10);
              INSERT INTO hub_messages (message_id, sender_actor_id, target_participant_id, target_node_id,
-                                       body, delivery_mode, delivery_state, created_at_ms, expires_at_ms)
-             SELECT 'question', 'sender', 'target', node_id, '', 'direct_now', 'delivered', 0, 100 FROM nodes;
+                                       body, delivery_mode, delivery_state, created_at_ms, expires_at_ms, required_node_ids_json)
+             SELECT 'question', 'sender', 'target', node_id, '', 'direct_now', 'delivered', 0, 100, json_array(node_id) FROM nodes;
              INSERT INTO hub_messages (message_id, sender_actor_id, target_participant_id, in_reply_to,
-                                       body, answer_json, operation_id, delivery_mode, delivery_state, created_at_ms, expires_at_ms)
-             VALUES ('answer', 'sender', 'target', 'question', '', '{}', 'receipt', 'direct_now', 'delivered', 0, 100);
+                                       body, answer_json, operation_id, delivery_mode, delivery_state, created_at_ms, expires_at_ms, required_node_ids_json)
+             SELECT 'answer', 'sender', 'target', 'question', '', '{}', 'receipt', 'direct_now', 'delivered', 0, 100, json_array(node_id) FROM nodes;
              WITH RECURSIVE numbers(i) AS (VALUES (1) UNION ALL SELECT i + 1 FROM numbers WHERE i < 250)
              INSERT INTO hub_messages (message_id, sender_actor_id, target_participant_id, target_node_id,
-                                       in_reply_to, body, delivery_mode, delivery_state, created_at_ms, expires_at_ms)
-             SELECT 'reply_' || i, 'sender', 'target', node_id, 'question', '', 'direct_now', 'delivered', 0, 1000
+                                       in_reply_to, body, delivery_mode, delivery_state, created_at_ms, expires_at_ms, required_node_ids_json)
+             SELECT 'reply_' || i, 'sender', 'target', node_id, 'question', '', 'direct_now', 'delivered', 0, 1000, json_array(node_id)
              FROM numbers CROSS JOIN nodes;",
         )?;
         Ok(WriteOutcome::new(()))
@@ -615,8 +638,8 @@ async fn gc_preserves_single_answer_after_receipt_expiry_and_bounds_reply_detach
         assert!(answer_receipt.is_none());
         let duplicate = tx.execute(
             "INSERT INTO hub_messages (message_id, sender_actor_id, target_participant_id, in_reply_to,
-                                       body, answer_json, delivery_mode, delivery_state, created_at_ms, expires_at_ms)
-             VALUES ('duplicate', 'sender', 'target', 'question', '', '{}', 'direct_now', 'delivered', 0, 100)",
+                                       body, answer_json, delivery_mode, delivery_state, created_at_ms, expires_at_ms, required_node_ids_json)
+             SELECT 'duplicate', 'sender', 'target', 'question', '', '{}', 'direct_now', 'delivered', 0, 100, json_array(node_id) FROM nodes",
             [],
         );
         assert!(matches!(duplicate, Err(error) if error.sqlite_error_code() == Some(rusqlite::ErrorCode::ConstraintViolation)));
@@ -777,6 +800,9 @@ fn gc_filters_use_the_retention_and_recovery_indexes() -> TestResult {
         "{blobs}"
     );
     assert!(!blobs.contains("USE TEMP B-TREE"), "{blobs}");
+    let posts = explain(&tx, gc::EXPIRED_POST_PREFIX, params!["thread", 5, 199])?;
+    assert!(posts.contains("idx_thread_posts_expiry_seq"), "{posts}");
+    assert!(!posts.contains("USE TEMP B-TREE"), "{posts}");
     let messages = explain(&tx, recovery::RECOVERABLE_MESSAGES, [])?;
     assert!(
         messages.contains("USING INDEX idx_hub_messages_recovery"),
@@ -843,5 +869,135 @@ async fn init_and_open_reject_empty_state_dir() -> TestResult {
     assert!(init_err.is_err());
     let open_err = open_default(Path::new("")).await;
     assert!(open_err.is_err());
+    Ok(())
+}
+
+#[test]
+fn gc_thread_queries_use_indexes_without_analyze() -> TestResult {
+    let mut db = Connection::open_in_memory()?;
+    db.execute_batch(MIGRATION_V1.sql)?;
+    let tx = db.transaction()?;
+    tx.execute_batch(
+        "WITH RECURSIVE n(i) AS (VALUES (1) UNION ALL SELECT i + 1 FROM n WHERE i < 500)
+         INSERT INTO threads (thread_id, title, created_by_actor_id, status, head_seq,
+                              created_at_ms, updated_at_ms, closed_at_ms, expires_at_ms)
+         SELECT 'thr_' || i, 'T', 'owner', CASE WHEN i % 2 = 0 THEN 'closed' ELSE 'open' END,
+                1, 0, 0, CASE WHEN i % 2 = 0 THEN 1 ELSE NULL END,
+                CASE WHEN i % 2 = 0 THEN i * 10 ELSE NULL END
+         FROM n;
+         WITH RECURSIVE n(i) AS (VALUES (1) UNION ALL SELECT i + 1 FROM n WHERE i < 500)
+         INSERT INTO thread_posts (thread_id, seq, post_id, author_actor_id, author_kind,
+                                   author_handle, body, created_at_ms, expires_at_ms)
+         SELECT 'thr_' || i, 1, 'msg_' || i, 'owner', 'human', 'owner', 'body', 0, i * 10
+         FROM n;",
+    )?;
+    // Deliberately do NOT run ANALYZE so production planner behavior is verified.
+    let expired_post_thread = explain(&tx, gc::EXPIRED_POST_THREAD, params![1000])?;
+    assert!(
+        expired_post_thread.contains("idx_thread_posts_expires"),
+        "{expired_post_thread}"
+    );
+    assert!(
+        !expired_post_thread.contains("USE TEMP B-TREE"),
+        "{expired_post_thread}"
+    );
+
+    let expired_post_prefix = explain(&tx, gc::EXPIRED_POST_PREFIX, params!["thr_1", 1000, 199])?;
+    assert!(
+        expired_post_prefix.contains("idx_thread_posts_expiry_seq"),
+        "{expired_post_prefix}"
+    );
+    assert!(
+        !expired_post_prefix.contains("USE TEMP B-TREE"),
+        "{expired_post_prefix}"
+    );
+
+    let tombstoned = explain(&tx, gc::TOMBSTONED_CLOSED_THREAD, [])?;
+    assert!(tombstoned.contains("idx_threads_expires"), "{tombstoned}");
+    assert!(!tombstoned.contains("USE TEMP B-TREE"), "{tombstoned}");
+
+    let expired_closed = explain(&tx, gc::EXPIRED_CLOSED_THREAD, params![1000])?;
+    assert!(
+        expired_closed.contains("idx_threads_expires"),
+        "{expired_closed}"
+    );
+    assert!(
+        !expired_closed.contains("USE TEMP B-TREE"),
+        "{expired_closed}"
+    );
+
+    // Thread dispatch staging, global pending pause, and restart recovery check must all
+    // use partial indexes rather than full table scans (without ANALYZE).
+    let stage_plan = explain(
+        &tx,
+        crate::threads::STAGE_CANDIDATES_SQL,
+        params!["node_1", 1_i64, "", ""],
+    )?;
+    assert!(
+        stage_plan.contains("USING INDEX idx_thread_members_stage"),
+        "{stage_plan}"
+    );
+    assert!(!stage_plan.contains("SCAN m"), "{stage_plan}");
+
+    let pause_plan = explain(&tx, crate::threads::PAUSE_ALL_PENDING_SQL, [])?;
+    assert!(
+        pause_plan.contains("USING INDEX idx_thread_members_pending_blobs")
+            || pause_plan.contains("USING COVERING INDEX idx_thread_members_pending_blobs"),
+        "{pause_plan}"
+    );
+
+    let recovery_pending = explain(
+        &tx,
+        "SELECT EXISTS (SELECT 1 FROM thread_members WHERE state='active' AND pending_delivery_id IS NOT NULL)",
+        [],
+    )?;
+    assert!(
+        recovery_pending.contains("USING INDEX idx_thread_members_pending_blobs")
+            || recovery_pending.contains("USING COVERING INDEX idx_thread_members_pending_blobs"),
+        "{recovery_pending}"
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn prune_messages_detaches_hub_native_non_answer_reply_without_check_violation() -> TestResult
+{
+    let scratch = Scratch::new()?;
+    init(&scratch.0, "Hub-native GC").await?;
+    let hub = open_default(&scratch.0).await?;
+    hub.engine
+        .db()
+        .write_sqlite(|tx| {
+            tx.execute_batch(
+                "INSERT INTO hub_messages (message_id, sender_actor_id, sender_node_id, target_node_id,
+                                           target_participant_id, required_node_ids_json, body,
+                                           delivery_mode, delivery_state, created_at_ms, expires_at_ms)
+                 VALUES ('msg_00000000000000000000000001', 'usr_admin', NULL, NULL,
+                         'part_recipient', '[]', 'parent', 'direct_now', 'delivered', 0, 100);
+                 INSERT INTO hub_messages (message_id, sender_actor_id, sender_node_id, target_node_id,
+                                           target_participant_id, required_node_ids_json, in_reply_to, body,
+                                           delivery_mode, delivery_state, created_at_ms, expires_at_ms)
+                 VALUES ('msg_00000000000000000000000002', 'usr_admin', NULL, NULL,
+                         'part_recipient', '[]', 'msg_00000000000000000000000001', 'reply',
+                         'direct_now', 'delivered', 50, 1000);",
+            )?;
+            Ok(WriteOutcome::new(()))
+        })
+        .await?;
+
+    hub.engine.gc_once(200).await?;
+    let remaining: (u64, Option<String>) = hub
+        .engine
+        .reads()
+        .read(|db| {
+            Ok(db.query_row(
+                "SELECT COUNT(*), MAX(in_reply_to) FROM hub_messages",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )?)
+        })
+        .await?;
+    assert_eq!(remaining, (1, None));
+    hub.engine.shutdown().await?;
     Ok(())
 }

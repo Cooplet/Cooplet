@@ -80,6 +80,7 @@ CREATE TABLE operations (
     resource_id         TEXT,
     result_json         TEXT,
     error_json          TEXT,
+    bridge_origin       TEXT,
     created_at_ms       INTEGER NOT NULL,
     updated_at_ms       INTEGER NOT NULL,
     expires_at_ms       INTEGER NOT NULL,
@@ -109,6 +110,7 @@ CREATE TABLE messages (
     delivery_detail     TEXT,
     operation_id        TEXT    REFERENCES operations(operation_id) ON DELETE SET NULL,
     hub_message_id      TEXT,
+    hub_parent_message_id TEXT,
     created_at_ms       INTEGER NOT NULL,
     delivered_at_ms     INTEGER,
     expires_at_ms       INTEGER NOT NULL,
@@ -156,10 +158,16 @@ CREATE TABLE thread_inject_fences (
     thread_id              TEXT    NOT NULL,
     participant_id         TEXT    NOT NULL REFERENCES participants(participant_id) ON DELETE CASCADE,
     highest_dispatched_seq INTEGER NOT NULL,
+    delivery_generation    INTEGER NOT NULL DEFAULT 0 CHECK (delivery_generation >= 0),
+    last_delivery_id       TEXT,
+    last_from_seq          INTEGER,
     state                  TEXT    NOT NULL CHECK (state IN ('injecting','confirmed','unknown')),
     updated_at_ms          INTEGER NOT NULL,
     expires_at_ms          INTEGER NOT NULL,
-    PRIMARY KEY (thread_id, participant_id)
+    PRIMARY KEY (thread_id, participant_id),
+    CHECK ((last_delivery_id IS NULL AND last_from_seq IS NULL) OR
+           (last_delivery_id IS NOT NULL AND last_from_seq IS NOT NULL AND
+            last_from_seq >= 1 AND last_from_seq <= highest_dispatched_seq))
 );
 CREATE INDEX idx_thread_fences_participant_fk ON thread_inject_fences(participant_id);
 CREATE INDEX idx_thread_fences_unresolved ON thread_inject_fences(state)

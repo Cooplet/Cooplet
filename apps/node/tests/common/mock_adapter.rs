@@ -8,9 +8,10 @@ use std::{
     collections::{BTreeMap, HashMap},
     io,
     path::PathBuf,
+    process::Command,
     sync::{
         Arc, Mutex, MutexGuard,
-        atomic::{AtomicU64, AtomicUsize, Ordering},
+        atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering},
     },
     time::Duration,
 };
@@ -37,10 +38,18 @@ pub struct MockAdapter {
     state: Arc<MockState>,
 }
 
+type DiscoveryBarrier = (oneshot::Sender<()>, oneshot::Receiver<()>);
+type ManagedLaunchBarrier = (PathBuf, oneshot::Sender<()>, oneshot::Receiver<()>);
+
 struct MockState {
     sessions: Mutex<HashMap<(ParticipantId, u64), MockSession>>,
     stop_modes: Mutex<Vec<StopMode>>,
     discoveries: AtomicUsize,
+    discovery_barrier: Mutex<Option<DiscoveryBarrier>>,
+    managed_launch_barrier: Mutex<Option<ManagedLaunchBarrier>>,
+    fail_next_open: AtomicBool,
+    open_calls: AtomicUsize,
+    submit_calls: AtomicUsize,
     effects: Arc<AtomicUsize>,
     submits_sent: mpsc::UnboundedSender<MockSubmit>,
     submits: AsyncMutex<mpsc::UnboundedReceiver<MockSubmit>>,
@@ -87,6 +96,11 @@ impl Default for MockAdapter {
                 sessions: Mutex::default(),
                 stop_modes: Mutex::default(),
                 discoveries: 0.into(),
+                discovery_barrier: Mutex::default(),
+                managed_launch_barrier: Mutex::default(),
+                fail_next_open: AtomicBool::new(false),
+                open_calls: 0.into(),
+                submit_calls: 0.into(),
                 effects: Arc::new(0.into()),
                 submits_sent,
                 submits: submits.into(),
@@ -98,6 +112,10 @@ impl Default for MockAdapter {
 }
 
 impl MockAdapter {
+    pub fn fail_next_open(&self) {
+        self.state.fail_next_open.store(true, Ordering::Release);
+    }
+
     pub fn session(&self, id: &ParticipantId, generation: u64) -> Option<MockSession> {
         lock(&self.state.sessions)
             .get(&(id.clone(), generation))
@@ -106,6 +124,31 @@ impl MockAdapter {
 
     pub fn submits(&self) -> usize {
         self.state.effects.load(Ordering::SeqCst)
+    }
+
+    pub fn submit_calls(&self) -> usize {
+        self.state.submit_calls.load(Ordering::SeqCst)
+    }
+
+    pub fn open_calls(&self) -> usize {
+        self.state.open_calls.load(Ordering::SeqCst)
+    }
+
+    pub fn hold_discovery(&self) -> (oneshot::Receiver<()>, oneshot::Sender<()>) {
+        let (entered, observed) = oneshot::channel();
+        let (release, hold) = oneshot::channel();
+        *lock(&self.state.discovery_barrier) = Some((entered, hold));
+        (observed, release)
+    }
+
+    pub fn hold_managed_launch(
+        &self,
+        marker: PathBuf,
+    ) -> (oneshot::Receiver<()>, oneshot::Sender<()>) {
+        let (entered, observed) = oneshot::channel();
+        let (release, hold) = oneshot::channel();
+        *lock(&self.state.managed_launch_barrier) = Some((marker, entered, hold));
+        (observed, release)
     }
 
     pub fn discoveries(&self) -> usize {
@@ -148,6 +191,17 @@ impl MockSession {
 }
 
 impl MockSubmit {
+    /// Count a native effect immediately and let the controller release its ACK later.
+    pub fn admit(self) -> io::Result<oneshot::Sender<SubmitOutcome>> {
+        if self.request.admission.is_expired() {
+            return Err(io::Error::other(
+                "Fixture admission expired before the native effect",
+            ));
+        }
+        self.effects.fetch_add(1, Ordering::SeqCst);
+        Ok(self.result)
+    }
+
     pub fn finish(self, outcome: SubmitOutcome) -> io::Result<()> {
         let outcome = if matches!(
             outcome,
@@ -180,6 +234,11 @@ impl ClientAdapter for MockAdapter {
     fn discover<'a>(&'a self, _: &'a AdapterConfig) -> BoxFuture<'a, Result<DiscoveryReport>> {
         Box::pin(async move {
             self.state.discoveries.fetch_add(1, Ordering::SeqCst);
+            let barrier = lock(&self.state.discovery_barrier).take();
+            if let Some((entered, hold)) = barrier {
+                let _ = entered.send(());
+                let _ = hold.await;
+            }
             Ok(DiscoveryReport {
                 client_kind: self.kind().into(),
                 available: true,
@@ -208,6 +267,27 @@ impl ClientAdapter for MockAdapter {
         request: SessionOpenRequest,
     ) -> BoxFuture<'_, Result<OpenedSession>> {
         Box::pin(async move {
+            self.state.open_calls.fetch_add(1, Ordering::SeqCst);
+            if self.state.fail_next_open.swap(false, Ordering::AcqRel) {
+                return Err(NodeError::internal(
+                    "The fixture could not open a native session",
+                ));
+            }
+            let barrier = lock(&self.state.managed_launch_barrier).take();
+            if let Some((marker, entered, hold)) = barrier {
+                let _ = entered.send(());
+                let _ = hold.await;
+                let mut command = Command::new("sh");
+                command
+                    .args(["-c", "printf started > \"$1\"; exec sleep 5", "sh"])
+                    .arg(marker);
+                request.spawner.spawn(command).await.map_err(|_| {
+                    NodeError::internal("The fixture sanitized the managed spawn error")
+                })?;
+                return Err(NodeError::internal(
+                    "The fixture has no managed session protocol",
+                ));
+            }
             let (native_key, adapter_binding) = match request.mode {
                 SessionOpenMode::Create => (
                     NativeSessionKey {
@@ -283,6 +363,7 @@ impl ClientAdapter for MockAdapter {
         request: SubmitTurnRequest,
     ) -> BoxFuture<'a, SubmitOutcome> {
         Box::pin(async move {
+            self.state.submit_calls.fetch_add(1, Ordering::SeqCst);
             if request.admission.is_expired() {
                 return SubmitOutcome::Expired;
             }

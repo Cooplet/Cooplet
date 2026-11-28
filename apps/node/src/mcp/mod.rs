@@ -17,7 +17,9 @@ pub async fn run(cred_path: &Path) -> Result<(), Box<dyn Error + Send + Sync>> {
         .map_err(|_| io::Error::other("Could not read a private participant credential"))?;
     let protected = private_tree(cred_path)
         .map_err(|_| io::Error::other("Could not identify the Node's private state directory"))?;
-    let (client, _) = credential.connect(PrincipalKind::Participant).await?;
+    let (client, _) = credential
+        .connect_for_delegation(PrincipalKind::Participant)
+        .await?;
     let context = ToolContext::new(
         client,
         credential.node_id,

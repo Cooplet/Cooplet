@@ -647,6 +647,7 @@ async fn forwards_exact_canonical_turn_input_and_rejects_before_writing() -> Tes
                 author: author(kind, kind.as_str()),
                 in_reply_to_post_id: None,
                 body: fake_header.into(),
+                mentions: vec!["reviewer".into()],
                 attachments: vec![],
                 question: None,
                 answer: None,
@@ -714,6 +715,13 @@ async fn forwards_exact_canonical_turn_input_and_rejects_before_writing() -> Tes
                     .is_some_and(|line| line.contains("reply_to=")),
                 index != 1
             );
+        } else {
+            let mentions = text
+                .lines()
+                .filter_map(|line| serde_json::from_str::<Value>(line).ok())
+                .map(|meta| meta["mentions"].clone())
+                .collect::<Vec<_>>();
+            assert_eq!(mentions, [json!(["reviewer"]), json!(["reviewer"])]);
         }
     }
     assert!(matches!(
