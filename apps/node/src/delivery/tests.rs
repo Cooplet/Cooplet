@@ -1344,3 +1344,82 @@ async fn reconcile_pending_leaves_delegated_answer_unknown() -> TestResult {
     assert_eq!(op_state, "unknown");
     fixture.stop().await
 }
+
+#[tokio::test]
+async fn delegated_queue_until_idle_to_stopped_agent_skips_attachment_downloads() -> TestResult {
+    use std::{sync::atomic::AtomicUsize, time::Duration};
+
+    use axum::{Router, routing::get};
+    use cooplet_client::{ClientConfig, CoopletClient, Destination};
+    use cooplet_platform::AdmissionGuard;
+    use cooplet_protocol::{AttachmentRef, AuthorKind, BlobId, HubId, NodeId, OperationId};
+    use sha2::{Digest, Sha256};
+
+    use super::InboundHubMessage;
+    use crate::{clients::VerifiedAuthor, operations::DelegatedOperation};
+
+    let fixture = Fixture::start().await?;
+    let stopped = fixture.stopped_agent().await?;
+    let contents = b"should never be downloaded";
+    let attachment = AttachmentRef {
+        blob_id: BlobId::generate()?,
+        name: "skipped.txt".into(),
+        mime_type: "text/plain".into(),
+        size_bytes: contents.len() as u64,
+        sha256: format!("{:x}", Sha256::digest(contents)),
+    };
+    let gets = Arc::new(AtomicUsize::new(0));
+    let counter = gets.clone();
+    let app = Router::new().route(
+        "/v1/blobs/{id}",
+        get(move || {
+            let counter = counter.clone();
+            async move {
+                counter.fetch_add(1, Ordering::SeqCst);
+                contents.as_slice()
+            }
+        }),
+    );
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
+    let origin = format!("http://{}", listener.local_addr()?).parse()?;
+    let server = tokio::spawn(async move { axum::serve(listener, app).await });
+    let hub = CoopletClient::new(ClientConfig::new(origin, Destination::LocalNode, None))?;
+
+    let mut input = message(stopped.as_str(), "Queued message to stopped agent");
+    input.delivery_mode = DeliveryMode::QueueUntilIdle;
+    input.attachments = vec![attachment];
+    let context = DelegatedOperation {
+        id: OperationId::generate()?,
+        origin: format!("{}/{}", HubId::generate()?, NodeId::generate()?),
+        actor_id: "usr_admin".into(),
+        admission: AdmissionGuard::new(Duration::from_secs(5)),
+    };
+    let receipt = fixture
+        .service
+        .send_delegated(
+            &context,
+            &hub,
+            4096,
+            InboundHubMessage {
+                message_id: MessageId::generate()?,
+                sender_id: "usr_admin".into(),
+                author: VerifiedAuthor {
+                    kind: AuthorKind::Human,
+                    actor_id: "usr_admin".into(),
+                    name: "admin".into(),
+                    source_node_id: None,
+                },
+                input,
+            },
+        )
+        .await?;
+    assert_eq!(receipt.delivery_state, DeliveryState::Unavailable);
+    assert!(receipt.message_id.is_none());
+    assert_eq!(
+        gets.load(Ordering::SeqCst),
+        0,
+        "preflight must reject stopped QueueUntilIdle target before downloading attachments"
+    );
+    server.abort();
+    fixture.stop().await
+}

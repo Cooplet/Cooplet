@@ -146,28 +146,6 @@ impl DeliveryService {
             }),
             input: message.input.clone(),
         };
-        let preflight_denial = if !message.input.attachments.is_empty()
-            && message.input.delivery_mode == DeliveryMode::DirectNow
-            && message.input.answer.is_none()
-        {
-            let to = message.input.to.clone();
-            let target = self
-                .reads
-                .read(move |conn| Ok(recipient(conn, &to)))
-                .await??;
-            if target.kind == ParticipantKind::Agent {
-                match self.agents.live_session(&target.id).map(|s| s.state()) {
-                    Some(ParticipantState::Idle) => None,
-                    Some(ParticipantState::Working) => Some(SlotDenial::Busy),
-                    Some(ParticipantState::AwaitingApproval) => Some(SlotDenial::AwaitingApproval),
-                    _ => Some(SlotDenial::Unavailable),
-                }
-            } else {
-                None
-            }
-        } else {
-            None
-        };
         let materialize = || {
             self.load_hub_attachments(
                 hub,
@@ -176,24 +154,64 @@ impl DeliveryService {
                 max_blob_bytes,
             )
         };
-        if let Some(denial) = preflight_denial {
-            let attempt = build_attempt(Vec::new());
-            return self
-                .send_new_with_preflight(&guard, attempt, Some(&delegated.admission), Some(denial))
-                .await;
-        }
-        let attempt = build_attempt(materialize().await?);
-        match self
-            .send_new(&guard, attempt, Some(&delegated.admission))
-            .await
-        {
-            Err(error) if cache_changed(&error) => {
-                let attempt = build_attempt(materialize().await?);
-                self.send_new(&guard, attempt, Some(&delegated.admission))
-                    .await
+        for attempt_idx in 0..2 {
+            if let Some(denial) = self.preflight_delegated_attachments(&message.input).await? {
+                let attempt = build_attempt(Vec::new());
+                return self
+                    .send_new_with_preflight(
+                        &guard,
+                        attempt,
+                        Some(&delegated.admission),
+                        Some(denial),
+                    )
+                    .await;
             }
-            result => result,
+            let attempt = build_attempt(materialize().await?);
+            match self
+                .send_new(&guard, attempt, Some(&delegated.admission))
+                .await
+            {
+                Err(error) if attempt_idx == 0 && cache_changed(&error) => continue,
+                result => return result,
+            }
         }
+        Err(NodeError::internal(
+            "Delegated message attachment retry loop exited unexpectedly",
+        ))
+    }
+
+    async fn preflight_delegated_attachments(
+        &self,
+        input: &SendMessageRequest,
+    ) -> Result<Option<SlotDenial>> {
+        if input.attachments.is_empty() || input.answer.is_some() {
+            return Ok(None);
+        }
+        let to = input.to.clone();
+        let target = self
+            .reads
+            .read(move |conn| Ok(recipient(conn, &to)))
+            .await??;
+        if target.kind != ParticipantKind::Agent {
+            return Ok(None);
+        }
+        let state = self.agents.live_session(&target.id).map(|s| s.state());
+        Ok(match input.delivery_mode {
+            DeliveryMode::DirectNow => match state {
+                Some(ParticipantState::Idle) => None,
+                Some(ParticipantState::Working) => Some(SlotDenial::Busy),
+                Some(ParticipantState::AwaitingApproval) => Some(SlotDenial::AwaitingApproval),
+                _ => Some(SlotDenial::Unavailable),
+            },
+            DeliveryMode::QueueUntilIdle => match state {
+                Some(
+                    ParticipantState::Idle
+                    | ParticipantState::Working
+                    | ParticipantState::AwaitingApproval,
+                ) => None,
+                _ => Some(SlotDenial::Unavailable),
+            },
+        })
     }
 
     async fn existing_receipt(
@@ -263,7 +281,11 @@ impl DeliveryService {
                     | ParticipantState::AwaitingApproval,
             )
         });
-        let live_generation = live.as_ref().map(|session| session.generation());
+        let live_generation = if forced_denial.is_some() {
+            None
+        } else {
+            live.as_ref().map(|session| session.generation())
+        };
         let mut slot = None;
         let mut direct_denial = forced_denial.unwrap_or(SlotDenial::Unavailable);
         let admission = external_admission

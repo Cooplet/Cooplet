@@ -224,6 +224,7 @@ fn thread_delivery_contains_blob(
            AND m.role != 'observer' AND m.wake_policy != 'muted'
            AND m.pending_delivery_id IS NOT NULL
            AND n.status = 'online' AND n.revoked_at_ms IS NULL
+           AND t.status = 'open'
            AND (t.expires_at_ms IS NULL OR (t.expires_at_ms != 0 AND t.expires_at_ms > ?3))
          LIMIT 16",
     )?;

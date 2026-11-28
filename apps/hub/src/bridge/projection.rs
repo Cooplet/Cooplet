@@ -13,7 +13,9 @@ use tokio::sync::{mpsc, watch};
 use crate::{
     AppState,
     error::HubError,
-    storage::events::{EventAudience, NewEvent, append, node_disconnected_data},
+    storage::events::{
+        EventAudience, NewEvent, advance_head, append, node_disconnected_data, record,
+    },
 };
 
 use super::registry::{CloseReason, SessionKey};
@@ -207,22 +209,29 @@ pub(super) async fn worker(
         let Some(first) = next else {
             return Ok(());
         };
-        let mut batch = Vec::with_capacity(MAX_PROJECTION_BATCH);
-        batch.push(first);
-        while batch.len() < MAX_PROJECTION_BATCH {
+        let mut events = Vec::with_capacity(MAX_PROJECTION_BATCH);
+        let mut last_seq = first.0;
+        events.push(first.1);
+        while events.len() < MAX_PROJECTION_BATCH {
             match incoming.try_recv() {
-                Ok(item) => batch.push(item),
+                Ok((seq, event)) => {
+                    last_seq = seq;
+                    events.push(event);
+                }
                 Err(_) => break,
             }
         }
-        let last_seq = batch.last().map_or(0, |(seq, _)| *seq);
-        let events: Vec<NodeEventPayload> = batch.into_iter().map(|(_, event)| event).collect();
         let key = key.clone();
         let hub_id = state.meta.hub_id.clone();
         let cancelled = close.clone();
         let wake_node = key.node_id.clone();
         let wall_clock = state.wall_clock.clone();
         let write = state.db.write_wait(move |tx| {
+            if cancelled.borrow().is_some() {
+                return Err(
+                    HubError::new(ErrorCode::BridgeUnavailable, "The bridge closed.").into(),
+                );
+            }
             require_session(tx, &key)?;
             let now = wall_clock();
             let mut idle_participants = HashSet::new();
@@ -233,6 +242,9 @@ pub(super) async fn worker(
                     idle_participants.insert(participant);
                 }
                 notices.extend(applied_notices);
+            }
+            if let Some(last) = notices.last() {
+                advance_head(tx, last.seq)?;
             }
             for participant in &idle_participants {
                 crate::threads::participant_idle(tx, &key.node_id, participant)?;
@@ -255,7 +267,6 @@ pub(super) async fn worker(
         applied.send_replace(last_seq);
         if !idle_participants.is_empty() {
             crate::threads::on_participants_idle(&state, &wake_node, &idle_participants);
-            crate::threads::wake(&state, &wake_node);
         }
     }
 }
@@ -431,7 +442,7 @@ fn apply_event(
     data["node_id"] = json!(key.node_id);
     let mut notices = Vec::with_capacity(kinds.len());
     for kind in kinds {
-        notices.push(append(
+        notices.push(record(
             tx,
             hub_id,
             NewEvent {

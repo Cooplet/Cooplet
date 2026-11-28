@@ -2409,6 +2409,40 @@ async fn dm_size_cap_duplicate_blobs_allowed_nodes_and_reason_forwarding() -> Te
     .ok_or("expected rejection with stripped invalid reason")?;
     assert!(!err.problem().extensions.contains_key("reason"));
 
+    // 5. Remote Busy outcome forwards validated snake_case reason and drops invalid reason.
+    let valid_busy = ProblemDetails::new(ErrorCode::ParticipantBusy, "busy")
+        .with_extension("reason", "cancel_unavailable");
+    bridge.set(CommandOutcome::Busy, Some(valid_busy))?;
+    let err = send_message(
+        &f.state,
+        &f.admin,
+        "valid-busy-reason-key",
+        direct(&allowed_node, &agent_allowed)?,
+    )
+    .await
+    .err()
+    .ok_or("expected busy with valid reason")?;
+    assert_eq!(err.problem().code, ErrorCode::ParticipantBusy);
+    assert_eq!(
+        err.problem().extensions.get("reason"),
+        Some(&json!("cancel_unavailable"))
+    );
+
+    let invalid_busy = ProblemDetails::new(ErrorCode::ParticipantBusy, "busy")
+        .with_extension("reason", "Bad Reason!");
+    bridge.set(CommandOutcome::Busy, Some(invalid_busy))?;
+    let err = send_message(
+        &f.state,
+        &f.admin,
+        "invalid-busy-reason-key",
+        direct(&allowed_node, &agent_allowed)?,
+    )
+    .await
+    .err()
+    .ok_or("expected busy with stripped invalid reason")?;
+    assert_eq!(err.problem().code, ErrorCode::ParticipantBusy);
+    assert!(!err.problem().extensions.contains_key("reason"));
+
     f.close().await?;
     Ok(())
 }

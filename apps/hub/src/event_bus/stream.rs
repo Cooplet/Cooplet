@@ -23,8 +23,32 @@ const AUTH_INTERVAL: Duration = Duration::from_secs(30);
 const MAX_IDLE_EXPIRY_WAIT_MS: i64 = 30_000;
 const NDJSON_MEDIA_TYPE: &str = "application/x-ndjson";
 const PING_FRAME: &[u8] = b"{\"type\":\"ping\"}\n";
+const EVENT_KIND_COUNT: usize = EventKind::ALL.len();
+const CURSOR_CATCHUP_STRIDE: u64 = 10_000;
 
-type Watermark = (u64, u64);
+fn event_kind_index(kind: EventKind) -> usize {
+    EventKind::ALL
+        .iter()
+        .position(|candidate| *candidate == kind)
+        .unwrap_or(0)
+}
+
+#[derive(Clone)]
+pub(super) struct Watermark {
+    head: u64,
+    lag_gen: u64,
+    by_kind: [u64; EVENT_KIND_COUNT],
+}
+
+impl Default for Watermark {
+    fn default() -> Self {
+        Self {
+            head: 0,
+            lag_gen: 0,
+            by_kind: [0; EVENT_KIND_COUNT],
+        }
+    }
+}
 
 #[derive(Clone)]
 pub(crate) struct EventWake(watch::Receiver<Watermark>);
@@ -32,7 +56,7 @@ pub(crate) struct EventWake(watch::Receiver<Watermark>);
 impl EventWake {
     pub(crate) fn new(db: &DbActor, mut shutdown: watch::Receiver<()>) -> Self {
         let mut subscription = db.subscribe();
-        let (wake, receiver) = watch::channel::<Watermark>((0, 0));
+        let (wake, receiver) = watch::channel(Watermark::default());
         tokio::spawn(async move {
             loop {
                 tokio::select! {
@@ -40,9 +64,15 @@ impl EventWake {
                     _ = shutdown.changed() => break,
                     _ = wake.closed() => break,
                     event = subscription.recv() => match event {
-                        Ok(event) => wake.send_modify(|(head, _)| *head = (*head).max(event.seq)),
+                        Ok(event) => wake.send_modify(|watermark| {
+                            watermark.head = watermark.head.max(event.seq);
+                            let slot = &mut watermark.by_kind[event_kind_index(event.kind)];
+                            *slot = (*slot).max(event.seq);
+                        }),
                         Err(broadcast::error::RecvError::Lagged(_)) => {
-                            wake.send_modify(|(_, generation)| *generation = generation.wrapping_add(1));
+                            wake.send_modify(|watermark| {
+                                watermark.lag_gen = watermark.lag_gen.wrapping_add(1);
+                            });
                         }
                         Err(broadcast::error::RecvError::Closed) => break,
                     },
@@ -57,17 +87,32 @@ impl EventWake {
     }
 }
 
-fn is_thread_event_kind(kind: EventKind) -> bool {
-    matches!(
-        kind,
+pub(super) fn is_thread_event_kind(kind: EventKind) -> bool {
+    match kind {
         EventKind::ThreadCreated
-            | EventKind::ThreadPostCreated
-            | EventKind::ThreadPinUpdated
-            | EventKind::ThreadMemberUpdated
-            | EventKind::ThreadClosed
-            | EventKind::QuestionAnswered
-            | EventKind::BlobDeleted
-    )
+        | EventKind::ThreadUpdated
+        | EventKind::ThreadClosed
+        | EventKind::ThreadMemberUpdated
+        | EventKind::ThreadPostCreated
+        | EventKind::ThreadPinUpdated
+        | EventKind::QuestionAnswered
+        | EventKind::BlobDeleted => true,
+        EventKind::NodeConnected
+        | EventKind::NodeDisconnected
+        | EventKind::NodeStatus
+        | EventKind::ParticipantCreated
+        | EventKind::ParticipantStateChanged
+        | EventKind::ParticipantAwaitingApproval
+        | EventKind::ParticipantStopped
+        | EventKind::MessageCreated
+        | EventKind::MessageDeliveryUpdated
+        | EventKind::BlobStored
+        | EventKind::WorkflowRunStarted
+        | EventKind::WorkflowRunFinished
+        | EventKind::WorkflowStepStarted
+        | EventKind::WorkflowStepCompleted
+        | EventKind::WorkflowLog => false,
+    }
 }
 
 pub(super) async fn response(
@@ -82,7 +127,7 @@ pub(super) async fn response(
         rows: STREAM_SCAN_LIMIT,
         items: STREAM_SCAN_LIMIT,
     };
-    wake.borrow_and_update();
+    let seen_lag_gen = wake.borrow_and_update().lag_gen;
     thread_acl.borrow_and_update();
     let watch_thread_acl = !reader.caller.is_global_reader()
         && (reader.kinds.is_empty() || reader.kinds.iter().copied().any(is_thread_event_kind));
@@ -109,6 +154,7 @@ pub(super) async fn response(
     let state = EventStream {
         reader,
         wake,
+        seen_lag_gen,
         revocations,
         thread_acl,
         watch_thread_acl,
@@ -137,6 +183,7 @@ pub(super) async fn response(
 struct EventStream {
     reader: Arc<Reader>,
     wake: watch::Receiver<Watermark>,
+    seen_lag_gen: u64,
     revocations: watch::Receiver<u64>,
     thread_acl: watch::Receiver<u64>,
     watch_thread_acl: bool,
@@ -244,7 +291,18 @@ impl EventStream {
                 }
                 change = self.wake.changed() => {
                     change.ok()?;
-                    self.needs_scan = true;
+                    let watermark = self.wake.borrow_and_update().clone();
+                    let lagged = watermark.lag_gen != self.seen_lag_gen;
+                    self.seen_lag_gen = watermark.lag_gen;
+                    let relevant = lagged
+                        || self.reader.kinds.is_empty()
+                        || watermark.head.saturating_sub(self.cursor) >= CURSOR_CATCHUP_STRIDE
+                        || self.reader.kinds.iter().any(|kind| {
+                            watermark.by_kind[event_kind_index(*kind)] > self.cursor
+                        });
+                    if relevant {
+                        self.needs_scan = true;
+                    }
                 }
                 () = tokio::time::sleep_until(deadline) => {},
             }
@@ -265,7 +323,7 @@ impl EventStream {
     async fn scan(&mut self) -> Option<()> {
         // Coalesce existing wakeups. A notification sent during this snapshot stays
         // pending for another pass if the snapshot could not see its commit.
-        self.wake.borrow_and_update();
+        self.seen_lag_gen = self.wake.borrow_and_update().lag_gen;
         let next = tokio::select! {
             biased;
             _ = self.shutdown.changed() => return None,

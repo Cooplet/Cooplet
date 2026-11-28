@@ -82,15 +82,15 @@ async fn receive(
         return Ok(previous);
     }
 
-    let Some(live) = state.agents.live_session(&request.member_id) else {
-        return Ok((ThreadDeliveryOutcome::Unavailable, Some("no_live_session")));
-    };
-    if let Some(denial) = preflight_live_state(live.state()) {
-        return Ok(denial);
-    }
     let (mut slot, _gate, previous, attachments) = {
         let mut attempt = 0u8;
         loop {
+            let Some(live) = state.agents.live_session(&request.member_id) else {
+                return Ok((ThreadDeliveryOutcome::Unavailable, Some("no_live_session")));
+            };
+            if let Some(denial) = preflight_live_state(live.state()) {
+                return Ok(denial);
+            }
             let attachments = prepare_attachments(state, hub, request, admission).await?;
             let slot = match live.try_thread_submit(request.delivery_id.as_str()) {
                 Ok(slot) => slot,

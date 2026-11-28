@@ -498,6 +498,7 @@ pub(crate) async fn wait(
                     .map(ThreadWakePolicy::from)
                     .unwrap_or(member.wake_policy);
                 let policy_changed = policy != member.wake_policy;
+                let confirmed_changed = body.since_seq > member.confirmed_seq;
                 member.wake_policy = policy;
                 let head_seq = board.head_seq;
                 let relevant = if policy == pre_policy && head_seq >= pre_head {
@@ -518,15 +519,17 @@ pub(crate) async fn wait(
                 };
                 super::dispatch::record_wait(
                     ctx.tx,
-                    &id,
-                    &member.member_key,
-                    body.since_seq,
-                    head_seq,
-                    member.wake_policy,
-                    policy_changed,
-                    relevant,
+                    super::dispatch::WaitSchedule {
+                        thread_id: &id,
+                        member_key: &member.member_key,
+                        since_seq: body.since_seq,
+                        head_seq,
+                        wake_policy: member.wake_policy,
+                        policy_changed,
+                        relevant_last: relevant,
+                    },
                 )?;
-                if policy_changed {
+                if policy_changed || confirmed_changed {
                     let updated = members::member(ctx.tx, &id, &member.member_key)?
                         .ok_or_else(store::not_found)?;
                     ctx.event(

@@ -124,11 +124,13 @@ fn thread_scope_expiry_inner(
     now: i64,
     allow_left_member: bool,
 ) -> rusqlite::Result<Option<i64>> {
-    let expiry = db.query_row(
-        "SELECT COALESCE(expires_at_ms,9223372036854775807) FROM threads
-         WHERE thread_id=?1 AND (expires_at_ms IS NULL OR (expires_at_ms != 0 AND expires_at_ms > ?2))",
-        params![thread_id.as_str(), now], |row| row.get(0),
-    ).optional()?;
+    let expiry = db
+        .prepare_cached(
+            "SELECT COALESCE(expires_at_ms,9223372036854775807) FROM threads
+             WHERE thread_id=?1 AND (expires_at_ms IS NULL OR (expires_at_ms != 0 AND expires_at_ms > ?2))",
+        )?
+        .query_row(params![thread_id.as_str(), now], |row| row.get(0))
+        .optional()?;
     if expiry.is_none() || caller.require_scope(ServiceScope::Read).is_err() {
         return Ok(None);
     }
@@ -152,7 +154,7 @@ fn thread_scope_expiry_inner(
         && let Some(allowed) = caller.allowed_nodes()
     {
         let mut stmt = db.prepare_cached(
-            "SELECT DISTINCT substr(member_key,1,instr(member_key,'/')-1)
+            "SELECT substr(member_key,1,instr(member_key,'/')-1)
              FROM thread_members WHERE thread_id=?1 AND instr(member_key,'/') > 0",
         )?;
         let mut rows = stmt.query([thread_id.as_str()])?;
@@ -200,11 +202,11 @@ pub(super) fn effective_floor(
     floor: u64,
     now: i64,
 ) -> rusqlite::Result<u64> {
-    db.query_row(
+    db.prepare_cached(
         "SELECT MAX(?2,COALESCE((SELECT seq FROM thread_posts
           WHERE thread_id=?1 AND expires_at_ms<=?3 ORDER BY expires_at_ms DESC,seq DESC LIMIT 1),0))",
-        params![thread_id.as_str(), floor, now], |row| row.get(0),
-    )
+    )?
+    .query_row(params![thread_id.as_str(), floor, now], |row| row.get(0))
 }
 
 pub(super) fn board(db: &Connection, id: &ThreadId, now: i64) -> Result<ThreadSummary, HubError> {

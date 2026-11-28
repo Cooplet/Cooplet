@@ -26,7 +26,13 @@ pub(super) struct MemberAddress {
 }
 
 impl MemberAddress {
-    fn resolve(db: &Connection, caller: &AuthenticatedCaller, key: &str) -> Result<Self, HubError> {
+    fn resolve(
+        db: &Connection,
+        caller: &AuthenticatedCaller,
+        thread_id: &ThreadId,
+        key: &str,
+        extra_nodes: &[String],
+    ) -> Result<Self, HubError> {
         if let Some((node_id, participant_id)) = key.split_once('/') {
             let node_id = NodeId::parse(node_id)?;
             let participant = ParticipantId::parse(participant_id)?;
@@ -54,11 +60,29 @@ impl MemberAddress {
             if UserId::parse(key).is_err() && ServicePrincipalId::parse(key).is_err() {
                 return Err(HubError::invalid("Invalid thread member key."));
             }
+            let extra_json = serde_json::to_string(extra_nodes)?;
             let (participant_id, label) = db
                 .query_row(
                     "SELECT COALESCE(participant_id,principal_id),username FROM principals
-                 WHERE principal_id=?1 AND disabled_at_ms IS NULL",
-                    [key],
+                 WHERE principal_id=?1 AND disabled_at_ms IS NULL
+                   AND (allowed_nodes_json IS NULL
+                        OR ((?3 IS NULL OR EXISTS(SELECT 1 FROM json_each(allowed_nodes_json) WHERE value=?3))
+                            AND NOT EXISTS(
+                                SELECT 1 FROM thread_members tm
+                                WHERE tm.thread_id=?2 AND instr(tm.member_key,'/')>0
+                                  AND substr(tm.member_key,1,instr(tm.member_key,'/')-1)
+                                      NOT IN (SELECT value FROM json_each(allowed_nodes_json))
+                            )
+                            AND NOT EXISTS(
+                                SELECT 1 FROM json_each(?4) en
+                                WHERE en.value NOT IN (SELECT value FROM json_each(allowed_nodes_json))
+                            )))",
+                    params![
+                        key,
+                        thread_id.as_str(),
+                        caller.source_node_id().map(NodeId::as_str),
+                        extra_json,
+                    ],
                     |row| Ok((row.get(0)?, row.get(1)?)),
                 )
                 .optional()?
@@ -191,7 +215,7 @@ pub(super) fn add_creator(
         wake_policy: None,
         delivery_mode: None,
     };
-    add(ctx, thread_id, 0, request)?;
+    add(ctx, thread_id, 0, request, &[])?;
     Ok(())
 }
 
@@ -200,8 +224,9 @@ pub(super) fn add(
     id: &ThreadId,
     head: u64,
     body: ThreadMemberJoinRequest,
+    extra_nodes: &[String],
 ) -> Result<MemberView, HubError> {
-    let address = MemberAddress::resolve(ctx.tx, ctx.caller, &body.member_key)?;
+    let address = MemberAddress::resolve(ctx.tx, ctx.caller, id, &body.member_key, extra_nodes)?;
     let existing = member(ctx.tx, id, &body.member_key)?;
     if existing
         .as_ref()
@@ -230,19 +255,21 @@ pub(super) fn add(
         let disputed = existing.pending.is_some();
         dispatch::reset_member_on_rejoin(
             ctx.tx,
-            id,
-            &body.member_key,
-            address.node_id.as_ref(),
-            role,
-            wake,
-            mode,
-            disputed,
-            if disputed {
-                existing.confirmed_seq
-            } else {
-                head
+            dispatch::RejoinSchedule {
+                thread_id: id,
+                member_key: &body.member_key,
+                node_id: address.node_id.as_ref(),
+                role,
+                wake_policy: wake,
+                delivery_mode: mode,
+                disputed,
+                confirmed_seq: if disputed {
+                    existing.confirmed_seq
+                } else {
+                    head
+                },
+                now_ms: ctx.now,
             },
-            ctx.now,
         )?;
     } else {
         let handle = match body.handle {
@@ -334,7 +361,7 @@ pub(crate) async fn join(
         let board = store::board(ctx.tx, &id, ctx.now)?;
         require_manager(ctx, &id)?;
         store::require_open(&board)?;
-        let saved = add(ctx, &id, board.head_seq, body)?;
+        let saved = add(ctx, &id, board.head_seq, body, &[])?;
         Ok((id, saved))
     })
     .await
@@ -394,6 +421,38 @@ pub(crate) async fn resume(
     body: ThreadMemberResumeRequest,
 ) -> Result<MemberView, HubError> {
     let operation = Operation::new(key, "thread.member.resume", Some(&id), &body)?;
+    // Pre-scan historical posts on ReadPool so DbActor only scans the post delta.
+    let pre_id = id.clone();
+    let pre_member_key = body
+        .member_key
+        .clone()
+        .unwrap_or_else(|| caller.actor_id().to_owned());
+    let pre_after = body.after_seq;
+    let prescan = store::verified_read(state, caller, move |db, caller, now| {
+        if !store::can_access_thread_scope(db, caller, &pre_id, now)? {
+            return Ok(None);
+        }
+        let Some(existing) = member(db, &pre_id, &pre_member_key)? else {
+            return Ok(None);
+        };
+        if existing.state != ThreadMemberState::PausedUnknown
+            || existing.node_id.is_none()
+            || existing.role == ThreadRole::Observer
+            || existing.wake_policy != ThreadWakePolicy::MentionsOnly
+        {
+            return Ok(None);
+        }
+        let board = store::board(db, &pre_id, now)?;
+        if pre_after > board.head_seq {
+            return Ok(None);
+        }
+        let found = posts::last_relevant_seq(db, &pre_id, pre_after, board.head_seq, &existing)?;
+        Ok(Some((board.head_seq, existing.wake_policy, found)))
+    })
+    .await
+    .ok()
+    .flatten();
+
     store::mutate(state, caller, operation, move |ctx, _| {
         ctx.caller.require_scope(ServiceScope::Collaborate)?;
         let key = body
@@ -419,19 +478,39 @@ pub(crate) async fn resume(
             .filter(|seq| i64::try_from(*seq).is_ok())
             .ok_or_else(|| HubError::internal("Thread delivery generation overflow."))?;
         let relevant = if existing.node_id.is_some() && existing.role != ThreadRole::Observer {
-            posts::last_relevant_seq(ctx.tx, &id, body.after_seq, board.head_seq, &existing)?
+            if let Some((pre_head, pre_policy, pre_found)) = prescan
+                && pre_policy == existing.wake_policy
+                && board.head_seq >= pre_head
+            {
+                let delta = if board.head_seq > pre_head {
+                    posts::last_relevant_seq(
+                        ctx.tx,
+                        &id,
+                        pre_head.max(body.after_seq),
+                        board.head_seq,
+                        &existing,
+                    )?
+                } else {
+                    None
+                };
+                delta.or_else(|| pre_found.filter(|seq| *seq > body.after_seq))
+            } else {
+                posts::last_relevant_seq(ctx.tx, &id, body.after_seq, board.head_seq, &existing)?
+            }
         } else {
             None
         };
         dispatch::apply_resume_schedule(
             ctx.tx,
-            &id,
-            key,
-            existing.delivery_mode,
-            generation,
-            body.after_seq,
-            board.head_seq,
-            relevant,
+            dispatch::ResumeSchedule {
+                thread_id: &id,
+                member_key: key,
+                delivery_mode: existing.delivery_mode,
+                generation,
+                after_seq: body.after_seq,
+                head_seq: board.head_seq,
+                relevant_last: relevant,
+            },
         )?;
         let saved = member(ctx.tx, &id, key)?.ok_or_else(store::not_found)?;
         ctx.event(

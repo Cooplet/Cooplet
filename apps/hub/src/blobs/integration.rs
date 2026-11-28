@@ -640,7 +640,7 @@ async fn paired_dm_blob_acl_reuse_thread_oracle_and_stopped_agent_upload() -> Te
         Ok(WriteOutcome::new(()))
     }).await?;
 
-    // Stopped agent cannot upload via X-Cooplet-Participant (IMPL-62).
+    // Stopped agent cannot upload via X-Cooplet-Participant.
     let mut stopped_headers = upload_headers(None);
     stopped_headers.insert(
         X_COOPLET_PARTICIPANT,
@@ -745,7 +745,7 @@ async fn paired_dm_blob_acl_reuse_thread_oracle_and_stopped_agent_upload() -> Te
     let resp = download(&fixture.state, &svc_a_and_b, dm_blob.blob_id.clone()).await?;
     assert_eq!(to_bytes(resp.into_body(), 16).await?.as_ref(), b"paired");
 
-    // Thread blob existence oracle protection (IMPL-49): attaching a thread blob to DM returns 404,
+    // Thread blob existence oracle protection: attaching a thread blob to DM returns 404,
     // while caller outside target node scope receives 403 before blob lookup.
     let board = threads::create(
         &fixture.state,

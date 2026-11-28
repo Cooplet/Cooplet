@@ -424,7 +424,7 @@ fn event_filter_requires_valid_nonempty_csv_and_deduplicates_labels() -> TestRes
 async fn quiet_stream_reconciles_a_durable_commit_without_a_wake() -> TestResult {
     let fixture = Fixture::new().await?;
     // Isolate the stream from broadcasts while using the real writer and reader.
-    let (_silent, wake) = watch::channel((0, 0));
+    let (_silent, wake) = watch::channel(super::stream::Watermark::default());
     let mut body = super::stream::response(
         Reader::new(&fixture.state, &fixture.admin, Vec::new()),
         0,
@@ -641,12 +641,124 @@ async fn stream_closes_naturally_when_token_ttl_expires_without_revocation_bump(
         token.secret.as_str(),
     )
     .await?;
-    let mut body = fixture.stream(&caller, 0).await?;
     tokio::time::pause();
+    let mut body = fixture.stream(&caller, 0).await?;
+    let mut next_fut = std::pin::pin!(body.next());
+    // First poll enters next_frame() and parks on sleep_until(expiry) well before PING_INTERVAL (15s).
+    let pending =
+        std::future::poll_fn(|cx| std::task::Poll::Ready(next_fut.as_mut().poll(cx).is_pending()))
+            .await;
+    assert!(pending, "stream must park waiting for token expiry");
+    tokio::time::advance(Duration::from_millis(4_999)).await;
+    let still_pending =
+        std::future::poll_fn(|cx| std::task::Poll::Ready(next_fut.as_mut().poll(cx).is_pending()))
+            .await;
+    assert!(still_pending, "stream must not close before token expiry");
     wall.store(now + 5_001, Ordering::Relaxed);
-    tokio::time::advance(Duration::from_secs(6)).await;
+    tokio::time::advance(Duration::from_millis(2)).await;
+    let ended = tokio::time::timeout(Duration::from_millis(100), next_fut.as_mut()).await?;
+    assert!(
+        ended.is_none(),
+        "stream must close promptly at token expiry"
+    );
     tokio::time::resume();
-    assert_eq!(next_frame(&mut body).await?, None);
+    fixture.close().await
+}
+
+#[tokio::test]
+async fn filtered_event_stream_tracks_thread_updated_and_ignores_unrelated_kinds() -> TestResult {
+    use crate::threads;
+    use cooplet_protocol::{ThreadCreateRequest, ThreadMemberJoinRequest};
+
+    let fixture = Fixture::new().await?;
+    let (service, _) = fixture.service(&[]).await?;
+    let board = threads::create(
+        &fixture.state,
+        &fixture.admin,
+        "thread-updated-acl-board",
+        ThreadCreateRequest {
+            title: "ACL Filter".into(),
+            topic: None,
+            creator_handle: None,
+            members: vec![ThreadMemberJoinRequest {
+                member_key: service.actor_id().into(),
+                handle: Some("watcher".into()),
+                role: None,
+                wake_policy: None,
+                delivery_mode: None,
+            }],
+        },
+    )
+    .await?;
+
+    // Filtered stream subscribing only to `thread.updated` must still watch thread ACL changes
+    // and wake on `thread.updated`, while ignoring unrelated `blob.stored` events.
+    let mut filtered = stream(
+        &fixture.state,
+        &service,
+        EventStreamQuery {
+            after: 0,
+            kinds: Some("thread.updated".into()),
+        },
+        fixture.state.revocations.subscribe(),
+    )
+    .await?
+    .into_body()
+    .into_data_stream();
+
+    // Publish an unrelated event kind; filtered stream must stay parked (no frame emitted).
+    fixture
+        .publish(vec![(
+            EventAudience::OwnerOnly {
+                actor_id: service.actor_id().into(),
+            },
+            json!({"ignored": true}),
+        )])
+        .await?;
+    assert!(
+        tokio::time::timeout(Duration::from_millis(80), filtered.next())
+            .await
+            .is_err(),
+        "unrelated event kind must not produce a frame on filtered stream"
+    );
+
+    // Now emit a `thread.updated` event for the board and verify the filtered stream wakes and delivers it.
+    let hub = fixture.state.meta.hub_id.clone();
+    let tid = board.thread_id.clone();
+    fixture
+        .state
+        .db
+        .write_sqlite(move |tx| {
+            let ev = append(
+                tx,
+                &hub,
+                NewEvent {
+                    kind: EventKind::ThreadUpdated,
+                    aggregate_type: AggregateType::Thread,
+                    aggregate_id: tid.as_str(),
+                    actor_id: None,
+                    created_at_ms: now_ms(),
+                    data: json!({"thread_id": tid.as_str(), "title": "Renamed"}),
+                    audience: EventAudience::Thread {
+                        thread_id: tid.clone(),
+                    },
+                },
+            )?;
+            Ok(WriteOutcome::with_events((), vec![ev]))
+        })
+        .await?;
+    let frame = next_frame(&mut filtered)
+        .await?
+        .ok_or("expected thread.updated frame")?;
+    let EventStreamFrame::Event { event } = frame else {
+        return Err("expected Event frame for thread.updated".into());
+    };
+    assert_eq!(event.kind, EventKind::ThreadUpdated);
+    assert_eq!(event.payload["title"], "Renamed");
+    assert!(super::stream::is_thread_event_kind(
+        EventKind::ThreadUpdated
+    ));
+    drop(filtered);
     fixture.close().await
 }
 

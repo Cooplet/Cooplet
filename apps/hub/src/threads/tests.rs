@@ -505,7 +505,7 @@ async fn thread_scopes_wait_context_observer_muted_and_resync_extensions() -> Te
     .await?;
     let id = board.thread_id;
 
-    // Read-only service principal is forbidden on both wait and self-leave (IMPL-67).
+    // Read-only service principal is forbidden on both wait and self-leave.
     assert_eq!(
         wait(
             &fixture.state,
@@ -583,7 +583,7 @@ async fn thread_scopes_wait_context_observer_muted_and_resync_extensions() -> Te
     assert_eq!(obs_left.state, ThreadMemberState::Left);
 
     // Post #1 mentions worker; Post #2 is unaddressed context.
-    // wait(since_seq=0) under mentions_only must return BOTH posts up to head_seq=2 (IMPL-52).
+    // wait(since_seq=0) under mentions_only must return BOTH posts up to head_seq=2.
     let first = post(
         &fixture.state,
         &fixture.admin,
@@ -626,7 +626,7 @@ async fn thread_scopes_wait_context_observer_muted_and_resync_extensions() -> Te
         }
         other => return Err(format!("expected Ready, got {other:?}").into()),
     }
-    // No-op wake_policy must not emit ThreadMemberUpdated (IMPL-56).
+    // No-op wake_policy without advancing confirmed_seq must not emit ThreadMemberUpdated.
     assert_eq!(fixture.member_update_count(&id).await?, before_events);
 
     // Changing wake_policy emits ThreadMemberUpdated with confirmed_seq and delivery_generation.
@@ -659,7 +659,9 @@ async fn thread_scopes_wait_context_observer_muted_and_resync_extensions() -> Te
     assert_eq!(payload["data"]["confirmed_seq"], 2);
     assert_eq!(payload["data"]["delivery_generation"], 0);
 
-    // Muted member calling wait without policy stays Waiting and advances confirmed_seq.
+    // Muted member calling wait without policy stays Waiting, advances confirmed_seq,
+    // and emits ThreadMemberUpdated; repeating with unchanged confirmed_seq emits nothing.
+    let before_muted_wait = fixture.member_update_count(&id).await?;
     let muted_wait = wait(
         &fixture.state,
         &muted,
@@ -674,8 +676,30 @@ async fn thread_scopes_wait_context_observer_muted_and_resync_extensions() -> Te
         muted_wait,
         ThreadWaitResponse::Waiting { head_seq: 2 }
     ));
+    assert_eq!(
+        fixture.member_update_count(&id).await?,
+        before_muted_wait + 1
+    );
+    let muted_wait_noop = wait(
+        &fixture.state,
+        &muted,
+        id.clone(),
+        ThreadWaitRequest {
+            since_seq: 1,
+            wake_policy: None,
+        },
+    )
+    .await?;
+    assert!(matches!(
+        muted_wait_noop,
+        ThreadWaitResponse::Waiting { head_seq: 2 }
+    ));
+    assert_eq!(
+        fixture.member_update_count(&id).await?,
+        before_muted_wait + 1
+    );
 
-    // 410 ResyncRequired includes thread_id, floor_seq, head_seq, reason="cursor_pruned" (IMPL-59).
+    // 410 ResyncRequired includes thread_id, floor_seq, head_seq, reason="cursor_pruned".
     fixture
         .wall
         .store(BASE_NOW + RETENTION_MS + 1, Ordering::Relaxed);
@@ -707,7 +731,7 @@ async fn thread_limits_pins_mentions_and_question_expiry_are_enforced() -> TestR
         .service("alice", r#"["read","collaborate"]"#)
         .await?;
 
-    // > 64 initial members rejected with 400 (IMPL-66c).
+    // > 64 initial members rejected with 400.
     let too_many: Vec<ThreadMemberJoinRequest> = (0..=MAX_THREAD_INITIAL_MEMBERS)
         .map(|i| ThreadMemberJoinRequest {
             member_key: format!("sp_{i}"),
@@ -795,7 +819,7 @@ async fn thread_limits_pins_mentions_and_question_expiry_are_enforced() -> TestR
         ErrorCode::PayloadTooLarge
     );
 
-    // Question with expires_at_ms <= now rejected with 400 (IMPL-66b).
+    // Question with expires_at_ms <= now rejected with 400.
     let mut expired_q = post_req("Expired question");
     expired_q.question = Some(QuestionPayload {
         prompt: "Too late?".into(),
@@ -977,5 +1001,175 @@ async fn thread_limits_pins_mentions_and_question_expiry_are_enforced() -> TestR
     let list_page = list(&fixture.state, &fixture.admin, ThreadListQuery::default()).await?;
     assert_eq!(list_page.items.len(), 1);
 
+    fixture.close().await
+}
+
+#[tokio::test]
+async fn hub_native_member_resolve_enforces_allowed_nodes_on_create_and_join() -> TestResult {
+    use cooplet_protocol::ParticipantId;
+
+    let fixture = Fixture::new().await?;
+    let node_a = NodeId::generate()?;
+    let node_b = NodeId::generate()?;
+    let agent_a = ParticipantId::generate()?;
+    let owner = fixture.admin.actor_id().to_owned();
+    let seed = (node_a.clone(), node_b.clone(), agent_a.clone(), owner);
+    fixture
+        .state
+        .db
+        .write_sqlite(move |tx| {
+            for node in [&seed.0, &seed.1] {
+                tx.execute(
+                    "INSERT INTO nodes (node_id, display_name, owner_principal_id, credential_hmac,
+                        session_epoch, status, enrolled_at_ms)
+                     VALUES (?1, 'Worker', ?2, ?1, 1, 'online', 1)",
+                    params![node.as_str(), seed.3],
+                )?;
+            }
+            tx.execute(
+                "INSERT INTO node_participants (node_id, participant_id, kind, name, state, synced_epoch, updated_at_ms)
+                 VALUES (?1, ?2, 'agent', 'WorkerA', 'idle', 1, 1)",
+                params![seed.0.as_str(), seed.2.as_str()],
+            )?;
+            Ok(WriteOutcome::new(()))
+        })
+        .await?;
+
+    let make_scoped_service = |name: &str, allowed_nodes: Vec<NodeId>| {
+        let state = fixture.state.clone();
+        let name = name.to_owned();
+        async move {
+            let principal = ServicePrincipalId::generate()?;
+            let token_id = TokenId::generate()?;
+            let minted = mint_service(&state.master, &principal)?;
+            let verifier = minted.verifier;
+            let allowed = serde_json::to_string(&allowed_nodes)?;
+            let now = crate::now_ms();
+            state
+                .db
+                .write_sqlite(move |tx| {
+                    tx.execute(
+                        "INSERT INTO principals (principal_id, kind, username, display_name, scopes_json,
+                            allowed_nodes_json, created_at_ms, updated_at_ms)
+                         VALUES (?1, 'service', ?2, ?2, '[\"read\",\"collaborate\"]', ?3, ?4, ?4)",
+                        params![principal.as_str(), name, allowed, now],
+                    )?;
+                    tx.execute(
+                        "INSERT INTO auth_tokens (token_id, principal_id, token_kind, verifier_hmac,
+                            scopes_json, allowed_nodes_json, expires_at_ms, created_at_ms)
+                         VALUES (?1, ?2, 'service_token', ?3, '[\"read\",\"collaborate\"]', ?4, ?5, ?6)",
+                        params![
+                            token_id.as_str(),
+                            principal.as_str(),
+                            verifier,
+                            allowed,
+                            i64::MAX,
+                            now
+                        ],
+                    )?;
+                    Ok(WriteOutcome::new(()))
+                })
+                .await?;
+            Ok::<_, Box<dyn Error + Send + Sync>>(
+                auth::authenticate(&state.reads, &state.master, minted.secret.as_str()).await?,
+            )
+        }
+    };
+
+    let svc_only_b = make_scoped_service("svc_only_b", vec![node_b.clone()]).await?;
+    let svc_has_a = make_scoped_service("svc_has_a", vec![node_a.clone()]).await?;
+    let agent_key = format!("{node_a}/{agent_a}");
+
+    // Creating a thread with both node_a agent and svc_only_b (allowed_nodes=[node_b]) returns 404.
+    assert_eq!(
+        create(
+            &fixture.state,
+            &fixture.admin,
+            "create-cross-scope",
+            ThreadCreateRequest {
+                title: "Scoped board".into(),
+                topic: None,
+                creator_handle: None,
+                members: vec![
+                    ThreadMemberJoinRequest {
+                        member_key: agent_key.clone(),
+                        handle: Some("worker_a".into()),
+                        role: None,
+                        wake_policy: None,
+                        delivery_mode: None,
+                    },
+                    ThreadMemberJoinRequest {
+                        member_key: svc_only_b.actor_id().into(),
+                        handle: Some("bot_b".into()),
+                        role: None,
+                        wake_policy: None,
+                        delivery_mode: None,
+                    },
+                ],
+            },
+        )
+        .await
+        .err()
+        .ok_or("expected 404 when adding out-of-scope hub-native service on create")?
+        .problem()
+        .code,
+        ErrorCode::NotFound
+    );
+
+    // Creating with agent_a succeeds, then joining svc_only_b returns 404 while svc_has_a succeeds.
+    let board = create(
+        &fixture.state,
+        &fixture.admin,
+        "create-node-a-board",
+        ThreadCreateRequest {
+            title: "Node A board".into(),
+            topic: None,
+            creator_handle: None,
+            members: vec![ThreadMemberJoinRequest {
+                member_key: agent_key,
+                handle: Some("worker_a".into()),
+                role: None,
+                wake_policy: None,
+                delivery_mode: None,
+            }],
+        },
+    )
+    .await?;
+    assert_eq!(
+        join(
+            &fixture.state,
+            &fixture.admin,
+            board.thread_id.clone(),
+            "join-out-of-scope-svc",
+            ThreadMemberJoinRequest {
+                member_key: svc_only_b.actor_id().into(),
+                handle: Some("bot_b".into()),
+                role: None,
+                wake_policy: None,
+                delivery_mode: None,
+            },
+        )
+        .await
+        .err()
+        .ok_or("expected 404 when joining out-of-scope hub-native service")?
+        .problem()
+        .code,
+        ErrorCode::NotFound
+    );
+    let joined = join(
+        &fixture.state,
+        &fixture.admin,
+        board.thread_id,
+        "join-in-scope-svc",
+        ThreadMemberJoinRequest {
+            member_key: svc_has_a.actor_id().into(),
+            handle: Some("bot_a".into()),
+            role: None,
+            wake_policy: None,
+            delivery_mode: None,
+        },
+    )
+    .await?;
+    assert_eq!(joined.member_key, svc_has_a.actor_id());
     fixture.close().await
 }

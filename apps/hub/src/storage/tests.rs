@@ -77,8 +77,10 @@ async fn gate_sqlite_hygiene() -> TestResult {
         assert_eq!(journal, "wal");
         assert!(tx.query_row("SELECT NOT EXISTS(SELECT 1 FROM pragma_foreign_key_check)", [], |row| row.get::<_, bool>(0))?);
         assert!(tx.query_row(
-            "SELECT COUNT(*)=2 FROM sqlite_schema WHERE type='index' AND name IN (
-               'idx_thread_posts_expiry_seq', 'idx_thread_members_pending_blobs'
+            "SELECT COUNT(*)=3 FROM sqlite_schema WHERE type='index' AND name IN (
+               'idx_thread_posts_expiry_seq',
+               'idx_thread_members_pending_blobs',
+               'idx_thread_members_stage'
              )",
             [],
             |row| row.get::<_, bool>(0),
@@ -922,6 +924,37 @@ fn gc_thread_queries_use_indexes_without_analyze() -> TestResult {
     assert!(
         !expired_closed.contains("USE TEMP B-TREE"),
         "{expired_closed}"
+    );
+
+    // Thread dispatch staging, global pending pause, and restart recovery check must all
+    // use partial indexes rather than full table scans (without ANALYZE).
+    let stage_plan = explain(
+        &tx,
+        crate::threads::STAGE_CANDIDATES_SQL,
+        params!["node_1", 1_i64, "", ""],
+    )?;
+    assert!(
+        stage_plan.contains("USING INDEX idx_thread_members_stage"),
+        "{stage_plan}"
+    );
+    assert!(!stage_plan.contains("SCAN m"), "{stage_plan}");
+
+    let pause_plan = explain(&tx, crate::threads::PAUSE_ALL_PENDING_SQL, [])?;
+    assert!(
+        pause_plan.contains("USING INDEX idx_thread_members_pending_blobs")
+            || pause_plan.contains("USING COVERING INDEX idx_thread_members_pending_blobs"),
+        "{pause_plan}"
+    );
+
+    let recovery_pending = explain(
+        &tx,
+        "SELECT EXISTS (SELECT 1 FROM thread_members WHERE state='active' AND pending_delivery_id IS NOT NULL)",
+        [],
+    )?;
+    assert!(
+        recovery_pending.contains("USING INDEX idx_thread_members_pending_blobs")
+            || recovery_pending.contains("USING COVERING INDEX idx_thread_members_pending_blobs"),
+        "{recovery_pending}"
     );
     Ok(())
 }

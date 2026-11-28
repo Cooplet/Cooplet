@@ -259,7 +259,7 @@ fn failure_response(id: OperationId, error: NodeError) -> CommandResPayload {
     let mut response = response(id, outcome);
     if matches!(
         outcome,
-        CommandOutcome::Rejected | CommandOutcome::AwaitingApproval
+        CommandOutcome::Rejected | CommandOutcome::AwaitingApproval | CommandOutcome::Busy
     ) {
         let code = error.code();
         response.error = Some(

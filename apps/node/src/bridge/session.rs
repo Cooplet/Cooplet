@@ -1,9 +1,10 @@
 use std::{
     collections::{HashMap, HashSet, VecDeque},
-    future::{Future, pending, ready},
+    future::{Future, poll_fn, ready},
     path::Path,
     pin::Pin,
     sync::Arc,
+    task::Poll,
     time::Duration,
 };
 
@@ -16,7 +17,7 @@ use cooplet_protocol::{
     RosterReadyPayload, ThreadAckPayload, ThreadDeliverPayload, ThreadDeliveryOutcome, ThreadId,
 };
 use futures_util::{
-    SinkExt, StreamExt,
+    Sink, SinkExt, StreamExt,
     stream::{SplitSink, SplitStream},
 };
 use http::{
@@ -54,6 +55,7 @@ const SEND_TIMEOUT: Duration = Duration::from_secs(10);
 const CLOSE_TIMEOUT: Duration = Duration::from_millis(250);
 const MAX_COMMANDS: usize = 32;
 const MAX_THREAD_DELIVERIES: usize = 16;
+const MAX_IMMEDIATE_REPLIES: usize = (MAX_COMMANDS + MAX_THREAD_DELIVERIES) * 2;
 const OUTBOX_CAPACITY: usize =
     MAX_COMMANDS + MAX_THREAD_DELIVERIES + super::reverse::MAX_REVERSE_IN_FLIGHT;
 
@@ -283,10 +285,9 @@ impl Attempt<'_> {
             }
         };
 
-        let phase = Some((deadline, Exit::RosterTimeout));
         let mut frames: VecDeque<_> = roster.frames.into();
         while !frames.is_empty() {
-            io.flush_control_queue(phase);
+            io.flush_control_queue();
             let write_limit = io.write_deadline();
             let heartbeat = io.heartbeat_poll_deadline();
             let can_write_app = io.can_write_app();
@@ -298,19 +299,19 @@ impl Attempt<'_> {
                     return Err(write_limit.map_or(Exit::RosterTimeout, |(_, exit)| exit));
                 }
                 () = wait_deadline(&*self.bridge.clock, heartbeat), if heartbeat.is_some() => {
-                    io.heartbeat_tick(phase)?;
+                    io.heartbeat_tick()?;
                 }
-                outcome = poll_active_write(&mut io.active_write), if io.active_write.is_some() => {
-                    io.finish_write(outcome, phase)?;
+                outcome = poll_active_write(&mut io.sink, &mut io.active_write), if io.active_write.is_some() => {
+                    io.finish_write(outcome)?;
                 }
                 message = io.stream.next() => {
-                    if let Some(frame) = io.received(message, phase).await? {
+                    if let Some(frame) = io.received(message).await? {
                         return Err(if frame.epoch == epoch { Exit::Protocol } else { Exit::EpochMismatch });
                     }
                 }
                 () = ready(()), if can_write_app => {
                     if let Some(frame) = frames.pop_front() {
-                        io.start_write(WriteOp::Send(Message::Text(frame.into())), phase);
+                        io.start_write(WriteOp::Send(Message::Text(frame.into())));
                     }
                 }
             }
@@ -344,11 +345,11 @@ impl Attempt<'_> {
         if *stop.borrow() {
             return Err(Exit::Stopping);
         }
-        io.flush_control_queue(None);
+        io.flush_control_queue();
         if let Some(heartbeat) = io.heartbeat_poll_deadline()
             && self.bridge.clock.is_expired(heartbeat)
         {
-            io.heartbeat_tick(None)?;
+            io.heartbeat_tick()?;
         }
         online.requests.expire(&*self.bridge.clock);
         let write_limit = io.write_deadline();
@@ -362,19 +363,19 @@ impl Attempt<'_> {
             () = wait_deadline(&*self.bridge.clock, write_limit.map(|(at, _)| at)), if write_limit.is_some() => {
                 return Err(write_limit.map_or(Exit::SendTimeout, |(_, exit)| exit));
             }
-            outcome = poll_active_write(&mut io.active_write), if io.active_write.is_some() => {
-                io.finish_write(outcome, None)?;
+            outcome = poll_active_write(&mut io.sink, &mut io.active_write), if io.active_write.is_some() => {
+                io.finish_write(outcome)?;
             }
-            () = wait_deadline(&*self.bridge.clock, heartbeat), if heartbeat.is_some() => io.heartbeat_tick(None)?,
+            () = wait_deadline(&*self.bridge.clock, heartbeat), if heartbeat.is_some() => io.heartbeat_tick()?,
             () = wait_deadline(&*self.bridge.clock, correlation) => online.requests.expire(&*self.bridge.clock),
             socket_message = io.stream.next() => {
-                if let Some(frame) = io.received(socket_message, None).await? {
+                if let Some(frame) = io.received(socket_message).await? {
                     self.handle(online, frame)?;
                 }
             }
             () = ready(()), if can_write_app && !online.immediate_replies.is_empty() => {
                 if let Some(reply) = online.immediate_replies.pop_front() {
-                    io.start_write(WriteOp::Send(reply), None);
+                    io.start_write(WriteOp::Send(reply));
                 }
             }
             outbound = online.input.recv(), if can_write_app && online.immediate_replies.is_empty() => {
@@ -394,7 +395,7 @@ impl Attempt<'_> {
                 if let Some(mut request) = online.requests.take_ready(ready_cursor)
                     && request.mark_sent(&*self.bridge.clock)
                 {
-                    io.start_write(WriteOp::Send(Message::Text(request.take_frame().into())), None);
+                    io.start_write(WriteOp::Send(Message::Text(request.take_frame().into())));
                     online.requests.sent(request);
                 }
             }
@@ -412,9 +413,7 @@ impl Attempt<'_> {
                     self.bridge.clock.clone(),
                 );
                 if let Some(rejected) = self.dispatch_command(online, request, admission) {
-                    online
-                        .immediate_replies
-                        .push_back(encode_payload(online.epoch, &rejected)?);
+                    push_immediate_reply(&mut online.immediate_replies, online.epoch, &rejected)?;
                 }
             }
             FrameKind::ThreadDeliver => {
@@ -424,9 +423,7 @@ impl Attempt<'_> {
                     self.bridge.clock.clone(),
                 );
                 if let Some(rejected) = self.dispatch_thread(online, request, admission) {
-                    online
-                        .immediate_replies
-                        .push_back(encode_payload(online.epoch, &rejected)?);
+                    push_immediate_reply(&mut online.immediate_replies, online.epoch, &rejected)?;
                 }
             }
             FrameKind::NodeResponse => online
@@ -756,22 +753,26 @@ fn ws_error(error: WsError) -> Exit {
     }
 }
 
-type NodeSinkOutcome = (SplitSink<WebSocket, Message>, Result<(), WsError>);
-
 enum WriteOp {
     Send(Message),
     Flush,
 }
 
+enum WriteState {
+    Send(Option<Message>),
+    Flush,
+}
+
 struct ActiveWrite {
-    future: Pin<Box<dyn Future<Output = NodeSinkOutcome> + Send>>,
+    state: WriteState,
     deadline: MonoInstant,
     on_timeout: Exit,
 }
 
 struct Wire {
     stream: SplitStream<WebSocket>,
-    sink: Option<SplitSink<WebSocket, Message>>,
+    sink: SplitSink<WebSocket, Message>,
+    close_sent: bool,
     active_write: Option<ActiveWrite>,
     control_writes: VecDeque<WriteOp>,
     heartbeat: Heartbeat,
@@ -783,7 +784,8 @@ impl Wire {
         let (sink, stream) = socket.split();
         Self {
             stream,
-            sink: Some(sink),
+            sink,
+            close_sent: false,
             active_write: None,
             control_writes: VecDeque::new(),
             heartbeat: Heartbeat::new(&*clock),
@@ -792,11 +794,11 @@ impl Wire {
     }
 
     fn can_write_app(&self) -> bool {
-        self.sink.is_some() && self.control_writes.is_empty()
+        self.active_write.is_none() && self.control_writes.is_empty()
     }
 
     fn heartbeat_poll_deadline(&self) -> Option<MonoInstant> {
-        if self.heartbeat.awaiting.is_some() || self.sink.is_some() {
+        if self.heartbeat.awaiting.is_some() || self.active_write.is_none() {
             Some(self.heartbeat.deadline())
         } else {
             None
@@ -809,45 +811,33 @@ impl Wire {
             .map(|write| (write.deadline, write.on_timeout))
     }
 
-    fn transport_write_deadline(
-        &self,
-        timeout: Duration,
-        phase_limit: Option<(MonoInstant, Exit)>,
-    ) -> (MonoInstant, Exit) {
+    fn transport_write_deadline(&self, timeout: Duration) -> (MonoInstant, Exit) {
         let mut bound = (self.clock.deadline_after(timeout), Exit::SendTimeout);
         if let Some((_, pong_deadline)) = self.heartbeat.awaiting
             && pong_deadline.is_earlier_than(bound.0)
         {
             bound = (pong_deadline, Exit::PongTimeout);
         }
-        if let Some(limit) = phase_limit
-            && limit.0.is_earlier_than(bound.0)
-        {
-            bound = limit;
-        }
         bound
     }
 
-    fn start_write(&mut self, op: WriteOp, phase_limit: Option<(MonoInstant, Exit)>) {
-        let Some(mut sink) = self.sink.take() else {
+    fn start_write(&mut self, op: WriteOp) {
+        if self.active_write.is_some() {
             return;
+        }
+        let (deadline, on_timeout) = self.transport_write_deadline(SEND_TIMEOUT);
+        let state = match op {
+            WriteOp::Send(message) => WriteState::Send(Some(message)),
+            WriteOp::Flush => WriteState::Flush,
         };
-        let (deadline, on_timeout) = self.transport_write_deadline(SEND_TIMEOUT, phase_limit);
-        let future = Box::pin(async move {
-            let result = match op {
-                WriteOp::Send(message) => sink.send(message).await,
-                WriteOp::Flush => sink.flush().await,
-            };
-            (sink, result)
-        });
         self.active_write = Some(ActiveWrite {
-            future,
+            state,
             deadline,
             on_timeout,
         });
     }
 
-    fn queue_control_write(&mut self, op: WriteOp, phase_limit: Option<(MonoInstant, Exit)>) {
+    fn queue_control_write(&mut self, op: WriteOp) {
         if matches!(op, WriteOp::Flush)
             && self
                 .control_writes
@@ -856,30 +846,25 @@ impl Wire {
         {
             return;
         }
-        if self.sink.is_some() {
-            self.start_write(op, phase_limit);
+        if self.active_write.is_none() {
+            self.start_write(op);
         } else {
             self.control_writes.push_back(op);
         }
     }
 
-    fn flush_control_queue(&mut self, phase_limit: Option<(MonoInstant, Exit)>) {
-        if self.sink.is_some()
+    fn flush_control_queue(&mut self) {
+        if self.active_write.is_none()
             && let Some(op) = self.control_writes.pop_front()
         {
-            self.start_write(op, phase_limit);
+            self.start_write(op);
         }
     }
 
-    fn finish_write(
-        &mut self,
-        outcome: NodeSinkOutcome,
-        phase_limit: Option<(MonoInstant, Exit)>,
-    ) -> SessionResult<()> {
+    fn finish_write(&mut self, outcome: Result<(), WsError>) -> SessionResult<()> {
         self.active_write = None;
-        self.sink = Some(outcome.0);
-        outcome.1.map_err(ws_error)?;
-        self.flush_control_queue(phase_limit);
+        outcome.map_err(ws_error)?;
+        self.flush_control_queue();
         Ok(())
     }
 
@@ -890,9 +875,8 @@ impl Wire {
         stop: &watch::Receiver<bool>,
     ) -> SessionResult<BridgeFrame> {
         let clock = self.clock.clone();
-        let phase = Some((deadline, phase_timeout));
         loop {
-            self.flush_control_queue(phase);
+            self.flush_control_queue();
             let write_limit = self.write_deadline();
             let heartbeat = self.heartbeat_poll_deadline();
             tokio::select! {
@@ -903,13 +887,13 @@ impl Wire {
                     return Err(write_limit.map_or(phase_timeout, |(_, exit)| exit));
                 }
                 () = wait_deadline(&*clock, heartbeat), if heartbeat.is_some() => {
-                    self.heartbeat_tick(phase)?;
+                    self.heartbeat_tick()?;
                 }
-                outcome = poll_active_write(&mut self.active_write), if self.active_write.is_some() => {
-                    self.finish_write(outcome, phase)?;
+                outcome = poll_active_write(&mut self.sink, &mut self.active_write), if self.active_write.is_some() => {
+                    self.finish_write(outcome)?;
                 }
                 input = self.stream.next() => {
-                    if let Some(frame) = self.received(input, phase).await? {
+                    if let Some(frame) = self.received(input).await? {
                         return Ok(frame);
                     }
                 }
@@ -920,7 +904,6 @@ impl Wire {
     async fn received(
         &mut self,
         input: Option<Result<Message, WsError>>,
-        phase_limit: Option<(MonoInstant, Exit)>,
     ) -> SessionResult<Option<BridgeFrame>> {
         let message = input.ok_or(Exit::Transport)?.map_err(ws_error)?;
         match message {
@@ -934,19 +917,18 @@ impl Wire {
             }
             Message::Ping(_) => {
                 // Tungstenite queues the RFC 6455 Pong while reading a Ping.
-                self.queue_control_write(WriteOp::Flush, phase_limit);
+                self.queue_control_write(WriteOp::Flush);
                 Ok(None)
             }
             Message::Close(close) => {
                 // Send the automatically queued close reply before dropping the stream.
+                self.close_sent = true;
                 self.active_write = None;
-                if let Some(mut sink) = self.sink.take() {
-                    let deadline = self.clock.deadline_after(CLOSE_TIMEOUT);
-                    tokio::select! {
-                        biased;
-                        () = wait_deadline(&*self.clock, Some(deadline)) => {},
-                        _ = sink.flush() => {},
-                    }
+                let deadline = self.clock.deadline_after(CLOSE_TIMEOUT);
+                tokio::select! {
+                    biased;
+                    () = wait_deadline(&*self.clock, Some(deadline)) => {},
+                    _ = self.sink.flush() => {},
                 }
                 if close.is_some_and(|close| u16::from(close.code) == 4003) {
                     Err(Exit::Revoked)
@@ -958,24 +940,22 @@ impl Wire {
         }
     }
 
-    fn heartbeat_tick(&mut self, phase_limit: Option<(MonoInstant, Exit)>) -> SessionResult<()> {
+    fn heartbeat_tick(&mut self) -> SessionResult<()> {
         if self.heartbeat.awaiting.is_some() {
             return Err(Exit::PongTimeout);
         }
         let bytes = self.heartbeat.serial.to_be_bytes();
         self.heartbeat.start_ping(&*self.clock, bytes);
-        self.queue_control_write(
-            WriteOp::Send(Message::Ping(bytes.to_vec().into())),
-            phase_limit,
-        );
+        self.queue_control_write(WriteOp::Send(Message::Ping(bytes.to_vec().into())));
         Ok(())
     }
 
     async fn close(&mut self, code: CloseCode, reason: &'static str) {
-        self.active_write = None;
-        let Some(mut sink) = self.sink.take() else {
+        if self.close_sent {
             return;
-        };
+        }
+        self.close_sent = true;
+        self.active_write = None;
         let deadline = self.clock.deadline_after(CLOSE_TIMEOUT);
         let message = Message::Close(Some(CloseFrame {
             code,
@@ -984,13 +964,13 @@ impl Wire {
         tokio::select! {
             biased;
             () = wait_deadline(&*self.clock, Some(deadline)) => {},
-            _ = sink.send(message) => {},
+            _ = self.sink.send(message) => {},
         }
     }
 
     fn start_payload(&mut self, epoch: u64, payload: &impl BridgePayload) -> SessionResult<()> {
         let message = encode_payload(epoch, payload)?;
-        self.start_write(WriteOp::Send(message), None);
+        self.start_write(WriteOp::Send(message));
         Ok(())
     }
 
@@ -1008,8 +988,8 @@ impl Wire {
                 () = wait_deadline(&*clock, write_limit.map(|(at, _)| at)), if write_limit.is_some() => {
                     return Err(write_limit.map_or(Exit::SendTimeout, |(_, exit)| exit));
                 }
-                outcome = poll_active_write(&mut self.active_write), if self.active_write.is_some() => {
-                    self.finish_write(outcome, None)?;
+                outcome = poll_active_write(&mut self.sink, &mut self.active_write), if self.active_write.is_some() => {
+                    self.finish_write(outcome)?;
                 }
             }
         }
@@ -1017,17 +997,50 @@ impl Wire {
     }
 }
 
-async fn poll_active_write(active: &mut Option<ActiveWrite>) -> NodeSinkOutcome {
-    match active.as_mut() {
-        Some(write) => write.future.as_mut().await,
-        None => pending().await,
-    }
+async fn poll_active_write(
+    sink: &mut SplitSink<WebSocket, Message>,
+    active: &mut Option<ActiveWrite>,
+) -> Result<(), WsError> {
+    poll_fn(|cx| {
+        let Some(write) = active.as_mut() else {
+            return Poll::Pending;
+        };
+        loop {
+            match &mut write.state {
+                WriteState::Send(slot) => match Pin::new(&mut *sink).poll_ready(cx) {
+                    Poll::Pending => return Poll::Pending,
+                    Poll::Ready(Err(error)) => return Poll::Ready(Err(error)),
+                    Poll::Ready(Ok(())) => {
+                        if let Some(message) = slot.take()
+                            && let Err(error) = Pin::new(&mut *sink).start_send(message)
+                        {
+                            return Poll::Ready(Err(error));
+                        }
+                        write.state = WriteState::Flush;
+                    }
+                },
+                WriteState::Flush => return Pin::new(&mut *sink).poll_flush(cx),
+            }
+        }
+    })
+    .await
 }
 
 fn encode_payload(epoch: u64, payload: &impl BridgePayload) -> SessionResult<Message> {
     let bytes = BridgeFrame::encode_json(epoch, payload).map_err(|_| Exit::Protocol)?;
     let text = String::from_utf8(bytes).map_err(|_| Exit::Protocol)?;
     Ok(Message::Text(text.into()))
+}
+
+fn push_immediate_reply(
+    queue: &mut VecDeque<Message>,
+    epoch: u64,
+    payload: &impl BridgePayload,
+) -> SessionResult<()> {
+    if queue.len() < MAX_IMMEDIATE_REPLIES {
+        queue.push_back(encode_payload(epoch, payload)?);
+    }
+    Ok(())
 }
 
 struct Heartbeat {
@@ -1213,10 +1226,7 @@ mod tests {
         wire.heartbeat.start_ping(&*clock, [0; 8]);
         clock.at(9_999);
         let (_stopping, stop) = watch::channel(false);
-        wire.start_write(
-            WriteOp::Send(Message::Text("blocked".repeat(10).into())),
-            None,
-        );
+        wire.start_write(WriteOp::Send(Message::Text("blocked".repeat(10).into())));
         let mut write = pin!(wire.drive_write_to_completion(&stop));
         assert!(poll_once(write.as_mut()).await.is_pending());
         clock.at(10_000);
@@ -1231,10 +1241,7 @@ mod tests {
         let clock = Arc::new(Clock::default());
         let (mut wire, mut peer) = blocked_wire(&clock).await;
         clock.at(14_999);
-        wire.start_write(
-            WriteOp::Send(Message::Text("healthy".repeat(10).into())),
-            None,
-        );
+        wire.start_write(WriteOp::Send(Message::Text("healthy".repeat(10).into())));
         let drain = {
             let mut write = pin!(wire.drive_write_to_completion(&stop));
             assert!(poll_once(write.as_mut()).await.is_pending());
@@ -1263,13 +1270,11 @@ mod tests {
         let (mut wire, _peer) = blocked_wire(&clock).await;
         wire.heartbeat.start_ping(&*clock, [0; 8]);
         wire.sink
-            .as_mut()
-            .ok_or("missing sink")?
             .feed(Message::Text("buffered".repeat(10).into()))
             .await?;
         clock.at(9_999);
         let (_stopping, stop) = watch::channel(false);
-        wire.start_write(WriteOp::Flush, None);
+        wire.start_write(WriteOp::Flush);
         let mut flush = pin!(wire.drive_write_to_completion(&stop));
         assert!(poll_once(flush.as_mut()).await.is_pending());
         clock.at(10_000);
@@ -1288,7 +1293,7 @@ mod tests {
         let (mut wire, mut peer) = blocked_wire(&clock).await;
         clock.at(15_000);
         let (_stopping, stop) = watch::channel(false);
-        wire.heartbeat_tick(None).map_err(|e| e.reason())?;
+        wire.heartbeat_tick().map_err(|e| e.reason())?;
         {
             let mut sending = pin!(wire.drive_write_to_completion(&stop));
             assert!(poll_once(sending.as_mut()).await.is_pending());
@@ -1308,7 +1313,8 @@ mod tests {
     }
 
     #[tokio::test(start_paused = true)]
-    async fn close_sends_frame_even_after_pong_timeout() -> Result<(), Box<dyn std::error::Error>> {
+    async fn close_sends_frame_even_after_pong_timeout_and_with_active_write()
+    -> Result<(), Box<dyn std::error::Error>> {
         let clock = Arc::new(Clock::default());
         let (transport, mut peer) = tokio::io::duplex(4096);
         let socket = WebSocketStream::from_raw_socket(
@@ -1319,14 +1325,68 @@ mod tests {
         .await;
         let mut wire = Wire::new(socket, clock.clone());
         wire.heartbeat.start_ping(&*clock, [0; 8]);
+        // Start an unpolled write so active_write is Some when close() is invoked.
+        wire.start_write(WriteOp::Send(Message::Text("in-flight".into())));
+        assert!(wire.active_write.is_some());
         clock.at(10_000);
         wire.close(CloseCode::Away, "pong_timeout").await;
         let mut bytes = [0u8; 64];
         let n = peer.read(&mut bytes).await?;
         assert!(
             n > 0,
-            "expected RFC 6455 close frame bytes after PongTimeout"
+            "expected RFC 6455 close frame bytes after PongTimeout with active write"
         );
+        Ok(())
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn phase_deadline_never_leaks_into_active_write_across_phases()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let clock = Arc::new(Clock::default());
+        let (transport, peer) = tokio::io::duplex(4096);
+        let socket = WebSocketStream::from_raw_socket(
+            Box::new(transport) as Box<dyn WebSocketIo>,
+            tokio_tungstenite::tungstenite::protocol::Role::Client,
+            None,
+        )
+        .await;
+        let mut wire = Wire::new(socket, clock.clone());
+        let mut server = WebSocketStream::from_raw_socket(
+            Box::new(peer) as Box<dyn WebSocketIo>,
+            tokio_tungstenite::tungstenite::protocol::Role::Server,
+            None,
+        )
+        .await;
+        // Peer sends Ping right before connect deadline followed by HelloAck.
+        server.send(Message::Ping(vec![1, 2].into())).await?;
+        let hello = BridgeFrame::encode_json(
+            1,
+            &HelloAckPayload {
+                hub_id: cooplet_protocol::HubId::generate()?,
+                node_id: cooplet_protocol::NodeId::generate()?,
+                max_inflight_commands: 32,
+                max_inflight_threads: 16,
+                pending_op_ids: Vec::new(),
+            },
+        )?;
+        server
+            .send(Message::Text(String::from_utf8(hello)?.into()))
+            .await?;
+
+        clock.at(29_950);
+        let connect_deadline = MonoInstant::from_millis(30_000);
+        let (_stopping, stop) = watch::channel(false);
+        let frame = wire
+            .next_app(connect_deadline, Exit::ConnectTimeout, &stop)
+            .await
+            .map_err(|e| e.reason())?;
+        assert_eq!(frame.epoch, 1);
+        // If a control write remained active, its deadline must be SEND_TIMEOUT (39_950),
+        // never the expired connect_deadline (30_000).
+        if let Some((limit, on_timeout)) = wire.write_deadline() {
+            assert_eq!(on_timeout.reason(), Exit::SendTimeout.reason());
+            assert!(connect_deadline.is_earlier_than(limit));
+        }
         Ok(())
     }
 
@@ -1354,8 +1414,8 @@ mod tests {
         let mut client = Wire::new(client_ws, clock.clone());
         let mut server = Wire::new(server_ws, clock);
         let payload = "x".repeat(200 * 1024);
-        client.start_write(WriteOp::Send(Message::Text(payload.clone().into())), None);
-        server.start_write(WriteOp::Send(Message::Text(payload.clone().into())), None);
+        client.start_write(WriteOp::Send(Message::Text(payload.clone().into())));
+        server.start_write(WriteOp::Send(Message::Text(payload.clone().into())));
 
         let drive = async {
             let mut client_got = None;
@@ -1366,11 +1426,11 @@ mod tests {
                 || server_got.is_none()
             {
                 tokio::select! {
-                    outcome = poll_active_write(&mut client.active_write), if client.active_write.is_some() => {
-                        client.finish_write(outcome, None).map_err(|e| e.reason())?;
+                    outcome = poll_active_write(&mut client.sink, &mut client.active_write), if client.active_write.is_some() => {
+                        client.finish_write(outcome).map_err(|e| e.reason())?;
                     }
-                    outcome = poll_active_write(&mut server.active_write), if server.active_write.is_some() => {
-                        server.finish_write(outcome, None).map_err(|e| e.reason())?;
+                    outcome = poll_active_write(&mut server.sink, &mut server.active_write), if server.active_write.is_some() => {
+                        server.finish_write(outcome).map_err(|e| e.reason())?;
                     }
                     msg = client.stream.next(), if client_got.is_none() => {
                         if let Some(Ok(Message::Text(text))) = msg {
@@ -1424,6 +1484,31 @@ mod tests {
             let exit = ws_error(WsError::Http(Box::new(response)));
             assert_eq!(exit.terminal_code(), matches.then_some(code));
         }
+        Ok(())
+    }
+
+    #[test]
+    fn immediate_replies_cap_constant_bounds_burst_rejections()
+    -> Result<(), Box<dyn std::error::Error>> {
+        assert_eq!(
+            MAX_IMMEDIATE_REPLIES,
+            (MAX_COMMANDS + MAX_THREAD_DELIVERIES) * 2
+        );
+        let mut queue: VecDeque<Message> = VecDeque::new();
+        for _ in 0..(MAX_IMMEDIATE_REPLIES + 32) {
+            let reply = CommandResPayload {
+                op_id: OperationId::generate()?,
+                outcome: CommandOutcome::Rejected,
+                resource_id: None,
+                result: None,
+                error: Some(ProblemDetails::new(
+                    ErrorCode::RateLimited,
+                    "The Node command limit is reached",
+                )),
+            };
+            push_immediate_reply(&mut queue, 1, &reply).map_err(|e| e.reason())?;
+        }
+        assert_eq!(queue.len(), MAX_IMMEDIATE_REPLIES);
         Ok(())
     }
 }

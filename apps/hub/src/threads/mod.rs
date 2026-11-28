@@ -21,6 +21,8 @@ pub(crate) use dispatch::{
     Dispatch, on_participants_idle, participant_idle, pause_node_pending, reconcile_fences,
     recover_pending, wake,
 };
+#[cfg(test)]
+pub(crate) use dispatch::{PAUSE_ALL_PENDING_SQL, STAGE_CANDIDATES_SQL};
 pub(crate) use members::{join, leave, list_members, resume};
 pub(crate) use posts::{delete_pin, post, read, set_pin, wait};
 pub(crate) use store::can_access_thread_scope;
@@ -85,11 +87,19 @@ pub(crate) async fn create(
         ctx.event(&thread_id, EventKind::ThreadCreated, &created)?;
         members::add_creator(ctx, &thread_id, body.creator_handle)?;
         let mut keys = BTreeSet::new();
+        let extra_nodes: Vec<String> = body
+            .members
+            .iter()
+            .filter_map(|member| {
+                let (node, _) = member.member_key.split_once('/')?;
+                Some(node.to_owned())
+            })
+            .collect();
         for member in body.members {
             if !keys.insert(member.member_key.clone()) || member.member_key == ctx.caller.actor_id() {
                 return Err(HubError::invalid("A thread member was specified more than once."));
             }
-            members::add(ctx, &thread_id, 0, member)?;
+            members::add(ctx, &thread_id, 0, member, &extra_nodes)?;
         }
         Ok((thread_id, created))
     }).await

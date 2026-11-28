@@ -922,9 +922,20 @@ async fn http_rejections_use_problems_and_auth_reads_leave_wal_unchanged() -> Te
             "payload_too_large",
         )?;
     }
-    for extra in ["Content-Length: 5\r\n", "Transfer-Encoding: chunked\r\n"] {
+    for (request, extra) in [
+        ("GET /v1/health", "Content-Length: 5\r\n"),
+        ("GET /v1/health", "Transfer-Encoding: chunked\r\n"),
+        (
+            "DELETE /v1/threads/thr_00000000000000000000000000/pins/plan",
+            "Idempotency-Key: delete-sized-body\r\nContent-Type: application/json\r\nContent-Length: 19\r\n",
+        ),
+        (
+            "DELETE /v1/threads/thr_00000000000000000000000000/pins/plan",
+            "Idempotency-Key: delete-chunked-body\r\nContent-Type: application/json\r\nTransfer-Encoding: chunked\r\n",
+        ),
+    ] {
         let headers = format!(
-            "GET /v1/health HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\nAuthorization: Bearer {token}\r\n{extra}\r\n"
+            "{request} HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\nAuthorization: Bearer {token}\r\n{extra}\r\n"
         );
         assert_problem(
             &raw_http(address, &headers, &[]).await?,

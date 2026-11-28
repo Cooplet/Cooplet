@@ -192,9 +192,13 @@ CREATE TABLE thread_members (
 );
 CREATE INDEX idx_thread_members_pending ON thread_members(node_id, participant_id, thread_id)
     WHERE state = 'active' AND node_id IS NOT NULL;
+CREATE INDEX idx_thread_members_stage ON thread_members(node_id, participant_id, thread_id)
+    WHERE state = 'active' AND node_id IS NOT NULL AND pending_delivery_id IS NULL
+      AND role != 'observer' AND wake_policy != 'muted'
+      AND (direct_wake_seq > 0 OR last_wake_seq > confirmed_seq OR resume_through_seq IS NOT NULL);
 CREATE INDEX idx_thread_members_member_key ON thread_members(member_key, thread_id);
 CREATE INDEX idx_thread_members_pending_blobs ON thread_members(node_id, thread_id)
-    WHERE state = 'active' AND role != 'observer' AND wake_policy != 'muted' AND pending_delivery_id IS NOT NULL;
+    WHERE state = 'active' AND pending_delivery_id IS NOT NULL;
 
 CREATE TABLE thread_posts (
     thread_id           TEXT    NOT NULL REFERENCES threads(thread_id) ON DELETE CASCADE,

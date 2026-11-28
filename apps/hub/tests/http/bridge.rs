@@ -688,7 +688,9 @@ async fn roster_caps_event_batching_awaiting_approval_declaration_and_delete_bod
     )?;
     assert_eq!(final_state, "idle");
 
-    // 4. DELETE with a non-empty JSON body is rejected with 400 InvalidRequest.
+    // 4. DELETE pin admission: empty body with Content-Length: 0 succeeds,
+    // non-empty Content-Length is rejected with 413 PayloadTooLarge, and
+    // Transfer-Encoding: chunked is rejected with 400 InvalidRequest.
     let board: ThreadSummary = admin
         .post_json(
             "/v1/threads",
@@ -696,20 +698,58 @@ async fn roster_caps_event_batching_awaiting_approval_declaration_and_delete_bod
             Some("delete-body-thread"),
         )
         .await?;
+    let pin_path = format!("/v1/threads/{}/pins/plan", board.thread_id);
     let auth = format!("Bearer {}", hub.secret);
-    let delete_resp = hub
+    let body = br#"{"unexpected":true}"#;
+    let body_len = body.len().to_string();
+
+    let empty_delete = hub
         .raw(
             "DELETE",
-            &format!("/v1/threads/{}/pins/plan", board.thread_id),
+            &pin_path,
             &[
                 ("X-Cooplet-Hub", hub.id.as_str()),
                 ("Authorization", &auth),
+                ("Idempotency-Key", "delete-pin-empty-body"),
                 ("Content-Type", "application/json"),
+                ("Content-Length", "0"),
             ],
-            br#"{"unexpected":true}"#,
+            b"",
         )
         .await?;
-    delete_resp.problem(400, ErrorCode::InvalidRequest)?;
+    assert_eq!(empty_delete.status, 200);
+
+    let sized_delete = hub
+        .raw(
+            "DELETE",
+            &pin_path,
+            &[
+                ("X-Cooplet-Hub", hub.id.as_str()),
+                ("Authorization", &auth),
+                ("Idempotency-Key", "delete-pin-sized-body"),
+                ("Content-Type", "application/json"),
+                ("Content-Length", &body_len),
+            ],
+            body,
+        )
+        .await?;
+    sized_delete.problem(413, ErrorCode::PayloadTooLarge)?;
+
+    let chunked_delete = hub
+        .raw(
+            "DELETE",
+            &pin_path,
+            &[
+                ("X-Cooplet-Hub", hub.id.as_str()),
+                ("Authorization", &auth),
+                ("Idempotency-Key", "delete-pin-chunked-body"),
+                ("Content-Type", "application/json"),
+                ("Transfer-Encoding", "chunked"),
+            ],
+            b"13\r\n{\"unexpected\":true}\r\n0\r\n\r\n",
+        )
+        .await?;
+    chunked_delete.problem(400, ErrorCode::InvalidRequest)?;
 
     drop(socket);
     Ok(())

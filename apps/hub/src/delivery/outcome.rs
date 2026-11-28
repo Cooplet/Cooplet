@@ -134,11 +134,14 @@ pub(super) fn classify(
         | CommandOutcome::Delivered
         | CommandOutcome::Queued
         | CommandOutcome::Succeeded => unknown_terminal(request),
-        CommandOutcome::Busy => failure(
-            request,
-            DeliveryState::Busy,
-            ProblemDetails::new(ErrorCode::ParticipantBusy, "The participant is busy."),
-        ),
+        CommandOutcome::Busy => {
+            let mut problem =
+                ProblemDetails::new(ErrorCode::ParticipantBusy, "The participant is busy.");
+            if let Some(remote) = response.error.as_ref() {
+                copy_extensions(&mut problem, remote);
+            }
+            failure(request, DeliveryState::Busy, problem)
+        }
         CommandOutcome::AwaitingApproval => {
             let mut problem = ProblemDetails::new(
                 ErrorCode::AwaitingApproval,

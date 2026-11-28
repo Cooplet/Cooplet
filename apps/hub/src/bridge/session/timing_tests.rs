@@ -911,3 +911,139 @@ async fn cancelled_thread_delivery_does_not_block_replacement_for_same_member() 
     drop(client);
     hub.close().await
 }
+
+#[tokio::test]
+async fn duplicate_reverse_request_at_capacity_closes_socket_and_rate_limit_preserves_slots()
+-> TestResult {
+    use cooplet_protocol::{
+        NodeRequestCaller, NodeRequestPayload, NodeResponsePayload, NodeRpcOperation,
+        NodeRpcOutcome,
+    };
+
+    let (hub, mut client, epoch) = Fixture::open().await?;
+    let participant = ready_agent(&mut client, epoch, ParticipantState::Idle).await?;
+
+    // Send a NodeEvent while the DB writer is stalled so all 16 reverse RPCs block waiting
+    // for the projection barrier (`applied >= accepted_events`).
+    let writer = hub.block_writer().await?;
+    send_payload(
+        &mut client,
+        epoch,
+        &NodeEventPayload::ParticipantStateChanged {
+            participant_id: participant.clone(),
+            state: ParticipantState::Working,
+            approval_id: None,
+            action_hint: None,
+            summary: None,
+            wait_kind: None,
+            can_respond_remotely: None,
+        },
+    )
+    .await?;
+
+    let make_req = |request_id: OperationId| NodeRequestPayload {
+        request_id,
+        caller: NodeRequestCaller::Participant {
+            participant_id: participant.clone(),
+        },
+        operation: NodeRpcOperation::ThreadList {
+            query: Default::default(),
+        },
+    };
+    let mut live_ids = Vec::with_capacity(REVERSE_SLOTS);
+    for _ in 0..REVERSE_SLOTS {
+        let id = OperationId::generate()?;
+        send_payload(&mut client, epoch, &make_req(id.clone())).await?;
+        live_ids.push(id);
+    }
+
+    // 17th distinct request_id exceeds REVERSE_SLOTS and gets synthetic RateLimited without
+    // evicting any of the 16 live slots or closing the session.
+    let overflow_id = OperationId::generate()?;
+    send_payload(&mut client, epoch, &make_req(overflow_id.clone())).await?;
+    let resp: NodeResponsePayload = next_frame(&mut client).await?.decode_payload()?;
+    assert_eq!(resp.request_id, overflow_id);
+    assert!(matches!(
+        resp.outcome,
+        NodeRpcOutcome::Problem { ref problem } if problem.code == ErrorCode::RateLimited
+    ));
+
+    // Reusing one of the 16 live request_ids at capacity must close the session with 1002.
+    send_payload(&mut client, epoch, &make_req(live_ids[0].clone())).await?;
+    let ClientMessage::Close(Some(close)) = next_message(&mut client).await? else {
+        return Err("expected 1002 protocol close on duplicate reverse request_id".into());
+    };
+    assert_eq!(u16::from(close.code), 1002);
+
+    writer.release().await?;
+    drop(client);
+    hub.close().await
+}
+
+#[tokio::test]
+async fn early_node_event_and_revocation_close_with_active_write_behave_cleanly() -> TestResult {
+    let (hub, mut client, epoch) = Fixture::open().await?;
+    let participant = agent("early-worker", ParticipantState::Working)?;
+    let pid = participant.participant_id.clone();
+
+    // Send a Ping right before RosterSync to interleave control writes during handshake.
+    client
+        .send(ClientMessage::Ping(Bytes::from_static(PROBE)))
+        .await?;
+    send_roster(&mut client, epoch, vec![participant]).await?;
+    let mut ready_seen = false;
+    while !ready_seen {
+        match next_message(&mut client).await? {
+            ClientMessage::Pong(_) => {}
+            ClientMessage::Text(text) => {
+                let _: RosterReadyPayload =
+                    BridgeFrame::from_json(text.as_bytes())?.decode_payload()?;
+                ready_seen = true;
+            }
+            other => return Err(format!("unexpected handshake frame: {other:?}").into()),
+        }
+    }
+
+    // Immediately emit a NodeEvent and verify it is projected cleanly without closing.
+    let mut events = hub.state.db.subscribe();
+    send_payload(
+        &mut client,
+        epoch,
+        &NodeEventPayload::ParticipantStateChanged {
+            participant_id: pid.clone(),
+            state: ParticipantState::Idle,
+            approval_id: None,
+            action_hint: None,
+            summary: None,
+            wait_kind: None,
+            can_respond_remotely: None,
+        },
+    )
+    .await?;
+    time::timeout(TIMEOUT, async {
+        loop {
+            if events.recv().await?.kind == EventKind::ParticipantStateChanged {
+                return Ok::<_, tokio::sync::broadcast::error::RecvError>(());
+            }
+        }
+    })
+    .await??;
+
+    // Queue an outbound command and immediately revoke the node; the client must still receive
+    // the RFC 6455 4003 close frame (never silently dropped by an active write).
+    let (_op_id, cmd) = hub.command(5_000)?;
+    hub.registry.disconnect_revoked(&hub.node_id);
+    loop {
+        match next_message(&mut client).await? {
+            ClientMessage::Text(_) | ClientMessage::Pong(_) => continue,
+            ClientMessage::Close(Some(close)) => {
+                assert_eq!(u16::from(close.code), 4003);
+                break;
+            }
+            other => return Err(format!("expected 4003 close frame, got {other:?}").into()),
+        }
+    }
+    let _ = time::timeout(TIMEOUT, cmd).await;
+    drop(client);
+    hub.close().await
+}
