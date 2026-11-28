@@ -60,6 +60,7 @@ impl Fixture {
             &ready.engine,
             ready.meta,
             ready.master,
+            ready.thread_acl_watch,
             Arc::new(OfflineBridge),
             stopped,
             LIMIT,
@@ -603,5 +604,337 @@ async fn thread_machine_grant_only_covers_live_posts_in_the_pending_suffix() -> 
         assert!(!thread_delivery_contains_blob(tx, thread, node, recent, 101)?);
         Ok(WriteOutcome::new(()))
     }).await?;
+    fixture.close().await
+}
+
+#[tokio::test]
+async fn paired_dm_blob_acl_reuse_thread_oracle_and_stopped_agent_upload() -> TestResult {
+    use crate::{credentials::mint_service, event_bus, threads};
+    use cooplet_protocol::{ServicePrincipalId, ThreadCreateRequest, ThreadPostRequest, TokenId};
+
+    let fixture = Fixture::new(1024).await?;
+    let (a, node_a) = fixture.node().await?;
+    let (b, _node_b) = fixture.node().await?;
+    let x_part = ParticipantId::generate()?;
+    let z_part = ParticipantId::generate()?;
+    let stopped_part = ParticipantId::generate()?;
+    let seed = (
+        a.clone(),
+        x_part.clone(),
+        z_part.clone(),
+        stopped_part.clone(),
+    );
+    fixture.state.db.write_sqlite(move |tx| {
+        let now = now_ms();
+        for (part, state) in [
+            (&seed.1, "idle"),
+            (&seed.2, "idle"),
+            (&seed.3, "stopped"),
+        ] {
+            tx.execute(
+                "INSERT INTO node_participants (node_id, participant_id, kind, name, state, synced_epoch, updated_at_ms)
+                 VALUES (?1, ?2, 'agent', 'agent', ?3, 0, ?4)",
+                params![seed.0.as_str(), part.as_str(), state, now],
+            )?;
+        }
+        Ok(WriteOutcome::new(()))
+    }).await?;
+
+    // Stopped agent cannot upload via X-Cooplet-Participant (IMPL-62).
+    let mut stopped_headers = upload_headers(None);
+    stopped_headers.insert(
+        X_COOPLET_PARTICIPANT,
+        HeaderValue::from_str(stopped_part.as_str())?,
+    );
+    assert_eq!(
+        upload(
+            &fixture.state,
+            &node_a,
+            &stopped_headers,
+            Body::from("nope")
+        )
+        .await
+        .err()
+        .ok_or("expected 403 for stopped participant upload")?
+        .problem()
+        .code,
+        ErrorCode::Forbidden
+    );
+
+    // X@A uploads a blob and attaches it to paired DM (A -> B).
+    let mut x_headers = upload_headers(None);
+    x_headers.insert(
+        X_COOPLET_PARTICIPANT,
+        HeaderValue::from_str(x_part.as_str())?,
+    );
+    let (_, dm_blob) = upload(&fixture.state, &node_a, &x_headers, Body::from("paired")).await?;
+    let args = (
+        a.clone(),
+        b.clone(),
+        x_part.clone(),
+        z_part.clone(),
+        dm_blob.clone(),
+    );
+    fixture
+        .state
+        .db
+        .write::<_, HubError, _>(move |tx| {
+            let x_caller = auth::attest_node_participant(tx, &args.0, &args.2, None)?;
+            let z_caller = auth::attest_node_participant(tx, &args.0, &args.3, None)?;
+            let atts = std::slice::from_ref(&args.4);
+            // Attach to (target=B, peer=A)
+            attach_to_node(tx, &x_caller, &args.1, Some(&args.0), atts, now_ms())?;
+            // X@A reuse -> Ok
+            preflight_node_attachments(tx, &x_caller, &args.1, Some(&args.0), atts, now_ms())?;
+            // Z@A reuse of X@A's blob -> 403 Forbidden
+            assert_eq!(
+                preflight_node_attachments(tx, &z_caller, &args.1, Some(&args.0), atts, now_ms())
+                    .err()
+                    .ok_or_else(|| HubError::internal("expected 403 for Z@A"))?
+                    .problem()
+                    .code,
+                ErrorCode::Forbidden
+            );
+            Ok(WriteOutcome::new(()))
+        })
+        .await?;
+
+    // Helper to create scoped service principals with specific allowed_nodes.
+    let make_service = |nodes: Vec<NodeId>| {
+        let state = fixture.state.clone();
+        async move {
+            let sp = ServicePrincipalId::generate()?;
+            let tid = TokenId::generate()?;
+            let minted = mint_service(&state.master, &sp)?;
+            let verifier = minted.verifier;
+            let allowed = serde_json::to_string(&nodes)?;
+            let now = now_ms();
+            state.db.write_sqlite(move |tx| {
+                tx.execute(
+                    "INSERT INTO principals (principal_id, kind, username, display_name, scopes_json,
+                        allowed_nodes_json, created_at_ms, updated_at_ms)
+                     VALUES (?1, 'service', ?1, 'Svc', '[\"read\",\"collaborate\"]', ?2, ?3, ?3)",
+                    params![sp.as_str(), allowed, now],
+                )?;
+                tx.execute(
+                    "INSERT INTO auth_tokens (token_id, principal_id, token_kind, verifier_hmac,
+                        scopes_json, expires_at_ms, created_at_ms)
+                     VALUES (?1, ?2, 'service_token', ?3, '[\"read\",\"collaborate\"]', ?4, ?5)",
+                    params![tid.as_str(), sp.as_str(), verifier, i64::MAX, now],
+                )?;
+                Ok(WriteOutcome::new(()))
+            }).await?;
+            Ok::<_, Box<dyn Error + Send + Sync>>(
+                auth::authenticate(&state.reads, &state.master, minted.secret.as_str()).await?,
+            )
+        }
+    };
+    let svc_only_b = make_service(vec![b.clone()]).await?;
+    let svc_a_and_b = make_service(vec![a.clone(), b.clone()]).await?;
+
+    // Scoped service with only [B] gets 403 on paired (A, B) blob download; [A, B] succeeds.
+    assert_eq!(
+        download(&fixture.state, &svc_only_b, dm_blob.blob_id.clone())
+            .await
+            .err()
+            .ok_or("expected 403 for [B]-only service")?
+            .problem()
+            .code,
+        ErrorCode::Forbidden
+    );
+    let resp = download(&fixture.state, &svc_a_and_b, dm_blob.blob_id.clone()).await?;
+    assert_eq!(to_bytes(resp.into_body(), 16).await?.as_ref(), b"paired");
+
+    // Thread blob existence oracle protection (IMPL-49): attaching a thread blob to DM returns 404,
+    // while caller outside target node scope receives 403 before blob lookup.
+    let board = threads::create(
+        &fixture.state,
+        &fixture.admin,
+        "blob-oracle-board",
+        ThreadCreateRequest {
+            title: "Secret board".into(),
+            topic: None,
+            creator_handle: None,
+            members: Vec::new(),
+        },
+    )
+    .await?;
+    let (_, thread_blob) = upload(
+        &fixture.state,
+        &fixture.admin,
+        &upload_headers(None),
+        Body::from("secret"),
+    )
+    .await?;
+    threads::post(
+        &fixture.state,
+        &fixture.admin,
+        board.thread_id.clone(),
+        "attach-thread-blob",
+        ThreadPostRequest {
+            body: "attached".into(),
+            mentions: Vec::new(),
+            attachments: vec![thread_blob.clone()],
+            question: None,
+            answer: None,
+            in_reply_to: None,
+        },
+    )
+    .await?;
+    let check_args = (
+        svc_only_b.clone(),
+        a.clone(),
+        b.clone(),
+        thread_blob.clone(),
+    );
+    fixture
+        .state
+        .db
+        .write::<_, HubError, _>(move |tx| {
+            let atts = std::slice::from_ref(&check_args.3);
+            // Caller allowed on B probing a thread blob on DM to B -> 404 NotFound (no existence oracle).
+            assert_eq!(
+                preflight_node_attachments(tx, &check_args.0, &check_args.2, None, atts, now_ms())
+                    .err()
+                    .ok_or_else(|| HubError::internal("expected 404 for thread blob on DM"))?
+                    .problem()
+                    .code,
+                ErrorCode::NotFound
+            );
+            // Caller NOT allowed on A probing any blob on DM to A -> 403 Forbidden before lookup.
+            assert_eq!(
+                preflight_node_attachments(tx, &check_args.0, &check_args.1, None, atts, now_ms())
+                    .err()
+                    .ok_or_else(|| HubError::internal("expected 403 for disallowed node"))?
+                    .problem()
+                    .code,
+                ErrorCode::Forbidden
+            );
+            Ok(WriteOutcome::new(()))
+        })
+        .await?;
+
+    // GC tombstoning of paired DM blob: blob.deleted hidden from [B], visible to [A, B].
+    let blob_id_expire = dm_blob.blob_id.clone();
+    fixture
+        .state
+        .db
+        .write_sqlite(move |tx| {
+            tx.execute(
+                "UPDATE blobs SET expires_at_ms = 1 WHERE blob_id = ?1",
+                [blob_id_expire.as_str()],
+            )?;
+            Ok(WriteOutcome::new(()))
+        })
+        .await?;
+    fixture.engine.gc_once(10).await?;
+    let page_b = event_bus::page(
+        &fixture.state,
+        &svc_only_b,
+        event_bus::EventsQuery {
+            after: 0,
+            limit: Some(100),
+            kinds: Some("blob.deleted".into()),
+        },
+    )
+    .await?;
+    assert!(page_b.items.is_empty());
+    let page_ab = event_bus::page(
+        &fixture.state,
+        &svc_a_and_b,
+        event_bus::EventsQuery {
+            after: 0,
+            limit: Some(100),
+            kinds: Some("blob.deleted".into()),
+        },
+    )
+    .await?;
+    assert_eq!(page_ab.items.len(), 1);
+    assert_eq!(page_ab.items[0].aggregate_id, dm_blob.blob_id.as_str());
+
+    // Thread blob download via production path: non-member -> 404; expired closed thread -> 404 for member, 200 for admin.
+    assert_eq!(
+        download(&fixture.state, &svc_only_b, thread_blob.blob_id.clone())
+            .await
+            .err()
+            .ok_or("expected 404 for non-member thread blob download")?
+            .problem()
+            .code,
+        ErrorCode::NotFound
+    );
+    threads::join(
+        &fixture.state,
+        &fixture.admin,
+        board.thread_id.clone(),
+        "join-for-blob",
+        cooplet_protocol::ThreadMemberJoinRequest {
+            member_key: svc_only_b.actor_id().into(),
+            handle: Some("svcb".into()),
+            role: Some(cooplet_protocol::ThreadRole::Observer),
+            wake_policy: None,
+            delivery_mode: None,
+        },
+    )
+    .await?;
+    let obs_resp = download(&fixture.state, &svc_only_b, thread_blob.blob_id.clone()).await?;
+    assert_eq!(
+        to_bytes(obs_resp.into_body(), 16).await?.as_ref(),
+        b"secret"
+    );
+    // Offline node receives 404 on live thread blob download (OfflineBridge.is_online == false, no existence oracle).
+    assert_eq!(
+        download(&fixture.state, &node_a, thread_blob.blob_id.clone())
+            .await
+            .err()
+            .ok_or("expected 404 for offline node thread blob download")?
+            .problem()
+            .code,
+        ErrorCode::NotFound
+    );
+    // Close and expire the thread -> 404 before GC; after GC removes the closed thread, the blob
+    // transitions to GlobalArchiveOnly (403 for scoped service, 200 for global admin).
+    threads::close(
+        &fixture.state,
+        &fixture.admin,
+        board.thread_id.clone(),
+        "close-blob-board",
+    )
+    .await?;
+    let tid = board.thread_id.clone();
+    fixture
+        .state
+        .db
+        .write_sqlite(move |tx| {
+            tx.execute(
+                "UPDATE threads SET expires_at_ms = 0 WHERE thread_id = ?1",
+                [tid.as_str()],
+            )?;
+            Ok(WriteOutcome::new(()))
+        })
+        .await?;
+    assert_eq!(
+        download(&fixture.state, &svc_only_b, thread_blob.blob_id.clone())
+            .await
+            .err()
+            .ok_or("expected 404 after closed thread tombstone")?
+            .problem()
+            .code,
+        ErrorCode::NotFound
+    );
+    fixture.engine.gc_once(10).await?;
+    assert_eq!(
+        download(&fixture.state, &svc_only_b, thread_blob.blob_id.clone())
+            .await
+            .err()
+            .ok_or("expected 403 for scoped service after archive detach")?
+            .problem()
+            .code,
+        ErrorCode::Forbidden
+    );
+    let admin_resp = download(&fixture.state, &fixture.admin, thread_blob.blob_id).await?;
+    assert_eq!(
+        to_bytes(admin_resp.into_body(), 16).await?.as_ref(),
+        b"secret"
+    );
     fixture.close().await
 }

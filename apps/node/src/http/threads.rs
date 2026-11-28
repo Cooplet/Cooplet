@@ -25,6 +25,7 @@ type ThreadResponse<T> = Result<(StatusCode, ResponseJson<T>)>;
     params(("Idempotency-Key" = String, Header)),
     responses(
         (status = 201, description = "Created", body = ThreadSummary),
+        (status = 404, description = "A listed initial member was not found", body = ProblemDetails, content_type = "application/problem+json"),
         (status = 429, description = "Too many requests in flight", body = ProblemDetails, content_type = "application/problem+json"),
         (status = 502, description = "Hub bridge unavailable", body = ProblemDetails, content_type = "application/problem+json")
     )
@@ -67,8 +68,8 @@ pub(super) async fn list(
 }
 
 #[utoipa::path(
-    get, path = "/v1/threads/{thread_id}", security(("bearer" = [])),
-    params(("thread_id" = ThreadId, Path)),
+    get, path = "/v1/threads/{id}", security(("bearer" = [])),
+    params(("id" = ThreadId, Path)),
     responses(
         (status = 200, description = "Success", body = ThreadSummary),
         (status = 429, description = "Too many requests in flight", body = ProblemDetails, content_type = "application/problem+json"),
@@ -88,12 +89,12 @@ pub(super) async fn get(
 }
 
 #[utoipa::path(
-    post, path = "/v1/threads/{thread_id}/close", security(("bearer" = [])),
+    post, path = "/v1/threads/{id}/close", security(("bearer" = [])),
     request_body(
         content = Option<ThreadCloseRequest>,
         description = "Optional empty JSON object. Omit the body or send {}."
     ),
-    params(("thread_id" = ThreadId, Path), ("Idempotency-Key" = String, Header)),
+    params(("id" = ThreadId, Path), ("Idempotency-Key" = String, Header)),
     responses(
         (status = 200, description = "Success", body = ThreadSummary),
         (status = 429, description = "Too many requests in flight", body = ProblemDetails, content_type = "application/problem+json"),
@@ -118,9 +119,9 @@ pub(super) async fn close(
 }
 
 #[utoipa::path(
-    post, path = "/v1/threads/{thread_id}/posts", security(("bearer" = [])),
+    post, path = "/v1/threads/{id}/posts", security(("bearer" = [])),
     request_body = ThreadPostRequest,
-    params(("thread_id" = ThreadId, Path), ("Idempotency-Key" = String, Header)),
+    params(("id" = ThreadId, Path), ("Idempotency-Key" = String, Header)),
     responses(
         (status = 201, description = "Created", body = ThreadPostReceipt),
         (status = 429, description = "Too many requests in flight", body = ProblemDetails, content_type = "application/problem+json"),
@@ -146,8 +147,8 @@ pub(super) async fn post(
 }
 
 #[utoipa::path(
-    get, path = "/v1/threads/{thread_id}/posts", security(("bearer" = [])),
-    params(("thread_id" = ThreadId, Path), ThreadReadQuery),
+    get, path = "/v1/threads/{id}/posts", security(("bearer" = [])),
+    params(("id" = ThreadId, Path), ThreadReadQuery),
     responses(
         (status = 200, description = "Success", body = ThreadReadResponse),
         (status = 410, description = "Thread history requires resynchronization", body = ProblemDetails, content_type = "application/problem+json"),
@@ -169,9 +170,9 @@ pub(super) async fn read(
 }
 
 #[utoipa::path(
-    put, path = "/v1/threads/{thread_id}/pins/{pin_key}", security(("bearer" = [])),
+    put, path = "/v1/threads/{id}/pins/{pin_key}", security(("bearer" = [])),
     request_body = ThreadPinSetRequest,
-    params(("thread_id" = ThreadId, Path), ("pin_key" = String, Path), ("Idempotency-Key" = String, Header)),
+    params(("id" = ThreadId, Path), ("pin_key" = String, Path), ("Idempotency-Key" = String, Header)),
     responses(
         (status = 200, description = "Success", body = ThreadPinView),
         (status = 409, description = "Pin version conflict", body = ProblemDetails, content_type = "application/problem+json"),
@@ -199,8 +200,8 @@ pub(super) async fn pin_set(
 }
 
 #[utoipa::path(
-    delete, path = "/v1/threads/{thread_id}/pins/{pin_key}", security(("bearer" = [])),
-    params(("thread_id" = ThreadId, Path), ("pin_key" = String, Path), ThreadPinDeleteQuery, ("Idempotency-Key" = String, Header)),
+    delete, path = "/v1/threads/{id}/pins/{pin_key}", security(("bearer" = [])),
+    params(("id" = ThreadId, Path), ("pin_key" = String, Path), ThreadPinDeleteQuery, ("Idempotency-Key" = String, Header)),
     responses(
         (status = 200, description = "Success", body = ThreadPinDeleteResponse),
         (status = 409, description = "Pin version conflict", body = ProblemDetails, content_type = "application/problem+json"),
@@ -228,9 +229,9 @@ pub(super) async fn pin_delete(
 }
 
 #[utoipa::path(
-    post, path = "/v1/threads/{thread_id}/wait", security(("bearer" = [])),
+    post, path = "/v1/threads/{id}/wait", security(("bearer" = [])),
     request_body = ThreadWaitRequest,
-    params(("thread_id" = ThreadId, Path)),
+    params(("id" = ThreadId, Path)),
     responses(
         (status = 200, description = "Success", body = ThreadWaitResponse),
         (status = 410, description = "Thread history requires resynchronization", body = ProblemDetails, content_type = "application/problem+json"),
@@ -252,8 +253,8 @@ pub(super) async fn wait(
 }
 
 #[utoipa::path(
-    get, path = "/v1/threads/{thread_id}/members", security(("bearer" = [])),
-    params(("thread_id" = ThreadId, Path), ThreadMembersQuery),
+    get, path = "/v1/threads/{id}/members", security(("bearer" = [])),
+    params(("id" = ThreadId, Path), ThreadMembersQuery),
     responses(
         (status = 200, description = "Success", body = ThreadMembersResponse),
         (status = 429, description = "Too many requests in flight", body = ProblemDetails, content_type = "application/problem+json"),
@@ -274,9 +275,9 @@ pub(super) async fn members(
 }
 
 #[utoipa::path(
-    post, path = "/v1/threads/{thread_id}/members/join", security(("bearer" = [])),
+    post, path = "/v1/threads/{id}/members/join", security(("bearer" = [])),
     request_body = ThreadMemberJoinRequest,
-    params(("thread_id" = ThreadId, Path), ("Idempotency-Key" = String, Header)),
+    params(("id" = ThreadId, Path), ("Idempotency-Key" = String, Header)),
     responses(
         (status = 200, description = "Success", body = MemberView),
         (status = 429, description = "Too many requests in flight", body = ProblemDetails, content_type = "application/problem+json"),
@@ -302,9 +303,9 @@ pub(super) async fn join(
 }
 
 #[utoipa::path(
-    post, path = "/v1/threads/{thread_id}/members/leave", security(("bearer" = [])),
+    post, path = "/v1/threads/{id}/members/leave", security(("bearer" = [])),
     request_body = ThreadMemberLeaveRequest,
-    params(("thread_id" = ThreadId, Path), ("Idempotency-Key" = String, Header)),
+    params(("id" = ThreadId, Path), ("Idempotency-Key" = String, Header)),
     responses(
         (status = 200, description = "Success", body = MemberView),
         (status = 429, description = "Too many requests in flight", body = ProblemDetails, content_type = "application/problem+json"),
@@ -330,9 +331,9 @@ pub(super) async fn leave(
 }
 
 #[utoipa::path(
-    post, path = "/v1/threads/{thread_id}/members/resume", security(("bearer" = [])),
+    post, path = "/v1/threads/{id}/members/resume", security(("bearer" = [])),
     request_body = ThreadMemberResumeRequest,
-    params(("thread_id" = ThreadId, Path), ("Idempotency-Key" = String, Header)),
+    params(("id" = ThreadId, Path), ("Idempotency-Key" = String, Header)),
     responses(
         (status = 200, description = "Success", body = MemberView),
         (status = 410, description = "Thread history requires resynchronization", body = ProblemDetails, content_type = "application/problem+json"),

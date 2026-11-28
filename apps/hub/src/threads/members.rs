@@ -15,7 +15,7 @@ use crate::{
 };
 
 use super::{
-    close_board, posts,
+    close_board, dispatch, posts,
     store::{self, Mutation, Operation},
 };
 
@@ -109,6 +109,8 @@ pub(super) fn event_data(id: &ThreadId, member: &MemberView) -> Value {
         "role": member.role,
         "wake_policy": member.wake_policy,
         "state": member.state,
+        "confirmed_seq": member.confirmed_seq,
+        "delivery_generation": member.delivery_generation,
     })
 }
 
@@ -143,11 +145,8 @@ pub(super) fn require_manager(ctx: &Mutation<'_>, id: &ThreadId) -> Result<(), H
 pub(super) fn require_contributor(
     ctx: &Mutation<'_>,
     id: &ThreadId,
-    require_collaborate: bool,
 ) -> Result<MemberView, HubError> {
-    if require_collaborate {
-        ctx.caller.require_scope(ServiceScope::Collaborate)?;
-    }
+    ctx.caller.require_scope(ServiceScope::Collaborate)?;
     let member = self_member(ctx, id)?;
     if member.role == ThreadRole::Observer {
         return Err(store::forbidden(
@@ -218,15 +217,32 @@ pub(super) fn add(
     let mode = body.delivery_mode.unwrap_or(DeliveryMode::QueueUntilIdle);
 
     if let Some(existing) = existing {
+        if let Some(requested_handle) = &body.handle {
+            let normalized = normalize_handle(requested_handle)
+                .ok_or_else(|| HubError::invalid("Invalid member handle."))?;
+            if normalized != existing.handle {
+                return Err(store::conflict(
+                    "A rejoining member must keep its original handle.",
+                    "handle_conflict",
+                ));
+            }
+        }
         let disputed = existing.pending.is_some();
-        ctx.tx.execute(
-            "UPDATE thread_members SET node_id=?1, role=?2, wake_policy=?3, delivery_mode=?4, state=?5,
-             confirmed_seq=?6, last_wake_seq=0, retry_exhausted_seq=0, resume_through_seq=NULL, joined_at_ms=?7, left_at_ms=NULL
-             WHERE thread_id=?8 AND member_key=?9",
-            params![address.node_id.as_ref().map(NodeId::as_str), role.as_str(), wake.as_str(), mode.as_str(),
-                if disputed { "paused_unknown" } else { "active" },
-                if disputed { existing.confirmed_seq } else { head }, ctx.now,
-                id.as_str(), body.member_key],
+        dispatch::reset_member_on_rejoin(
+            ctx.tx,
+            id,
+            &body.member_key,
+            address.node_id.as_ref(),
+            role,
+            wake,
+            mode,
+            disputed,
+            if disputed {
+                existing.confirmed_seq
+            } else {
+                head
+            },
+            ctx.now,
         )?;
     } else {
         let handle = match body.handle {
@@ -333,34 +349,41 @@ pub(crate) async fn leave(
 ) -> Result<MemberView, HubError> {
     let operation = Operation::new(key, "thread.member.leave", Some(&id), &body)?;
     store::mutate(state, caller, operation, move |ctx, _| {
-        let key = body.member_key.as_deref().unwrap_or_else(|| ctx.caller.actor_id());
+        let key = body
+            .member_key
+            .as_deref()
+            .unwrap_or_else(|| ctx.caller.actor_id());
         if key != ctx.caller.actor_id() {
             require_manager(ctx, &id)?;
         }
         let board = store::board(ctx.tx, &id, ctx.now)?;
+        store::require_open(&board)?;
         let existing = member(ctx.tx, &id, key)?.ok_or_else(store::not_found)?;
         if existing.state == ThreadMemberState::Left {
-            return Err(store::conflict("The actor has already left the thread.", "already_left"));
+            return Err(store::conflict(
+                "The actor has already left the thread.",
+                "already_left",
+            ));
         }
         let (count, owners): (u64, u64) = ctx.tx.query_row(
             "SELECT count(*),COALESCE(sum(role='owner'),0) FROM thread_members WHERE thread_id=?1 AND state!='left'",
             [id.as_str()], |row| Ok((row.get(0)?, row.get(1)?)),
         )?;
         if existing.role == ThreadRole::Owner && owners == 1 && count > 1 {
-            return Err(store::conflict("The last owner cannot leave while other members remain.", "last_owner"));
+            return Err(store::conflict(
+                "The last owner cannot leave while other members remain.",
+                "last_owner",
+            ));
         }
-        ctx.tx.execute(
-            "UPDATE thread_members SET state='left',left_at_ms=?1,resume_through_seq=NULL,last_wake_seq=0,retry_exhausted_seq=0
-             WHERE thread_id=?2 AND member_key=?3",
-            params![ctx.now, id.as_str(), key],
-        )?;
+        dispatch::reset_member_on_leave(ctx.tx, &id, key, ctx.now)?;
         let saved = member(ctx.tx, &id, key)?.ok_or_else(store::not_found)?;
         ctx.event(&id, EventKind::ThreadMemberUpdated, &event_data(&id, &saved))?;
-        if count == 1 && board.status == cooplet_protocol::ThreadStatus::Open {
+        if count == 1 {
             close_board(ctx, &id)?;
         }
         Ok((id, saved))
-    }).await
+    })
+    .await
 }
 
 pub(crate) async fn resume(
@@ -373,7 +396,10 @@ pub(crate) async fn resume(
     let operation = Operation::new(key, "thread.member.resume", Some(&id), &body)?;
     store::mutate(state, caller, operation, move |ctx, _| {
         ctx.caller.require_scope(ServiceScope::Collaborate)?;
-        let key = body.member_key.as_deref().unwrap_or_else(|| ctx.caller.actor_id());
+        let key = body
+            .member_key
+            .as_deref()
+            .unwrap_or_else(|| ctx.caller.actor_id());
         if key != ctx.caller.actor_id() {
             require_manager(ctx, &id)?;
         }
@@ -381,10 +407,15 @@ pub(crate) async fn resume(
         store::require_open(&board)?;
         let existing = member(ctx.tx, &id, key)?.ok_or_else(store::not_found)?;
         if existing.state != ThreadMemberState::PausedUnknown {
-            return Err(store::conflict("The member has no uncertain delivery to resume.", "not_paused"));
+            return Err(store::conflict(
+                "The member has no uncertain delivery to resume.",
+                "not_paused",
+            ));
         }
         store::validate_cursor(&board, body.after_seq)?;
-        let generation = existing.delivery_generation.checked_add(1)
+        let generation = existing
+            .delivery_generation
+            .checked_add(1)
             .filter(|seq| i64::try_from(*seq).is_ok())
             .ok_or_else(|| HubError::internal("Thread delivery generation overflow."))?;
         let relevant = if existing.node_id.is_some() && existing.role != ThreadRole::Observer {
@@ -392,18 +423,23 @@ pub(crate) async fn resume(
         } else {
             None
         };
-        let (last_wake, resume_through) = match existing.delivery_mode {
-            DeliveryMode::QueueUntilIdle => (relevant.unwrap_or(0), None),
-            DeliveryMode::DirectNow => (0, relevant.map(|_| board.head_seq)),
-        };
-        ctx.tx.execute(
-            "UPDATE thread_members SET state='active',delivery_generation=?1,confirmed_seq=?2,
-             pending_delivery_id=NULL,pending_from_seq=NULL,pending_to_seq=NULL,resume_through_seq=?3,last_wake_seq=?6,retry_exhausted_seq=0
-             WHERE thread_id=?4 AND member_key=?5",
-            params![generation, body.after_seq, resume_through, id.as_str(), key, last_wake],
+        dispatch::apply_resume_schedule(
+            ctx.tx,
+            &id,
+            key,
+            existing.delivery_mode,
+            generation,
+            body.after_seq,
+            board.head_seq,
+            relevant,
         )?;
         let saved = member(ctx.tx, &id, key)?.ok_or_else(store::not_found)?;
-        ctx.event(&id, EventKind::ThreadMemberUpdated, &event_data(&id, &saved))?;
+        ctx.event(
+            &id,
+            EventKind::ThreadMemberUpdated,
+            &event_data(&id, &saved),
+        )?;
         Ok((id, saved))
-    }).await
+    })
+    .await
 }

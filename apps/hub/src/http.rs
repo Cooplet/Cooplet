@@ -324,6 +324,7 @@ mod tests {
             &hub.engine,
             hub.meta,
             hub.master,
+            hub.thread_acl_watch,
             Arc::new(OfflineBridge),
             stop_rx,
             DEFAULT_MAX_BLOB_BYTES,

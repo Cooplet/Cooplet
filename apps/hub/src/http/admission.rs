@@ -100,7 +100,8 @@ async fn admit(gate: Gate, mut request: Request, next: Next) -> Result<Response,
     }
 
     let read_only = request.method() == Method::GET || request.method() == Method::HEAD;
-    check_body_headers(request.headers(), read_only, gate.access)?;
+    let bodyless = read_only || request.method() == Method::DELETE;
+    check_body_headers(request.headers(), bodyless, gate.access)?;
     let mut response = next.run(request).await;
     if response.status().is_success()
         && (gate.access == Access::EventStream || gate.access == Access::Blob && read_only)

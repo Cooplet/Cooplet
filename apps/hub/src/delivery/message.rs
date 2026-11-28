@@ -1,3 +1,5 @@
+use std::collections::HashSet;
+
 use cooplet_protocol::{
     AggregateType, AnswerPayload, AttachmentRef, AuthorKind, BridgeCommand, DeliveryMode,
     DeliveryState, ErrorCode, EventKind, HubId, MessageId, NodeId, OperationId, ParticipantId,
@@ -27,9 +29,16 @@ use super::{
 
 const MESSAGE_TTL_MS: i64 = 90 * 24 * 60 * 60 * 1_000;
 pub(super) const MAX_MESSAGE_ATTACHMENTS: usize = 64;
+const MAX_MESSAGE_BYTES: usize = 64 * 1024;
 
 impl MessageRequest {
     pub(super) fn normalize(&mut self) -> Result<(), HubError> {
+        if crate::storage::sql::json_byte_len(self)? > MAX_MESSAGE_BYTES {
+            return Err(HubError::new(
+                ErrorCode::PayloadTooLarge,
+                "A message request exceeds 64 KiB.",
+            ));
+        }
         if self.question.is_some() && self.answer.is_some() {
             return Err(HubError::invalid(
                 "A message cannot carry both a question and an answer.",
@@ -40,10 +49,14 @@ impl MessageRequest {
                 "A message may carry at most 64 attachments.",
             ));
         }
+        let mut seen_blobs = HashSet::with_capacity(self.attachments.len());
         for attachment in &self.attachments {
             attachment
                 .validate()
                 .map_err(|error| HubError::invalid(error.to_string()))?;
+            if !seen_blobs.insert(&attachment.blob_id) {
+                return Err(HubError::invalid("Duplicate attachment blob_id."));
+            }
         }
         if let Some(question) = &self.question {
             question
@@ -174,15 +187,15 @@ pub(super) fn preflight(
             participant_kind(db, node_id, &request.target_participant_id)?;
         }
         None if parent.is_none() => {
-            if caller.source_node_id().is_none() {
-                return Err(HubError::invalid(
-                    "A direct message requires a target node.",
-                ));
-            }
+            let source = caller
+                .source_node_id()
+                .ok_or_else(|| HubError::invalid("A direct message requires a target node."))?;
             let active: bool = db.query_row(
                 "SELECT EXISTS(SELECT 1 FROM principals
-                   WHERE participant_id = ?1 AND disabled_at_ms IS NULL)",
-                [request.target_participant_id.as_str()],
+                   WHERE participant_id = ?1 AND disabled_at_ms IS NULL
+                     AND (allowed_nodes_json IS NULL
+                          OR EXISTS(SELECT 1 FROM json_each(allowed_nodes_json) WHERE value = ?2)))",
+                params![request.target_participant_id.as_str(), source.as_str()],
                 |row| row.get(0),
             )?;
             if !active {

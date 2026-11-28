@@ -43,6 +43,7 @@ pub(in crate::http) fn router() -> Router<AppState> {
     responses(
         (status = 201, description = "Thread created.", body = ThreadSummary),
         (status = 403, description = "The caller cannot create threads or add a listed node."),
+        (status = 404, description = "A listed initial member was not found."),
     )
 )]
 pub(in crate::http) async fn create(
@@ -212,8 +213,9 @@ pub(in crate::http) async fn delete_pin(
     params(("id" = ThreadId, Path)),
     responses(
         (status = 200, description = "Current context or a registered wait.", body = ThreadWaitResponse),
-        (status = 403, description = "The caller cannot wait on this thread."),
+        (status = 403, description = "The caller lacks collaborate scope or cannot wait on this thread."),
         (status = 404, description = "Thread missing or not visible."),
+        (status = 409, description = "The thread is closed."),
         (status = 410, description = "The cursor predates the retained range."),
     )
 )]
@@ -273,9 +275,9 @@ pub(in crate::http) async fn join(
     params(("id" = ThreadId, Path)),
     responses(
         (status = 200, description = "Member left.", body = MemberView),
-        (status = 403, description = "The caller cannot remove this member."),
+        (status = 403, description = "The caller lacks collaborate scope or cannot remove this member."),
         (status = 404, description = "The thread or member is missing or not visible."),
-        (status = 409, description = "The thread still needs its last owner or the request conflicts."),
+        (status = 409, description = "The thread is closed, still needs its last owner, or the request conflicts."),
     )
 )]
 pub(in crate::http) async fn leave(

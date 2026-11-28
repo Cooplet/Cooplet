@@ -112,6 +112,8 @@ impl SessionKey {
     }
 }
 
+const MAX_ATTEMPTS_PER_NODE: usize = 3;
+
 impl LiveBridge {
     pub(crate) fn new(capacity: usize, clock: Arc<dyn MonoClock>) -> Self {
         Self {
@@ -156,6 +158,12 @@ impl LiveBridge {
             return Err(HubError::new(
                 ErrorCode::NodeRevoked,
                 "The node was revoked.",
+            ));
+        }
+        if entry.attempts >= MAX_ATTEMPTS_PER_NODE {
+            return Err(HubError::new(
+                ErrorCode::Overloaded,
+                "The node already has too many concurrent bridge sessions.",
             ));
         }
         entry.attempts += 1;
@@ -839,6 +847,28 @@ mod tests {
         drop(submit);
         cancelled.changed().await?;
         assert!(request.reply.is_cancelled());
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn per_node_attempt_cap_rejects_fourth_concurrent_admission()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let bridge = LiveBridge::new(1, Arc::new(MonotonicClock));
+        let node_id = NodeId::generate()?;
+        let a1 = bridge.admit(node_id.clone())?;
+        let a2 = bridge.admit(node_id.clone())?;
+        let a3 = bridge.admit(node_id.clone())?;
+        assert_eq!(
+            bridge
+                .admit(node_id.clone())
+                .err()
+                .map(|err| err.problem().code),
+            Some(ErrorCode::Overloaded)
+        );
+        drop(a1);
+        let a4 = bridge.admit(node_id)?;
+        drop((a2, a3, a4));
+        bridge.drain().await;
         Ok(())
     }
 }

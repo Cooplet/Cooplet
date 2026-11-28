@@ -1,10 +1,11 @@
-use std::collections::{BTreeSet, HashSet};
+use std::collections::{BTreeSet, HashMap, HashSet};
 
 use cooplet_protocol::{
-    ErrorCode, EventKind, MemberView, MessageId, OperationId, QuestionPayload, ThreadId,
-    ThreadPinDeleteQuery, ThreadPinDeleteResponse, ThreadPinSetRequest, ThreadPinView,
-    ThreadPostReceipt, ThreadPostRequest, ThreadPostWire, ThreadReadQuery, ThreadReadResponse,
-    ThreadSummary, ThreadWaitRequest, ThreadWaitResponse, ThreadWakePolicy, validate_pin_key,
+    ErrorCode, EventKind, MemberView, MessageId, OperationId, QuestionPayload, ServiceScope,
+    ThreadId, ThreadMemberState, ThreadPinDeleteQuery, ThreadPinDeleteResponse,
+    ThreadPinSetRequest, ThreadPinView, ThreadPostReceipt, ThreadPostRequest, ThreadPostWire,
+    ThreadReadQuery, ThreadReadResponse, ThreadRole, ThreadSummary, ThreadWaitRequest,
+    ThreadWaitResponse, ThreadWakePolicy, validate_pin_key,
 };
 use rusqlite::{Connection, OptionalExtension, Row, params};
 use serde_json::{Value, json};
@@ -54,7 +55,7 @@ pub(crate) async fn post(
 ) -> Result<ThreadPostReceipt, HubError> {
     let operation = Operation::new(key, "thread.post", Some(&id), &body)?;
     store::mutate(state, caller, operation, move |ctx, op_id| {
-        let author = members::require_contributor(ctx, &id, true)?;
+        let author = members::require_contributor(ctx, &id)?;
         let board = store::board(ctx.tx, &id, ctx.now)?;
         store::require_open(&board)?;
         let post = compose_post(ctx, &board, author, body)?;
@@ -132,6 +133,16 @@ fn compose_post(
     };
     post.validate()
         .map_err(|error| HubError::invalid(error.to_string()))?;
+    if post
+        .question
+        .as_ref()
+        .and_then(|question| question.expires_at_ms)
+        .is_some_and(|expiry| expiry <= ctx.now)
+    {
+        return Err(HubError::invalid(
+            "A thread question expiration must be in the future.",
+        ));
+    }
     if json_byte_len(&post)? > MAX_POST_BYTES {
         return Err(store::too_large("A thread post exceeds 64 KiB."));
     }
@@ -197,46 +208,43 @@ fn resolve_mentions(
     explicit: &[String],
     body: &str,
 ) -> Result<Vec<String>, HubError> {
+    if explicit.is_empty() && !body.contains('@') {
+        return Ok(Vec::new());
+    }
+    let mut by_key = HashSet::new();
+    let mut by_handle = HashMap::new();
+    let mut stmt = db.prepare_cached(
+        "SELECT member_key, handle FROM thread_members WHERE thread_id=?1 AND state!='left'",
+    )?;
+    let mut rows = stmt.query([id.as_str()])?;
+    while let Some(row) = rows.next()? {
+        let member_key: String = row.get(0)?;
+        let handle: String = row.get(1)?;
+        by_key.insert(member_key.clone());
+        by_handle.insert(handle, member_key);
+    }
     let mut found = BTreeSet::new();
-    let mut key_query = db.prepare_cached(
-        "SELECT member_key FROM thread_members WHERE thread_id=?1 AND member_key=?2 AND state!='left'",
-    )?;
-    let mut handle_query = db.prepare_cached(
-        "SELECT member_key FROM thread_members WHERE thread_id=?1 AND handle=?2 AND state!='left'",
-    )?;
     for mention in explicit {
         if mention.eq_ignore_ascii_case("all") {
             found.insert("all".to_owned());
             continue;
         }
-        if let Some(member_key) = key_query
-            .query_row(params![id.as_str(), mention], |row| row.get(0))
-            .optional()?
-        {
-            found.insert(member_key);
+        if by_key.contains(mention) {
+            found.insert(mention.clone());
             continue;
         }
         let handle = mention.to_ascii_lowercase();
-        let known = handle_query
-            .query_row(params![id.as_str(), handle], |row| row.get(0))
-            .optional()?;
-        found.insert(
-            known.ok_or_else(|| HubError::invalid("The explicit mention is not a live member."))?,
-        );
+        let member_key = by_handle
+            .get(&handle)
+            .ok_or_else(|| HubError::invalid("The explicit mention is not a live member."))?;
+        found.insert(member_key.clone());
     }
-    let mut seen = HashSet::new();
     for token in body_mention_tokens(body) {
         let lower = token.to_ascii_lowercase();
-        if !seen.insert(lower.clone()) {
-            continue;
-        }
         if lower == "all" {
             found.insert(lower);
-        } else if let Some(member_key) = handle_query
-            .query_row(params![id.as_str(), lower], |row| row.get(0))
-            .optional()?
-        {
-            found.insert(member_key);
+        } else if let Some(member_key) = by_handle.get(&lower) {
+            found.insert(member_key.clone());
         }
     }
     Ok(found.into_iter().collect())
@@ -283,38 +291,18 @@ fn store_post(
             op_id.as_str(), post.created_at_ms, expiry],
     )?;
     if expiry > ctx.now {
-        record_wakes(ctx, id, post, &mentions)?;
+        super::dispatch::record_post_wakes(
+            ctx.tx,
+            id,
+            post.seq,
+            &post.author_actor_id,
+            &mentions,
+            post.mentions.iter().any(|mention| mention == "all"),
+        )?;
     }
     ctx.tx.execute(
         "UPDATE threads SET head_seq=?1, updated_at_ms=?2 WHERE thread_id=?3",
         params![post.seq, post.created_at_ms, id.as_str()],
-    )?;
-    Ok(())
-}
-
-fn record_wakes(
-    ctx: &Mutation<'_>,
-    id: &ThreadId,
-    post: &ThreadPostWire,
-    mentions: &str,
-) -> rusqlite::Result<()> {
-    // Record queue eligibility with the post, including while the Node is offline.
-    // Each ordinary direct wake belongs to the current online session. Keep
-    // the earliest unfinished one; the intervening posts are already durable.
-    ctx.tx.execute(
-        "UPDATE thread_members AS m SET
-           last_wake_seq=CASE WHEN m.delivery_mode='queue_until_idle' THEN ?2
-               WHEN m.resume_through_seq IS NULL AND m.last_wake_seq=0 THEN ?2 ELSE last_wake_seq END,
-           resume_through_seq=CASE WHEN m.resume_through_seq IS NOT NULL THEN ?2 END
-         WHERE m.thread_id=?1 AND m.state='active' AND m.node_id IS NOT NULL
-           AND (m.delivery_mode='queue_until_idle' OR m.resume_through_seq IS NOT NULL
-                OR EXISTS(SELECT 1 FROM nodes WHERE node_id=m.node_id AND status='online' AND revoked_at_ms IS NULL))
-           AND m.role!='observer' AND m.wake_policy!='muted' AND m.member_key!=?3
-           AND (m.wake_policy='all' OR ?5 OR m.member_key IN (SELECT value FROM json_each(?4)))",
-        params![
-            id.as_str(), post.seq, post.author_actor_id, mentions,
-            post.mentions.iter().any(|mention| mention == "all")
-        ],
     )?;
     Ok(())
 }
@@ -462,40 +450,83 @@ pub(crate) async fn wait(
     id: ThreadId,
     body: ThreadWaitRequest,
 ) -> Result<ThreadWaitResponse, HubError> {
+    caller.require_scope(ServiceScope::Collaborate)?;
+    // Pre-scan historical posts on the ReadPool so the writer transaction only scans
+    // any delta committed after this snapshot.
+    let pre_id = id.clone();
+    let pre_since = body.since_seq;
+    let pre_policy_req = body.wake_policy;
+    let (pre_head, pre_policy, pre_relevant) =
+        store::verified_read(state, caller, move |db, caller, now| {
+            store::require_read(db, caller, &pre_id, now)?;
+            let mut member = members::member(db, &pre_id, caller.actor_id())?
+                .filter(|member| member.state != ThreadMemberState::Left)
+                .ok_or_else(|| {
+                    store::forbidden("This operation requires live thread membership.")
+                })?;
+            if member.role == ThreadRole::Observer {
+                return Err(store::forbidden(
+                    "Observers cannot contribute to this thread.",
+                ));
+            }
+            let board = store::board(db, &pre_id, now)?;
+            store::require_open(&board)?;
+            store::validate_cursor(&board, pre_since)?;
+            let policy = pre_policy_req
+                .map(ThreadWakePolicy::from)
+                .unwrap_or(member.wake_policy);
+            member.wake_policy = policy;
+            let relevant = last_relevant_seq(db, &pre_id, pre_since, board.head_seq, &member)?;
+            Ok((board.head_seq, policy, relevant))
+        })
+        .await?;
+
     let state_copy = state.clone();
     let caller = caller.clone();
     state
         .background
         .spawn(async move {
             let thread_id = id.clone();
-            let response = store::update(&state_copy, &caller, move |ctx| {
+            let (response, policy_changed) = store::update(&state_copy, &caller, move |ctx| {
                 store::require_read(ctx.tx, ctx.caller, &id, ctx.now)?;
-                let mut member = members::require_contributor(ctx, &id, false)?;
+                let mut member = members::require_contributor(ctx, &id)?;
                 let board = store::board(ctx.tx, &id, ctx.now)?;
                 store::require_open(&board)?;
                 store::validate_cursor(&board, body.since_seq)?;
-                let policy = body.wake_policy.map(ThreadWakePolicy::from).unwrap_or(member.wake_policy);
+                let policy = body
+                    .wake_policy
+                    .map(ThreadWakePolicy::from)
+                    .unwrap_or(member.wake_policy);
                 let policy_changed = policy != member.wake_policy;
                 member.wake_policy = policy;
                 let head_seq = board.head_seq;
-                let relevant = last_relevant_seq(ctx.tx, &id, body.since_seq, head_seq, &member)?;
-                ctx.tx.execute(
-                    "UPDATE thread_members SET confirmed_seq=MAX(confirmed_seq,?1),wake_policy=?2,
-                     last_wake_seq=CASE WHEN delivery_mode='queue_until_idle' AND ?7 THEN ?5
-                         WHEN ?1>=?6 THEN 0 ELSE last_wake_seq END,
-                     resume_through_seq=CASE WHEN resume_through_seq<=?1 THEN NULL ELSE resume_through_seq END
-                     WHERE thread_id=?3 AND member_key=?4",
-                    params![
-                        body.since_seq,
-                        member.wake_policy.as_str(),
-                        id.as_str(),
-                        member.member_key,
-                        relevant.unwrap_or(0),
-                        head_seq,
-                        policy_changed
-                    ],
+                let relevant = if policy == pre_policy && head_seq >= pre_head {
+                    let delta = if head_seq > pre_head {
+                        last_relevant_seq(
+                            ctx.tx,
+                            &id,
+                            pre_head.max(body.since_seq),
+                            head_seq,
+                            &member,
+                        )?
+                    } else {
+                        None
+                    };
+                    delta.or_else(|| pre_relevant.filter(|seq| *seq > body.since_seq))
+                } else {
+                    last_relevant_seq(ctx.tx, &id, body.since_seq, head_seq, &member)?
+                };
+                super::dispatch::record_wait(
+                    ctx.tx,
+                    &id,
+                    &member.member_key,
+                    body.since_seq,
+                    head_seq,
+                    member.wake_policy,
+                    policy_changed,
+                    relevant,
                 )?;
-                if body.wake_policy.is_some() {
+                if policy_changed {
                     let updated = members::member(ctx.tx, &id, &member.member_key)?
                         .ok_or_else(store::not_found)?;
                     ctx.event(
@@ -504,8 +535,8 @@ pub(crate) async fn wait(
                         &members::event_data(&id, &updated),
                     )?;
                 }
-                let Some(through) = relevant else {
-                    return Ok(ThreadWaitResponse::Waiting { head_seq });
+                let Some(_) = relevant else {
+                    return Ok((ThreadWaitResponse::Waiting { head_seq }, policy_changed));
                 };
                 let mut out = ThreadWaitResponse::Ready {
                     head_seq,
@@ -515,7 +546,7 @@ pub(crate) async fn wait(
                     next_since_seq: None,
                 };
                 let bytes = store::page_budget_bytes(&out)?;
-                let page = page_posts(ctx.tx, &id, (body.since_seq, through), 20, bytes)?;
+                let page = page_posts(ctx.tx, &id, (body.since_seq, head_seq), 20, bytes)?;
                 if let ThreadWaitResponse::Ready {
                     posts,
                     has_more,
@@ -527,10 +558,12 @@ pub(crate) async fn wait(
                     *has_more = page.next.is_some();
                     *next_since_seq = page.next;
                 }
-                Ok(out)
+                Ok((out, policy_changed))
             })
             .await?;
-            super::dispatch::wake_thread(&state_copy, thread_id).await;
+            if policy_changed {
+                super::dispatch::wake_thread(&state_copy, thread_id).await;
+            }
             Ok(response)
         })?
         .await
@@ -628,7 +661,7 @@ pub(crate) async fn set_pin(
 ) -> Result<ThreadPinView, HubError> {
     let operation = Operation::new(key, "thread.pin.set", Some(&id), &(&pin_key, &body))?;
     store::mutate(state, caller, operation, move |ctx, _| {
-        members::require_contributor(ctx, &id, true)?;
+        members::require_contributor(ctx, &id)?;
         let board = store::board(ctx.tx, &id, ctx.now)?;
         store::require_open(&board)?;
         validate_pin_key(&pin_key).map_err(|error| HubError::invalid(error.to_string()))?;
@@ -685,7 +718,7 @@ pub(crate) async fn delete_pin(
 ) -> Result<ThreadPinDeleteResponse, HubError> {
     let operation = Operation::new(key, "thread.pin.delete", Some(&id), &(&pin_key, &query))?;
     store::mutate(state, caller, operation, move |ctx, _| {
-        members::require_contributor(ctx, &id, true)?;
+        members::require_contributor(ctx, &id)?;
         let board = store::board(ctx.tx, &id, ctx.now)?;
         store::require_open(&board)?;
         validate_pin_key(&pin_key).map_err(|error| HubError::invalid(error.to_string()))?;

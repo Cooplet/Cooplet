@@ -328,13 +328,28 @@ impl GcDriver {
                 break;
             }
             let hooks = self.hooks.clone();
-            has_more = self
+            let result = self
                 .db
                 .write_sqlite(move |tx| {
                     let batch = hooks.prune_batch(tx, now, GC_BATCH_SIZE)?;
                     Ok(WriteOutcome::with_events(batch.has_more, batch.events))
                 })
-                .await?;
+                .await;
+            match result {
+                Ok(more) => {
+                    self.hooks.after_prune_commit();
+                    has_more = more;
+                }
+                Err(error) => {
+                    if matches!(
+                        error,
+                        StorageError::WriteOutcomeUnknown | StorageError::CommitFailed(_)
+                    ) {
+                        self.hooks.after_prune_commit();
+                    }
+                    return Err(error);
+                }
+            }
             prune_batches += 1;
         }
         Ok((prune_batches, has_more))

@@ -340,6 +340,7 @@ async fn run(args: RunArgs) -> CliResult<()> {
         engine,
         meta,
         master,
+        thread_acl_watch,
     } = storage::open(
         &args.state_dir,
         args.max_blob_bytes,
@@ -353,6 +354,7 @@ async fn run(args: RunArgs) -> CliResult<()> {
             &engine,
             meta,
             master,
+            thread_acl_watch,
             Arc::new(LiveBridge::new(
                 limits.active_bridges(),
                 Arc::new(MonotonicClock),

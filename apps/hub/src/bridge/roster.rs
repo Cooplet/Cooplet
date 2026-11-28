@@ -3,8 +3,8 @@ use std::collections::HashSet;
 use cooplet_platform::AdmissionGuard;
 use cooplet_protocol::{
     CommandResPayload, ErrorCode, MAX_PENDING_OP_IDS, MAX_ROSTER_BYTES, MAX_ROSTER_CATALOG_BYTES,
-    MAX_ROSTER_TEMPLATES, MAX_ROSTER_WORKFLOWS, OperationId, ParticipantWire, RosterSyncPayload,
-    ThreadFenceReport,
+    MAX_ROSTER_FENCES, MAX_ROSTER_TEMPLATES, MAX_ROSTER_WORKFLOWS, OperationId, ParticipantWire,
+    RosterSyncPayload, ThreadFenceReport,
 };
 use cooplet_storage::{WriteError, WriteOutcome};
 use rusqlite::params;
@@ -43,6 +43,7 @@ impl Roster {
             || self.participants.len() + chunk.participants.len() > MAX_PARTICIPANTS
             || self.catalog.templates.len() + chunk.templates.len() > MAX_ROSTER_TEMPLATES
             || self.catalog.workflows.len() + chunk.workflows.len() > MAX_ROSTER_WORKFLOWS
+            || self.fences.len() + chunk.unresolved_thread_fences.len() > MAX_ROSTER_FENCES
             || self.receipts.len() + chunk.resolved_op_receipts.len() > MAX_PENDING_OP_IDS
         {
             return Err(oversized());
@@ -219,9 +220,18 @@ mod tests {
             engine,
             meta,
             master,
+            thread_acl_watch,
         } = storage::open(&scratch.0, 1024, 16_384, 16_384).await?;
         let (_shutdown, stop) = watch::channel(());
-        let state = AppState::new(&engine, meta, master, Arc::new(OfflineBridge), stop, 1024)?;
+        let state = AppState::new(
+            &engine,
+            meta,
+            master,
+            thread_acl_watch,
+            Arc::new(OfflineBridge),
+            stop,
+            1024,
+        )?;
         let node_id = NodeId::generate()?;
         let id = node_id.clone();
         state

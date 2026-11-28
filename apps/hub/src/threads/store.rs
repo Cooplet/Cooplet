@@ -3,7 +3,7 @@ use cooplet_protocol::{
     ThreadStatus, ThreadSummary, canonical_sha256, validate_idempotency_key,
 };
 use cooplet_storage::{EventNotice, StorageError, WriteError, WriteFailure, WriteOutcome};
-use rusqlite::{Connection, OptionalExtension, Transaction, params};
+use rusqlite::{Connection, OptionalExtension, Row, Transaction, params};
 use serde::{Serialize, de::DeserializeOwned};
 
 use crate::{
@@ -84,8 +84,10 @@ pub(super) fn validate_cursor(board: &ThreadSummary, cursor: u64) -> Result<(), 
     if cursor < board.floor_seq {
         return Err(
             HubError::new(ErrorCode::ResyncRequired, "The thread cursor was pruned.")
+                .with_extension("thread_id", board.thread_id.as_str())
                 .with_extension("floor_seq", board.floor_seq)
-                .with_extension("head_seq", board.head_seq),
+                .with_extension("head_seq", board.head_seq)
+                .with_extension("reason", "cursor_pruned"),
         );
     }
     if cursor > board.head_seq {
@@ -112,6 +114,16 @@ pub(crate) fn thread_scope_expiry(
     thread_id: &ThreadId,
     now: i64,
 ) -> rusqlite::Result<Option<i64>> {
+    thread_scope_expiry_inner(db, caller, thread_id, now, false)
+}
+
+fn thread_scope_expiry_inner(
+    db: &Connection,
+    caller: &AuthenticatedCaller,
+    thread_id: &ThreadId,
+    now: i64,
+    allow_left_member: bool,
+) -> rusqlite::Result<Option<i64>> {
     let expiry = db.query_row(
         "SELECT COALESCE(expires_at_ms,9223372036854775807) FROM threads
          WHERE thread_id=?1 AND (expires_at_ms IS NULL OR (expires_at_ms != 0 AND expires_at_ms > ?2))",
@@ -123,10 +135,16 @@ pub(crate) fn thread_scope_expiry(
     if caller.is_global_reader() {
         return Ok(expiry);
     }
-    let member: bool = db.query_row(
-        "SELECT EXISTS (SELECT 1 FROM thread_members WHERE thread_id=?1 AND member_key=?2 AND state!='left')",
-        params![thread_id.as_str(), caller.actor_id()], |row| row.get(0),
-    )?;
+    let member_sql = if allow_left_member {
+        "SELECT EXISTS (SELECT 1 FROM thread_members WHERE thread_id=?1 AND member_key=?2)"
+    } else {
+        "SELECT EXISTS (SELECT 1 FROM thread_members WHERE thread_id=?1 AND member_key=?2 AND state!='left')"
+    };
+    let member: bool = db
+        .prepare_cached(member_sql)?
+        .query_row(params![thread_id.as_str(), caller.actor_id()], |row| {
+            row.get(0)
+        })?;
     if !member {
         return Ok(None);
     }
@@ -146,6 +164,21 @@ pub(crate) fn thread_scope_expiry(
         }
     }
     Ok(expiry)
+}
+
+pub(super) fn summary_from_row(row: &Row<'_>) -> rusqlite::Result<ThreadSummary> {
+    Ok(ThreadSummary {
+        thread_id: parse_col(row, 0)?,
+        title: row.get(1)?,
+        topic: row.get(2)?,
+        created_by_actor_id: row.get(3)?,
+        status: parse_col(row, 4)?,
+        head_seq: row.get(5)?,
+        floor_seq: row.get(6)?,
+        created_at_ms: row.get(7)?,
+        updated_at_ms: row.get(8)?,
+        closed_at_ms: row.get(9)?,
+    })
 }
 
 pub(super) fn require_read(
@@ -221,14 +254,21 @@ impl Operation {
         let Some(saved) = operations::load(db, caller.actor_id(), &self.key)? else {
             return Ok(None);
         };
+        // Check operation key conflicts before visibility checks so leaving a
+        // prior thread cannot mask a 409 operation_conflict as 404.
+        saved.check_match(self.kind, &self.digest)?;
         if saved.kind.starts_with("thread.") {
             let id = saved
                 .resource_id
                 .as_deref()
                 .ok_or_else(|| HubError::internal("Thread receipt has no resource ID."))?;
-            require_read(db, caller, &ThreadId::parse(id)?, now)?;
+            let allow_left = saved.kind == "thread.member.leave";
+            if thread_scope_expiry_inner(db, caller, &ThreadId::parse(id)?, now, allow_left)?
+                .is_none()
+            {
+                return Err(not_found());
+            }
         }
-        saved.check_match(self.kind, &self.digest)?;
         let receipt = saved
             .result_json
             .as_deref()
@@ -309,14 +349,21 @@ where
                 .write(move |tx| {
                     let now = clock();
                     reverify_caller_tx(tx, &write_caller, now)?;
-                    if let Some(id) = &write_operation.thread_id {
-                        require_read(tx, &write_caller, id, now)?;
-                    }
-                    if write_operation.kind != "thread.member.leave" {
-                        write_caller.require_scope(ServiceScope::Collaborate)?;
-                    }
-                    if let Some(data) = write_operation.replay(tx, &write_caller, now)? {
-                        return Ok(WriteOutcome::new((data, None)));
+                    write_caller.require_scope(ServiceScope::Collaborate)?;
+                    if write_operation.kind == "thread.member.leave" {
+                        if let Some(data) = write_operation.replay(tx, &write_caller, now)? {
+                            return Ok(WriteOutcome::new((data, None)));
+                        }
+                        if let Some(id) = &write_operation.thread_id {
+                            require_read(tx, &write_caller, id, now)?;
+                        }
+                    } else {
+                        if let Some(id) = &write_operation.thread_id {
+                            require_read(tx, &write_caller, id, now)?;
+                        }
+                        if let Some(data) = write_operation.replay(tx, &write_caller, now)? {
+                            return Ok(WriteOutcome::new((data, None)));
+                        }
                     }
                     let operation_id = OperationId::generate().map_err(HubError::from)?;
                     operations::insert(

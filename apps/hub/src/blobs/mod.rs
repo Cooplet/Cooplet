@@ -169,18 +169,22 @@ fn validate_node_attachment(
     attachment: &AttachmentRef,
     now_ms: i64,
 ) -> Result<BlobRow, HubError> {
-    let blob = lookup_blob(conn, &attachment.blob_id)?
-        .filter(|blob| blob.is_live(now_ms))
-        .ok_or_else(blob_not_found)?;
     if let Some(source) = caller.source_node_id() {
-        if blob.owner_actor_id != caller.actor_id()
-            || (source != node_id && Some(source) != peer_node_id)
-        {
+        if source != node_id && Some(source) != peer_node_id {
             return Err(blob_forbidden());
         }
     } else if !caller.allows_node(node_id)
         || peer_node_id.is_some_and(|peer| !caller.allows_node(peer))
     {
+        return Err(blob_forbidden());
+    }
+    let blob = lookup_blob(conn, &attachment.blob_id)?
+        .filter(|blob| blob.is_live(now_ms))
+        .ok_or_else(blob_not_found)?;
+    if matches!(blob.scope, BlobScope::Thread(_)) {
+        return Err(blob_not_found());
+    }
+    if caller.source_node_id().is_some() && blob.owner_actor_id != caller.actor_id() {
         return Err(blob_forbidden());
     }
     match &blob.scope {

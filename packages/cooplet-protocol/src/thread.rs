@@ -11,6 +11,8 @@ use crate::{
     ThreadId, ThreadPostWire, ValidationError,
 };
 
+pub const MAX_THREAD_INITIAL_MEMBERS: usize = 64;
+
 crate::wire::wire_string_enum! {
     pub enum ThreadStatus {
         Open => "open",

@@ -2651,6 +2651,16 @@
               }
             }
           },
+          "404": {
+            "description": "A listed initial member was not found",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            }
+          },
           "409": {
             "description": "The request conflicts with current state or a receipt",
             "content": {
@@ -2729,7 +2739,7 @@
         ]
       }
     },
-    "/v1/threads/{thread_id}": {
+    "/v1/threads/{id}": {
       "get": {
         "tags": [
           "threads"
@@ -2737,7 +2747,7 @@
         "operationId": "get",
         "parameters": [
           {
-            "name": "thread_id",
+            "name": "id",
             "in": "path",
             "required": true,
             "schema": {
@@ -2854,7 +2864,7 @@
         ]
       }
     },
-    "/v1/threads/{thread_id}/close": {
+    "/v1/threads/{id}/close": {
       "post": {
         "tags": [
           "threads"
@@ -2862,7 +2872,7 @@
         "operationId": "close",
         "parameters": [
           {
-            "name": "thread_id",
+            "name": "id",
             "in": "path",
             "required": true,
             "schema": {
@@ -3018,7 +3028,7 @@
         ]
       }
     },
-    "/v1/threads/{thread_id}/members": {
+    "/v1/threads/{id}/members": {
       "get": {
         "tags": [
           "threads"
@@ -3026,7 +3036,7 @@
         "operationId": "members",
         "parameters": [
           {
-            "name": "thread_id",
+            "name": "id",
             "in": "path",
             "required": true,
             "schema": {
@@ -3163,7 +3173,7 @@
         ]
       }
     },
-    "/v1/threads/{thread_id}/members/join": {
+    "/v1/threads/{id}/members/join": {
       "post": {
         "tags": [
           "threads"
@@ -3171,7 +3181,7 @@
         "operationId": "join",
         "parameters": [
           {
-            "name": "thread_id",
+            "name": "id",
             "in": "path",
             "required": true,
             "schema": {
@@ -3326,7 +3336,7 @@
         ]
       }
     },
-    "/v1/threads/{thread_id}/members/leave": {
+    "/v1/threads/{id}/members/leave": {
       "post": {
         "tags": [
           "threads"
@@ -3334,7 +3344,7 @@
         "operationId": "leave",
         "parameters": [
           {
-            "name": "thread_id",
+            "name": "id",
             "in": "path",
             "required": true,
             "schema": {
@@ -3489,7 +3499,7 @@
         ]
       }
     },
-    "/v1/threads/{thread_id}/members/resume": {
+    "/v1/threads/{id}/members/resume": {
       "post": {
         "tags": [
           "threads"
@@ -3497,7 +3507,7 @@
         "operationId": "resume",
         "parameters": [
           {
-            "name": "thread_id",
+            "name": "id",
             "in": "path",
             "required": true,
             "schema": {
@@ -3662,7 +3672,7 @@
         ]
       }
     },
-    "/v1/threads/{thread_id}/pins/{pin_key}": {
+    "/v1/threads/{id}/pins/{pin_key}": {
       "put": {
         "tags": [
           "threads"
@@ -3670,7 +3680,7 @@
         "operationId": "pin_set",
         "parameters": [
           {
-            "name": "thread_id",
+            "name": "id",
             "in": "path",
             "required": true,
             "schema": {
@@ -3839,7 +3849,7 @@
         "operationId": "pin_delete",
         "parameters": [
           {
-            "name": "thread_id",
+            "name": "id",
             "in": "path",
             "required": true,
             "schema": {
@@ -4002,7 +4012,7 @@
         ]
       }
     },
-    "/v1/threads/{thread_id}/posts": {
+    "/v1/threads/{id}/posts": {
       "get": {
         "tags": [
           "threads"
@@ -4010,7 +4020,7 @@
         "operationId": "read",
         "parameters": [
           {
-            "name": "thread_id",
+            "name": "id",
             "in": "path",
             "required": true,
             "schema": {
@@ -4173,7 +4183,7 @@
         "operationId": "post",
         "parameters": [
           {
-            "name": "thread_id",
+            "name": "id",
             "in": "path",
             "required": true,
             "schema": {
@@ -4328,7 +4338,7 @@
         ]
       }
     },
-    "/v1/threads/{thread_id}/wait": {
+    "/v1/threads/{id}/wait": {
       "post": {
         "tags": [
           "threads"
@@ -4336,7 +4346,7 @@
         "operationId": "wait",
         "parameters": [
           {
-            "name": "thread_id",
+            "name": "id",
             "in": "path",
             "required": true,
             "schema": {

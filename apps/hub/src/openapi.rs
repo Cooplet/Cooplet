@@ -212,6 +212,11 @@ fn describe_mutating(operation: &mut Operation, path: &str) {
             }
         }
     }
+    operation
+        .responses
+        .responses
+        .entry("507".into())
+        .or_insert_with(|| Response::new("Storage capacity exhausted.").into());
 }
 
 fn describe_responses(operation: &mut Operation, public: bool, requires_bearer: bool) {

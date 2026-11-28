@@ -1,6 +1,7 @@
 use std::{
     collections::{HashMap, HashSet, VecDeque},
     future::{Future, pending},
+    pin::Pin,
     sync::Arc,
     time::Duration,
 };
@@ -14,9 +15,12 @@ use cooplet_protocol::{
     ParticipantId, ProblemDetails, ProtocolError, ROSTER_TIMEOUT, RosterReadyPayload,
     RosterSyncPayload, ThreadAckPayload, ThreadId,
 };
-use futures_util::SinkExt;
+use futures_util::{
+    SinkExt, StreamExt,
+    stream::{SplitSink, SplitStream},
+};
 use tokio::{
-    sync::{OwnedSemaphorePermit, RwLock, mpsc, watch},
+    sync::{OwnedRwLockReadGuard, OwnedSemaphorePermit, RwLock, mpsc, watch},
     task::{JoinHandle, JoinSet},
     time,
 };
@@ -42,6 +46,7 @@ const CLOSE_TIMEOUT: Duration = Duration::from_secs(1);
 const WRITE_TIMEOUT: Duration = Duration::from_secs(5);
 const ACK_GRACE_MS: u64 = 35_000;
 const REVERSE_SLOTS: usize = 16;
+const EVENT_QUEUE: usize = 256;
 
 pub(super) async fn run(
     socket: WebSocket,
@@ -54,8 +59,12 @@ pub(super) async fn run(
     let (close_tx, close) = watch::channel(None);
     let (outbound, incoming) = mpsc::channel(SESSION_QUEUE);
     let (cancelled_tx, cancelled) = watch::channel(());
+    let (sink, stream) = socket.split();
     let mut session = Socket {
-        io: socket,
+        stream,
+        sink: Some(sink),
+        active_write: None,
+        control_writes: VecDeque::new(),
         close,
         authority: admission.authority(),
         clock: bridge.clock().clone(),
@@ -63,11 +72,12 @@ pub(super) async fn run(
         epoch: key.epoch,
     };
     let registered = admission.register(key.identity(), close_tx.clone(), outbound, cancelled_tx);
-    drop(handshake);
     if let Err(reason) = registered {
         session.send_close(reason).await;
+        drop(handshake);
         return;
     }
+    drop(handshake);
 
     let result = match session.synchronize(&state, &key).await {
         Ok(()) if bridge.ready(&key) => {
@@ -94,6 +104,7 @@ pub(super) async fn run(
 }
 
 type SessionResult<T> = Result<T, Exit>;
+type SinkOutcome = (SplitSink<WebSocket, Message>, Result<(), axum::Error>);
 
 #[derive(Debug)]
 enum Exit {
@@ -112,8 +123,22 @@ impl From<ProtocolError> for Exit {
     }
 }
 
+enum WriteOp {
+    Send(Message),
+    Flush,
+}
+
+struct ActiveWrite {
+    future: Pin<Box<dyn Future<Output = SinkOutcome> + Send>>,
+    deadline: MonoInstant,
+    _authorized: Option<OwnedRwLockReadGuard<()>>,
+}
+
 struct Socket {
-    io: WebSocket,
+    stream: SplitStream<WebSocket>,
+    sink: Option<SplitSink<WebSocket, Message>>,
+    active_write: Option<ActiveWrite>,
+    control_writes: VecDeque<WriteOp>,
     close: watch::Receiver<Option<CloseReason>>,
     authority: Arc<RwLock<()>>,
     clock: Arc<dyn MonoClock>,
@@ -127,6 +152,122 @@ struct Frame {
 }
 
 impl Socket {
+    fn can_write_app(&self) -> bool {
+        self.sink.is_some() && self.control_writes.is_empty()
+    }
+
+    fn heartbeat_poll_deadline(&self) -> Option<MonoInstant> {
+        if self.heartbeat.pong.is_some() || self.sink.is_some() {
+            Some(self.heartbeat.deadline())
+        } else {
+            None
+        }
+    }
+
+    fn write_deadline(&self) -> Option<MonoInstant> {
+        self.active_write.as_ref().map(|write| write.deadline)
+    }
+
+    fn transport_write_deadline(&self, phase_deadline: Option<MonoInstant>) -> MonoInstant {
+        let mut bound = self.clock.deadline_after(WRITE_TIMEOUT);
+        if let Some(pong) = self.heartbeat.pong {
+            bound = self.earlier(bound, pong);
+        }
+        if let Some(phase) = phase_deadline {
+            bound = self.earlier(bound, phase);
+        }
+        bound
+    }
+
+    fn start_write(
+        &mut self,
+        op: WriteOp,
+        phase_deadline: Option<MonoInstant>,
+        authorized: Option<OwnedRwLockReadGuard<()>>,
+    ) {
+        let Some(mut sink) = self.sink.take() else {
+            return;
+        };
+        let deadline = self.transport_write_deadline(phase_deadline);
+        let future = Box::pin(async move {
+            let result = match op {
+                WriteOp::Send(message) => sink.send(message).await,
+                WriteOp::Flush => sink.flush().await,
+            };
+            (sink, result)
+        });
+        self.active_write = Some(ActiveWrite {
+            future,
+            deadline,
+            _authorized: authorized,
+        });
+    }
+
+    fn queue_control_write(&mut self, op: WriteOp, phase_deadline: Option<MonoInstant>) {
+        if matches!(op, WriteOp::Flush)
+            && self
+                .control_writes
+                .iter()
+                .any(|queued| matches!(queued, WriteOp::Flush))
+        {
+            return;
+        }
+        if self.sink.is_some() {
+            self.start_write(op, phase_deadline, None);
+        } else {
+            self.control_writes.push_back(op);
+        }
+    }
+
+    fn flush_control_queue(&mut self, phase_deadline: Option<MonoInstant>) {
+        if self.sink.is_some()
+            && let Some(op) = self.control_writes.pop_front()
+        {
+            self.start_write(op, phase_deadline, None);
+        }
+    }
+
+    fn finish_write(
+        &mut self,
+        outcome: SinkOutcome,
+        phase_deadline: Option<MonoInstant>,
+    ) -> SessionResult<()> {
+        self.active_write = None;
+        self.sink = Some(outcome.0);
+        outcome.1.map_err(|_| Exit::Peer)?;
+        self.flush_control_queue(phase_deadline);
+        Ok(())
+    }
+
+    async fn drain_writes(&mut self, deadline: MonoInstant) -> SessionResult<()> {
+        let clock = self.clock.clone();
+        while self.active_write.is_some() || !self.control_writes.is_empty() {
+            self.flush_control_queue(Some(deadline));
+            let write_limit = self.write_deadline();
+            let heartbeat_limit = self.heartbeat_poll_deadline();
+            tokio::select! {
+                biased;
+                reason = closed(&mut self.close) => return Err(Exit::Close(reason)),
+                () = until(clock.as_ref(), Some(deadline)) => return Err(Exit::Close(CloseReason::Retry)),
+                () = until(clock.as_ref(), write_limit), if write_limit.is_some() => {
+                    return Err(Exit::Close(CloseReason::Retry));
+                }
+                () = until(clock.as_ref(), heartbeat_limit), if heartbeat_limit.is_some() => {
+                    self.heartbeat_tick(Some(deadline))?;
+                }
+                outcome = poll_active_write(&mut self.active_write), if self.active_write.is_some() => {
+                    self.finish_write(outcome, Some(deadline))?;
+                }
+                incoming = self.stream.next() => {
+                    if self.read(incoming, Some(deadline)).await?.is_some() {
+                        return Err(Exit::Close(CloseReason::InvalidFrame));
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
+
     async fn synchronize(&mut self, state: &AppState, key: &SessionKey) -> SessionResult<()> {
         let initial = self.clock.deadline_after(ROSTER_TIMEOUT);
         let pending = self
@@ -148,15 +289,25 @@ impl Socket {
         let guard = AdmissionGuard::with_clock(ROSTER_TIMEOUT, clock.clone());
         let mut roster = Roster::default();
         loop {
+            self.flush_control_queue(Some(deadline));
+            let write_limit = self.write_deadline();
+            let heartbeat_limit = self.heartbeat_poll_deadline();
             let packet = tokio::select! {
                 biased;
                 reason = closed(&mut self.close) => return Err(Exit::Close(reason)),
                 () = until(clock.as_ref(), Some(deadline)) => return Err(Exit::Close(CloseReason::Retry)),
-                () = until(clock.as_ref(), Some(self.heartbeat.deadline())) => {
-                    self.heartbeat_tick(Some(deadline)).await?;
+                () = until(clock.as_ref(), write_limit), if write_limit.is_some() => {
+                    return Err(Exit::Close(CloseReason::Retry));
+                }
+                () = until(clock.as_ref(), heartbeat_limit), if heartbeat_limit.is_some() => {
+                    self.heartbeat_tick(Some(deadline))?;
                     continue;
                 }
-                packet = self.io.recv() => packet,
+                outcome = poll_active_write(&mut self.active_write), if self.active_write.is_some() => {
+                    self.finish_write(outcome, Some(deadline))?;
+                    continue;
+                }
+                packet = self.stream.next() => packet,
             };
             let Some(Frame { frame, bytes }) = self.read(packet, Some(deadline)).await? else {
                 continue;
@@ -198,16 +349,26 @@ impl Socket {
         let clock = self.clock.clone();
         tokio::pin!(future);
         loop {
+            self.flush_control_queue(Some(deadline));
+            let write_limit = self.write_deadline();
+            let heartbeat_limit = self.heartbeat_poll_deadline();
             let incoming = tokio::select! {
                 biased;
                 reason = closed(&mut self.close) => return Err(Exit::Close(reason)),
                 () = until(clock.as_ref(), Some(deadline)) => return Err(Exit::Close(CloseReason::Retry)),
-                () = until(clock.as_ref(), Some(self.heartbeat.deadline())) => {
-                    self.heartbeat_tick(Some(deadline)).await?;
+                () = until(clock.as_ref(), write_limit), if write_limit.is_some() => {
+                    return Err(Exit::Close(CloseReason::Retry));
+                }
+                () = until(clock.as_ref(), heartbeat_limit), if heartbeat_limit.is_some() => {
+                    self.heartbeat_tick(Some(deadline))?;
+                    continue;
+                }
+                outcome = poll_active_write(&mut self.active_write), if self.active_write.is_some() => {
+                    self.finish_write(outcome, Some(deadline))?;
                     continue;
                 }
                 result = &mut future => return Ok(result),
-                incoming = self.io.recv() => incoming,
+                incoming = self.stream.next() => incoming,
             };
             if self.read(incoming, Some(deadline)).await?.is_some() {
                 return Err(Exit::Close(CloseReason::InvalidFrame));
@@ -220,9 +381,15 @@ impl Socket {
         message: Message,
         deadline: MonoInstant,
     ) -> SessionResult<()> {
+        self.drain_writes(deadline).await?;
         let authority = self.authority.clone();
-        let _authorized = self.wait_controls(deadline, authority.read_owned()).await?;
-        self.send_application(message, deadline).await
+        let authorized = self.wait_controls(deadline, authority.read_owned()).await?;
+        self.drain_writes(deadline).await?;
+        if self.clock.is_expired(deadline) {
+            return Err(Exit::Close(CloseReason::Retry));
+        }
+        self.start_write(WriteOp::Send(message), Some(deadline), Some(authorized));
+        self.drain_writes(deadline).await
     }
 
     async fn run_ready(
@@ -234,7 +401,7 @@ impl Socket {
         bridge: &LiveBridge,
         close_tx: &watch::Sender<Option<CloseReason>>,
     ) -> SessionResult<()> {
-        let (events, receive_events) = mpsc::channel(SESSION_QUEUE);
+        let (events, receive_events) = mpsc::channel(EVENT_QUEUE);
         let (applied_tx, applied) = watch::channel(0);
         let mut worker = tokio::spawn(projection::worker(
             state.clone(),
@@ -297,9 +464,16 @@ impl Socket {
         ready: &mut Ready,
         worker: &mut JoinHandle<Result<(), HubError>>,
     ) -> Result<(), (Exit, bool)> {
+        if let Some(reason) = *self.close.borrow() {
+            return Err((Exit::Close(reason), false));
+        }
+        self.flush_control_queue(None);
         let clock = self.clock.clone();
         let authority = self.authority.clone();
         let next_ack = ready.pending.deadline(clock.as_ref());
+        let write_limit = self.write_deadline();
+        let heartbeat_limit = self.heartbeat_poll_deadline();
+        let can_write_app = self.can_write_app();
         let result = tokio::select! {
             reason = closed(&mut self.close) => Err(Exit::Close(reason)),
             worker = worker => {
@@ -308,7 +482,15 @@ impl Socket {
                 }
                 return Err((Exit::Close(CloseReason::Retry), true));
             }
-            () = until(clock.as_ref(), Some(self.heartbeat.deadline())) => self.heartbeat_tick(None).await,
+            () = until(clock.as_ref(), write_limit), if write_limit.is_some() => {
+                Err(Exit::Close(CloseReason::Retry))
+            }
+            outcome = poll_active_write(&mut self.active_write), if self.active_write.is_some() => {
+                self.finish_write(outcome, None)
+            }
+            () = until(clock.as_ref(), heartbeat_limit), if heartbeat_limit.is_some() => {
+                self.heartbeat_tick(None)
+            }
             () = until(clock.as_ref(), next_ack) => {
                 ready.pending.expire(clock.as_ref());
                 Ok(())
@@ -320,9 +502,9 @@ impl Socket {
                 }
                 Err(_) => Err(Exit::Close(CloseReason::Retry)),
             },
-            frame = self.io.recv() => self.receive(state, key, ready, frame).await,
-            request = ready.incoming.recv() => match request {
-                Some(request) => self.forward(&mut ready.pending, request).await,
+            frame = self.stream.next() => self.receive(state, key, ready, frame).await,
+            request = ready.incoming.recv(), if can_write_app => match request {
+                Some(request) => self.forward(&mut ready.pending, request),
                 None => Err(Exit::Close(CloseReason::Retry)),
             },
             result = ready.rpc.join_next(), if !ready.rpc.is_empty() => match result {
@@ -332,10 +514,10 @@ impl Socket {
                 }
                 _ => Err(Exit::Close(CloseReason::Retry)),
             },
-            _authorized = authority.read_owned(), if !ready.responses.is_empty() => {
+            authorized = authority.read_owned(), if can_write_app && !ready.responses.is_empty() => {
                 if let Some(response) = ready.responses.pop_front() {
                     ready.requests.remove(&response.request_id);
-                    self.send_response(response).await
+                    self.start_response(response, authorized)
                 } else {
                     Ok(())
                 }
@@ -387,13 +569,12 @@ impl Socket {
             FrameKind::NodeRequest => {
                 let req: NodeRequestPayload = frame.decode_payload()?;
                 if ready.requests.len() >= REVERSE_SLOTS {
-                    if let Ok(_authorized) = self.authority.clone().try_read_owned() {
-                        self.send_response(problem_response(
+                    if ready.responses.len() < REVERSE_SLOTS * 2 {
+                        ready.responses.push_back(problem_response(
                             req.request_id,
                             ErrorCode::RateLimited,
                             "The node has no free reverse request slots.",
-                        ))
-                        .await?;
+                        ));
                     }
                 } else if !ready.requests.insert(req.request_id.clone()) {
                     return Err(Exit::Close(CloseReason::InvalidFrame));
@@ -433,7 +614,7 @@ impl Socket {
     async fn read(
         &mut self,
         packet: Option<Result<Message, axum::Error>>,
-        deadline: Option<MonoInstant>,
+        phase_deadline: Option<MonoInstant>,
     ) -> SessionResult<Option<Frame>> {
         let message = match packet {
             Some(Ok(message)) => message,
@@ -463,22 +644,15 @@ impl Socket {
             }
             Message::Binary(_) => Err(Exit::Close(CloseReason::InvalidDataType)),
             Message::Close(_) => {
-                let _ = time::timeout(CLOSE_TIMEOUT, self.io.flush()).await;
+                self.active_write = None;
+                if let Some(mut sink) = self.sink.take() {
+                    let _ = time::timeout(CLOSE_TIMEOUT, sink.flush()).await;
+                }
                 Err(Exit::Peer)
             }
             Message::Ping(_) => {
-                // Tungstenite queues the RFC Pong automatically.
-                let deadline = deadline.unwrap_or_else(|| self.clock.deadline_after(WRITE_TIMEOUT));
-                self.ensure_heartbeat(deadline).await?;
-                let deadline = self.write_deadline(deadline);
-                bounded(
-                    &mut self.close,
-                    self.clock.as_ref(),
-                    deadline,
-                    self.io.flush(),
-                )
-                .await?
-                .map_err(|_| Exit::Peer)?;
+                // Tungstenite queues the RFC Pong automatically. Flush it without blocking reads.
+                self.queue_control_write(WriteOp::Flush, phase_deadline);
                 Ok(None)
             }
             Message::Pong(payload) => {
@@ -488,20 +662,12 @@ impl Socket {
         }
     }
 
-    async fn heartbeat_tick(&mut self, deadline: Option<MonoInstant>) -> SessionResult<()> {
+    fn heartbeat_tick(&mut self, phase_deadline: Option<MonoInstant>) -> SessionResult<()> {
         if self.heartbeat.pong.is_some() {
             return Err(Exit::Close(CloseReason::Retry));
         }
         let payload = self.heartbeat.ping(self.clock.as_ref());
-        let limit = self.heartbeat.deadline();
-        let deadline = deadline.map_or(limit, |deadline| self.earlier(limit, deadline));
-        self.send(Message::Ping(payload), deadline).await
-    }
-
-    async fn ensure_heartbeat(&mut self, deadline: MonoInstant) -> SessionResult<()> {
-        if self.clock.is_expired(self.heartbeat.deadline()) {
-            self.heartbeat_tick(Some(deadline)).await?;
-        }
+        self.queue_control_write(WriteOp::Send(Message::Ping(payload)), phase_deadline);
         Ok(())
     }
 
@@ -514,39 +680,16 @@ impl Socket {
         }
     }
 
-    fn write_deadline(&self, deadline: MonoInstant) -> MonoInstant {
-        self.earlier(
-            self.earlier(deadline, self.heartbeat.deadline()),
-            self.clock.deadline_after(WRITE_TIMEOUT),
-        )
-    }
-
-    async fn send_application(
-        &mut self,
-        message: Message,
-        deadline: MonoInstant,
-    ) -> SessionResult<()> {
-        self.ensure_heartbeat(deadline).await?;
-        self.send(message, self.write_deadline(deadline)).await
-    }
-
-    async fn send(&mut self, message: Message, deadline: MonoInstant) -> SessionResult<()> {
-        bounded(
-            &mut self.close,
-            self.clock.as_ref(),
-            deadline,
-            self.io.send(message),
-        )
-        .await?
-        .map_err(|_| Exit::Peer)
-    }
-
     async fn send_close(&mut self, reason: CloseReason) {
+        self.active_write = None;
+        let Some(mut sink) = self.sink.take() else {
+            return;
+        };
         let reason = self.close.borrow().unwrap_or(reason);
         let (code, reason) = reason.frame();
         let _ = time::timeout(
             CLOSE_TIMEOUT,
-            self.io.send(Message::Close(Some(CloseFrame {
+            sink.send(Message::Close(Some(CloseFrame {
                 code,
                 reason: reason.into(),
             }))),
@@ -554,8 +697,11 @@ impl Socket {
         .await;
     }
 
-    async fn send_response(&mut self, response: NodeResponsePayload) -> SessionResult<()> {
-        let deadline = self.clock.deadline_after(WRITE_TIMEOUT);
+    fn start_response(
+        &mut self,
+        response: NodeResponsePayload,
+        authorized: OwnedRwLockReadGuard<()>,
+    ) -> SessionResult<()> {
         let encoded = match encode(self.epoch, &response) {
             Ok(encoded) => encoded,
             Err(_) => encode(
@@ -567,39 +713,41 @@ impl Socket {
                 ),
             )?,
         };
-        self.send_application(encoded, deadline).await
+        self.start_write(WriteOp::Send(encoded), None, Some(authorized));
+        Ok(())
     }
 
-    async fn forward(&mut self, pending: &mut Pending, request: Outbound) -> SessionResult<()> {
+    fn forward(&mut self, pending: &mut Pending, request: Outbound) -> SessionResult<()> {
         match request {
             Outbound::Command(request) => {
-                let Ok(_authorized) = self.authority.clone().try_read_owned() else {
+                let Ok(authorized) = self.authority.clone().try_read_owned() else {
                     return Ok(());
                 };
                 let mut request = *request;
                 let id = request.payload.op_id.clone();
-                if pending.commands.contains_key(&id) {
+                if pending.commands.contains_key(&id) || request.reply.is_cancelled() {
                     return Ok(());
                 }
                 let Some(granted) = self.clock.remaining_ms(request.deadline) else {
                     return Ok(());
                 };
                 request.payload.admission_budget_ms = granted;
-                let Ok(message) = encode(self.epoch, &request.payload) else {
-                    return Ok(());
+                let message = match encode(self.epoch, &request.payload) {
+                    Ok(message) => message,
+                    Err(error) => {
+                        tracing::warn!(op_id = %id, %error, "Could not encode outbound bridge command");
+                        return Ok(());
+                    }
                 };
-                if !self
-                    .forward_wire(message, request.deadline, &mut request.reply)
-                    .await?
-                {
-                    return Ok(());
-                }
+                request.reply.in_progress();
                 pending.commands.insert(
                     id,
                     Awaiting::new(self.clock.as_ref(), granted, (), request.reply),
                 );
+                self.start_write(WriteOp::Send(message), None, Some(authorized));
             }
-            Outbound::Thread(request, _authorized) => {
+            Outbound::Thread(request, authorized) => {
+                pending.remove_cancelled_threads();
                 let mut request = *request;
                 if request.reply.is_cancelled() {
                     return Ok(());
@@ -623,49 +771,29 @@ impl Socket {
                     return Ok(());
                 };
                 request.payload.admission_budget_ms = granted;
-                let Ok(message) = encode(self.epoch, &request.payload) else {
-                    return Ok(());
+                let message = match encode(self.epoch, &request.payload) {
+                    Ok(message) => message,
+                    Err(error) => {
+                        tracing::warn!(delivery_id = %id, %error, "Could not encode outbound thread delivery");
+                        return Ok(());
+                    }
                 };
-                if !self
-                    .forward_wire(message, request.deadline, &mut request.reply)
-                    .await?
-                {
-                    return Ok(());
-                }
+                request.reply.in_progress();
                 pending.threads.insert(
                     id,
                     Awaiting::new(self.clock.as_ref(), granted, correlation, request.reply),
                 );
+                self.start_write(WriteOp::Send(message), None, Some(authorized));
             }
         }
         Ok(())
     }
+}
 
-    async fn forward_wire<T>(
-        &mut self,
-        message: Message,
-        deadline: MonoInstant,
-        reply: &mut Reply<T>,
-    ) -> SessionResult<bool> {
-        if self.clock.is_expired(deadline) {
-            return Ok(false);
-        }
-        self.ensure_heartbeat(deadline).await?;
-        let deadline = self.write_deadline(deadline);
-        let mut started = false;
-        let write = async {
-            if reply.is_cancelled() {
-                return Ok(());
-            }
-            started = true;
-            reply.in_progress();
-            self.io.send(message).await
-        };
-        match bounded(&mut self.close, self.clock.as_ref(), deadline, write).await {
-            Ok(result) => result.map(|()| started).map_err(|_| Exit::Peer),
-            Err(Exit::Close(CloseReason::Retry)) if !started => Ok(false),
-            Err(error) => Err(error),
-        }
+async fn poll_active_write(active: &mut Option<ActiveWrite>) -> SinkOutcome {
+    match active.as_mut() {
+        Some(write) => write.future.as_mut().await,
+        None => pending().await,
     }
 }
 
@@ -678,6 +806,7 @@ fn encode<P: BridgePayload>(epoch: u64, payload: &P) -> Result<Message, Protocol
     Ok(Message::Text(text))
 }
 
+#[cfg(test)]
 async fn bounded<T>(
     close: &mut watch::Receiver<Option<CloseReason>>,
     clock: &dyn MonoClock,

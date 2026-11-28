@@ -13,11 +13,12 @@ use cooplet_storage::{
     BlobStoreConfig, Migration, StorageConfig, StorageEngine, StorageError, WriteOutcome,
 };
 use rusqlite::{Connection, params};
+use tokio::sync::watch;
 
 use crate::credentials::{Master, mint_bearer};
 
 pub(crate) mod events;
-mod gc;
+pub(crate) mod gc;
 pub(crate) mod operations;
 mod recovery;
 pub(crate) mod sql;
@@ -49,6 +50,7 @@ pub(crate) struct HubStorage {
     pub(crate) engine: StorageEngine,
     pub(crate) meta: HubMeta,
     pub(crate) master: Master,
+    pub(crate) thread_acl_watch: watch::Sender<u64>,
 }
 
 pub(crate) struct InitResult {
@@ -215,10 +217,11 @@ pub(crate) async fn open(
     let checked = Arc::new(Mutex::new(None));
     let destination = checked.clone();
     let state_dir = state_dir.to_owned();
+    let (thread_acl_watch, _) = watch::channel(0u64);
     let engine = StorageEngine::open_existing_managed_checked(
         config,
         &[MIGRATION_V1],
-        Arc::new(gc::HubGcHooks::default()),
+        Arc::new(gc::HubGcHooks::with_acl_watch(thread_acl_watch.clone())),
         Some(blob_config),
         move |connection| {
             if user_version(connection)? != MIGRATION_V1.version {
@@ -248,6 +251,7 @@ pub(crate) async fn open(
         engine,
         meta,
         master,
+        thread_acl_watch,
     })
 }
 

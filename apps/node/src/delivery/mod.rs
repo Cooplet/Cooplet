@@ -114,6 +114,10 @@ impl DeliveryService {
         self.closing.send_replace(true);
     }
 
+    pub(crate) fn subscribe_closing(&self) -> watch::Receiver<bool> {
+        self.closing.subscribe()
+    }
+
     pub async fn shutdown(&self) {
         self.stop_admission();
         let _idle = self.activity.write().await;

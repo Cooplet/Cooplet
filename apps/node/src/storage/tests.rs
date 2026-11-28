@@ -1041,3 +1041,92 @@ async fn events_kind_queries_and_blob_acl_use_indexes_without_table_scans() -> T
     node.engine.shutdown().await?;
     Ok(())
 }
+
+#[tokio::test]
+async fn recover_leaves_delegated_answers_unknown_and_uses_unresolved_fence_index() -> TestResult {
+    let scratch = Scratch::new()?;
+    let node = scratch.start().await?;
+
+    node.engine
+        .reads()
+        .read(|conn| {
+            let plan: Vec<String> = conn
+                .prepare(
+                    "EXPLAIN QUERY PLAN
+                     UPDATE thread_inject_fences SET state = 'unknown', updated_at_ms = ?1
+                     WHERE state = 'injecting' AND state IN ('injecting', 'unknown')",
+                )?
+                .query_map([100i64], |row| row.get(3))?
+                .collect::<rusqlite::Result<_>>()?;
+            assert!(
+                plan.iter()
+                    .any(|line| line.contains("idx_thread_fences_unresolved")),
+                "unresolved fence recovery plan: {plan:?}"
+            );
+            Ok(())
+        })
+        .await?;
+
+    node.engine
+        .db()
+        .write_sqlite(|tx| {
+            tx.execute_batch(
+                "INSERT INTO participants(participant_id, kind, name, state, created_at_ms, updated_at_ms)
+                 VALUES ('agent_rec','agent','agent_rec','idle',0,0);
+                 INSERT INTO messages(message_id, sender_id, recipient_id, body, question_json,
+                                      delivery_mode, delivery_state, created_at_ms, expires_at_ms)
+                 VALUES ('q_local','agent_rec','operator','','{}','direct_now','delivered',0,10000),
+                        ('q_deleg','agent_rec','operator','','{}','direct_now','delivered',0,10000);
+                 INSERT INTO operations(operation_id, actor_id, operation_key, kind, request_sha256,
+                                        state, bridge_origin, created_at_ms, updated_at_ms, expires_at_ms)
+                 VALUES ('op_local','operator','k_local','message.send','h1','in_progress',NULL,0,0,10000),
+                        ('op_deleg','operator','k_deleg','message.send','h2','in_progress','hub_1/node_1',0,0,10000);
+                 INSERT INTO messages(message_id, sender_id, recipient_id, in_reply_to, body, answer_json,
+                                      delivery_mode, delivery_state, operation_id, created_at_ms, expires_at_ms)
+                 VALUES ('a_local','operator','agent_rec','q_local','','{\"text\":\"ok\"}','direct_now','accepted','op_local',0,10000),
+                        ('a_deleg','operator','agent_rec','q_deleg','','{\"text\":\"ok\"}','direct_now','accepted','op_deleg',0,10000);
+                 INSERT INTO thread_inject_fences(thread_id, participant_id, highest_dispatched_seq,
+                                                  state, updated_at_ms, expires_at_ms)
+                 VALUES ('thr_1','agent_rec',1,'injecting',0,10000),
+                        ('thr_2','agent_rec',2,'unknown',5,10000);",
+            )?;
+            Ok(WriteOutcome::new(()))
+        })
+        .await?;
+
+    recover_with_boot_id(&node.engine, 50, None).await?;
+    let (local_state, deleg_state, f1, f2): (String, String, (String, i64), (String, i64)) = node
+        .engine
+        .reads()
+        .read(|conn| {
+            Ok((
+                conn.query_row(
+                    "SELECT state FROM operations WHERE operation_id = 'op_local'",
+                    [],
+                    |r| r.get(0),
+                )?,
+                conn.query_row(
+                    "SELECT state FROM operations WHERE operation_id = 'op_deleg'",
+                    [],
+                    |r| r.get(0),
+                )?,
+                conn.query_row(
+                    "SELECT state, updated_at_ms FROM thread_inject_fences WHERE thread_id = 'thr_1'",
+                    [],
+                    |r| Ok((r.get(0)?, r.get(1)?)),
+                )?,
+                conn.query_row(
+                    "SELECT state, updated_at_ms FROM thread_inject_fences WHERE thread_id = 'thr_2'",
+                    [],
+                    |r| Ok((r.get(0)?, r.get(1)?)),
+                )?,
+            ))
+        })
+        .await?;
+    assert_eq!(local_state, "succeeded");
+    assert_eq!(deleg_state, "unknown");
+    assert_eq!(f1, ("unknown".into(), 50));
+    assert_eq!(f2, ("unknown".into(), 5));
+    node.engine.shutdown().await?;
+    Ok(())
+}

@@ -56,6 +56,7 @@ impl Fixture {
             &storage.engine,
             storage.meta,
             storage.master,
+            storage.thread_acl_watch,
             Arc::new(OfflineBridge),
             signal,
             DEFAULT_MAX_BLOB_BYTES,
@@ -494,20 +495,13 @@ fn event_stream_query_rejects_limit_and_kind_queries_use_index() -> TestResult {
     assert!(single.contains("idx_hub_events_kind_seq"), "{single}");
     assert!(!single.contains("USE TEMP B-TREE"), "{single}");
 
-    let rare_multi = explain(
-        SELECT_KIND_SEQS,
-        &[&"blob.stored", &0u64, &5000u64, &101usize],
+    let multi_sql = multi_kind_query_sql(2);
+    let multi = explain(
+        &multi_sql,
+        &[&0u64, &5000u64, &"blob.stored", &"node.status", &101usize],
     )?;
-    assert!(
-        rare_multi.contains("COVERING INDEX idx_hub_events_kind_seq"),
-        "{rare_multi}"
-    );
-    assert!(!rare_multi.contains("USE TEMP B-TREE"), "{rare_multi}");
-    let dense_multi = explain(
-        SELECT_KIND_SEQS,
-        &[&"node.status", &0u64, &5000u64, &101usize],
-    )?;
-    assert!(!dense_multi.contains("USE TEMP B-TREE"), "{dense_multi}");
+    assert!(multi.contains("idx_hub_events_kind_seq"), "{multi}");
+    assert!(!multi.contains("USE TEMP B-TREE"), "{multi}");
     Ok(())
 }
 
@@ -605,12 +599,17 @@ async fn single_and_multi_kind_queries_return_ordered_events_and_advance_waterma
 
 #[tokio::test]
 async fn stream_closes_naturally_when_token_ttl_expires_without_revocation_bump() -> TestResult {
-    let fixture = Fixture::new().await?;
+    use std::sync::atomic::{AtomicI64, Ordering};
+
+    let mut fixture = Fixture::new().await?;
     let principal = ServicePrincipalId::generate()?;
     let token_id = TokenId::generate()?;
     let token = mint_service(&fixture.state.master, &principal)?;
     let verifier = token.verifier;
     let now = now_ms();
+    let wall = Arc::new(AtomicI64::new(now));
+    let injected = wall.clone();
+    fixture.state.wall_clock = Arc::new(move || injected.load(Ordering::Relaxed));
     fixture
         .state
         .db
@@ -629,7 +628,7 @@ async fn stream_closes_naturally_when_token_ttl_expires_without_revocation_bump(
                     token_id.as_str(),
                     principal.as_str(),
                     verifier,
-                    now + 150,
+                    now + 5_000,
                     now
                 ],
             )?;
@@ -643,6 +642,10 @@ async fn stream_closes_naturally_when_token_ttl_expires_without_revocation_bump(
     )
     .await?;
     let mut body = fixture.stream(&caller, 0).await?;
+    tokio::time::pause();
+    wall.store(now + 5_001, Ordering::Relaxed);
+    tokio::time::advance(Duration::from_secs(6)).await;
+    tokio::time::resume();
     assert_eq!(next_frame(&mut body).await?, None);
     fixture.close().await
 }
@@ -925,21 +928,38 @@ async fn closed_thread_expiry_and_gc_discard_buffered_frames_for_members() -> Te
     };
     assert_eq!(event.payload["after_expiry"], true);
 
-    // Keep the intermediate state from the first committed GC batch. The
-    // second member stream is still holding frames from before this write.
-    let thread = board.thread_id.clone();
+    // Keep the intermediate state from the first committed GC batch (tombstoning
+    // sets expires_at_ms=0 and bumps thread_acl_watch post-commit). The second
+    // member stream is still holding frames from before this write.
+    let hooks = Arc::new(crate::storage::gc::HubGcHooks::with_acl_watch(
+        fixture.state.thread_acl_watch.clone(),
+    ));
+    let hooks_tx = hooks.clone();
     fixture
         .state
         .db
         .write_sqlite(move |tx| {
-            let marked = tx.execute(
-                "UPDATE threads SET expires_at_ms=0 WHERE thread_id=?1 AND expires_at_ms<=?2",
-                params![thread.as_str(), now + 51],
-            )?;
-            assert_eq!(marked, 1);
-            Ok(WriteOutcome::new(()))
+            let batch = cooplet_storage::GcHooks::prune_batch(hooks_tx.as_ref(), tx, now + 51, 1)?;
+            assert!(batch.has_more);
+            Ok(WriteOutcome::with_events((), batch.events))
         })
         .await?;
+    cooplet_storage::GcHooks::after_prune_commit(hooks.as_ref());
+    let tombstoned: i64 = fixture
+        .state
+        .reads
+        .read({
+            let thread = board.thread_id.clone();
+            move |db| {
+                Ok(db.query_row(
+                    "SELECT expires_at_ms FROM threads WHERE thread_id=?1",
+                    [thread.as_str()],
+                    |row| row.get(0),
+                )?)
+            }
+        })
+        .await?;
+    assert_eq!(tombstoned, 0);
     wall.store(now, Ordering::Relaxed);
     let first = tokio::time::timeout(Duration::from_secs(2), rollback_stream.next())
         .await?
@@ -1076,5 +1096,132 @@ async fn a_nodes_departure_does_not_remove_it_from_historical_thread_acl() -> Te
     };
     assert_eq!(event.payload["outside"], true);
     drop(buffered);
+    fixture.close().await
+}
+
+#[tokio::test]
+async fn participant_created_redacts_approval_for_non_manage_and_gc_once_bumps_acl_watch()
+-> TestResult {
+    use std::sync::atomic::{AtomicI64, Ordering};
+
+    use crate::threads;
+    use cooplet_protocol::{ThreadCreateRequest, ThreadMemberJoinRequest};
+
+    let mut fixture = Fixture::new().await?;
+    let node = NodeId::generate()?;
+    let (read_svc, _) = fixture.service(std::slice::from_ref(&node)).await?;
+    let hub = fixture.state.meta.hub_id.clone();
+    let node_for_event = node.clone();
+    fixture
+        .state
+        .db
+        .write_sqlite(move |tx| {
+            let ev = append(
+                tx,
+                &hub,
+                NewEvent {
+                    kind: EventKind::ParticipantCreated,
+                    aggregate_type: AggregateType::Participant,
+                    aggregate_id: "part_01",
+                    actor_id: None,
+                    created_at_ms: now_ms(),
+                    data: json!({
+                        "participant_id": "part_01",
+                        "state": "awaiting_approval",
+                        "approval_id": "apr_secret",
+                        "can_respond_remotely": true,
+                        "summary": "Run build"
+                    }),
+                    audience: EventAudience::Nodes {
+                        node_ids: vec![node_for_event],
+                    },
+                },
+            )?;
+            Ok(WriteOutcome::with_events((), vec![ev]))
+        })
+        .await?;
+
+    let read_page = page(&fixture.state, &read_svc, query(0)).await?;
+    assert_eq!(read_page.items.len(), 1);
+    assert!(read_page.items[0].payload.get("approval_id").is_none());
+    assert_eq!(read_page.items[0].payload["can_respond_remotely"], false);
+
+    let admin_page = page(&fixture.state, &fixture.admin, query(0)).await?;
+    assert_eq!(admin_page.items[0].payload["approval_id"], "apr_secret");
+    assert_eq!(admin_page.items[0].payload["can_respond_remotely"], true);
+
+    // End-to-end StorageEngine::gc_once() bumps thread_acl_watch post-commit and invalidates
+    // buffered closed-thread frames for a member even after a clock rollback, while global
+    // archive reader keeps its stream unaffected.
+    let now = now_ms();
+    let wall = Arc::new(AtomicI64::new(now));
+    let injected = wall.clone();
+    fixture.state.wall_clock = Arc::new(move || injected.load(Ordering::Relaxed));
+    let (member_svc, _) = fixture.service(&[]).await?;
+    let board = threads::create(
+        &fixture.state,
+        &fixture.admin,
+        "gc-once-acl-board",
+        ThreadCreateRequest {
+            title: "GC ACL".into(),
+            topic: None,
+            creator_handle: None,
+            members: vec![ThreadMemberJoinRequest {
+                member_key: member_svc.actor_id().into(),
+                handle: Some("gc-reader".into()),
+                role: None,
+                wake_policy: None,
+                delivery_mode: None,
+            }],
+        },
+    )
+    .await?;
+    threads::close(
+        &fixture.state,
+        &fixture.admin,
+        board.thread_id.clone(),
+        "gc-once-acl-close",
+    )
+    .await?;
+    let tid = board.thread_id.clone();
+    fixture
+        .state
+        .db
+        .write_sqlite(move |tx| {
+            tx.execute(
+                "UPDATE threads SET expires_at_ms = ?1 WHERE thread_id = ?2",
+                params![now + 100, tid.as_str()],
+            )?;
+            Ok(WriteOutcome::new(()))
+        })
+        .await?;
+    let mut member_stream = fixture.stream(&member_svc, 0).await?;
+    let mut admin_stream = fixture.stream(&fixture.admin, 0).await?;
+    let acl_before = *fixture.state.thread_acl_watch.borrow();
+    fixture.engine.gc_once(now + 101).await?;
+    assert_ne!(*fixture.state.thread_acl_watch.borrow(), acl_before);
+    wall.store(now, Ordering::Relaxed);
+    fixture
+        .publish(vec![(
+            EventAudience::OwnerOnly {
+                actor_id: member_svc.actor_id().into(),
+            },
+            json!({"sentinel": true}),
+        )])
+        .await?;
+    let frame = next_frame(&mut member_stream)
+        .await?
+        .ok_or("member stream ended early")?;
+    let EventStreamFrame::Event { event } = frame else {
+        return Err("expected sentinel event after gc_once invalidation".into());
+    };
+    assert_eq!(event.payload["sentinel"], true);
+    // Admin archive stream still emits buffered historical events without discarding them.
+    let first_admin = next_frame(&mut admin_stream)
+        .await?
+        .ok_or("admin stream ended early")?;
+    assert!(matches!(first_admin, EventStreamFrame::Event { .. }));
+    drop(member_stream);
+    drop(admin_stream);
     fixture.close().await
 }

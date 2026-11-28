@@ -68,6 +68,7 @@ impl Fixture {
             &hub.engine,
             hub.meta,
             hub.master,
+            hub.thread_acl_watch,
             bridge,
             shutdown_rx,
             1024 * 1024,
@@ -2243,6 +2244,171 @@ async fn stale_destination_reservation_cannot_accept_a_command() -> TestResult {
     let (_, receipt) = send_message(&f.state, &f.admin, key, direct(&node, &recipient)?).await?;
     assert_eq!(receipt.delivery_state, DeliveryState::Delivered);
     assert_eq!(bridge.shared.submits.load(Ordering::SeqCst), 1);
+    f.close().await?;
+    Ok(())
+}
+
+#[tokio::test]
+async fn dm_size_cap_duplicate_blobs_allowed_nodes_and_reason_forwarding() -> TestResult {
+    let bridge = FakeBridge::new();
+    let f = Fixture::new(bridge.clone()).await?;
+    let allowed_node = NodeId::generate()?;
+    let denied_node = NodeId::generate()?;
+    let agent_allowed = ParticipantId::generate()?;
+    let agent_denied = ParticipantId::generate()?;
+    f.node(&allowed_node, &agent_allowed, "agent").await?;
+    f.node(&denied_node, &agent_denied, "agent").await?;
+
+    // 1. SendDirectMessage > 64 KiB fails with 413 before Tx 1 without reserving or submitting.
+    let huge: MessageRequest = serde_json::from_value(json!({
+        "target_node_id": allowed_node,
+        "target_participant_id": agent_allowed,
+        "body": "x".repeat(65 * 1024),
+    }))?;
+    result_code(
+        send_message(&f.state, &f.admin, "huge-dm-key", huge).await,
+        ErrorCode::PayloadTooLarge,
+    )?;
+    assert_eq!(bridge.shared.reserves.load(Ordering::SeqCst), 0);
+    assert_eq!(bridge.shared.submits.load(Ordering::SeqCst), 0);
+    let ops: i64 = f
+        .state
+        .reads
+        .read(|db| Ok(db.query_row("SELECT COUNT(*) FROM operations", [], |r| r.get(0))?))
+        .await?;
+    assert_eq!(ops, 0);
+
+    // 2. Duplicate attachment blob_id is rejected with 400 InvalidRequest.
+    let dup_blob = BlobId::generate()?;
+    let attachment = json!({
+        "blob_id": dup_blob,
+        "name": "dup.txt",
+        "mime_type": "text/plain",
+        "size_bytes": 4,
+        "sha256": "0".repeat(64),
+    });
+    let duplicate_blobs: MessageRequest = serde_json::from_value(json!({
+        "target_node_id": allowed_node,
+        "target_participant_id": agent_allowed,
+        "body": "duplicate attachments",
+        "attachments": [attachment.clone(), attachment],
+    }))?;
+    result_code(
+        send_message(&f.state, &f.admin, "dup-blob-key", duplicate_blobs).await,
+        ErrorCode::InvalidRequest,
+    )?;
+
+    // 3. NodeParticipant -> Hub-native DM respects recipient's allowed_nodes_json.
+    let sp_id = cooplet_protocol::ServicePrincipalId::generate()?;
+    let sp_part = ParticipantId::generate()?;
+    let allowed_json = serde_json::to_string(&[&allowed_node])?;
+    f.state
+        .db
+        .write_sqlite({
+            let sp_id = sp_id.clone();
+            let sp_part = sp_part.clone();
+            let allowed_node = allowed_node.clone();
+            let denied_node = denied_node.clone();
+            move |tx| {
+                let now = now_ms();
+                tx.execute(
+                    "INSERT INTO principals (principal_id, kind, username, display_name,
+                        participant_id, scopes_json, allowed_nodes_json, created_at_ms, updated_at_ms)
+                     VALUES (?1, 'service', 'scoped_bot', 'Scoped Bot', ?2, '[\"collaborate\"]', ?3, ?4, ?4)",
+                    rusqlite::params![sp_id.as_str(), sp_part.as_str(), allowed_json, now],
+                )?;
+                tx.execute(
+                    "UPDATE nodes SET session_epoch = 1 WHERE node_id IN (?1, ?2)",
+                    rusqlite::params![allowed_node.as_str(), denied_node.as_str()],
+                )?;
+                tx.execute(
+                    "UPDATE node_participants SET synced_epoch = 1 WHERE node_id IN (?1, ?2)",
+                    rusqlite::params![allowed_node.as_str(), denied_node.as_str()],
+                )?;
+                Ok(WriteOutcome::new(()))
+            }
+        })
+        .await?;
+    let from_allowed = f
+        .state
+        .reads
+        .read({
+            let node = allowed_node.clone();
+            let agent = agent_allowed.clone();
+            move |conn| {
+                Ok(crate::auth::attest_node_participant(
+                    conn,
+                    &node,
+                    &agent,
+                    Some((1, 1)),
+                ))
+            }
+        })
+        .await??;
+    let from_denied = f
+        .state
+        .reads
+        .read({
+            let node = denied_node.clone();
+            let agent = agent_denied.clone();
+            move |conn| {
+                Ok(crate::auth::attest_node_participant(
+                    conn,
+                    &node,
+                    &agent,
+                    Some((1, 1)),
+                ))
+            }
+        })
+        .await??;
+    let to_scoped_bot = || -> TestResult<MessageRequest> {
+        Ok(serde_json::from_value(json!({
+            "target_participant_id": sp_part,
+            "body": "hello scoped bot",
+        }))?)
+    };
+    result_code(
+        send_message(&f.state, &from_denied, "dm-denied-node", to_scoped_bot()?).await,
+        ErrorCode::NotFound,
+    )?;
+    let (status, delivered) =
+        send_message(&f.state, &from_allowed, "dm-allowed-node", to_scoped_bot()?).await?;
+    assert_eq!(status, StatusCode::CREATED);
+    assert_eq!(delivered.delivery_state, DeliveryState::Delivered);
+
+    // 4. Remote rejection forwards validated snake_case reason and drops invalid reason.
+    bridge.shared.session_epoch.store(1, Ordering::SeqCst);
+    let valid_remote = ProblemDetails::new(ErrorCode::InvalidRequest, "stale")
+        .with_extension("reason", "approval_stale");
+    bridge.set(CommandOutcome::Rejected, Some(valid_remote))?;
+    let err = send_message(
+        &f.state,
+        &f.admin,
+        "valid-reason-key",
+        direct(&allowed_node, &agent_allowed)?,
+    )
+    .await
+    .err()
+    .ok_or("expected rejection with valid reason")?;
+    assert_eq!(
+        err.problem().extensions.get("reason"),
+        Some(&json!("approval_stale"))
+    );
+
+    let invalid_remote = ProblemDetails::new(ErrorCode::InvalidRequest, "bad")
+        .with_extension("reason", "NOT VALID REASON!");
+    bridge.set(CommandOutcome::Rejected, Some(invalid_remote))?;
+    let err = send_message(
+        &f.state,
+        &f.admin,
+        "invalid-reason-key",
+        direct(&allowed_node, &agent_allowed)?,
+    )
+    .await
+    .err()
+    .ok_or("expected rejection with stripped invalid reason")?;
+    assert!(!err.problem().extensions.contains_key("reason"));
+
     f.close().await?;
     Ok(())
 }

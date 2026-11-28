@@ -365,6 +365,11 @@ fn copy_extensions(local: &mut ProblemDetails, remote: &ProblemDetails) {
             .extensions
             .insert("existing_answer_id".into(), Value::from(id));
     }
+    if let Some(reason) = value("reason").filter(|r| cooplet_protocol::is_valid_error_reason(r)) {
+        local
+            .extensions
+            .insert("reason".into(), Value::from(reason));
+    }
 }
 
 pub(super) fn redact_error(error: HubError, can_manage: bool) -> HubError {

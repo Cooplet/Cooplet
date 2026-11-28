@@ -311,10 +311,13 @@ impl NodeBridge {
         let current = self.binding.borrow().clone();
         match current {
             BindingState::Bound(hub) => {
-                if hub.hub_id() != &request.hub_id || hub.url() != &url {
+                if hub.hub_id() != &request.hub_id
+                    || hub.url() != &url
+                    || hub.credentials.ca_cert_pem != request.ca_cert_pem
+                {
                     return Err(NodeError::new(
                         ErrorCode::OperationConflict,
-                        "This Node is already enrolled with a different Hub origin or identity",
+                        "This Node is already enrolled with a different Hub origin, identity, or CA bundle",
                     ));
                 }
                 if context.project(&hub).await.is_err() {
@@ -546,6 +549,144 @@ mod tests {
         assert!(origin("https://example.test/path").is_err());
         assert!(origin("https://name@example.test/").is_err());
         assert!(root_certificates(Some(&"\n".repeat(MAX_CA_BYTES))).is_err());
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn binding_fault_and_idempotent_enroll_mismatch_return_conflict()
+    -> std::result::Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        use crate::{
+            config::{NodeConfig, OpenNode},
+            http::Tasks,
+        };
+
+        let root = std::env::temp_dir().join(format!(
+            "cooplet-binding-test-{}",
+            cooplet_protocol::RequestId::generate()?
+        ));
+        std::fs::create_dir(&root)?;
+        struct Clean(PathBuf);
+        impl Drop for Clean {
+            fn drop(&mut self) {
+                let _ = std::fs::remove_dir_all(&self.0);
+            }
+        }
+        let _clean = Clean(root.clone());
+
+        let open = OpenNode::start(NodeConfig::new(root.join("state"), root.clone())).await?;
+        let creds_dir = open.state_dir.join(CREDS_DIR);
+        let tasks = Arc::new(Tasks::default());
+        let hub_id = HubId::generate()?;
+        let assigned_node = NodeId::generate()?;
+        let ulid = assigned_node
+            .as_str()
+            .strip_prefix("node_")
+            .ok_or("bad node ulid")?;
+        let secret = "0123456789abcdef".repeat(4);
+
+        // 1. Corrupt creds/hub.json puts NodeBridge into Fault; enroll & connection return 409
+        //    invalid_hub_binding while the Node database stays readable.
+        PrivateFs::write_private_file_atomic(&creds_dir, HUB_FILE, b"{not valid json")?;
+        let faulty = NodeBridge::load(
+            open.info.node_id.clone(),
+            open.state_dir.clone(),
+            open.engine.db().clone(),
+            open.engine.reads().clone(),
+        )
+        .await;
+        let conn_err = faulty
+            .connection()
+            .err()
+            .ok_or("faulty binding must fail connection")?;
+        assert_eq!(conn_err.code(), ErrorCode::OperationConflict);
+        assert_eq!(conn_err.0.extensions["reason"], "invalid_hub_binding");
+        let enroll_err = faulty
+            .enroll(
+                &tasks,
+                EnrollRequest {
+                    hub_url: "http://127.0.0.1:9999".into(),
+                    hub_id: hub_id.clone(),
+                    token: format!("cplt_enr_{ulid}.{secret}"),
+                    name: None,
+                    ca_cert_pem: None,
+                },
+            )
+            .await
+            .err()
+            .ok_or("faulty binding must reject enroll")?;
+        assert_eq!(enroll_err.code(), ErrorCode::OperationConflict);
+        assert_eq!(enroll_err.0.extensions["reason"], "invalid_hub_binding");
+        let head: u64 = open
+            .engine
+            .reads()
+            .read(|conn| {
+                Ok(conn.query_row(
+                    "SELECT events_head_seq FROM node_meta WHERE id = 1",
+                    [],
+                    |r| r.get(0),
+                )?)
+            })
+            .await?;
+        assert_eq!(head, 0);
+
+        // 2. Valid creds/hub.json puts NodeBridge into Bound; idempotent enroll succeeds only on
+        //    matching (hub_id, hub_url, ca_cert_pem) and returns 409 on any mismatch.
+        let ca_other = "-----BEGIN CERTIFICATE-----\nBBBB\n-----END CERTIFICATE-----\n";
+        let saved = Credentials {
+            local_node_id: open.info.node_id.clone(),
+            hub_id: hub_id.clone(),
+            node_id: assigned_node.clone(),
+            generation: 1,
+            hub_url: "http://127.0.0.1:9999/".into(),
+            ca_cert_pem: None,
+            node_token: format!("cplt_node_{ulid}.{secret}"),
+            enrolled_at_ms: 1_000,
+        };
+        PrivateFs::write_private_file_atomic(&creds_dir, HUB_FILE, &serde_json::to_vec(&saved)?)?;
+        let bound = NodeBridge::load(
+            open.info.node_id.clone(),
+            open.state_dir.clone(),
+            open.engine.db().clone(),
+            open.engine.reads().clone(),
+        )
+        .await;
+        let (status, resp) = bound
+            .enroll(
+                &tasks,
+                EnrollRequest {
+                    hub_url: "http://127.0.0.1:9999".into(),
+                    hub_id: hub_id.clone(),
+                    token: format!("cplt_enr_{ulid}.{secret}"),
+                    name: None,
+                    ca_cert_pem: None,
+                },
+            )
+            .await?;
+        assert_eq!(status, StatusCode::OK);
+        assert!(matches!(resp.status, EnrollmentStatus::AlreadyEnrolled));
+
+        for (bad_url, bad_hub, bad_ca) in [
+            ("http://127.0.0.1:9999", HubId::generate()?, None),
+            ("http://127.0.0.1:8888", hub_id.clone(), None),
+            ("http://127.0.0.1:9999", hub_id, Some(ca_other)),
+        ] {
+            let mismatch = bound
+                .enroll(
+                    &tasks,
+                    EnrollRequest {
+                        hub_url: bad_url.into(),
+                        hub_id: bad_hub,
+                        token: format!("cplt_enr_{ulid}.{secret}"),
+                        name: None,
+                        ca_cert_pem: bad_ca.map(str::to_owned),
+                    },
+                )
+                .await
+                .err()
+                .ok_or("mismatched idempotent enroll must return 409")?;
+            assert_eq!(mismatch.code(), ErrorCode::OperationConflict);
+        }
+        open.engine.shutdown().await?;
         Ok(())
     }
 }

@@ -552,3 +552,165 @@ async fn shutdown_reports_a_failed_disconnect_commit() -> TestResult {
     assert_eq!(recorded, "online");
     Ok(())
 }
+
+#[tokio::test]
+async fn roster_caps_event_batching_awaiting_approval_declaration_and_delete_body_rejection()
+-> TestResult {
+    let hub = Hub::start().await?;
+    let admin = hub.admin()?;
+    let enrolled = enroll(&hub, "CapsWorker", "caps-worker").await?;
+
+    // 1. RosterSync with >256 templates across chunks closes with 1009.
+    let (mut tpl_sock, tpl_epoch) = open(&hub, &enrolled).await?;
+    for chunk_index in 0..2_u32 {
+        let mut sync = roster();
+        sync.chunk_index = chunk_index;
+        sync.is_final = chunk_index == 1;
+        sync.templates = (0..130)
+            .map(|i| TemplateSummary {
+                template_id: format!("tpl-{chunk_index}-{i}"),
+                title: format!("Template {chunk_index}-{i}"),
+                client_kind: "mock".into(),
+                description: None,
+            })
+            .collect();
+        send(&mut tpl_sock, tpl_epoch, &sync).await?;
+    }
+    close_code(&mut tpl_sock, 1009, "bridge_frame_too_large").await?;
+
+    // 2. RosterSync with >4096 unresolved thread fences across chunks closes with 1009.
+    let (mut fence_sock, fence_epoch) = open(&hub, &enrolled).await?;
+    let fence_participant = ParticipantId::generate()?;
+    for chunk_index in 0..5_u32 {
+        let mut sync = roster();
+        sync.chunk_index = chunk_index;
+        sync.is_final = chunk_index == 4;
+        sync.unresolved_thread_fences = (0..1000)
+            .map(|_| -> TestResult<cooplet_protocol::ThreadFenceReport> {
+                Ok(cooplet_protocol::ThreadFenceReport {
+                    thread_id: cooplet_protocol::ThreadId::generate()?,
+                    participant_id: fence_participant.clone(),
+                    delivery_generation: 0,
+                    highest_dispatched_seq: 1,
+                    last_delivery_id: None,
+                    last_from_seq: None,
+                })
+            })
+            .collect::<TestResult<Vec<_>>>()?;
+        if send(&mut fence_sock, fence_epoch, &sync).await.is_err() {
+            break;
+        }
+    }
+    close_code(&mut fence_sock, 1009, "bridge_frame_too_large").await?;
+
+    // 3. Ready bridge: burst of 100 NodeEvents batches cleanly, and ParticipantDeclared in
+    //    AwaitingApproval emits BOTH participant.created and participant.awaiting_approval.
+    let (mut socket, epoch) = open(&hub, &enrolled).await?;
+    let existing = ParticipantId::generate()?;
+    ready(&mut socket, epoch, &agent_roster(existing.clone())).await?;
+    for i in 0..100 {
+        let state = if i % 2 == 0 {
+            ParticipantState::Working
+        } else {
+            ParticipantState::Idle
+        };
+        send(
+            &mut socket,
+            epoch,
+            &cooplet_protocol::NodeEventPayload::ParticipantStateChanged {
+                participant_id: existing.clone(),
+                state,
+                approval_id: None,
+                action_hint: None,
+                summary: None,
+                wait_kind: None,
+                can_respond_remotely: None,
+            },
+        )
+        .await?;
+    }
+    let awaiting = ParticipantId::generate()?;
+    send(
+        &mut socket,
+        epoch,
+        &cooplet_protocol::NodeEventPayload::ParticipantDeclared {
+            participant: ParticipantWire {
+                participant_id: awaiting.clone(),
+                kind: ParticipantKind::Agent,
+                name: "awaiting-agent".into(),
+                client_kind: Some("mock".into()),
+                workspace_dir: None,
+                state: ParticipantState::AwaitingApproval,
+                capabilities: json!({}),
+                wait_kind: Some(ApprovalWaitKind::Permission),
+                approval_id: Some("apr_declare_1".into()),
+                action_hint: Some("Approve shell".into()),
+                summary: Some("Run command".into()),
+                can_respond_remotely: Some(true),
+            },
+        },
+    )
+    .await?;
+
+    // Wait until the declared participant is projected, then check events in SQLite.
+    let db = rusqlite::Connection::open(hub.database_path())?;
+    timeout(DEADLINE, async {
+        loop {
+            let found: i64 = db.query_row(
+                "SELECT COUNT(*) FROM node_participants WHERE node_id = ?1 AND participant_id = ?2",
+                rusqlite::params![enrolled.node_id.as_str(), awaiting.as_str()],
+                |row| row.get(0),
+            )?;
+            if found == 1 {
+                return Ok::<_, Box<dyn std::error::Error + Send + Sync>>(());
+            }
+            tokio::time::sleep(Duration::from_millis(15)).await;
+        }
+    })
+    .await??;
+
+    let kinds: Vec<String> = db
+        .prepare("SELECT kind FROM events WHERE aggregate_id = ?1 ORDER BY seq")?
+        .query_map([awaiting.as_str()], |row| row.get(0))?
+        .collect::<rusqlite::Result<_>>()?;
+    assert!(
+        kinds.iter().any(|k| k == "participant.created"),
+        "missing participant.created in {kinds:?}"
+    );
+    assert!(
+        kinds.iter().any(|k| k == "participant.awaiting_approval"),
+        "missing participant.awaiting_approval in {kinds:?}"
+    );
+    let final_state: String = db.query_row(
+        "SELECT state FROM node_participants WHERE node_id = ?1 AND participant_id = ?2",
+        rusqlite::params![enrolled.node_id.as_str(), existing.as_str()],
+        |row| row.get(0),
+    )?;
+    assert_eq!(final_state, "idle");
+
+    // 4. DELETE with a non-empty JSON body is rejected with 400 InvalidRequest.
+    let board: ThreadSummary = admin
+        .post_json(
+            "/v1/threads",
+            &json!({"title": "Delete body check", "members": []}),
+            Some("delete-body-thread"),
+        )
+        .await?;
+    let auth = format!("Bearer {}", hub.secret);
+    let delete_resp = hub
+        .raw(
+            "DELETE",
+            &format!("/v1/threads/{}/pins/plan", board.thread_id),
+            &[
+                ("X-Cooplet-Hub", hub.id.as_str()),
+                ("Authorization", &auth),
+                ("Content-Type", "application/json"),
+            ],
+            br#"{"unexpected":true}"#,
+        )
+        .await?;
+    delete_resp.problem(400, ErrorCode::InvalidRequest)?;
+
+    drop(socket);
+    Ok(())
+}

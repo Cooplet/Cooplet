@@ -446,10 +446,8 @@ pub(crate) fn attest_node_participant(
     let mut statement = conn.prepare_cached(
         "SELECT p.kind, p.name FROM node_participants p JOIN nodes n USING (node_id)
          WHERE p.node_id = ?1 AND p.participant_id = ?2 AND p.kind IN ('human', 'agent')
-           AND (?3 IS NULL OR (
-                 n.status = 'online' AND p.synced_epoch = ?3
-                 AND (p.kind = 'human' OR p.state IN ('starting', 'idle', 'working', 'awaiting_approval', 'stopping'))
-           ))",
+           AND (p.kind = 'human' OR p.state IN ('starting', 'idle', 'working', 'awaiting_approval', 'stopping'))
+           AND (?3 IS NULL OR (n.status = 'online' AND p.synced_epoch = ?3))",
     )?;
     let (kind, name): (String, String) = statement
         .query_row(

@@ -25,7 +25,7 @@ use super::{
 const CONTROL_BODY_LIMIT: usize = 64 * 1024;
 const ENROLL_BODY_LIMIT: usize = 128 * 1024;
 const MESSAGE_BODY_LIMIT: usize = 2 * 1024 * 1024;
-const THREAD_BODY_LIMIT: usize = 192 * 1024;
+const THREAD_BODY_LIMIT: usize = 64 * 1024;
 
 pub fn router(state: NodeState) -> Router {
     let messages = Router::new()
@@ -38,27 +38,21 @@ pub fn router(state: NodeState) -> Router {
         .layer(Extension(BodyLimit(ENROLL_BODY_LIMIT)));
     let threads = Router::new()
         .route("/v1/threads", get(threads::list).post(threads::create))
-        .route("/v1/threads/{thread_id}", get(threads::get))
-        .route("/v1/threads/{thread_id}/close", post(threads::close))
+        .route("/v1/threads/{id}", get(threads::get))
+        .route("/v1/threads/{id}/close", post(threads::close))
         .route(
-            "/v1/threads/{thread_id}/posts",
+            "/v1/threads/{id}/posts",
             get(threads::read).post(threads::post),
         )
         .route(
-            "/v1/threads/{thread_id}/pins/{pin_key}",
+            "/v1/threads/{id}/pins/{pin_key}",
             axum::routing::put(threads::pin_set).delete(threads::pin_delete),
         )
-        .route("/v1/threads/{thread_id}/wait", post(threads::wait))
-        .route("/v1/threads/{thread_id}/members", get(threads::members))
-        .route("/v1/threads/{thread_id}/members/join", post(threads::join))
-        .route(
-            "/v1/threads/{thread_id}/members/leave",
-            post(threads::leave),
-        )
-        .route(
-            "/v1/threads/{thread_id}/members/resume",
-            post(threads::resume),
-        )
+        .route("/v1/threads/{id}/wait", post(threads::wait))
+        .route("/v1/threads/{id}/members", get(threads::members))
+        .route("/v1/threads/{id}/members/join", post(threads::join))
+        .route("/v1/threads/{id}/members/leave", post(threads::leave))
+        .route("/v1/threads/{id}/members/resume", post(threads::resume))
         .layer(middleware::from_fn_with_state(state.clone(), bound_get))
         .layer(DefaultBodyLimit::max(THREAD_BODY_LIMIT))
         .layer(Extension(BodyLimit(THREAD_BODY_LIMIT)));
@@ -103,7 +97,10 @@ async fn bound_get(
     request: Request,
     next: Next,
 ) -> Result<Response> {
-    if !matches!(*request.method(), Method::GET | Method::HEAD) {
+    if !matches!(
+        *request.method(),
+        Method::GET | Method::HEAD | Method::DELETE
+    ) {
         return Ok(next.run(request).await);
     }
     let limit = request
@@ -121,7 +118,7 @@ async fn bound_get(
     };
     if request.headers().contains_key(TRANSFER_ENCODING) || non_empty_length {
         return Err(invalid_request(
-            "GET and HEAD requests must not include a body",
+            "GET, HEAD, and DELETE requests must not include a body",
         ));
     }
     let (parts, body) = request.into_parts();
@@ -129,7 +126,7 @@ async fn bound_get(
     let bytes = buffer(bounded, &state).await?;
     if !bytes.is_empty() {
         return Err(invalid_request(
-            "GET and HEAD requests must not include a body",
+            "GET, HEAD, and DELETE requests must not include a body",
         ));
     }
     Ok(next.run(Request::from_parts(parts, Body::empty())).await)

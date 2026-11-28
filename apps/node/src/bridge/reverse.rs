@@ -17,7 +17,7 @@ use crate::error::{NodeError, Result};
 
 use super::{NodeBridge, offline, session::Outbound, wait_deadline};
 
-const MAX_REVERSE_IN_FLIGHT: usize = 16;
+pub(super) const MAX_REVERSE_IN_FLIGHT: usize = 16;
 const WAITING: u8 = 0;
 const SENT: u8 = 1;
 const CANCELED: u8 = 2;
@@ -61,10 +61,6 @@ pub(super) struct ReverseRequest {
 }
 
 impl ReverseRequest {
-    pub(super) fn deadline(&self) -> MonoInstant {
-        self.ticket.deadline
-    }
-
     pub(super) fn take_frame(&mut self) -> String {
         std::mem::take(&mut self.frame)
     }

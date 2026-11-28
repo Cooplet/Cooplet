@@ -10809,6 +10809,32 @@
               }
             }
           },
+          "404": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "A listed initial member was not found.",
+            "headers": {
+              "Cache-Control": {
+                "schema": {
+                  "enum": [
+                    "no-store"
+                  ],
+                  "type": "string"
+                }
+              },
+              "X-Cooplet-Hub": {
+                "schema": {
+                  "pattern": "^hub_[0-7][0-9a-hjkmnpqrstvwxyz]{25}$",
+                  "type": "string"
+                }
+              }
+            }
+          },
           "409": {
             "content": {
               "application/problem+json": {
@@ -10896,6 +10922,32 @@
               }
             },
             "description": "Hub temporarily unavailable or unable to confirm the delivery outcome.",
+            "headers": {
+              "Cache-Control": {
+                "schema": {
+                  "enum": [
+                    "no-store"
+                  ],
+                  "type": "string"
+                }
+              },
+              "X-Cooplet-Hub": {
+                "schema": {
+                  "pattern": "^hub_[0-7][0-9a-hjkmnpqrstvwxyz]{25}$",
+                  "type": "string"
+                }
+              }
+            }
+          },
+          "507": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Storage capacity exhausted.",
             "headers": {
               "Cache-Control": {
                 "schema": {
@@ -11439,6 +11491,32 @@
               }
             },
             "description": "Hub temporarily unavailable or unable to confirm the delivery outcome.",
+            "headers": {
+              "Cache-Control": {
+                "schema": {
+                  "enum": [
+                    "no-store"
+                  ],
+                  "type": "string"
+                }
+              },
+              "X-Cooplet-Hub": {
+                "schema": {
+                  "pattern": "^hub_[0-7][0-9a-hjkmnpqrstvwxyz]{25}$",
+                  "type": "string"
+                }
+              }
+            }
+          },
+          "507": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Storage capacity exhausted.",
             "headers": {
               "Cache-Control": {
                 "schema": {
@@ -12018,6 +12096,32 @@
                 }
               }
             }
+          },
+          "507": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Storage capacity exhausted.",
+            "headers": {
+              "Cache-Control": {
+                "schema": {
+                  "enum": [
+                    "no-store"
+                  ],
+                  "type": "string"
+                }
+              },
+              "X-Cooplet-Hub": {
+                "schema": {
+                  "pattern": "^hub_[0-7][0-9a-hjkmnpqrstvwxyz]{25}$",
+                  "type": "string"
+                }
+              }
+            }
           }
         },
         "tags": [
@@ -12166,7 +12270,7 @@
                 }
               }
             },
-            "description": "The caller cannot remove this member.",
+            "description": "The caller lacks collaborate scope or cannot remove this member.",
             "headers": {
               "Cache-Control": {
                 "schema": {
@@ -12218,7 +12322,7 @@
                 }
               }
             },
-            "description": "The thread still needs its last owner or the request conflicts.",
+            "description": "The thread is closed, still needs its last owner, or the request conflicts.",
             "headers": {
               "Cache-Control": {
                 "schema": {
@@ -12297,6 +12401,32 @@
               }
             },
             "description": "Hub temporarily unavailable or unable to confirm the delivery outcome.",
+            "headers": {
+              "Cache-Control": {
+                "schema": {
+                  "enum": [
+                    "no-store"
+                  ],
+                  "type": "string"
+                }
+              },
+              "X-Cooplet-Hub": {
+                "schema": {
+                  "pattern": "^hub_[0-7][0-9a-hjkmnpqrstvwxyz]{25}$",
+                  "type": "string"
+                }
+              }
+            }
+          },
+          "507": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Storage capacity exhausted.",
             "headers": {
               "Cache-Control": {
                 "schema": {
@@ -12634,6 +12764,32 @@
                 }
               }
             }
+          },
+          "507": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Storage capacity exhausted.",
+            "headers": {
+              "Cache-Control": {
+                "schema": {
+                  "enum": [
+                    "no-store"
+                  ],
+                  "type": "string"
+                }
+              },
+              "X-Cooplet-Hub": {
+                "schema": {
+                  "pattern": "^hub_[0-7][0-9a-hjkmnpqrstvwxyz]{25}$",
+                  "type": "string"
+                }
+              }
+            }
           }
         },
         "tags": [
@@ -12908,6 +13064,32 @@
               }
             },
             "description": "Hub temporarily unavailable or unable to confirm the delivery outcome.",
+            "headers": {
+              "Cache-Control": {
+                "schema": {
+                  "enum": [
+                    "no-store"
+                  ],
+                  "type": "string"
+                }
+              },
+              "X-Cooplet-Hub": {
+                "schema": {
+                  "pattern": "^hub_[0-7][0-9a-hjkmnpqrstvwxyz]{25}$",
+                  "type": "string"
+                }
+              }
+            }
+          },
+          "507": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Storage capacity exhausted.",
             "headers": {
               "Cache-Control": {
                 "schema": {
@@ -13209,6 +13391,32 @@
               }
             },
             "description": "Hub temporarily unavailable or unable to confirm the delivery outcome.",
+            "headers": {
+              "Cache-Control": {
+                "schema": {
+                  "enum": [
+                    "no-store"
+                  ],
+                  "type": "string"
+                }
+              },
+              "X-Cooplet-Hub": {
+                "schema": {
+                  "pattern": "^hub_[0-7][0-9a-hjkmnpqrstvwxyz]{25}$",
+                  "type": "string"
+                }
+              }
+            }
+          },
+          "507": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Storage capacity exhausted.",
             "headers": {
               "Cache-Control": {
                 "schema": {
@@ -13810,6 +14018,32 @@
                 }
               }
             }
+          },
+          "507": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Storage capacity exhausted.",
+            "headers": {
+              "Cache-Control": {
+                "schema": {
+                  "enum": [
+                    "no-store"
+                  ],
+                  "type": "string"
+                }
+              },
+              "X-Cooplet-Hub": {
+                "schema": {
+                  "pattern": "^hub_[0-7][0-9a-hjkmnpqrstvwxyz]{25}$",
+                  "type": "string"
+                }
+              }
+            }
           }
         },
         "tags": [
@@ -13948,7 +14182,7 @@
                 }
               }
             },
-            "description": "The caller cannot wait on this thread.",
+            "description": "The caller lacks collaborate scope or cannot wait on this thread.",
             "headers": {
               "Cache-Control": {
                 "schema": {
@@ -14000,7 +14234,7 @@
                 }
               }
             },
-            "description": "Hub identity mismatch or route-specific conflict.",
+            "description": "The thread is closed.",
             "headers": {
               "Cache-Control": {
                 "schema": {
@@ -14105,6 +14339,32 @@
               }
             },
             "description": "Hub temporarily unavailable or unable to confirm the delivery outcome.",
+            "headers": {
+              "Cache-Control": {
+                "schema": {
+                  "enum": [
+                    "no-store"
+                  ],
+                  "type": "string"
+                }
+              },
+              "X-Cooplet-Hub": {
+                "schema": {
+                  "pattern": "^hub_[0-7][0-9a-hjkmnpqrstvwxyz]{25}$",
+                  "type": "string"
+                }
+              }
+            }
+          },
+          "507": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Storage capacity exhausted.",
             "headers": {
               "Cache-Control": {
                 "schema": {

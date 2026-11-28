@@ -58,17 +58,6 @@ impl ToolError {
                 .recovery_fields()
                 .map(|(key, value)| (key, value.clone())),
         );
-        if let Some(reason) = problem.extensions.get("reason").and_then(Value::as_str)
-            && reason.len() <= 64
-            && reason.contains('_')
-            && reason
-                .bytes()
-                .all(|byte| byte.is_ascii_lowercase() || byte == b'_')
-        {
-            error
-                .extensions
-                .insert("reason", Value::String(reason.to_owned()));
-        }
         error
     }
 

@@ -1,8 +1,8 @@
 use cooplet_client::CoopletClient;
 use cooplet_platform::AdmissionGuard;
 use cooplet_protocol::{
-    ErrorCode, NodeId, OperationId, ThreadAckPayload, ThreadDeliverPayload, ThreadDeliveryOutcome,
-    ThreadFenceReport,
+    ErrorCode, NodeId, OperationId, ParticipantState, ThreadAckPayload, ThreadDeliverPayload,
+    ThreadDeliveryOutcome, ThreadFenceReport,
 };
 use cooplet_storage::{WriteError, WriteOutcome};
 use rusqlite::{Connection, OptionalExtension, params};
@@ -16,6 +16,7 @@ use crate::{
     error::{NodeError, Result},
     http::NodeState,
     operations::{ADMISSION_EXPIRED, admission_expired},
+    storage::retry_recovery_write,
 };
 
 const FENCE_TTL_MS: i64 = 90 * 24 * 60 * 60 * 1000;
@@ -84,50 +85,57 @@ async fn receive(
     let Some(live) = state.agents.live_session(&request.member_id) else {
         return Ok((ThreadDeliveryOutcome::Unavailable, Some("no_live_session")));
     };
-    let attachments = prepare_attachments(state, hub, request, admission).await?;
-    let mut slot = match live.try_thread_submit(request.delivery_id.as_str()) {
-        Ok(slot) => slot,
-        Err(SlotDenial::Busy) => {
-            return Ok((ThreadDeliveryOutcome::Busy, Some("participant_busy")));
-        }
-        Err(SlotDenial::AwaitingApproval) => {
-            return Ok((
-                ThreadDeliveryOutcome::AwaitingApproval,
-                Some("awaiting_approval"),
-            ));
-        }
-        Err(SlotDenial::Unavailable) => {
-            return Ok((
-                ThreadDeliveryOutcome::Unavailable,
-                Some("intake_unavailable"),
-            ));
-        }
-    };
-    let Some(_gate) = state
-        .delivery
-        .thread_locks
-        .try_lock((request.thread_id.clone(), request.member_id.clone()))
-    else {
-        // A prior session can still be settling a fence after its live slot was
-        // replaced. Retry this transient conflict without waiting for Idle.
-        return Ok((
-            ThreadDeliveryOutcome::Unavailable,
-            Some("thread_delivery_in_progress"),
-        ));
-    };
-
-    let (admitted, attachments) = match begin(state, request, admission, attachments).await {
-        Err(error) if cache_changed(&error) => {
-            // GC may have won after we opened a cached file. The failed transaction
-            // left the fence unchanged, so refetch once under the original guard.
+    if let Some(denial) = preflight_live_state(live.state()) {
+        return Ok(denial);
+    }
+    let (mut slot, _gate, previous, attachments) = {
+        let mut attempt = 0u8;
+        loop {
             let attachments = prepare_attachments(state, hub, request, admission).await?;
-            begin(state, request, admission, attachments).await?
+            let slot = match live.try_thread_submit(request.delivery_id.as_str()) {
+                Ok(slot) => slot,
+                Err(SlotDenial::Busy) => {
+                    return Ok((ThreadDeliveryOutcome::Busy, Some("participant_busy")));
+                }
+                Err(SlotDenial::AwaitingApproval) => {
+                    return Ok((
+                        ThreadDeliveryOutcome::AwaitingApproval,
+                        Some("awaiting_approval"),
+                    ));
+                }
+                Err(SlotDenial::Unavailable) => {
+                    return Ok((
+                        ThreadDeliveryOutcome::Unavailable,
+                        Some("intake_unavailable"),
+                    ));
+                }
+            };
+            let Some(gate) = state
+                .delivery
+                .thread_locks
+                .try_lock((request.thread_id.clone(), request.member_id.clone()))
+            else {
+                // A prior session can still be settling a fence after its live slot was
+                // replaced. Retry this transient conflict without waiting for Idle.
+                return Ok((
+                    ThreadDeliveryOutcome::Unavailable,
+                    Some("thread_delivery_in_progress"),
+                ));
+            };
+            match begin(state, request, admission, attachments).await {
+                Ok((FenceAdmission::New(previous), attachments)) => {
+                    break (slot, gate, previous, attachments);
+                }
+                Ok((FenceAdmission::Replay(result), _)) => return Ok(result),
+                Err(error) if attempt == 0 && cache_changed(&error) => {
+                    // Drop the live slot and thread lock before refetching attachments.
+                    drop(gate);
+                    drop(slot);
+                    attempt += 1;
+                }
+                Err(error) => return Err(error),
+            }
         }
-        result => result?,
-    };
-    let previous = match admitted {
-        FenceAdmission::New(previous) => previous,
-        FenceAdmission::Replay(result) => return Ok(result),
     };
     let input = make_input(request, attachments);
     let outcome = if admission.is_expired() {
@@ -153,16 +161,60 @@ async fn receive(
         }
         Err(error) => {
             tracing::warn!(delivery_id = %request.delivery_id, %error, "Thread fence finalization could not be confirmed");
-            slot.finish(
-                &SubmitOutcome::Unknown("thread fence finalization failed".into()),
-                false,
-            )
-            .await;
+            let failure = SubmitOutcome::Unknown("thread fence finalization failed".into());
+            slot.finish(&failure, false).await;
+            let recovery_delivery = request.clone();
+            tokio::spawn(retry_recovery_write(
+                state.db.clone(),
+                state.delivery.subscribe_closing(),
+                move |tx, now| {
+                    tx.execute(
+                        &format!(
+                            "UPDATE thread_inject_fences SET state = 'unknown', updated_at_ms = ?7 {CURRENT}"
+                        ),
+                        params![
+                            recovery_delivery.thread_id.as_str(),
+                            recovery_delivery.member_id.as_str(),
+                            recovery_delivery.delivery_generation,
+                            recovery_delivery.delivery_id.as_str(),
+                            recovery_delivery.from_seq,
+                            recovery_delivery.to_seq,
+                            now,
+                        ],
+                    )?;
+                    let mut events = Vec::new();
+                    apply_submit_outcome(
+                        tx,
+                        now,
+                        &recovery_delivery.member_id,
+                        generation,
+                        event_seq,
+                        &failure,
+                        &mut events,
+                    )?;
+                    Ok(events)
+                },
+            ));
             Ok((
                 ThreadDeliveryOutcome::Unknown,
                 Some("fence_outcome_unknown"),
             ))
         }
+    }
+}
+
+fn preflight_live_state(state: ParticipantState) -> Option<FenceResult> {
+    match state {
+        ParticipantState::Idle => None,
+        ParticipantState::Working => Some((ThreadDeliveryOutcome::Busy, Some("participant_busy"))),
+        ParticipantState::AwaitingApproval => Some((
+            ThreadDeliveryOutcome::AwaitingApproval,
+            Some("awaiting_approval"),
+        )),
+        _ => Some((
+            ThreadDeliveryOutcome::Unavailable,
+            Some("intake_unavailable"),
+        )),
     }
 }
 
@@ -440,4 +492,392 @@ pub(in crate::bridge) fn visit_fences(
         visit(row?)?;
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use std::{fs, path::PathBuf, sync::Arc, time::Duration};
+
+    use cooplet_client::{ClientConfig, CoopletClient, Destination};
+    use cooplet_protocol::{DeliveryMode, ParticipantId, RequestId, ThreadId};
+    use futures_util::future::BoxFuture;
+    use serde_json::json;
+    use tokio::sync::{mpsc, watch};
+
+    use super::*;
+    use crate::{
+        bridge::NodeBridge,
+        clients::{
+            AdapterCapabilities, AdapterConfig, AdapterRegistry, AgentConfig, AgentService,
+            ApprovalDecision, ApprovalRespondOutcome, ClientAdapter, CreateAgentRequest,
+            DiscoveryReport, NativeSessionKey, OpenedSession, ParticipantRuntimeState,
+            PersistedSessionRef, ProcessOwnership, SessionHandle, SessionInspection,
+            SessionOpenRequest, StopMode, StopOutcome, TuiAttachPlan,
+        },
+        config::{NodeConfig, OpenNode},
+        delivery::DeliveryService,
+        http::Tasks,
+        operations::OperationBook,
+    };
+
+    type TestResult<T = ()> = std::result::Result<T, Box<dyn std::error::Error + Send + Sync>>;
+
+    struct Scratch(PathBuf);
+
+    impl Drop for Scratch {
+        fn drop(&mut self) {
+            let _ = fs::remove_dir_all(&self.0);
+        }
+    }
+
+    struct StubAdapter {
+        outcome: SubmitOutcome,
+    }
+
+    impl ClientAdapter for StubAdapter {
+        fn kind(&self) -> &'static str {
+            "stub-thread"
+        }
+
+        fn discover<'a>(
+            &'a self,
+            _config: &'a AdapterConfig,
+        ) -> BoxFuture<'a, Result<DiscoveryReport>> {
+            Box::pin(async {
+                Ok(DiscoveryReport {
+                    client_kind: self.kind().into(),
+                    available: true,
+                    binary_path: None,
+                    version: None,
+                    capabilities: self.capabilities(),
+                    detail: None,
+                })
+            })
+        }
+
+        fn capabilities(&self) -> AdapterCapabilities {
+            AdapterCapabilities {
+                supports_create: true,
+                ..AdapterCapabilities::default()
+            }
+        }
+
+        fn create_or_resume(
+            &self,
+            request: SessionOpenRequest,
+        ) -> BoxFuture<'_, Result<OpenedSession>> {
+            Box::pin(async move {
+                let native_key = NativeSessionKey {
+                    client_kind: self.kind().into(),
+                    store_namespace: "test".into(),
+                    native_session_id: format!("sess-{}", request.participant_id),
+                };
+                let persisted = PersistedSessionRef {
+                    participant_id: request.participant_id,
+                    generation: request.generation,
+                    native_key: Some(native_key.clone()),
+                    process_ownership: ProcessOwnership::Attached,
+                    workspace_dir: request.workspace_dir,
+                    runtime_dir: request.runtime_dir,
+                    process_identity: None,
+                    adapter_binding: json!({}),
+                };
+                let (_tx, rx) = mpsc::channel(4);
+                Ok(OpenedSession {
+                    native_key,
+                    process_ownership: ProcessOwnership::Attached,
+                    handle: SessionHandle::new(_tx, persisted),
+                    capabilities: self.capabilities(),
+                    initial_state: ParticipantRuntimeState::Idle,
+                    adapter_binding: json!({}),
+                    events: rx,
+                })
+            })
+        }
+
+        fn inspect_state<'a>(
+            &'a self,
+            _target: &'a PersistedSessionRef,
+            _live: Option<&'a SessionHandle>,
+        ) -> BoxFuture<'a, Result<SessionInspection>> {
+            Box::pin(async {
+                Ok(SessionInspection {
+                    state: ParticipantRuntimeState::Idle,
+                    detail: None,
+                })
+            })
+        }
+
+        fn submit_turn<'a>(
+            &'a self,
+            _handle: &'a SessionHandle,
+            _request: SubmitTurnRequest,
+        ) -> BoxFuture<'a, SubmitOutcome> {
+            let outcome = self.outcome.clone();
+            Box::pin(async move { outcome })
+        }
+
+        fn respond_approval<'a>(
+            &'a self,
+            _handle: &'a SessionHandle,
+            _decision: ApprovalDecision,
+        ) -> BoxFuture<'a, ApprovalRespondOutcome> {
+            Box::pin(async { ApprovalRespondOutcome::Unsupported("stub".into()) })
+        }
+
+        fn cancel_or_stop<'a>(
+            &'a self,
+            _handle: &'a SessionHandle,
+            _mode: StopMode,
+        ) -> BoxFuture<'a, Result<StopOutcome>> {
+            Box::pin(async { Ok(StopOutcome::Stopped) })
+        }
+
+        fn tui_attach_plan<'a>(
+            &'a self,
+            _target: &'a PersistedSessionRef,
+            _live: Option<&'a SessionHandle>,
+        ) -> BoxFuture<'a, Result<TuiAttachPlan>> {
+            Box::pin(async { Err(NodeError::internal("unused")) })
+        }
+    }
+
+    fn sample_payload(
+        thread_id: &ThreadId,
+        member_id: &ParticipantId,
+        delivery_id: &OperationId,
+        generation: u64,
+        from_seq: u64,
+        to_seq: u64,
+    ) -> ThreadDeliverPayload {
+        ThreadDeliverPayload {
+            delivery_generation: generation,
+            delivery_id: delivery_id.clone(),
+            thread_id: thread_id.clone(),
+            member_id: member_id.clone(),
+            from_seq,
+            to_seq,
+            posts: Vec::new(),
+            truncated_earlier: false,
+            delivery_mode: DeliveryMode::QueueUntilIdle,
+            admission_budget_ms: 5_000,
+        }
+    }
+
+    #[test]
+    fn fence_replay_and_preflight_live_state_cover_all_branches() -> TestResult {
+        let thread_id = ThreadId::generate()?;
+        let member_id = ParticipantId::generate()?;
+        let op1 = OperationId::generate()?;
+        let op2 = OperationId::generate()?;
+        let confirmed = Fence {
+            generation: 2,
+            highest: 10,
+            delivery_id: Some(op1.to_string()),
+            first: Some(5),
+            state: "confirmed".into(),
+            updated_at: 100,
+            expires_at: 200,
+        };
+        assert_eq!(
+            confirmed.replay(&sample_payload(&thread_id, &member_id, &op2, 1, 11, 12)),
+            Some((ThreadDeliveryOutcome::Rejected, Some("stale_generation")))
+        );
+        assert_eq!(
+            confirmed.replay(&sample_payload(&thread_id, &member_id, &op2, 3, 1, 2)),
+            None
+        );
+        assert_eq!(
+            confirmed.replay(&sample_payload(&thread_id, &member_id, &op1, 2, 5, 10)),
+            Some((ThreadDeliveryOutcome::Delivered, None))
+        );
+        assert_eq!(
+            confirmed.replay(&sample_payload(&thread_id, &member_id, &op2, 2, 10, 12)),
+            Some((ThreadDeliveryOutcome::Unknown, Some("overlapping_range")))
+        );
+        assert_eq!(
+            confirmed.replay(&sample_payload(&thread_id, &member_id, &op2, 2, 11, 15)),
+            None
+        );
+        let unresolved = Fence {
+            state: "unknown".into(),
+            ..confirmed
+        };
+        assert_eq!(
+            unresolved.replay(&sample_payload(&thread_id, &member_id, &op2, 2, 11, 15)),
+            Some((
+                ThreadDeliveryOutcome::Unknown,
+                Some("prior_delivery_unknown")
+            ))
+        );
+
+        assert_eq!(preflight_live_state(ParticipantState::Idle), None);
+        assert_eq!(
+            preflight_live_state(ParticipantState::Working),
+            Some((ThreadDeliveryOutcome::Busy, Some("participant_busy")))
+        );
+        assert_eq!(
+            preflight_live_state(ParticipantState::AwaitingApproval),
+            Some((
+                ThreadDeliveryOutcome::AwaitingApproval,
+                Some("awaiting_approval")
+            ))
+        );
+        for unavailable in [
+            ParticipantState::Starting,
+            ParticipantState::Stopping,
+            ParticipantState::Stopped,
+            ParticipantState::Unavailable,
+            ParticipantState::Unknown,
+        ] {
+            assert_eq!(
+                preflight_live_state(unavailable),
+                Some((
+                    ThreadDeliveryOutcome::Unavailable,
+                    Some("intake_unavailable")
+                ))
+            );
+        }
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn failed_finish_returns_unknown_and_background_recovery_repairs_fence_and_participant()
+    -> TestResult {
+        let scratch = Scratch(
+            std::env::temp_dir().join(format!("cooplet-tdeliv-{}", RequestId::generate()?)),
+        );
+        fs::create_dir(&scratch.0)?;
+        let open =
+            OpenNode::start(NodeConfig::new(scratch.0.join("state"), scratch.0.clone())).await?;
+        let db = open.engine.db().clone();
+        let reads = open.engine.reads().clone();
+        let blobs = open.engine.blobs().ok_or("missing blobs")?.clone();
+        let operations = OperationBook::new(db.clone(), reads.clone());
+        let mut registry = AdapterRegistry::default();
+        registry.register(Arc::new(StubAdapter {
+            outcome: SubmitOutcome::Expired,
+        }))?;
+        let agents = Arc::new(AgentService::new(
+            db.clone(),
+            reads.clone(),
+            open.auth.clone(),
+            registry,
+            operations.clone(),
+            AgentConfig {
+                node_id: open.info.node_id.clone(),
+                endpoint: open.operator.address()?,
+                state_dir: open.state_dir.clone(),
+                workspace_dir: open.workspace_dir.clone(),
+            },
+        ));
+        let delivery = DeliveryService::new(
+            db.clone(),
+            reads.clone(),
+            blobs.clone(),
+            open.state_dir.join("blobs"),
+            agents.clone(),
+            operations.clone(),
+        )?;
+        let (shutdown, _) = watch::channel(false);
+        let state = NodeState {
+            info: open.info.clone(),
+            db: db.clone(),
+            reads: reads.clone(),
+            blobs,
+            max_blob_bytes: 1024 * 1024,
+            auth: open.auth.clone(),
+            operations,
+            agents: agents.clone(),
+            delivery: delivery.clone(),
+            bridge: Arc::new(NodeBridge::default()),
+            shutdown,
+            tasks: Arc::new(Tasks::default()),
+        };
+
+        let created = agents
+            .create(
+                open.operator.participant_id.as_str(),
+                "create-stub-agent",
+                CreateAgentRequest {
+                    client_kind: Some("stub-thread".into()),
+                    name: Some("stub".into()),
+                    ..Default::default()
+                },
+                None,
+            )
+            .await?;
+        let participant_id = created.participant_id;
+
+        // Fail finish()'s rollback DELETE on thread_inject_fences (and initial recovery UPDATE)
+        // to simulate a transient SQLite failure during finalization.
+        db.write_sqlite(|tx| {
+            tx.execute_batch(
+                "CREATE TRIGGER fail_fence_delete BEFORE DELETE ON thread_inject_fences
+                 BEGIN SELECT RAISE(ABORT, 'simulated delete failure'); END;
+                 CREATE TRIGGER fail_fence_unknown BEFORE UPDATE OF state ON thread_inject_fences
+                 WHEN NEW.state = 'unknown'
+                 BEGIN SELECT RAISE(ABORT, 'simulated recovery delay'); END;",
+            )?;
+            Ok(WriteOutcome::new(()))
+        })
+        .await?;
+
+        let hub = CoopletClient::new(ClientConfig::new(
+            "http://127.0.0.1:1".parse()?,
+            Destination::LocalNode,
+            None,
+        ))?;
+        let thread_id = ThreadId::generate()?;
+        let delivery_id = OperationId::generate()?;
+        let payload = sample_payload(&thread_id, &participant_id, &delivery_id, 0, 1, 1);
+        let ack = thread(
+            &state,
+            &hub,
+            payload,
+            AdmissionGuard::new(Duration::from_secs(5)),
+        )
+        .await;
+        assert_eq!(ack.outcome, ThreadDeliveryOutcome::Unknown);
+        assert_eq!(ack.detail.as_deref(), Some("fence_outcome_unknown"));
+
+        // Drop the triggers so the spawned retry_recovery_write succeeds.
+        db.write_sqlite(|tx| {
+            tx.execute_batch("DROP TRIGGER fail_fence_delete; DROP TRIGGER fail_fence_unknown;")?;
+            Ok(WriteOutcome::new(()))
+        })
+        .await?;
+
+        tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                let tid = thread_id.clone();
+                let pid = participant_id.clone();
+                let states: (String, String) = reads
+                    .read(move |conn| {
+                        let fence: String = conn.query_row(
+                            "SELECT state FROM thread_inject_fences WHERE thread_id = ?1 AND participant_id = ?2",
+                            params![tid.as_str(), pid.as_str()],
+                            |row| row.get(0),
+                        )?;
+                        let participant: String = conn.query_row(
+                            "SELECT state FROM participants WHERE participant_id = ?1",
+                            [pid.as_str()],
+                            |row| row.get(0),
+                        )?;
+                        Ok((fence, participant))
+                    })
+                    .await?;
+                if states == ("unknown".to_owned(), "unknown".to_owned()) {
+                    return Ok::<_, Box<dyn std::error::Error + Send + Sync>>(());
+                }
+                tokio::time::sleep(Duration::from_millis(15)).await;
+            }
+        })
+        .await??;
+
+        delivery.stop_admission();
+        agents.quiesce();
+        open.engine.shutdown().await?;
+        Ok(())
+    }
 }

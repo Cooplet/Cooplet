@@ -673,3 +673,84 @@ async fn completed_blocking_preparation_remains_pending_until_the_adapter_polls_
     assert!(!preparation.awaiting_managed_preparation());
     Ok(())
 }
+
+#[tokio::test]
+async fn respond_approval_after_recovery_unknown_returns_delivery_unknown_for_both_actions()
+-> TestResult {
+    use cooplet_protocol::{ApprovalAction, canonical_sha256};
+
+    let adapter = Arc::new(ProbeAdapter::default());
+    let (service, node, _scratch) = service(adapter).await?;
+    let participant_id = ParticipantId::generate()?;
+    let recovered_op_id = OperationId::generate()?;
+    let approval_id = "apr_recovered_1";
+    let fingerprint = canonical_sha256(&(
+        &participant_id,
+        ApprovalDecision {
+            approval_id: approval_id.into(),
+            action: ApprovalAction::Approve,
+        },
+    ))?;
+    let pid = participant_id.clone();
+    let op_id = recovered_op_id.clone();
+    node.engine
+        .db()
+        .write_sqlite(move |tx| {
+            tx.execute(
+                "INSERT INTO participants(participant_id, kind, name, state, created_at_ms, updated_at_ms)
+                 VALUES (?1, 'agent', 'recovered', 'unknown', 1, 1)",
+                rusqlite::params![pid.as_str()],
+            )?;
+            tx.execute(
+                "INSERT INTO operations(operation_id, actor_id, operation_key, kind, request_sha256,
+                                        state, resource_id, created_at_ms, updated_at_ms, expires_at_ms)
+                 VALUES (?1, 'operator', 'prior-apr-key', 'approval.respond', ?2, 'unknown', ?3, 1, 1, 9999999999999)",
+                rusqlite::params![op_id.as_str(), fingerprint, pid.as_str()],
+            )?;
+            Ok(WriteOutcome::new(()))
+        })
+        .await?;
+
+    let actor = node.operator.participant_id.as_str();
+    for (idx, action) in [ApprovalAction::Approve, ApprovalAction::Deny]
+        .into_iter()
+        .enumerate()
+    {
+        let err = service
+            .respond_approval(
+                actor,
+                &format!("retry-apr-{idx}"),
+                participant_id.clone(),
+                ApprovalDecision {
+                    approval_id: approval_id.into(),
+                    action,
+                },
+            )
+            .await
+            .err()
+            .ok_or("expected delivery_unknown for recovered unknown approval")?;
+        assert_eq!(err.code(), ErrorCode::DeliveryUnknown);
+        assert_eq!(err.0.extensions["reason"], "approval_outcome_unconfirmed");
+        assert_eq!(err.0.extensions["operation_id"], recovered_op_id.as_str());
+        assert_eq!(err.0.extensions["approval_id"], approval_id);
+    }
+
+    let stale = service
+        .respond_approval(
+            actor,
+            "unrelated-apr",
+            participant_id,
+            ApprovalDecision {
+                approval_id: "apr_other".into(),
+                action: ApprovalAction::Approve,
+            },
+        )
+        .await
+        .err()
+        .ok_or("expected approval_stale for unrelated approval")?;
+    assert_eq!(stale.code(), ErrorCode::InvalidRequest);
+    assert_eq!(stale.0.extensions["reason"], "approval_stale");
+
+    node.engine.shutdown().await?;
+    Ok(())
+}

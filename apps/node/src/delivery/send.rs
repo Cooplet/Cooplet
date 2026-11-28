@@ -146,6 +146,28 @@ impl DeliveryService {
             }),
             input: message.input.clone(),
         };
+        let preflight_denial = if !message.input.attachments.is_empty()
+            && message.input.delivery_mode == DeliveryMode::DirectNow
+            && message.input.answer.is_none()
+        {
+            let to = message.input.to.clone();
+            let target = self
+                .reads
+                .read(move |conn| Ok(recipient(conn, &to)))
+                .await??;
+            if target.kind == ParticipantKind::Agent {
+                match self.agents.live_session(&target.id).map(|s| s.state()) {
+                    Some(ParticipantState::Idle) => None,
+                    Some(ParticipantState::Working) => Some(SlotDenial::Busy),
+                    Some(ParticipantState::AwaitingApproval) => Some(SlotDenial::AwaitingApproval),
+                    _ => Some(SlotDenial::Unavailable),
+                }
+            } else {
+                None
+            }
+        } else {
+            None
+        };
         let materialize = || {
             self.load_hub_attachments(
                 hub,
@@ -154,6 +176,12 @@ impl DeliveryService {
                 max_blob_bytes,
             )
         };
+        if let Some(denial) = preflight_denial {
+            let attempt = build_attempt(Vec::new());
+            return self
+                .send_new_with_preflight(&guard, attempt, Some(&delegated.admission), Some(denial))
+                .await;
+        }
         let attempt = build_attempt(materialize().await?);
         match self
             .send_new(&guard, attempt, Some(&delegated.admission))
@@ -195,6 +223,17 @@ impl DeliveryService {
         attempt: Attempt,
         external_admission: Option<&AdmissionGuard>,
     ) -> Result<SendMessageResponse> {
+        self.send_new_with_preflight(guard, attempt, external_admission, None)
+            .await
+    }
+
+    async fn send_new_with_preflight(
+        self: &Arc<Self>,
+        guard: &OperationGuard,
+        attempt: Attempt,
+        external_admission: Option<&AdmissionGuard>,
+        forced_denial: Option<SlotDenial>,
+    ) -> Result<SendMessageResponse> {
         let operation = guard.operation.clone();
         // Validate reply authority before looking at the local recipient or taking its slot.
         let (attempt, target) = self
@@ -226,11 +265,12 @@ impl DeliveryService {
         });
         let live_generation = live.as_ref().map(|session| session.generation());
         let mut slot = None;
-        let mut direct_denial = SlotDenial::Unavailable;
+        let mut direct_denial = forced_denial.unwrap_or(SlotDenial::Unavailable);
         let admission = external_admission
             .cloned()
             .unwrap_or_else(|| AdmissionGuard::new(DIRECT_ADMISSION));
-        if attempt.input.delivery_mode == DeliveryMode::DirectNow
+        if forced_denial.is_none()
+            && attempt.input.delivery_mode == DeliveryMode::DirectNow
             && target.kind == ParticipantKind::Agent
             && let Some(session) = &live
         {

@@ -141,7 +141,8 @@ fn recover_delivery(tx: &Transaction<'_>, now: i64) -> rusqlite::Result<Vec<Even
     )?;
     events.extend(expire_queued(tx, now, -1)?);
     tx.execute(
-        "UPDATE thread_inject_fences SET state = 'unknown', updated_at_ms = ?1 WHERE state = 'injecting'",
+        "UPDATE thread_inject_fences SET state = 'unknown', updated_at_ms = ?1
+         WHERE state = 'injecting' AND state IN ('injecting', 'unknown')",
         [now],
     )?;
     Ok(events)

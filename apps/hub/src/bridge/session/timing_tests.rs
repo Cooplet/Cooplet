@@ -80,11 +80,20 @@ impl Fixture {
             engine,
             meta,
             master,
+            thread_acl_watch,
         } = storage::open(&scratch.0, 1024, 16_384, 16_384).await?;
         let (shutdown, stop) = watch::channel(());
         let clock = Arc::new(Clock::default());
         let registry = Arc::new(LiveBridge::new(1, clock.clone()));
-        let state = AppState::new(&engine, meta, master, registry.clone(), stop, 1024)?;
+        let state = AppState::new(
+            &engine,
+            meta,
+            master,
+            thread_acl_watch,
+            registry.clone(),
+            stop,
+            1024,
+        )?;
         let node_id = NodeId::generate()?;
         let credential = mint_node(&state.master, &node_id, 1)?;
         let id = node_id.clone();
@@ -803,6 +812,102 @@ async fn direct_post_and_the_only_idle_wake_survive_a_rolled_back_transition() -
             .await?;
         assert!(member.pending.is_none());
     }
+    drop(client);
+    hub.close().await
+}
+
+#[tokio::test]
+async fn cancelled_thread_delivery_does_not_block_replacement_for_same_member() -> TestResult {
+    let (hub, mut client, epoch) = Fixture::open().await?;
+    let participant = ready_agent(&mut client, epoch, ParticipantState::Idle).await?;
+    let thread_id = ThreadId::generate()?;
+
+    let make_post = |seq: u64| -> TestResult<cooplet_protocol::ThreadPostWire> {
+        Ok(cooplet_protocol::ThreadPostWire {
+            seq,
+            post_id: cooplet_protocol::MessageId::generate()?,
+            author_actor_id: "usr_admin".into(),
+            author_kind: cooplet_protocol::AuthorKind::Human,
+            author_handle: "admin".into(),
+            in_reply_to_post_id: None,
+            body: format!("post {seq}"),
+            mentions: Vec::new(),
+            attachments: Vec::new(),
+            question: None,
+            answer: None,
+            created_at_ms: 1_000,
+        })
+    };
+
+    let permit1 = hub
+        .registry
+        .reserve_thread(&hub.node_id, false)
+        .await
+        .map_err(|err| format!("reserve 1 failed: {err:?}"))?;
+    let delivery1 = OperationId::generate()?;
+    let payload1 = cooplet_protocol::ThreadDeliverPayload {
+        delivery_generation: 0,
+        delivery_id: delivery1.clone(),
+        thread_id: thread_id.clone(),
+        member_id: participant.clone(),
+        from_seq: 1,
+        to_seq: 1,
+        posts: vec![make_post(1)?],
+        truncated_earlier: false,
+        delivery_mode: DeliveryMode::QueueUntilIdle,
+        admission_budget_ms: 5_000,
+    };
+    let submit1 = tokio::spawn(permit1.submit(payload1));
+    let wire1: cooplet_protocol::ThreadDeliverPayload =
+        next_frame(&mut client).await?.decode_payload()?;
+    assert_eq!(wire1.delivery_id, delivery1);
+
+    // Cancel delivery 1 (dropping its future sets the cancel flag) and immediately submit a
+    // replacement delivery for the same (thread_id, member_id) without acking delivery 1.
+    submit1.abort();
+    let _ = submit1.await;
+
+    let permit2 = hub
+        .registry
+        .reserve_thread(&hub.node_id, false)
+        .await
+        .map_err(|err| format!("reserve 2 failed: {err:?}"))?;
+    let delivery2 = OperationId::generate()?;
+    let payload2 = cooplet_protocol::ThreadDeliverPayload {
+        delivery_generation: 1,
+        delivery_id: delivery2.clone(),
+        thread_id: thread_id.clone(),
+        member_id: participant.clone(),
+        from_seq: 2,
+        to_seq: 2,
+        posts: vec![make_post(2)?],
+        truncated_earlier: false,
+        delivery_mode: DeliveryMode::QueueUntilIdle,
+        admission_budget_ms: 5_000,
+    };
+    let submit2 = tokio::spawn(permit2.submit(payload2));
+    let wire2: cooplet_protocol::ThreadDeliverPayload =
+        next_frame(&mut client).await?.decode_payload()?;
+    assert_eq!(wire2.delivery_id, delivery2);
+    send_payload(
+        &mut client,
+        epoch,
+        &ThreadAckPayload {
+            delivery_id: delivery2.clone(),
+            delivery_generation: 1,
+            thread_id,
+            member_id: participant,
+            acked_seq: 2,
+            outcome: ThreadDeliveryOutcome::Delivered,
+            detail: None,
+        },
+    )
+    .await?;
+    let ack = time::timeout(TIMEOUT, submit2)
+        .await??
+        .map_err(|err| format!("replacement delivery failed: {err:?}"))?;
+    assert_eq!(ack.delivery_id, delivery2);
+    assert_eq!(ack.outcome, ThreadDeliveryOutcome::Delivered);
     drop(client);
     hub.close().await
 }

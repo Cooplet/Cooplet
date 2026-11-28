@@ -168,8 +168,10 @@ CREATE TABLE thread_members (
                         CHECK (state IN ('active','paused_unknown','left')),
     delivery_generation INTEGER NOT NULL DEFAULT 0 CHECK (delivery_generation >= 0),
     confirmed_seq       INTEGER NOT NULL DEFAULT 0,
-    -- Latest relevant queued post, or earliest unattempted direct post in this session.
+    -- Latest relevant post awaiting a queued delivery (queue_until_idle only).
     last_wake_seq       INTEGER NOT NULL DEFAULT 0 CHECK (last_wake_seq >= 0),
+    -- Earliest unattempted relevant post in this online session (direct_now only).
+    direct_wake_seq     INTEGER NOT NULL DEFAULT 0 CHECK (direct_wake_seq >= 0),
     -- Last queued or recovery wake that exhausted its transient delivery attempts.
     retry_exhausted_seq INTEGER NOT NULL DEFAULT 0 CHECK (retry_exhausted_seq >= 0),
     -- The head at explicit resume, extended by relevant direct wakes deferred into recovery.
@@ -182,6 +184,8 @@ CREATE TABLE thread_members (
     CHECK ((pending_delivery_id IS NULL AND pending_from_seq IS NULL AND pending_to_seq IS NULL)
         OR (pending_delivery_id IS NOT NULL AND pending_from_seq IS NOT NULL AND pending_to_seq IS NOT NULL
             AND pending_from_seq >= 1 AND pending_to_seq >= pending_from_seq)),
+    CHECK (last_wake_seq = 0 OR delivery_mode = 'queue_until_idle'),
+    CHECK (direct_wake_seq = 0 OR delivery_mode = 'direct_now'),
     CHECK (resume_through_seq IS NULL OR (resume_through_seq > confirmed_seq AND delivery_mode = 'direct_now' AND state = 'active')),
     PRIMARY KEY (thread_id, member_key),
     UNIQUE (thread_id, handle)

@@ -1266,3 +1266,81 @@ async fn early_hub_reply_links_at_read_time_and_equal_local_id_is_not_a_party() 
     );
     fixture.stop().await
 }
+
+#[tokio::test]
+async fn reconcile_pending_leaves_delegated_answer_unknown() -> TestResult {
+    use cooplet_protocol::OperationId;
+
+    use crate::operations::Operation;
+
+    let fixture = Fixture::start().await?;
+    let agent = fixture.stopped_agent().await?;
+    let actor_id = fixture.open.operator.participant_id.as_str().to_owned();
+    let q_id = MessageId::generate()?;
+    let ans_op_id = OperationId::generate()?;
+    let ans_msg_id = MessageId::generate()?;
+    let op = Operation {
+        id: ans_op_id.clone(),
+        actor_id: actor_id.clone(),
+        key: "delegated-answer-key".into(),
+        kind: "message.send",
+        hash: "deleg-hash".into(),
+        bridge_origin: Some("hub_x/node_y".into()),
+    };
+    {
+        let op = op.clone();
+        let q = q_id.clone();
+        let ans = ans_msg_id.clone();
+        let to = agent.clone();
+        fixture
+            .open
+            .engine
+            .db()
+            .write_sqlite(move |tx| {
+                tx.execute(
+                    "INSERT INTO messages (message_id, sender_id, recipient_id, body, question_json,
+                                           delivery_mode, delivery_state, created_at_ms, expires_at_ms)
+                     VALUES (?1, ?2, ?3, '', '{}', 'direct_now', 'delivered', ?4, ?5)",
+                    params![q.as_str(), to.as_str(), op.actor_id, NOW, NOW + 10_000],
+                )?;
+                op.reserve(tx, NOW, Some(ans.as_str()))?;
+                tx.execute(
+                    "INSERT INTO messages (message_id, sender_id, recipient_id, in_reply_to, body, answer_json,
+                                           delivery_mode, delivery_state, operation_id, created_at_ms, expires_at_ms)
+                     VALUES (?1, ?2, ?3, ?4, '', '{\"text\":\"yes\"}', 'direct_now', 'accepted', ?5, ?6, ?7)",
+                    params![
+                        ans.as_str(),
+                        op.actor_id,
+                        to.as_str(),
+                        q.as_str(),
+                        op.id.as_str(),
+                        NOW,
+                        NOW + 10_000
+                    ],
+                )?;
+                Ok(WriteOutcome::new(()))
+            })
+            .await?;
+    }
+    let err = fixture
+        .service
+        .reconcile_pending(&op, ans_op_id.as_str(), Some(ans_msg_id.as_str()), true)
+        .await
+        .err()
+        .ok_or("delegated answer reconciliation must return DeliveryUnknown")?;
+    assert_eq!(err.code(), ErrorCode::DeliveryUnknown);
+    let op_state: String = fixture
+        .open
+        .engine
+        .reads()
+        .read(move |conn| {
+            Ok(conn.query_row(
+                "SELECT state FROM operations WHERE operation_id = ?1",
+                [ans_op_id.as_str()],
+                |r| r.get(0),
+            )?)
+        })
+        .await?;
+    assert_eq!(op_state, "unknown");
+    fixture.stop().await
+}

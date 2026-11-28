@@ -869,3 +869,102 @@ async fn init_and_open_reject_empty_state_dir() -> TestResult {
     assert!(open_err.is_err());
     Ok(())
 }
+
+#[test]
+fn gc_thread_queries_use_indexes_without_analyze() -> TestResult {
+    let mut db = Connection::open_in_memory()?;
+    db.execute_batch(MIGRATION_V1.sql)?;
+    let tx = db.transaction()?;
+    tx.execute_batch(
+        "WITH RECURSIVE n(i) AS (VALUES (1) UNION ALL SELECT i + 1 FROM n WHERE i < 500)
+         INSERT INTO threads (thread_id, title, created_by_actor_id, status, head_seq,
+                              created_at_ms, updated_at_ms, closed_at_ms, expires_at_ms)
+         SELECT 'thr_' || i, 'T', 'owner', CASE WHEN i % 2 = 0 THEN 'closed' ELSE 'open' END,
+                1, 0, 0, CASE WHEN i % 2 = 0 THEN 1 ELSE NULL END,
+                CASE WHEN i % 2 = 0 THEN i * 10 ELSE NULL END
+         FROM n;
+         WITH RECURSIVE n(i) AS (VALUES (1) UNION ALL SELECT i + 1 FROM n WHERE i < 500)
+         INSERT INTO thread_posts (thread_id, seq, post_id, author_actor_id, author_kind,
+                                   author_handle, body, created_at_ms, expires_at_ms)
+         SELECT 'thr_' || i, 1, 'msg_' || i, 'owner', 'human', 'owner', 'body', 0, i * 10
+         FROM n;",
+    )?;
+    // Deliberately do NOT run ANALYZE so production planner behavior is verified.
+    let expired_post_thread = explain(&tx, gc::EXPIRED_POST_THREAD, params![1000])?;
+    assert!(
+        expired_post_thread.contains("idx_thread_posts_expires"),
+        "{expired_post_thread}"
+    );
+    assert!(
+        !expired_post_thread.contains("USE TEMP B-TREE"),
+        "{expired_post_thread}"
+    );
+
+    let expired_post_prefix = explain(&tx, gc::EXPIRED_POST_PREFIX, params!["thr_1", 1000, 199])?;
+    assert!(
+        expired_post_prefix.contains("idx_thread_posts_expiry_seq"),
+        "{expired_post_prefix}"
+    );
+    assert!(
+        !expired_post_prefix.contains("USE TEMP B-TREE"),
+        "{expired_post_prefix}"
+    );
+
+    let tombstoned = explain(&tx, gc::TOMBSTONED_CLOSED_THREAD, [])?;
+    assert!(tombstoned.contains("idx_threads_expires"), "{tombstoned}");
+    assert!(!tombstoned.contains("USE TEMP B-TREE"), "{tombstoned}");
+
+    let expired_closed = explain(&tx, gc::EXPIRED_CLOSED_THREAD, params![1000])?;
+    assert!(
+        expired_closed.contains("idx_threads_expires"),
+        "{expired_closed}"
+    );
+    assert!(
+        !expired_closed.contains("USE TEMP B-TREE"),
+        "{expired_closed}"
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn prune_messages_detaches_hub_native_non_answer_reply_without_check_violation() -> TestResult
+{
+    let scratch = Scratch::new()?;
+    init(&scratch.0, "Hub-native GC").await?;
+    let hub = open_default(&scratch.0).await?;
+    hub.engine
+        .db()
+        .write_sqlite(|tx| {
+            tx.execute_batch(
+                "INSERT INTO hub_messages (message_id, sender_actor_id, sender_node_id, target_node_id,
+                                           target_participant_id, required_node_ids_json, body,
+                                           delivery_mode, delivery_state, created_at_ms, expires_at_ms)
+                 VALUES ('msg_00000000000000000000000001', 'usr_admin', NULL, NULL,
+                         'part_recipient', '[]', 'parent', 'direct_now', 'delivered', 0, 100);
+                 INSERT INTO hub_messages (message_id, sender_actor_id, sender_node_id, target_node_id,
+                                           target_participant_id, required_node_ids_json, in_reply_to, body,
+                                           delivery_mode, delivery_state, created_at_ms, expires_at_ms)
+                 VALUES ('msg_00000000000000000000000002', 'usr_admin', NULL, NULL,
+                         'part_recipient', '[]', 'msg_00000000000000000000000001', 'reply',
+                         'direct_now', 'delivered', 50, 1000);",
+            )?;
+            Ok(WriteOutcome::new(()))
+        })
+        .await?;
+
+    hub.engine.gc_once(200).await?;
+    let remaining: (u64, Option<String>) = hub
+        .engine
+        .reads()
+        .read(|db| {
+            Ok(db.query_row(
+                "SELECT COUNT(*), MAX(in_reply_to) FROM hub_messages",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )?)
+        })
+        .await?;
+    assert_eq!(remaining, (1, None));
+    hub.engine.shutdown().await?;
+    Ok(())
+}

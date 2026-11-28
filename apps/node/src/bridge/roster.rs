@@ -5,10 +5,10 @@ use std::{
 
 use cooplet_protocol::{
     BridgeFrame, BridgePayload, CommandOutcome, CommandResPayload, ErrorCode, HelloAckPayload,
-    MAX_ROSTER_BYTES, MAX_ROSTER_CATALOG_BYTES, MAX_ROSTER_FENCE_BYTES, MAX_ROSTER_FRAMES,
-    MAX_ROSTER_PARTICIPANT_BYTES, MAX_ROSTER_TEMPLATE_BYTES, MAX_ROSTER_TEMPLATES,
-    MAX_WS_FRAME_BYTES, ParticipantId, ParticipantKind, ParticipantState, ParticipantWire,
-    RosterSyncPayload, TemplateSummary, ThreadFenceReport, validate_actor_handle,
+    MAX_ROSTER_BYTES, MAX_ROSTER_CATALOG_BYTES, MAX_ROSTER_FENCE_BYTES, MAX_ROSTER_FENCES,
+    MAX_ROSTER_FRAMES, MAX_ROSTER_PARTICIPANT_BYTES, MAX_ROSTER_TEMPLATE_BYTES,
+    MAX_ROSTER_TEMPLATES, MAX_WS_FRAME_BYTES, ParticipantId, ParticipantKind, ParticipantState,
+    ParticipantWire, RosterSyncPayload, TemplateSummary, ThreadFenceReport, validate_actor_handle,
     validate_display_name,
 };
 use cooplet_storage::ReadPool;
@@ -83,7 +83,14 @@ fn build_snapshot(
     for template in templates {
         builder.push(RequiredEntry::Template(template))?;
     }
-    execution::visit_fences(&tx, |fence| builder.push(RequiredEntry::Fence(fence)))?;
+    let mut fences = 0usize;
+    execution::visit_fences(&tx, |fence| {
+        if fences >= MAX_ROSTER_FENCES {
+            return Err(roster_limit());
+        }
+        fences += 1;
+        builder.push(RequiredEntry::Fence(fence))
+    })?;
     for receipt in receipts(&tx)? {
         builder.receipt(receipt)?;
     }

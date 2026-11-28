@@ -5,7 +5,7 @@ use axum::{
     response::{IntoResponse, Response},
 };
 use bytes::Bytes;
-use cooplet_protocol::EventStreamFrame;
+use cooplet_protocol::{EventKind, EventStreamFrame};
 use cooplet_storage::DbActor;
 use futures_util::stream;
 use http::header;
@@ -57,6 +57,19 @@ impl EventWake {
     }
 }
 
+fn is_thread_event_kind(kind: EventKind) -> bool {
+    matches!(
+        kind,
+        EventKind::ThreadCreated
+            | EventKind::ThreadPostCreated
+            | EventKind::ThreadPinUpdated
+            | EventKind::ThreadMemberUpdated
+            | EventKind::ThreadClosed
+            | EventKind::QuestionAnswered
+            | EventKind::BlobDeleted
+    )
+}
+
 pub(super) async fn response(
     reader: Arc<Reader>,
     after: u64,
@@ -71,6 +84,8 @@ pub(super) async fn response(
     };
     wake.borrow_and_update();
     thread_acl.borrow_and_update();
+    let watch_thread_acl = !reader.caller.is_global_reader()
+        && (reader.kinds.is_empty() || reader.kinds.iter().copied().any(is_thread_event_kind));
     let initial = tokio::select! {
         biased;
         _ = shutdown.changed() => return Err(HubError::new(
@@ -96,6 +111,7 @@ pub(super) async fn response(
         wake,
         revocations,
         thread_acl,
+        watch_thread_acl,
         shutdown,
         budget,
         pending: initial.frames.into(),
@@ -123,6 +139,7 @@ struct EventStream {
     wake: watch::Receiver<Watermark>,
     revocations: watch::Receiver<u64>,
     thread_acl: watch::Receiver<u64>,
+    watch_thread_acl: bool,
     shutdown: watch::Receiver<()>,
     budget: Budget,
     pending: VecDeque<BufferedFrame>,
@@ -144,7 +161,9 @@ impl EventStream {
 
             let now = Instant::now();
             let expiry = self.expiry_wait()?;
-            if self.revocations.has_changed().ok()? || self.thread_acl.has_changed().ok()? {
+            if self.revocations.has_changed().ok()?
+                || (self.watch_thread_acl && self.thread_acl.has_changed().ok()?)
+            {
                 self.discard_and_rescan().await?;
                 // Check for a second authorization change during the snapshot.
                 continue;
@@ -189,23 +208,13 @@ impl EventStream {
                 self.ping_at = now + PING_INTERVAL;
                 return Some(Bytes::from_static(PING_FRAME));
             }
-            if let Some((_, Some(expiry), _)) = self.pending.front() {
-                // GC can clear a closed board during a forward clock step. A clock
-                // rollback cannot restore access to a frame fetched before that commit.
-                let retained = (self.reader.clock)() < expiry.at_ms
-                    && tokio::select! {
-                        biased;
-                        _ = self.shutdown.changed() => return None,
-                        retained = self.reader.closed_thread_retained(&expiry.thread_id) => retained.ok()?,
-                    };
-                if self.revocations.has_changed().ok()? || self.thread_acl.has_changed().ok()? {
-                    continue;
-                }
-                self.expiry_wait()?;
-                if !retained || (self.reader.clock)() >= expiry.at_ms {
-                    self.discard_and_rescan().await?;
-                    continue;
-                }
+            // GC tombstoning bumps `thread_acl` post-commit (handled above even across clock rollbacks),
+            // so buffered closed-thread frames only need a cheap wall-clock expiry check here.
+            if let Some((_, Some(expiry_at_ms), _)) = self.pending.front()
+                && (self.reader.clock)() >= *expiry_at_ms
+            {
+                self.discard_and_rescan().await?;
+                continue;
             }
             if let Some((seq, _, frame)) = self.pending.pop_front() {
                 self.confirmed_cursor = if self.pending.is_empty() {
@@ -228,7 +237,7 @@ impl EventStream {
                     change.ok()?;
                     self.recheck_at = Instant::now();
                 }
-                change = self.thread_acl.changed() => {
+                change = self.thread_acl.changed(), if self.watch_thread_acl => {
                     change.ok()?;
                     // There are no buffered frames in this branch.
                     self.needs_scan = true;

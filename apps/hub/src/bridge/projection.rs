@@ -1,4 +1,4 @@
-use std::io;
+use std::{collections::HashSet, io};
 
 use cooplet_protocol::{
     AggregateType, ApprovalWaitKind, ErrorCode, EventKind, HubId, NodeEventPayload, NodeId,
@@ -19,6 +19,7 @@ use crate::{
 use super::registry::{CloseReason, SessionKey};
 
 pub(super) const MAX_PARTICIPANTS: usize = 4096;
+const MAX_PROJECTION_BATCH: usize = 64;
 
 #[derive(Default, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
@@ -195,41 +196,65 @@ pub(super) async fn worker(
     mut close: watch::Receiver<Option<CloseReason>>,
 ) -> Result<(), HubError> {
     loop {
+        if close.borrow().is_some() {
+            return Ok(());
+        }
         let next = tokio::select! {
             biased;
             _ = close.changed() => return Ok(()),
             next = incoming.recv() => next,
         };
-        let Some((seq, event)) = next else {
+        let Some(first) = next else {
             return Ok(());
         };
+        let mut batch = Vec::with_capacity(MAX_PROJECTION_BATCH);
+        batch.push(first);
+        while batch.len() < MAX_PROJECTION_BATCH {
+            match incoming.try_recv() {
+                Ok(item) => batch.push(item),
+                Err(_) => break,
+            }
+        }
+        let last_seq = batch.last().map_or(0, |(seq, _)| *seq);
+        let events: Vec<NodeEventPayload> = batch.into_iter().map(|(_, event)| event).collect();
         let key = key.clone();
         let hub_id = state.meta.hub_id.clone();
         let cancelled = close.clone();
         let wake_node = key.node_id.clone();
         let wall_clock = state.wall_clock.clone();
-        let idle = state
-            .db
-            .write(move |tx| {
-                require_session(tx, &key)?;
-                let now = wall_clock();
-                let (idle, event) = apply_event(tx, &hub_id, &key, now, event)?;
-                if let Some(participant) = &idle {
-                    crate::threads::participant_idle(tx, &key.node_id, participant)?;
+        let write = state.db.write_wait(move |tx| {
+            require_session(tx, &key)?;
+            let now = wall_clock();
+            let mut idle_participants = HashSet::new();
+            let mut notices = Vec::new();
+            for event in events {
+                let (idle, applied_notices) = apply_event(tx, &hub_id, &key, now, event)?;
+                if let Some(participant) = idle {
+                    idle_participants.insert(participant);
                 }
-                if cancelled.borrow().is_some() {
-                    return Err(
-                        HubError::new(ErrorCode::BridgeUnavailable, "The bridge closed.").into(),
-                    );
-                }
-                Ok::<_, WriteError<HubError>>(WriteOutcome::with_events(
-                    idle,
-                    event.into_iter().collect(),
-                ))
-            })
-            .await?;
-        applied.send_replace(seq);
-        if idle.is_some() {
+                notices.extend(applied_notices);
+            }
+            for participant in &idle_participants {
+                crate::threads::participant_idle(tx, &key.node_id, participant)?;
+            }
+            if cancelled.borrow().is_some() {
+                return Err(
+                    HubError::new(ErrorCode::BridgeUnavailable, "The bridge closed.").into(),
+                );
+            }
+            Ok::<_, WriteError<HubError>>(WriteOutcome::with_events(
+                idle_participants.into_iter().collect::<Vec<_>>(),
+                notices,
+            ))
+        });
+        let idle_participants = tokio::select! {
+            biased;
+            _ = close.changed() => return Ok(()),
+            result = write => result?,
+        };
+        applied.send_replace(last_seq);
+        if !idle_participants.is_empty() {
+            crate::threads::on_participants_idle(&state, &wake_node, &idle_participants);
             crate::threads::wake(&state, &wake_node);
         }
     }
@@ -270,8 +295,8 @@ fn apply_event(
     key: &SessionKey,
     now: i64,
     event: NodeEventPayload,
-) -> Result<(Option<ParticipantId>, Option<EventNotice>), HubError> {
-    let (kind, aggregate_type, aggregate_id, data, idle) = match event {
+) -> Result<(Option<ParticipantId>, Vec<EventNotice>), HubError> {
+    let (kinds, aggregate_type, aggregate_id, data, idle) = match event {
         NodeEventPayload::ParticipantDeclared { participant } => {
             let previous = previous_participant(tx, key, &participant.participant_id)?;
             if previous.is_none() {
@@ -288,24 +313,31 @@ fn apply_event(
             }
             upsert_participant(tx, key, &participant, now)?;
             let approval = ApprovalView::from_participant(&participant);
-            let change_kind = if let Some(previous) = previous {
+            let change_kinds = if let Some(previous) = previous {
                 changed_state(
                     &previous,
                     participant.state,
                     &approval.encode(participant.state)?,
                 )
+                .into_iter()
+                .collect::<Vec<_>>()
+            } else if participant.state == ParticipantState::AwaitingApproval {
+                vec![
+                    EventKind::ParticipantCreated,
+                    EventKind::ParticipantAwaitingApproval,
+                ]
             } else {
-                Some(EventKind::ParticipantCreated)
+                vec![EventKind::ParticipantCreated]
             };
-            let Some(kind) = change_kind else {
+            if change_kinds.is_empty() {
                 let idle = (participant.state == ParticipantState::Idle)
                     .then_some(participant.participant_id);
-                return Ok((idle, None));
-            };
+                return Ok((idle, Vec::new()));
+            }
             let mut data = serde_json::to_value(&participant)?;
             data["intake_state"] = json!(participant.state.intake_state());
             (
-                kind,
+                change_kinds,
                 AggregateType::Participant,
                 participant.participant_id.to_string(),
                 data,
@@ -335,7 +367,7 @@ fn apply_event(
             let Some(kind) = changed_state(&previous, state, &encoded) else {
                 return Ok((
                     (state == ParticipantState::Idle).then_some(participant_id),
-                    None,
+                    Vec::new(),
                 ));
             };
             tx.execute(
@@ -356,7 +388,7 @@ fn apply_event(
             data["state"] = json!(state);
             data["intake_state"] = json!(state.intake_state());
             (
-                kind,
+                vec![kind],
                 AggregateType::Participant,
                 participant_id.to_string(),
                 data,
@@ -387,7 +419,7 @@ fn apply_event(
                 })?
                 .remove("type");
             (
-                kind,
+                vec![kind],
                 AggregateType::WorkflowRun,
                 run_id.to_string(),
                 data,
@@ -397,9 +429,9 @@ fn apply_event(
     };
     let mut data = data;
     data["node_id"] = json!(key.node_id);
-    Ok((
-        idle,
-        Some(append(
+    let mut notices = Vec::with_capacity(kinds.len());
+    for kind in kinds {
+        notices.push(append(
             tx,
             hub_id,
             NewEvent {
@@ -408,11 +440,12 @@ fn apply_event(
                 aggregate_id: &aggregate_id,
                 actor_id: None,
                 created_at_ms: now,
-                data,
+                data: data.clone(),
                 audience: node_audience(&key.node_id),
             },
-        )?),
-    ))
+        )?);
+    }
+    Ok((idle, notices))
 }
 
 fn changed_state(

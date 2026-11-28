@@ -92,7 +92,7 @@ fn queue_coalesces_once_idle_and_cannot_accept_an_old_generation_ack() -> TestRe
         (1, 5, 5)
     );
     assert!(attempt()?.is_none());
-    let delivery = Delivery::from_payload(&node, 5, &payload);
+    let delivery = Delivery::from_payload(&node, 5, &payload, true);
     assert!(
         !finish(
             &tx,
@@ -352,6 +352,7 @@ impl Fixture {
             &storage.engine,
             storage.meta,
             storage.master,
+            storage.thread_acl_watch,
             bridge.clone(),
             signal,
             DEFAULT_MAX_BLOB_BYTES,
@@ -532,6 +533,7 @@ impl Fixture {
             })
             .await?;
         if state == ParticipantState::Idle {
+            on_participants_idle(&self.state, &self.node, std::slice::from_ref(&self.worker));
             wake(&self.state, &self.node);
         }
         Ok(())
@@ -1300,7 +1302,7 @@ async fn retry_clocks_and_limits_belong_to_the_delivery_address() -> TestResult 
         member_id: ParticipantId::generate()?,
         thread_id: thread,
     };
-    let mut sweep = Sweep::new();
+    let mut sweep = Sweep::new(INITIAL_RETRY);
     let attempt = |number| RetryAttempt {
         epoch: TEST_EPOCH,
         generation: 2,
@@ -1326,7 +1328,7 @@ async fn retry_clocks_and_limits_belong_to_the_delivery_address() -> TestResult 
             break;
         }
 
-        let due = Instant::now() + retry_delay(number);
+        let due = Instant::now() + retry_delay(INITIAL_RETRY, number);
         assert_eq!(sweep.deadline(), Some(due));
         assert_eq!(
             retry_number(&sweep.retries, &beta, TEST_EPOCH, 2, 3),
@@ -1341,7 +1343,7 @@ async fn retry_clocks_and_limits_belong_to_the_delivery_address() -> TestResult 
             retry_number(&sweep.retries, &alpha, TEST_EPOCH + 1, 2, 3),
             Some(0)
         );
-        tokio::time::advance(retry_delay(number) - Duration::from_millis(1)).await;
+        tokio::time::advance(retry_delay(INITIAL_RETRY, number) - Duration::from_millis(1)).await;
         sweep.release_due(Instant::now());
         assert_eq!(retry_number(&sweep.retries, &alpha, TEST_EPOCH, 2, 3), None);
         tokio::time::advance(Duration::from_millis(1)).await;
@@ -1387,6 +1389,7 @@ async fn peer_ack_cannot_shorten_a_live_queue_backoff() -> TestResult {
 #[tokio::test]
 async fn exhausted_member_stays_quiet_across_workers_until_its_own_idle() -> TestResult {
     let mut fixture = Fixture::new(true).await?;
+    fixture.state.thread_dispatch = Dispatch::with_initial_retry(Duration::from_millis(5));
     let thread = fixture.board(DeliveryMode::QueueUntilIdle).await?;
     let peer = fixture
         .add_peer(&thread, DeliveryMode::QueueUntilIdle)
@@ -1423,5 +1426,175 @@ async fn exhausted_member_stays_quiet_across_workers_until_its_own_idle() -> Tes
     assert_eq!((fresh.payload.from_seq, fresh.payload.to_seq), (1, 2));
     fresh.complete(ThreadDeliveryOutcome::Delivered)?;
     fixture.settle().await?;
+    fixture.close().await
+}
+
+#[tokio::test]
+async fn concurrent_idle_prevents_stale_exhaustion_and_resets_retry_backoff() -> TestResult {
+    let mut fixture = Fixture::new(true).await?;
+    // Long initial retry proves the concurrent Idle cleared in-memory backoff instead of sleeping.
+    fixture.state.thread_dispatch = Dispatch::with_initial_retry(Duration::from_secs(30));
+    let thread = fixture.board(DeliveryMode::QueueUntilIdle).await?;
+    fixture.set_worker(ParticipantState::Idle).await?;
+    fixture.settle().await?;
+    fixture.post(&thread, "race-idle", "@worker review").await?;
+
+    let first = fixture.attempt().await?;
+    // A fresh Idle arrives while the attempt is in flight, clearing idle_delivery_id.
+    fixture.set_worker(ParticipantState::Idle).await?;
+    // Even if this attempt finishes Unavailable (or as the final exhausted attempt),
+    // finish must not set retry_exhausted_seq or sleep 30s.
+    first.complete(ThreadDeliveryOutcome::Unavailable)?;
+    let second = tokio::time::timeout(Duration::from_secs(2), fixture.attempts.recv())
+        .await?
+        .ok_or("expected immediate retry after concurrent Idle")?;
+    assert_eq!((second.payload.from_seq, second.payload.to_seq), (1, 1));
+    second.complete(ThreadDeliveryOutcome::Delivered)?;
+    fixture.settle().await?;
+    fixture.close().await
+}
+
+#[tokio::test]
+async fn stage_clears_expired_wake_wait_policy_resets_exhaustion_and_finish_avoids_event_spam()
+-> TestResult {
+    use cooplet_protocol::{ThreadWaitPolicy, ThreadWaitRequest};
+
+    let mut fixture = Fixture::new(true).await?;
+    fixture.state.thread_dispatch = Dispatch::with_initial_retry(Duration::from_millis(2));
+    let thread = fixture.board(DeliveryMode::QueueUntilIdle).await?;
+    fixture.set_worker(ParticipantState::Idle).await?;
+    fixture.settle().await?;
+    let posted = fixture
+        .post(&thread, "exhaust-and-wait", "@worker check")
+        .await?;
+
+    let count_member_events = |state: &AppState, thread_id: ThreadId| {
+        let reads = state.reads.clone();
+        async move {
+            reads
+                .read(move |db| {
+                    Ok(db.query_row(
+                        "SELECT COUNT(*) FROM events WHERE kind = ?1 AND aggregate_id = ?2",
+                        params![EventKind::ThreadMemberUpdated.as_str(), thread_id.as_str()],
+                        |row| row.get::<_, u64>(0),
+                    )?)
+                })
+                .await
+        }
+    };
+
+    let before = count_member_events(&fixture.state, thread.clone()).await?;
+    for _ in 0..=RETRIES {
+        let wire = fixture.attempt().await?;
+        wire.complete(ThreadDeliveryOutcome::Unavailable)?;
+    }
+    fixture.settle().await?;
+    // Unavailable outcomes never emit ThreadMemberUpdated (IMPL-56).
+    assert_eq!(
+        count_member_events(&fixture.state, thread.clone()).await?,
+        before
+    );
+
+    // Policy change via wait clears retry_exhausted_seq (IMPL-53(4)) and resumes delivery.
+    let node = fixture.node.clone();
+    let worker = fixture.worker.clone();
+    let actor = storage::sql::read_tx(&fixture.state.reads, move |db| {
+        auth::attest_node_participant(db, &node, &worker, Some((1, TEST_EPOCH)))
+    })
+    .await?;
+    let _ = threads::wait(
+        &fixture.state,
+        &actor,
+        thread.clone(),
+        ThreadWaitRequest {
+            since_seq: 0,
+            wake_policy: Some(ThreadWaitPolicy::All),
+        },
+    )
+    .await?;
+    let retried = fixture.attempt().await?;
+    retried.complete(ThreadDeliveryOutcome::Busy)?;
+    fixture.settle().await?;
+    // Only the policy change emitted 1 event; Busy emitted 0.
+    assert_eq!(
+        count_member_events(&fixture.state, thread.clone()).await?,
+        before + 1
+    );
+
+    // Logically expired last_wake_seq is cleared to 0 during stage() (IMPL-53(3)).
+    fixture.wall.store(
+        posted.created_at_ms + threads::RETENTION_MS + 1,
+        Ordering::Relaxed,
+    );
+    fixture.set_worker(ParticipantState::Idle).await?;
+    fixture.settle().await?;
+    let wake_after_expiry: u64 = fixture
+        .state
+        .reads
+        .read({
+            let t = thread.clone();
+            let k = fixture.member_key();
+            move |db| {
+                Ok(db.query_row(
+                    "SELECT last_wake_seq FROM thread_members WHERE thread_id=?1 AND member_key=?2",
+                    params![t.as_str(), k],
+                    |row| row.get(0),
+                )?)
+            }
+        })
+        .await?;
+    assert_eq!(wake_after_expiry, 0);
+
+    // reconcile_fences ignores state = 'left' (never resurrects a departed member).
+    let left = threads::leave(
+        &fixture.state,
+        &fixture.admin,
+        thread.clone(),
+        "leave-before-fence",
+        cooplet_protocol::ThreadMemberLeaveRequest {
+            member_key: Some(fixture.member_key()),
+        },
+    )
+    .await?;
+    assert_eq!(left.state, cooplet_protocol::ThreadMemberState::Left);
+    let hub_id = fixture.state.meta.hub_id.clone();
+    let node = fixture.node.clone();
+    let t = thread.clone();
+    let w = fixture.worker.clone();
+    fixture
+        .state
+        .db
+        .write_sqlite(move |tx| {
+            reconcile_fences(
+                tx,
+                &hub_id,
+                &node,
+                &[ThreadFenceReport {
+                    thread_id: t,
+                    participant_id: w,
+                    delivery_generation: 0,
+                    highest_dispatched_seq: 1,
+                    last_delivery_id: None,
+                    last_from_seq: None,
+                }],
+                TEST_NOW,
+                &mut Vec::new(),
+            )?;
+            Ok(WriteOutcome::new(()))
+        })
+        .await?;
+    let member_after = fixture
+        .state
+        .reads
+        .read({
+            let k = fixture.member_key();
+            move |db| Ok(members::member(db, &thread, &k)?)
+        })
+        .await?
+        .ok_or("member row missing")?;
+    assert_eq!(
+        member_after.state,
+        cooplet_protocol::ThreadMemberState::Left
+    );
     fixture.close().await
 }

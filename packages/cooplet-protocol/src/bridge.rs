@@ -30,6 +30,7 @@ pub const MAX_ROSTER_WORKFLOW_BYTES: usize = 4 * 1024;
 pub const MAX_ROSTER_FENCE_BYTES: usize = 1024;
 pub const MAX_ROSTER_TEMPLATES: usize = 256;
 pub const MAX_ROSTER_WORKFLOWS: usize = 256;
+pub const MAX_ROSTER_FENCES: usize = 4096;
 pub const MAX_ROSTER_CATALOG_BYTES: usize = 1024 * 1024;
 pub const MAX_THREAD_DELIVERY_POSTS: usize = 20;
 
@@ -608,6 +609,9 @@ impl BridgePayload for RosterSyncPayload {
             || self.workflows.len() > MAX_ROSTER_WORKFLOWS
         {
             return Err(ValidationError("roster catalog count"));
+        }
+        if self.unresolved_thread_fences.len() > MAX_ROSTER_FENCES {
+            return Err(ValidationError("roster fence count"));
         }
         for participant in &self.participants {
             participant.validate()?;

@@ -566,7 +566,7 @@ async fn participant_by_name(
 }
 
 async fn approval(dir: &Path, args: ApprovalArgs, action: ApprovalAction) -> CliResult {
-    let client = operator(dir).await?;
+    let client = operator_for_delegation(dir).await?;
     let operation_key = operation_key_or_generate(args.operation_key)?;
     let (participant_id, approval_id) = if let Some(approval_id) = args.approval_id {
         (args.name.parse::<ParticipantId>()?, approval_id)

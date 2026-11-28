@@ -12,7 +12,7 @@ use cooplet_protocol::{
     HubId, ServiceScope, SourceKind, ThreadId,
 };
 use cooplet_storage::ReadPool;
-use rusqlite::{Connection, OptionalExtension, Row, params};
+use rusqlite::{Connection, Row, ToSql, params};
 use serde::{Deserialize, de::IgnoredAny};
 use tokio::sync::watch;
 use utoipa::IntoParams;
@@ -41,12 +41,29 @@ const SELECT_SINGLE_KIND_EVENTS: &str = "
     SELECT seq, event_id, kind, aggregate_type, aggregate_id, actor_id,
            payload_json, created_at_ms
       FROM events WHERE kind = ?1 AND seq > ?2 AND seq <= ?3 ORDER BY seq LIMIT ?4";
-const SELECT_KIND_SEQS: &str = "
-    SELECT seq FROM events WHERE kind = ?1 AND seq > ?2 AND seq <= ?3 ORDER BY seq LIMIT ?4";
-const SELECT_EVENT_BY_SEQ: &str = "
-    SELECT seq, event_id, kind, aggregate_type, aggregate_id, actor_id,
-           payload_json, created_at_ms
-      FROM events WHERE seq = ?1";
+
+fn multi_kind_query_sql(kind_count: usize) -> String {
+    // Merge distinct per-kind index scans (`idx_hub_events_kind_seq`) directly
+    // in sequence order with zero temporary B-trees or point lookups.
+    let mut sql = String::new();
+    for index in 0..kind_count {
+        if index > 0 {
+            sql.push_str(" UNION ALL ");
+        }
+        let param = index + 3;
+        use std::fmt::Write as _;
+        let _ = write!(
+            sql,
+            "SELECT seq, event_id, kind, aggregate_type, aggregate_id, actor_id, \
+             payload_json, created_at_ms \
+             FROM events WHERE kind = ?{param} AND seq > ?1 AND seq <= ?2"
+        );
+    }
+    let limit_param = kind_count + 3;
+    use std::fmt::Write as _;
+    let _ = write!(sql, " ORDER BY seq LIMIT ?{limit_param}");
+    sql
+}
 
 #[derive(Deserialize, IntoParams)]
 #[serde(deny_unknown_fields)]
@@ -189,23 +206,6 @@ impl Reader {
         )
         .await
     }
-
-    async fn closed_thread_retained(&self, thread_id: &ThreadId) -> Result<bool, HubError> {
-        let thread_id = thread_id.clone();
-        let clock = self.clock.clone();
-        self.reads
-            .read(move |db| {
-                let mut statement = db.prepare_cached(
-                    "SELECT EXISTS(
-                       SELECT 1 FROM threads
-                       WHERE thread_id=?1 AND status='closed' AND expires_at_ms!=0 AND expires_at_ms>?2
-                     )",
-                )?;
-                Ok(statement.query_row(params![thread_id.as_str(), clock()], |row| row.get(0))?)
-            })
-            .await
-            .map_err(HubError::from)
-    }
 }
 
 #[derive(Clone, Copy)]
@@ -288,12 +288,7 @@ struct StreamBatch {
     has_more: bool,
 }
 
-struct ClosedThreadExpiry {
-    thread_id: ThreadId,
-    at_ms: i64,
-}
-
-type BufferedFrame = (u64, Option<ClosedThreadExpiry>, Bytes);
+type BufferedFrame = (u64, Option<i64>, Bytes);
 
 enum StreamSnapshot {
     Batch(StreamBatch),
@@ -389,7 +384,7 @@ fn read_stream_snapshot(
     }))
 }
 
-type Projected = (EventEnvelope, Option<ClosedThreadExpiry>);
+type Projected = (EventEnvelope, Option<i64>);
 
 struct Projection<'a> {
     db: &'a Connection,
@@ -403,7 +398,7 @@ impl Projection<'_> {
     fn audience_expiry(
         &mut self,
         audience: &EventAudience,
-    ) -> Result<Option<Option<ClosedThreadExpiry>>, HubError> {
+    ) -> Result<Option<Option<i64>>, HubError> {
         let caller = &self.reader.caller;
         let visible = match audience {
             EventAudience::OwnerOnly { actor_id } => {
@@ -422,12 +417,7 @@ impl Projection<'_> {
                     self.thread_expiries.insert(thread_id.clone(), expiry);
                     expiry
                 };
-                return Ok(expiry.map(|at_ms| {
-                    (at_ms != i64::MAX).then(|| ClosedThreadExpiry {
-                        thread_id: thread_id.clone(),
-                        at_ms,
-                    })
-                }));
+                return Ok(expiry.map(|at_ms| (at_ms != i64::MAX).then_some(at_ms)));
             }
             EventAudience::GlobalArchiveOnly => caller.is_global_reader(),
         };
@@ -442,7 +432,7 @@ fn scan_events(
     head: u64,
     row_limit: usize,
     now: i64,
-    accept: impl FnMut(EventEnvelope, Option<ClosedThreadExpiry>) -> Result<bool, HubError>,
+    accept: impl FnMut(EventEnvelope, Option<i64>) -> Result<bool, HubError>,
 ) -> Result<(u64, bool), HubError> {
     let mut projection = Projection {
         db,
@@ -461,7 +451,19 @@ fn scan_events(
         return scan_rows(&mut rows, &mut projection, start, head, row_limit, accept);
     }
     if (2..=MAX_INDEXED_KINDS).contains(&reader.kinds.len()) {
-        return scan_multi_kind(&mut projection, start, head, row_limit, accept);
+        let sql = multi_kind_query_sql(reader.kinds.len());
+        let mut statement = db.prepare_cached(&sql)?;
+        let fetch_limit = row_limit + 1;
+        let kind_strs: Vec<&'static str> = reader.kinds.iter().map(|kind| kind.as_str()).collect();
+        let mut bindings: Vec<&dyn ToSql> = Vec::with_capacity(kind_strs.len() + 3);
+        bindings.push(&start);
+        bindings.push(&head);
+        for kind in &kind_strs {
+            bindings.push(kind);
+        }
+        bindings.push(&fetch_limit);
+        let mut rows = statement.query(bindings.as_slice())?;
+        return scan_rows(&mut rows, &mut projection, start, head, row_limit, accept);
     }
     let mut statement = db.prepare_cached(SELECT_ALL_EVENTS)?;
     let mut rows = statement.query(params![start, head, row_limit + 1])?;
@@ -474,7 +476,7 @@ fn scan_rows(
     start: u64,
     head: u64,
     row_limit: usize,
-    mut accept: impl FnMut(EventEnvelope, Option<ClosedThreadExpiry>) -> Result<bool, HubError>,
+    mut accept: impl FnMut(EventEnvelope, Option<i64>) -> Result<bool, HubError>,
 ) -> Result<(u64, bool), HubError> {
     let mut next_seq = start;
     for _ in 0..row_limit {
@@ -495,46 +497,6 @@ fn scan_rows(
         next_seq = head;
     }
     Ok((next_seq, has_more))
-}
-
-fn scan_multi_kind(
-    projection: &mut Projection<'_>,
-    start: u64,
-    head: u64,
-    row_limit: usize,
-    mut accept: impl FnMut(EventEnvelope, Option<ClosedThreadExpiry>) -> Result<bool, HubError>,
-) -> Result<(u64, bool), HubError> {
-    let db = projection.db;
-    let mut candidates = Vec::new();
-    let mut seq_query = db.prepare_cached(SELECT_KIND_SEQS)?;
-    for kind in &projection.reader.kinds {
-        let mut rows = seq_query.query(params![kind.as_str(), start, head, row_limit + 1])?;
-        while let Some(row) = rows.next()? {
-            candidates.push(row.get::<_, u64>(0)?);
-        }
-    }
-    candidates.sort_unstable();
-    let more_candidates = candidates.len() > row_limit;
-    candidates.truncate(row_limit);
-
-    let mut row_query = db.prepare_cached(SELECT_EVENT_BY_SEQ)?;
-    let mut next_seq = start;
-    for seq in candidates {
-        let maybe_event = row_query
-            .query_row([seq], |row| Ok(project(row, projection, seq)))
-            .optional()?
-            .transpose()?;
-        if let Some(Some((event, expiry))) = maybe_event
-            && !accept(event, expiry)?
-        {
-            return Ok((next_seq, true));
-        }
-        next_seq = seq;
-    }
-    if !more_candidates {
-        next_seq = head;
-    }
-    Ok((next_seq, more_candidates))
 }
 
 fn project(

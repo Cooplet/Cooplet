@@ -3,19 +3,23 @@ mod members;
 mod posts;
 mod store;
 
+#[cfg(test)]
+mod tests;
+
 use std::collections::BTreeSet;
 
 use cooplet_protocol::{
-    AuthorKind, ErrorCode, EventKind, NodeRpcOperation, NodeRpcResult, ServiceScope,
-    ThreadCloseRequest, ThreadCreateRequest, ThreadId, ThreadListQuery, ThreadListResponse,
-    ThreadStatus, ThreadSummary,
+    AuthorKind, ErrorCode, EventKind, MAX_THREAD_INITIAL_MEMBERS, NodeId, NodeRpcOperation,
+    NodeRpcResult, ServiceScope, ThreadCloseRequest, ThreadCreateRequest, ThreadId,
+    ThreadListQuery, ThreadListResponse, ThreadStatus, ThreadSummary,
 };
 use rusqlite::params;
 
 use crate::{AppState, auth::AuthenticatedCaller, error::HubError, storage::sql::json_byte_len};
 
 pub(crate) use dispatch::{
-    Dispatch, participant_idle, pause_node_pending, reconcile_fences, recover_pending, wake,
+    Dispatch, on_participants_idle, participant_idle, pause_node_pending, reconcile_fences,
+    recover_pending, wake,
 };
 pub(crate) use members::{join, leave, list_members, resume};
 pub(crate) use posts::{delete_pin, post, read, set_pin, wait};
@@ -51,6 +55,11 @@ pub(crate) async fn create(
         .unwrap_or(0);
     if json_byte_len(&body.title)? + topic_bytes > MAX_TITLE_BYTES {
         return Err(store::too_large("Thread title and topic exceed 8 KiB."));
+    }
+    if body.members.len() > MAX_THREAD_INITIAL_MEMBERS {
+        return Err(HubError::invalid(
+            "A thread can be created with at most 64 initial members.",
+        ));
     }
     let operation = store::Operation::new(key, "thread.create", None, &body)?;
     store::mutate(state, caller, operation, move |ctx, _| {
@@ -100,33 +109,69 @@ pub(crate) async fn list(
         };
         let mut bytes = store::page_budget_bytes(&result)?;
         let global = caller.is_global_reader();
-        let mut statement = db.prepare_cached(if global {
-            "SELECT thread_id FROM threads WHERE thread_id>?1 AND (?2 IS NULL OR status=?2)
-             AND (expires_at_ms IS NULL OR (expires_at_ms!=0 AND expires_at_ms>?3))
-             ORDER BY thread_id"
+        let allowed_json = if !global && caller.source_node_id().is_none() {
+            caller
+                .allowed_nodes()
+                .map(|nodes| {
+                    let ids: Vec<&str> = nodes.iter().map(NodeId::as_str).collect();
+                    serde_json::to_string(&ids)
+                })
+                .transpose()?
         } else {
-            "SELECT m.thread_id FROM thread_members m JOIN threads t USING(thread_id)
-             WHERE m.member_key=?4 AND m.thread_id>?1 AND m.state!='left' AND (?2 IS NULL OR t.status=?2)
-             AND (t.expires_at_ms IS NULL OR (t.expires_at_ms!=0 AND t.expires_at_ms>?3))
-             ORDER BY m.thread_id"
-        })?;
+            None
+        };
         let after = query.after.as_ref().map_or("", ThreadId::as_str);
         let status = query.status.map(ThreadStatus::as_str);
-        let mut rows = if global {
-            statement.query(params![after, status, now])?
+        let fetch_limit = limit + 1;
+        let mut statement = db.prepare_cached(if global {
+            "SELECT thread_id,title,topic,created_by_actor_id,status,head_seq,floor_seq,
+                    created_at_ms,updated_at_ms,closed_at_ms
+             FROM threads
+             WHERE thread_id>?1 AND (?2 IS NULL OR status=?2)
+               AND (expires_at_ms IS NULL OR (expires_at_ms!=0 AND expires_at_ms>?3))
+             ORDER BY thread_id LIMIT ?4"
+        } else if allowed_json.is_some() {
+            "SELECT t.thread_id,t.title,t.topic,t.created_by_actor_id,t.status,t.head_seq,t.floor_seq,
+                    t.created_at_ms,t.updated_at_ms,t.closed_at_ms
+             FROM thread_members m JOIN threads t USING(thread_id)
+             WHERE m.member_key=?4 AND m.thread_id>?1 AND m.state!='left' AND (?2 IS NULL OR t.status=?2)
+               AND (t.expires_at_ms IS NULL OR (t.expires_at_ms!=0 AND t.expires_at_ms>?3))
+               AND NOT EXISTS (
+                   SELECT 1 FROM thread_members tm
+                   WHERE tm.thread_id=t.thread_id AND instr(tm.member_key,'/')>0
+                     AND substr(tm.member_key,1,instr(tm.member_key,'/')-1)
+                         NOT IN (SELECT value FROM json_each(?5))
+               )
+             ORDER BY m.thread_id LIMIT ?6"
         } else {
-            statement.query(params![after, status, now, caller.actor_id()])?
+            "SELECT t.thread_id,t.title,t.topic,t.created_by_actor_id,t.status,t.head_seq,t.floor_seq,
+                    t.created_at_ms,t.updated_at_ms,t.closed_at_ms
+             FROM thread_members m JOIN threads t USING(thread_id)
+             WHERE m.member_key=?4 AND m.thread_id>?1 AND m.state!='left' AND (?2 IS NULL OR t.status=?2)
+               AND (t.expires_at_ms IS NULL OR (t.expires_at_ms!=0 AND t.expires_at_ms>?3))
+             ORDER BY m.thread_id LIMIT ?5"
+        })?;
+        let mut rows = if global {
+            statement.query(params![after, status, now, fetch_limit])?
+        } else if let Some(allowed) = &allowed_json {
+            statement.query(params![
+                after,
+                status,
+                now,
+                caller.actor_id(),
+                allowed,
+                fetch_limit
+            ])?
+        } else {
+            statement.query(params![after, status, now, caller.actor_id(), fetch_limit])?
         };
         while let Some(row) = rows.next()? {
-            let id: ThreadId = crate::storage::sql::parse_col(row, 0)?;
-            if !global && !can_access_thread_scope(db, caller, &id, now)? {
-                continue;
-            }
             if result.items.len() >= limit {
                 result.next_after = result.items.last().map(|item| item.thread_id.clone());
                 break;
             }
-            let board = store::board(db, &id, now)?;
+            let mut board = store::summary_from_row(row)?;
+            board.floor_seq = store::effective_floor(db, &board.thread_id, board.floor_seq, now)?;
             if !store::add_to_page(&mut bytes, &board, result.items.len())? {
                 result.next_after = result.items.last().map(|item| item.thread_id.clone());
                 break;
