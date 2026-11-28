@@ -65,6 +65,16 @@ pub(crate) async fn create(
     }
     let operation = store::Operation::new(key, "thread.create", None, &body)?;
     store::mutate(state, caller, operation, move |ctx, _| {
+        members::validate_optional_handle(body.creator_handle.as_deref())?;
+        let mut keys = BTreeSet::new();
+        for member in &body.members {
+            if !keys.insert(member.member_key.clone()) || member.member_key == ctx.caller.actor_id() {
+                return Err(HubError::invalid(
+                    "A thread member was specified more than once.",
+                ));
+            }
+            members::validate_member_input(ctx.caller, member)?;
+        }
         let thread_id = ThreadId::generate()?;
         let actor_id = ctx.caller.actor_id().to_owned();
         let created = ThreadSummary {
@@ -86,20 +96,15 @@ pub(crate) async fn create(
         )?;
         ctx.event(&thread_id, EventKind::ThreadCreated, &created)?;
         members::add_creator(ctx, &thread_id, body.creator_handle)?;
-        let mut keys = BTreeSet::new();
-        let extra_nodes: Vec<String> = body
+        // Resolve and insert node members before hub-native members so every node
+        // scope in the new thread is visible in `thread_members` before checking
+        // hub-native `allowed_nodes_json`, preventing existence/scope oracles.
+        let (node_members, hub_members): (Vec<_>, Vec<_>) = body
             .members
-            .iter()
-            .filter_map(|member| {
-                let (node, _) = member.member_key.split_once('/')?;
-                Some(node.to_owned())
-            })
-            .collect();
-        for member in body.members {
-            if !keys.insert(member.member_key.clone()) || member.member_key == ctx.caller.actor_id() {
-                return Err(HubError::invalid("A thread member was specified more than once."));
-            }
-            members::add(ctx, &thread_id, 0, member, &extra_nodes)?;
+            .into_iter()
+            .partition(|member| member.member_key.contains('/'));
+        for member in node_members.into_iter().chain(hub_members) {
+            members::add(ctx, &thread_id, 0, member)?;
         }
         Ok((thread_id, created))
     }).await

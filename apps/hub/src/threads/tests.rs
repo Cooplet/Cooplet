@@ -1080,7 +1080,7 @@ async fn hub_native_member_resolve_enforces_allowed_nodes_on_create_and_join() -
     let svc_has_a = make_scoped_service("svc_has_a", vec![node_a.clone()]).await?;
     let agent_key = format!("{node_a}/{agent_a}");
 
-    // Creating a thread with both node_a agent and svc_only_b (allowed_nodes=[node_b]) returns 404.
+    // Creating a thread with svc_only_b listed FIRST before node_a agent still returns 404.
     assert_eq!(
         create(
             &fixture.state,
@@ -1092,15 +1092,15 @@ async fn hub_native_member_resolve_enforces_allowed_nodes_on_create_and_join() -
                 creator_handle: None,
                 members: vec![
                     ThreadMemberJoinRequest {
-                        member_key: agent_key.clone(),
-                        handle: Some("worker_a".into()),
+                        member_key: svc_only_b.actor_id().into(),
+                        handle: Some("bot_b".into()),
                         role: None,
                         wake_policy: None,
                         delivery_mode: None,
                     },
                     ThreadMemberJoinRequest {
-                        member_key: svc_only_b.actor_id().into(),
-                        handle: Some("bot_b".into()),
+                        member_key: agent_key.clone(),
+                        handle: Some("worker_a".into()),
                         role: None,
                         wake_policy: None,
                         delivery_mode: None,
@@ -1116,7 +1116,80 @@ async fn hub_native_member_resolve_enforces_allowed_nodes_on_create_and_join() -
         ErrorCode::NotFound
     );
 
-    // Creating with agent_a succeeds, then joining svc_only_b returns 404 while svc_has_a succeeds.
+    // Pre-validation rejects malformed keys (400) and unauthorized caller nodes (403)
+    // before resolving any hub-native principal (preventing allowed_nodes oracles).
+    assert_eq!(
+        create(
+            &fixture.state,
+            &fixture.admin,
+            "create-malformed-second",
+            ThreadCreateRequest {
+                title: "Malformed second".into(),
+                topic: None,
+                creator_handle: None,
+                members: vec![
+                    ThreadMemberJoinRequest {
+                        member_key: svc_only_b.actor_id().into(),
+                        handle: Some("bot_b".into()),
+                        role: None,
+                        wake_policy: None,
+                        delivery_mode: None,
+                    },
+                    ThreadMemberJoinRequest {
+                        member_key: "invalid/invalid".into(),
+                        handle: Some("bad".into()),
+                        role: None,
+                        wake_policy: None,
+                        delivery_mode: None,
+                    },
+                ],
+            },
+        )
+        .await
+        .err()
+        .ok_or("expected 400 for malformed second member key")?
+        .problem()
+        .code,
+        ErrorCode::InvalidRequest
+    );
+    let fake_node_b_key = format!("{node_b}/{}", ParticipantId::generate()?);
+    assert_eq!(
+        create(
+            &fixture.state,
+            &svc_has_a,
+            "create-unauth-node-oracle",
+            ThreadCreateRequest {
+                title: "Unauth node".into(),
+                topic: None,
+                creator_handle: None,
+                members: vec![
+                    ThreadMemberJoinRequest {
+                        member_key: svc_only_b.actor_id().into(),
+                        handle: Some("bot_b".into()),
+                        role: None,
+                        wake_policy: None,
+                        delivery_mode: None,
+                    },
+                    ThreadMemberJoinRequest {
+                        member_key: fake_node_b_key,
+                        handle: Some("worker_b".into()),
+                        role: None,
+                        wake_policy: None,
+                        delivery_mode: None,
+                    },
+                ],
+            },
+        )
+        .await
+        .err()
+        .ok_or("expected 403 for unauthorized node before resolving hub-native member")?
+        .problem()
+        .code,
+        ErrorCode::Forbidden
+    );
+
+    // Creating with agent_a succeeds, then joining svc_only_b with invalid handle returns 400
+    // (before principal lookup), valid handle returns 404, while svc_has_a succeeds.
     let board = create(
         &fixture.state,
         &fixture.admin,
@@ -1135,6 +1208,27 @@ async fn hub_native_member_resolve_enforces_allowed_nodes_on_create_and_join() -
         },
     )
     .await?;
+    assert_eq!(
+        join(
+            &fixture.state,
+            &fixture.admin,
+            board.thread_id.clone(),
+            "join-invalid-handle-before-lookup",
+            ThreadMemberJoinRequest {
+                member_key: svc_only_b.actor_id().into(),
+                handle: Some("all".into()),
+                role: None,
+                wake_policy: None,
+                delivery_mode: None,
+            },
+        )
+        .await
+        .err()
+        .ok_or("expected 400 for reserved handle before principal lookup")?
+        .problem()
+        .code,
+        ErrorCode::InvalidRequest
+    );
     assert_eq!(
         join(
             &fixture.state,

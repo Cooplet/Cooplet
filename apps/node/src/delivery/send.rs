@@ -281,7 +281,10 @@ impl DeliveryService {
                     | ParticipantState::AwaitingApproval,
             )
         });
-        let live_generation = if forced_denial.is_some() {
+        let live_generation = if matches!(forced_denial, Some(SlotDenial::Unavailable))
+            || (forced_denial.is_some()
+                && attempt.input.delivery_mode == DeliveryMode::QueueUntilIdle)
+        {
             None
         } else {
             live.as_ref().map(|session| session.generation())

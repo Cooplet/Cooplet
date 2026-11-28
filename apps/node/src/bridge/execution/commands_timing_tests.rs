@@ -567,3 +567,140 @@ async fn delegated_approval_persists_its_ack_after_admission_expiry() -> TestRes
     );
     fixture.stop().await
 }
+
+#[tokio::test]
+async fn delegated_direct_dm_with_attachments_preserves_busy_and_awaiting_approval_without_blob_gets()
+-> TestResult {
+    use std::sync::atomic::AtomicUsize;
+
+    use cooplet_protocol::ErrorCode;
+
+    let fixture = Fixture::start().await?;
+    let receiver = fixture.agent().await?;
+    let session = fixture
+        .adapter
+        .session(&receiver, 1)
+        .ok_or("missing mock session")?;
+
+    let contents = b"should not be fetched on preflight denial";
+    let attachment = AttachmentRef {
+        blob_id: BlobId::generate()?,
+        name: "note.txt".into(),
+        mime_type: "text/plain".into(),
+        size_bytes: contents.len() as u64,
+        sha256: format!("{:x}", Sha256::digest(contents)),
+    };
+    let gets = Arc::new(AtomicUsize::new(0));
+    let counter = gets.clone();
+    let app = Router::new().route(
+        "/v1/blobs/{id}",
+        get(move || {
+            let counter = counter.clone();
+            async move {
+                counter.fetch_add(1, Ordering::SeqCst);
+                contents.as_slice()
+            }
+        }),
+    );
+    let listener = TcpListener::bind("127.0.0.1:0").await?;
+    let blob_origin = format!("http://{}", listener.local_addr()?);
+    let server = tokio::spawn(async move { axum::serve(listener, app).await });
+
+    // 1. Move the live agent to `Working` and verify DirectNow + attachment returns
+    // Busy (409 participant_busy) with 0 blob GETs.
+    let mut events = fixture.state.db.subscribe();
+    session
+        .emit(AdapterEventKind::StateChanged(
+            crate::clients::ParticipantRuntimeState::Working,
+        ))
+        .await?;
+    timeout(WAIT, async {
+        while events.recv().await?.kind != EventKind::ParticipantStateChanged {}
+        Ok::<_, tokio::sync::broadcast::error::RecvError>(())
+    })
+    .await??;
+
+    let busy_cmd = fixture.start_command(
+        BridgeCommand::SendMessage {
+            message_id: MessageId::generate()?,
+            sender_kind: AuthorKind::Human,
+            sender_name: "admin".into(),
+            sender_node_id: None,
+            recipient_id: receiver.clone(),
+            in_reply_to: None,
+            body: "direct while working".into(),
+            attachments: vec![attachment.clone()],
+            question: None,
+            answer: None,
+        },
+        SLOW_BUDGET,
+        relay_client(&blob_origin)?,
+    )?;
+    let busy_res = busy_cmd.finish().await?;
+    assert_eq!(busy_res.outcome, CommandOutcome::Busy);
+    assert_eq!(
+        busy_res.error.as_ref().map(|p| p.code),
+        Some(ErrorCode::ParticipantBusy)
+    );
+    assert_eq!(gets.load(Ordering::SeqCst), 0);
+
+    // 2. Move the live agent to `AwaitingApproval` and verify DirectNow + attachment returns
+    // AwaitingApproval (with approval_id metadata) and 0 blob GETs.
+    let mut events = fixture.state.db.subscribe();
+    session
+        .emit(AdapterEventKind::ApprovalRequested(ApprovalWait {
+            approval_id: Some("native-apr-direct".into()),
+            kind: ApprovalWaitKind::Permission,
+            summary: Some("Approve command".into()),
+            can_respond_remotely: true,
+            action_hint: None,
+        }))
+        .await?;
+    timeout(WAIT, async {
+        while events.recv().await?.kind != EventKind::ParticipantAwaitingApproval {}
+        Ok::<_, tokio::sync::broadcast::error::RecvError>(())
+    })
+    .await??;
+    let agent = receiver.clone();
+    let public_approval_id: String = fixture
+        .state
+        .reads
+        .read(move |db| {
+            Ok(db.query_row(
+                "SELECT json_extract(adapter_binding_json, '$.core.pending_approval.public_id')
+                 FROM participants WHERE participant_id = ?1",
+                [agent.as_str()],
+                |row| row.get(0),
+            )?)
+        })
+        .await?;
+
+    let apr_cmd = fixture.start_command(
+        BridgeCommand::SendMessage {
+            message_id: MessageId::generate()?,
+            sender_kind: AuthorKind::Human,
+            sender_name: "admin".into(),
+            sender_node_id: None,
+            recipient_id: receiver,
+            in_reply_to: None,
+            body: "direct while awaiting approval".into(),
+            attachments: vec![attachment],
+            question: None,
+            answer: None,
+        },
+        SLOW_BUDGET,
+        relay_client(&blob_origin)?,
+    )?;
+    let apr_res = apr_cmd.finish().await?;
+    assert_eq!(apr_res.outcome, CommandOutcome::AwaitingApproval);
+    let problem = apr_res.error.ok_or("missing awaiting_approval problem")?;
+    assert_eq!(problem.code, ErrorCode::AwaitingApproval);
+    assert_eq!(
+        problem.extensions.get("approval_id"),
+        Some(&serde_json::json!(public_approval_id))
+    );
+    assert_eq!(gets.load(Ordering::SeqCst), 0);
+
+    server.abort();
+    fixture.stop().await
+}

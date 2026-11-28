@@ -192,14 +192,6 @@ impl Socket {
         self.active_write.as_ref().map(|write| write.deadline)
     }
 
-    fn transport_write_deadline(&self) -> MonoInstant {
-        let mut bound = self.clock.deadline_after(WRITE_TIMEOUT);
-        if let Some(pong) = self.heartbeat.pong {
-            bound = self.earlier(bound, pong);
-        }
-        bound
-    }
-
     fn start_write(&mut self, op: WriteOp, authorized: Option<OwnedRwLockReadGuard<()>>) {
         if self.active_write.is_some() {
             return;
@@ -210,7 +202,7 @@ impl Socket {
         };
         self.active_write = Some(ActiveWrite {
             state,
-            deadline: self.transport_write_deadline(),
+            deadline: self.clock.deadline_after(WRITE_TIMEOUT),
             _authorized: authorized,
         });
     }
@@ -728,7 +720,11 @@ impl Socket {
             Message::Binary(_) => Err(Exit::Close(CloseReason::InvalidDataType)),
             Message::Close(_) => {
                 self.close_sent = true;
-                self.active_write = None;
+                let _authorized = self
+                    .active_write
+                    .take()
+                    .filter(|write| matches!(write.state, WriteState::Flush))
+                    .and_then(|write| write._authorized);
                 let _ = time::timeout(CLOSE_TIMEOUT, self.sink.flush()).await;
                 Err(Exit::Peer)
             }
@@ -753,21 +749,16 @@ impl Socket {
         Ok(())
     }
 
-    fn earlier(&self, left: MonoInstant, right: MonoInstant) -> MonoInstant {
-        if self.clock.remaining_ms(left).unwrap_or(0) <= self.clock.remaining_ms(right).unwrap_or(0)
-        {
-            left
-        } else {
-            right
-        }
-    }
-
     async fn send_close(&mut self, reason: CloseReason) {
         if self.close_sent {
             return;
         }
         self.close_sent = true;
-        self.active_write = None;
+        let _authorized = self
+            .active_write
+            .take()
+            .filter(|write| matches!(write.state, WriteState::Flush))
+            .and_then(|write| write._authorized);
         let reason = self.close.borrow().unwrap_or(reason);
         let (code, reason) = reason.frame();
         let _ = time::timeout(

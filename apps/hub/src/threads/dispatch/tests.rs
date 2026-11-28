@@ -547,7 +547,6 @@ impl Fixture {
             .await?;
         if state == ParticipantState::Idle {
             on_participants_idle(&self.state, &self.node, std::slice::from_ref(&self.worker));
-            wake(&self.state, &self.node);
         }
         Ok(())
     }
@@ -1340,7 +1339,7 @@ async fn retry_clocks_and_limits_belong_to_the_delivery_address() -> TestResult 
             .spawn(async move { (alpha_copy, Some(retry), Completion::Transient) });
         // A newly committed post cannot slip between the DB finish and its JoinSet outcome.
         assert_eq!(retry_number(&sweep.retries, &alpha, TEST_EPOCH, 2, 4), None);
-        assert!(sweep.next().await);
+        assert!(sweep.next(false).await);
         if number == RETRIES {
             assert!(sweep.deadline().is_none());
             break;
@@ -1375,7 +1374,7 @@ async fn retry_clocks_and_limits_belong_to_the_delivery_address() -> TestResult 
     sweep
         .pending
         .spawn(async move { (beta, Some(retry), Completion::Transient) });
-    assert!(sweep.next().await);
+    assert!(sweep.next(false).await);
     assert_eq!(sweep.deadline(), Some(Instant::now() + INITIAL_RETRY));
     Ok(())
 }
@@ -1517,7 +1516,7 @@ async fn concurrent_idle_prevents_stale_exhaustion_and_resets_retry_backoff() ->
     sweep
         .pending
         .spawn(async move { (task_candidate, Some(retry), Completion::Transient) });
-    assert!(sweep.next().await);
+    assert!(sweep.next(false).await);
     assert!(
         !sweep.retries.contains_key(&candidate),
         "idle_reset during InFlight must drop retry entry instead of sleeping"
@@ -1768,5 +1767,139 @@ async fn deliver_recycles_bridge_when_fallback_unknown_write_fails() -> TestResu
     let completion = tokio::time::timeout(STEP_TIMEOUT, deliver_task).await??;
     assert!(matches!(completion, Completion::Finished));
     assert_eq!(bridge.transient_disconnects.load(Ordering::SeqCst), 1);
+    Ok(())
+}
+
+#[tokio::test]
+async fn many_stale_prescan_candidates_yield_without_stalling_live_delivery() -> TestResult {
+    let mut fixture = Fixture::new(true).await?;
+    // Long retry proves stale prescans use Attempt::Yield without triggering Retry backoff.
+    fixture.state.thread_dispatch = Dispatch::with_initial_retry(Duration::from_secs(30));
+    let mut threads_list = Vec::new();
+    for _ in 0..17 {
+        threads_list.push(fixture.board(DeliveryMode::DirectNow).await?);
+    }
+    threads_list.sort();
+    let live_thread = threads_list.pop().ok_or("missing live thread")?;
+    let key = fixture.member_key();
+    let owner = fixture.admin.actor_id().to_owned();
+    let mention = serde_json::to_string(&[&key])?;
+    let stale_threads = threads_list.clone();
+    let live_clone = live_thread.clone();
+    fixture
+        .state
+        .db
+        .write_sqlite(move |tx| {
+            // Seed 16 stale DirectNow MentionsOnly threads (>64 unmentioned posts each)
+            // sorted strictly ahead of the live thread.
+            for t in &stale_threads {
+                for seq in 1..=70_u64 {
+                    tx.execute(
+                        "INSERT INTO thread_posts(thread_id,seq,post_id,author_actor_id,author_kind,
+                            author_handle,body,mentions_json,created_at_ms,expires_at_ms)
+                         VALUES(?1,?2,?3,?4,'human','owner','noise','[]',?5,?6)",
+                        params![
+                            t.as_str(),
+                            seq,
+                            cooplet_protocol::MessageId::generate()
+                                .map_err(|e| rusqlite::Error::ToSqlConversionFailure(Box::new(e)))?
+                                .as_str(),
+                            owner,
+                            TEST_NOW,
+                            TEST_NOW + threads::RETENTION_MS
+                        ],
+                    )?;
+                }
+                tx.execute(
+                    "UPDATE threads SET head_seq=70 WHERE thread_id=?1",
+                    [t.as_str()],
+                )?;
+                tx.execute(
+                    "UPDATE thread_members SET direct_wake_seq=1 WHERE thread_id=?1 AND member_key=?2",
+                    params![t.as_str(), key],
+                )?;
+            }
+            for seq in 1..=70_u64 {
+                let mentions = if seq == 70 { mention.as_str() } else { "[]" };
+                tx.execute(
+                    "INSERT INTO thread_posts(thread_id,seq,post_id,author_actor_id,author_kind,
+                        author_handle,body,mentions_json,created_at_ms,expires_at_ms)
+                     VALUES(?1,?2,?3,?4,'human','owner','live',?5,?6,?7)",
+                    params![
+                        live_clone.as_str(),
+                        seq,
+                        cooplet_protocol::MessageId::generate()
+                            .map_err(|e| rusqlite::Error::ToSqlConversionFailure(Box::new(e)))?
+                            .as_str(),
+                        owner,
+                        mentions,
+                        TEST_NOW,
+                        TEST_NOW + threads::RETENTION_MS
+                    ],
+                )?;
+            }
+            tx.execute(
+                "UPDATE threads SET head_seq=70 WHERE thread_id=?1",
+                [live_clone.as_str()],
+            )?;
+            tx.execute(
+                "UPDATE thread_members SET direct_wake_seq=1 WHERE thread_id=?1 AND member_key=?2",
+                params![live_clone.as_str(), key],
+            )?;
+            Ok(WriteOutcome::new(()))
+        })
+        .await?;
+
+    wake(&fixture.state, &fixture.node);
+    let delivered = tokio::time::timeout(Duration::from_secs(3), fixture.attempts.recv())
+        .await?
+        .ok_or("live thread stalled behind stale prescan candidates")?;
+    assert_eq!(delivered.payload.thread_id, live_thread);
+    assert_eq!(
+        (delivered.payload.from_seq, delivered.payload.to_seq),
+        (1, 70)
+    );
+    delivered.complete(ThreadDeliveryOutcome::Delivered)?;
+    fixture.settle().await?;
+    fixture.close().await
+}
+
+#[tokio::test]
+async fn drive_queue_exits_promptly_when_inflight_fails_transiently_during_shutdown() -> TestResult
+{
+    let mut fixture = Fixture::new(true).await?;
+    // Long backoff proves shutdown prevents a second RetryPhase::Sleeping after shutdown.changed().
+    fixture.state.thread_dispatch = Dispatch::with_initial_retry(Duration::from_secs(30));
+    fixture.bridge.free_slot.add_permits(1);
+    let board_a = fixture.board(DeliveryMode::QueueUntilIdle).await?;
+    let peer = fixture
+        .add_peer(&board_a, DeliveryMode::QueueUntilIdle)
+        .await?;
+    fixture.set_worker(ParticipantState::Idle).await?;
+    fixture.settle().await?;
+    fixture
+        .post(&board_a, "shutdown-two-members", "@all check")
+        .await?;
+
+    let first = fixture.attempt().await?;
+    let second = fixture.attempt().await?;
+    assert_ne!(first.payload.member_id, second.payload.member_id);
+    assert!(first.payload.member_id == peer || second.payload.member_id == peer);
+
+    // Put the first member into RetryPhase::Sleeping(30s) while the second remains InFlight.
+    first.complete(ThreadDeliveryOutcome::Unavailable)?;
+    tokio::time::sleep(Duration::from_millis(30)).await;
+
+    // Trigger Hub shutdown once (consuming shutdown.changed() while deadline.is_some()),
+    // then finish the still-in-flight second member transiently.
+    fixture.state.background.close();
+    let _ = fixture.shutdown.send(());
+    tokio::time::sleep(Duration::from_millis(20)).await;
+    second.complete(ThreadDeliveryOutcome::Unavailable)?;
+
+    tokio::time::timeout(Duration::from_secs(2), fixture.state.background.drain())
+        .await
+        .map_err(|_| "drive_queue slept on RetryPhase::Sleeping after shutdown")?;
+    fixture.engine.shutdown().await?;
     Ok(())
 }

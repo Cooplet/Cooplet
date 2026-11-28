@@ -25,13 +25,42 @@ pub(super) struct MemberAddress {
     label: String,
 }
 
+pub(super) fn validate_optional_handle(handle: Option<&str>) -> Result<(), HubError> {
+    if let Some(handle) = handle
+        && normalize_handle(handle).is_none()
+    {
+        return Err(HubError::invalid("Invalid member handle."));
+    }
+    Ok(())
+}
+
+pub(super) fn validate_member_input(
+    caller: &AuthenticatedCaller,
+    body: &ThreadMemberJoinRequest,
+) -> Result<(), HubError> {
+    validate_optional_handle(body.handle.as_deref())?;
+    if let Some((node_id, participant_id)) = body.member_key.split_once('/') {
+        let node_id = NodeId::parse(node_id)?;
+        let _ = ParticipantId::parse(participant_id)?;
+        if caller.source_node_id().is_none() && !caller.allows_node(&node_id) {
+            return Err(store::forbidden(
+                "This credential cannot add the requested node.",
+            ));
+        }
+    } else if UserId::parse(&body.member_key).is_err()
+        && ServicePrincipalId::parse(&body.member_key).is_err()
+    {
+        return Err(HubError::invalid("Invalid thread member key."));
+    }
+    Ok(())
+}
+
 impl MemberAddress {
     fn resolve(
         db: &Connection,
         caller: &AuthenticatedCaller,
         thread_id: &ThreadId,
         key: &str,
-        extra_nodes: &[String],
     ) -> Result<Self, HubError> {
         if let Some((node_id, participant_id)) = key.split_once('/') {
             let node_id = NodeId::parse(node_id)?;
@@ -60,7 +89,6 @@ impl MemberAddress {
             if UserId::parse(key).is_err() && ServicePrincipalId::parse(key).is_err() {
                 return Err(HubError::invalid("Invalid thread member key."));
             }
-            let extra_json = serde_json::to_string(extra_nodes)?;
             let (participant_id, label) = db
                 .query_row(
                     "SELECT COALESCE(participant_id,principal_id),username FROM principals
@@ -72,16 +100,11 @@ impl MemberAddress {
                                 WHERE tm.thread_id=?2 AND instr(tm.member_key,'/')>0
                                   AND substr(tm.member_key,1,instr(tm.member_key,'/')-1)
                                       NOT IN (SELECT value FROM json_each(allowed_nodes_json))
-                            )
-                            AND NOT EXISTS(
-                                SELECT 1 FROM json_each(?4) en
-                                WHERE en.value NOT IN (SELECT value FROM json_each(allowed_nodes_json))
                             )))",
                     params![
                         key,
                         thread_id.as_str(),
                         caller.source_node_id().map(NodeId::as_str),
-                        extra_json,
                     ],
                     |row| Ok((row.get(0)?, row.get(1)?)),
                 )
@@ -215,7 +238,7 @@ pub(super) fn add_creator(
         wake_policy: None,
         delivery_mode: None,
     };
-    add(ctx, thread_id, 0, request, &[])?;
+    add(ctx, thread_id, 0, request)?;
     Ok(())
 }
 
@@ -224,9 +247,9 @@ pub(super) fn add(
     id: &ThreadId,
     head: u64,
     body: ThreadMemberJoinRequest,
-    extra_nodes: &[String],
 ) -> Result<MemberView, HubError> {
-    let address = MemberAddress::resolve(ctx.tx, ctx.caller, id, &body.member_key, extra_nodes)?;
+    validate_member_input(ctx.caller, &body)?;
+    let address = MemberAddress::resolve(ctx.tx, ctx.caller, id, &body.member_key)?;
     let existing = member(ctx.tx, id, &body.member_key)?;
     if existing
         .as_ref()
@@ -361,7 +384,7 @@ pub(crate) async fn join(
         let board = store::board(ctx.tx, &id, ctx.now)?;
         require_manager(ctx, &id)?;
         store::require_open(&board)?;
-        let saved = add(ctx, &id, board.head_seq, body, &[])?;
+        let saved = add(ctx, &id, board.head_seq, body)?;
         Ok((id, saved))
     })
     .await

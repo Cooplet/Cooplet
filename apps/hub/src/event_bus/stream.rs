@@ -295,7 +295,7 @@ impl EventStream {
                     let lagged = watermark.lag_gen != self.seen_lag_gen;
                     self.seen_lag_gen = watermark.lag_gen;
                     let relevant = lagged
-                        || self.reader.kinds.is_empty()
+                        || (self.reader.kinds.is_empty() && watermark.head > self.cursor)
                         || watermark.head.saturating_sub(self.cursor) >= CURSOR_CATCHUP_STRIDE
                         || self.reader.kinds.iter().any(|kind| {
                             watermark.by_kind[event_kind_index(*kind)] > self.cursor

@@ -120,12 +120,15 @@ pub(super) fn upsert_participant(
 }
 
 pub(super) fn require_session(tx: &Transaction<'_>, key: &SessionKey) -> Result<(), HubError> {
-    let current = tx.query_row(
-        "SELECT EXISTS(SELECT 1 FROM nodes WHERE node_id = ?1 AND generation = ?2
-                       AND session_epoch = ?3 AND revoked_at_ms IS NULL AND status != 'revoked')",
-        params![key.node_id.as_str(), key.generation, key.epoch],
-        |row| row.get::<_, bool>(0),
-    )?;
+    let current = tx
+        .prepare_cached(
+            "SELECT EXISTS(SELECT 1 FROM nodes WHERE node_id = ?1 AND generation = ?2
+                           AND session_epoch = ?3 AND revoked_at_ms IS NULL AND status != 'revoked')",
+        )?
+        .query_row(
+            params![key.node_id.as_str(), key.generation, key.epoch],
+            |row| row.get::<_, bool>(0),
+        )?;
     if !current {
         return Err(HubError::new(
             ErrorCode::BridgeUnavailable,
@@ -381,18 +384,18 @@ fn apply_event(
                     Vec::new(),
                 ));
             };
-            tx.execute(
+            tx.prepare_cached(
                 "UPDATE node_participants SET state = ?1, approval_json = ?2, updated_at_ms = ?3
                    WHERE node_id = ?4 AND participant_id = ?5 AND synced_epoch = ?6",
-                params![
-                    state.as_str(),
-                    encoded,
-                    now,
-                    key.node_id.as_str(),
-                    participant_id.as_str(),
-                    key.epoch
-                ],
-            )?;
+            )?
+            .execute(params![
+                state.as_str(),
+                encoded,
+                now,
+                key.node_id.as_str(),
+                participant_id.as_str(),
+                key.epoch
+            ])?;
             let mut data = serde_json::to_value(approval)?;
             data["participant_id"] = json!(participant_id);
             data["name"] = json!(previous.name);

@@ -692,7 +692,7 @@ async fn filtered_event_stream_tracks_thread_updated_and_ignores_unrelated_kinds
     .await?;
 
     // Filtered stream subscribing only to `thread.updated` must still watch thread ACL changes
-    // and wake on `thread.updated`, while ignoring unrelated `blob.stored` events.
+    // and skip SQLite scans on unrelated `node.status` broadcasts via `Watermark::by_kind`.
     let mut filtered = stream(
         &fixture.state,
         &service,
@@ -706,7 +706,34 @@ async fn filtered_event_stream_tracks_thread_updated_and_ignores_unrelated_kinds
     .into_body()
     .into_data_stream();
 
-    // Publish an unrelated event kind; filtered stream must stay parked (no frame emitted).
+    // Commit a `thread.updated` row silently (`WriteOutcome::new(())`, no broadcast so
+    // `by_kind[ThreadUpdated]` stays 0). Then broadcast an unrelated `node.status` event.
+    // Because `by_kind` filters out `node.status`, the filtered stream must NOT scan SQLite
+    // and therefore must NOT see the silent `thread.updated` row yet.
+    let hub = fixture.state.meta.hub_id.clone();
+    let tid = board.thread_id.clone();
+    fixture
+        .state
+        .db
+        .write_sqlite(move |tx| {
+            let _ = append(
+                tx,
+                &hub,
+                NewEvent {
+                    kind: EventKind::ThreadUpdated,
+                    aggregate_type: AggregateType::Thread,
+                    aggregate_id: tid.as_str(),
+                    actor_id: None,
+                    created_at_ms: now_ms(),
+                    data: json!({"thread_id": tid.as_str(), "title": "Silent"}),
+                    audience: EventAudience::Thread {
+                        thread_id: tid.clone(),
+                    },
+                },
+            )?;
+            Ok(WriteOutcome::new(()))
+        })
+        .await?;
     fixture
         .publish(vec![(
             EventAudience::OwnerOnly {
@@ -719,10 +746,39 @@ async fn filtered_event_stream_tracks_thread_updated_and_ignores_unrelated_kinds
         tokio::time::timeout(Duration::from_millis(80), filtered.next())
             .await
             .is_err(),
-        "unrelated event kind must not produce a frame on filtered stream"
+        "unrelated node.status wake must skip SQLite scan on thread.updated filtered stream"
     );
 
-    // Now emit a `thread.updated` event for the board and verify the filtered stream wakes and delivers it.
+    // Mutate thread ACL by joining a second member (bumps `thread_acl_watch` while only
+    // broadcasting `thread.member.updated`, so `by_kind[ThreadUpdated]` stays 0). Because
+    // `watch_thread_acl` is enabled for `kinds=thread.updated`, the ACL watch wakes the
+    // stream and its rescan delivers the silent `thread.updated` row.
+    let (other, _) = fixture.service(&[]).await?;
+    threads::join(
+        &fixture.state,
+        &fixture.admin,
+        board.thread_id.clone(),
+        "acl-watch-join-other",
+        ThreadMemberJoinRequest {
+            member_key: other.actor_id().into(),
+            handle: Some("peer".into()),
+            role: None,
+            wake_policy: None,
+            delivery_mode: None,
+        },
+    )
+    .await?;
+    let silent_frame = next_frame(&mut filtered)
+        .await?
+        .ok_or("expected silent thread.updated after ACL watch wake")?;
+    let EventStreamFrame::Event { event } = silent_frame else {
+        return Err("expected Event frame for silent thread.updated".into());
+    };
+    assert_eq!(event.kind, EventKind::ThreadUpdated);
+    assert_eq!(event.payload["title"], "Silent");
+
+    // Verify a broadcast `thread.updated` wakes the filtered stream directly, and that after
+    // removing `service` from the board a subsequent `thread.updated` is hidden.
     let hub = fixture.state.meta.hub_id.clone();
     let tid = board.thread_id.clone();
     fixture
@@ -755,6 +811,47 @@ async fn filtered_event_stream_tracks_thread_updated_and_ignores_unrelated_kinds
     };
     assert_eq!(event.kind, EventKind::ThreadUpdated);
     assert_eq!(event.payload["title"], "Renamed");
+
+    threads::leave(
+        &fixture.state,
+        &fixture.admin,
+        board.thread_id.clone(),
+        "acl-watch-leave",
+        cooplet_protocol::ThreadMemberLeaveRequest {
+            member_key: Some(service.actor_id().into()),
+        },
+    )
+    .await?;
+    let hub = fixture.state.meta.hub_id.clone();
+    let tid = board.thread_id.clone();
+    fixture
+        .state
+        .db
+        .write_sqlite(move |tx| {
+            let ev = append(
+                tx,
+                &hub,
+                NewEvent {
+                    kind: EventKind::ThreadUpdated,
+                    aggregate_type: AggregateType::Thread,
+                    aggregate_id: tid.as_str(),
+                    actor_id: None,
+                    created_at_ms: now_ms(),
+                    data: json!({"thread_id": tid.as_str(), "title": "SecretAfterLeave"}),
+                    audience: EventAudience::Thread {
+                        thread_id: tid.clone(),
+                    },
+                },
+            )?;
+            Ok(WriteOutcome::with_events((), vec![ev]))
+        })
+        .await?;
+    assert!(
+        tokio::time::timeout(Duration::from_millis(80), filtered.next())
+            .await
+            .is_err(),
+        "departed member must not receive thread.updated after leave"
+    );
     assert!(super::stream::is_thread_event_kind(
         EventKind::ThreadUpdated
     ));

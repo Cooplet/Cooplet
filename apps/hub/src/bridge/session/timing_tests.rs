@@ -982,11 +982,14 @@ async fn duplicate_reverse_request_at_capacity_closes_socket_and_rate_limit_pres
 
 #[tokio::test]
 async fn early_node_event_and_revocation_close_with_active_write_behave_cleanly() -> TestResult {
+    use tokio::net::TcpSocket;
+    use tokio_tungstenite::client_async;
+
     let (hub, mut client, epoch) = Fixture::open().await?;
     let participant = agent("early-worker", ParticipantState::Working)?;
     let pid = participant.participant_id.clone();
 
-    // Send a Ping right before RosterSync to interleave control writes during handshake.
+    // Send Ping right before RosterSync to interleave control writes during handshake.
     client
         .send(ClientMessage::Ping(Bytes::from_static(PROBE)))
         .await?;
@@ -1028,22 +1031,140 @@ async fn early_node_event_and_revocation_close_with_active_write_behave_cleanly(
         }
     })
     .await??;
+    drop(client);
+    time::timeout(TIMEOUT, hub.registry.drain()).await?;
 
-    // Queue an outbound command and immediately revoke the node; the client must still receive
-    // the RFC 6455 4003 close frame (never silently dropped by an active write).
-    let (_op_id, cmd) = hub.command(5_000)?;
+    // Open a second connection with tiny TCP send+recv buffers (4 KiB each) so stopping reads
+    // deterministically backpressures Hub writes (`active_write.is_some()`), then verify
+    // `disconnect_revoked` still delivers RFC 6455 close code 4003 mid-burst.
+    let server_sock = TcpSocket::new_v4()?;
+    server_sock.set_send_buffer_size(4096)?;
+    server_sock.bind("127.0.0.1:0".parse()?)?;
+    let listener = server_sock.listen(16)?;
+    let address = listener.local_addr()?;
+    let app = router(hub.state.clone(), RequestLimits::default());
+    let server2 = tokio::spawn(async move { axum::serve(listener, app).await });
+    let cred = mint_node(&hub.state.master, &hub.node_id, 2)?;
+    let nid = hub.node_id.clone();
+    let verifier = cred.verifier;
+    hub.state
+        .db
+        .write_sqlite(move |tx| {
+            tx.execute(
+                "UPDATE nodes SET generation = 2, credential_hmac = ?2 WHERE node_id = ?1",
+                params![nid.as_str(), verifier],
+            )?;
+            Ok(WriteOutcome::new(()))
+        })
+        .await?;
+    let tcp_sock = TcpSocket::new_v4()?;
+    tcp_sock.set_recv_buffer_size(4096)?;
+    let tcp = tcp_sock.connect(address).await?;
+    let mut request = format!("ws://{address}/v1/bridge/connect").into_client_request()?;
+    request
+        .headers_mut()
+        .insert("x-cooplet-hub", hub.state.meta.hub_id.as_str().parse()?);
+    request.headers_mut().insert(
+        header::AUTHORIZATION,
+        format!("Bearer {}", cred.secret.into_string()).parse()?,
+    );
+    request
+        .headers_mut()
+        .insert(header::SEC_WEBSOCKET_PROTOCOL, BRIDGE_SUBPROTOCOL.parse()?);
+    let (mut bp_client, _) = time::timeout(TIMEOUT, client_async(request, tcp)).await??;
+    let hello_frame: BridgeFrame = {
+        let ClientMessage::Text(text) = time::timeout(TIMEOUT, bp_client.next())
+            .await?
+            .ok_or("bp bridge closed")??
+        else {
+            return Err("expected HelloAck".into());
+        };
+        BridgeFrame::from_json(text.as_bytes())?
+    };
+    let epoch2 = hello_frame.epoch;
+    let roster_wire = String::from_utf8(BridgeFrame::encode_json(
+        epoch2,
+        &RosterSyncPayload {
+            chunk_index: 0,
+            is_final: true,
+            participants: Vec::new(),
+            templates: Vec::new(),
+            workflows: Vec::new(),
+            unresolved_thread_fences: Vec::new(),
+            resolved_op_receipts: Vec::new(),
+        },
+    )?)?;
+    bp_client
+        .send(ClientMessage::Text(roster_wire.into()))
+        .await?;
+    let ClientMessage::Text(ready_txt) = time::timeout(TIMEOUT, bp_client.next())
+        .await?
+        .ok_or("bp bridge closed before ready")??
+    else {
+        return Err("expected RosterReady".into());
+    };
+    let _: RosterReadyPayload = BridgeFrame::from_json(ready_txt.as_bytes())?.decode_payload()?;
+
+    // Flood 24 large (~48 KiB) CommandReq frames (>1.1 MiB) while NOT reading from bp_client
+    // so the Hub socket is backpressured mid-write (`active_write.is_some()`), then revoke.
+    let large_body = "z".repeat(48 * 1024);
+    let mut submitted = Vec::new();
+    for _ in 0..24 {
+        let permit = hub
+            .registry
+            .reserve(&hub.node_id)
+            .map_err(|err| format!("reserve failed: {err:?}"))?;
+        let payload = CommandReqPayload {
+            op_id: OperationId::generate()?,
+            actor_id: "usr_admin".into(),
+            command: BridgeCommand::SendMessage {
+                message_id: cooplet_protocol::MessageId::generate()?,
+                sender_kind: cooplet_protocol::AuthorKind::Human,
+                sender_name: "admin".into(),
+                sender_node_id: None,
+                recipient_id: pid.clone(),
+                in_reply_to: None,
+                body: large_body.clone(),
+                attachments: Vec::new(),
+                question: None,
+                answer: None,
+            },
+            delivery_mode: DeliveryMode::DirectNow,
+            admission_budget_ms: 5_000,
+            ttl_ms: None,
+        };
+        submitted.push(tokio::spawn(permit.submit(payload)));
+    }
+    time::sleep(Duration::from_millis(50)).await;
     hub.registry.disconnect_revoked(&hub.node_id);
-    loop {
-        match next_message(&mut client).await? {
-            ClientMessage::Text(_) | ClientMessage::Pong(_) => continue,
+
+    let mut frames_before_close = 0usize;
+    let mut saw_revoked_close = false;
+    while let Ok(Some(Ok(msg))) = time::timeout(TIMEOUT, bp_client.next()).await {
+        match msg {
+            ClientMessage::Text(_) => frames_before_close += 1,
+            ClientMessage::Pong(_) | ClientMessage::Ping(_) => {}
             ClientMessage::Close(Some(close)) => {
                 assert_eq!(u16::from(close.code), 4003);
+                saw_revoked_close = true;
                 break;
             }
             other => return Err(format!("expected 4003 close frame, got {other:?}").into()),
         }
     }
-    let _ = time::timeout(TIMEOUT, cmd).await;
-    drop(client);
+    assert!(
+        saw_revoked_close,
+        "Hub must deliver 4003 close frame even when writes were backpressured"
+    );
+    assert!(
+        frames_before_close < 24,
+        "revocation should interrupt the backpressured burst (saw {frames_before_close}/24)"
+    );
+    for cmd in submitted {
+        let _ = time::timeout(TIMEOUT, cmd).await;
+    }
+    server2.abort();
+    let _ = server2.await;
+    drop(bp_client);
     hub.close().await
 }

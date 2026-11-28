@@ -600,6 +600,10 @@ async fn thread_machine_grant_only_covers_live_posts_in_the_pending_suffix() -> 
         assert!(thread_delivery_contains_blob(tx, thread, node, recent, 101)?);
         assert!(!thread_delivery_contains_blob(tx, thread, node, expired, 101)?);
         assert!(!thread_delivery_contains_blob(tx, thread, node, truncated, 100)?);
+        tx.execute("UPDATE threads SET status = 'closed' WHERE thread_id = ?1", [thread.as_str()])?;
+        assert!(!thread_delivery_contains_blob(tx, thread, node, recent, 101)?);
+        tx.execute("UPDATE threads SET status = 'open' WHERE thread_id = ?1", [thread.as_str()])?;
+        assert!(thread_delivery_contains_blob(tx, thread, node, recent, 101)?);
         tx.execute("UPDATE thread_members SET state = 'paused_unknown' WHERE thread_id = ?1", [thread.as_str()])?;
         assert!(!thread_delivery_contains_blob(tx, thread, node, recent, 101)?);
         Ok(WriteOutcome::new(()))

@@ -194,6 +194,7 @@ enum Attempt {
     NoCandidate,
     Offline,
     Saturated,
+    Yield,
     Retry,
 }
 
@@ -285,8 +286,12 @@ impl Sweep {
 
     async fn start(&mut self, state: &AppState, node_id: &NodeId) -> Attempt {
         let mut prescans: Vec<PrescanHint> = Vec::new();
-        for _ in 0..MAX_STAGE_PRESCANS {
+        let mut seen_candidates: HashSet<Candidate> = HashSet::new();
+        for round in 0..=MAX_STAGE_PRESCANS {
             let mut shutdown = state.shutdown.clone();
+            if shutdown.has_changed().unwrap_or(true) {
+                return Attempt::Offline;
+            }
             let reserved = tokio::select! {
                 biased;
                 _ = shutdown.changed() => return Attempt::Offline,
@@ -372,6 +377,16 @@ impl Sweep {
                 Ok(StageResult::NeedsPrescan(request)) => {
                     // Release the bridge slot and authority guard before scanning on ReadPool.
                     drop(permit);
+                    seen_candidates.insert(request.candidate.clone());
+                    if round == MAX_STAGE_PRESCANS {
+                        // Distinguish forward progress across multiple stale candidates from
+                        // repeated misses on the same candidate under heavy write churn.
+                        return if seen_candidates.len() > 1 {
+                            Attempt::Yield
+                        } else {
+                            Attempt::Retry
+                        };
+                    }
                     match run_prescan(state, *request).await {
                         Ok(found) => {
                             prescans.push(found);
@@ -428,7 +443,7 @@ impl Sweep {
         }
     }
 
-    async fn next(&mut self) -> bool {
+    async fn next(&mut self, shutting_down: bool) -> bool {
         while let Some(result) = self.pending.join_next().await {
             match result {
                 Ok((candidate, retry, outcome)) => {
@@ -437,7 +452,8 @@ impl Sweep {
                         && let Some((current, phase)) = entries.get_mut(&candidate)
                         && *current == attempt
                     {
-                        if matches!(outcome, Completion::Transient)
+                        if !shutting_down
+                            && matches!(outcome, Completion::Transient)
                             && attempt.number < RETRIES
                             && matches!(*phase, RetryPhase::InFlight { idle_reset: false })
                         {
@@ -471,7 +487,18 @@ async fn drive_queue(
     let mut stage_failures = 0;
     let mut stage_retry_at = None;
     let mut shutdown = state.shutdown.clone();
+    let mut shutting_down = shutdown.has_changed().unwrap_or(true);
     loop {
+        if !shutting_down && state.shutdown.has_changed().unwrap_or(true) {
+            shutting_down = true;
+        }
+        if shutting_down {
+            Arc::make_mut(&mut sweep.retries)
+                .retain(|_, (_, p)| matches!(p, RetryPhase::InFlight { .. }));
+            scan = false;
+            follow_up = false;
+            stage_retry_at = None;
+        }
         let idle_reset = queue.take_idle_resets();
         if !idle_reset.is_empty() {
             Arc::make_mut(&mut sweep.retries).retain(|candidate, (_, phase)| {
@@ -489,21 +516,28 @@ async fn drive_queue(
         let current = *wake.borrow_and_update();
         if observed != current {
             observed = current;
-            if stage_failures > RETRIES {
-                stage_failures = 0;
-            }
-            if scan {
-                // Finish this keyset sweep before considering new work on earlier keys.
-                follow_up = true;
-            } else {
-                sweep.cursor = None;
-                scan = true;
+            if !shutting_down {
+                if stage_failures > RETRIES {
+                    stage_failures = 0;
+                }
+                if scan {
+                    // Finish this keyset sweep before considering new work on earlier keys.
+                    follow_up = true;
+                } else {
+                    sweep.cursor = None;
+                    scan = true;
+                }
             }
         }
-        if scan && stage_retry_at.is_none() && stage_failures <= RETRIES {
+        if !shutting_down && scan && stage_retry_at.is_none() && stage_failures <= RETRIES {
             match sweep.start(&state, &node_id).await {
                 Attempt::Started => {
                     stage_failures = 0;
+                    continue;
+                }
+                Attempt::Yield => {
+                    stage_failures = 0;
+                    tokio::task::yield_now().await;
                     continue;
                 }
                 Attempt::NoCandidate => {
@@ -529,21 +563,27 @@ async fn drive_queue(
                 }
             }
         }
-        if !scan && std::mem::take(&mut follow_up) {
+        if !shutting_down && !scan && std::mem::take(&mut follow_up) {
             sweep.cursor = None;
             scan = true;
             continue;
         }
 
-        let deadline = sweep.deadline().into_iter().chain(stage_retry_at).min();
+        let deadline = if shutting_down {
+            None
+        } else {
+            sweep.deadline().into_iter().chain(stage_retry_at).min()
+        };
         if !sweep.pending.is_empty() || deadline.is_some() {
             tokio::select! {
-                change = wake.changed() => {
+                change = wake.changed(), if !shutting_down => {
                     if change.is_err() { return; }
                 }
-                rescan = sweep.next(), if !sweep.pending.is_empty() => {
-                    follow_up |= rescan;
-                    scan = true;
+                rescan = sweep.next(shutting_down), if !sweep.pending.is_empty() => {
+                    if !shutting_down {
+                        follow_up |= rescan;
+                        scan = true;
+                    }
                 }
                 () = async {
                     if let Some(at) = deadline { tokio::time::sleep_until(at).await; }
@@ -555,17 +595,19 @@ async fn drive_queue(
                     }
                     follow_up = true;
                 }
-                _ = shutdown.changed(), if deadline.is_some() => {
+                _ = shutdown.changed(), if !shutting_down && deadline.is_some() => {
+                    shutting_down = true;
                     Arc::make_mut(&mut sweep.retries)
                         .retain(|_, (_, p)| matches!(p, RetryPhase::InFlight { .. }));
+                    scan = false;
+                    follow_up = false;
                     stage_retry_at = None;
-                    stage_failures = RETRIES + 1;
                 }
             }
             continue;
         }
         let mut nodes = state.thread_dispatch.lock();
-        if *wake.borrow() == observed {
+        if shutting_down || *wake.borrow() == observed {
             nodes.remove(&node_id);
             return;
         }

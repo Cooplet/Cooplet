@@ -295,8 +295,8 @@ impl Attempt<'_> {
                 biased;
                 () = wait_stopped(stop) => return Err(Exit::Stopping),
                 () = wait_deadline(&*self.bridge.clock, Some(deadline)) => return Err(Exit::RosterTimeout),
-                () = wait_deadline(&*self.bridge.clock, write_limit.map(|(at, _)| at)), if write_limit.is_some() => {
-                    return Err(write_limit.map_or(Exit::RosterTimeout, |(_, exit)| exit));
+                () = wait_deadline(&*self.bridge.clock, write_limit), if write_limit.is_some() => {
+                    return Err(Exit::SendTimeout);
                 }
                 () = wait_deadline(&*self.bridge.clock, heartbeat), if heartbeat.is_some() => {
                     io.heartbeat_tick()?;
@@ -360,8 +360,8 @@ impl Attempt<'_> {
         let can_write_app = io.can_write_app();
         tokio::select! {
             () = wait_stopped(stop) => return Err(Exit::Stopping),
-            () = wait_deadline(&*self.bridge.clock, write_limit.map(|(at, _)| at)), if write_limit.is_some() => {
-                return Err(write_limit.map_or(Exit::SendTimeout, |(_, exit)| exit));
+            () = wait_deadline(&*self.bridge.clock, write_limit), if write_limit.is_some() => {
+                return Err(Exit::SendTimeout);
             }
             outcome = poll_active_write(&mut io.sink, &mut io.active_write), if io.active_write.is_some() => {
                 io.finish_write(outcome)?;
@@ -766,7 +766,6 @@ enum WriteState {
 struct ActiveWrite {
     state: WriteState,
     deadline: MonoInstant,
-    on_timeout: Exit,
 }
 
 struct Wire {
@@ -805,35 +804,21 @@ impl Wire {
         }
     }
 
-    fn write_deadline(&self) -> Option<(MonoInstant, Exit)> {
-        self.active_write
-            .as_ref()
-            .map(|write| (write.deadline, write.on_timeout))
-    }
-
-    fn transport_write_deadline(&self, timeout: Duration) -> (MonoInstant, Exit) {
-        let mut bound = (self.clock.deadline_after(timeout), Exit::SendTimeout);
-        if let Some((_, pong_deadline)) = self.heartbeat.awaiting
-            && pong_deadline.is_earlier_than(bound.0)
-        {
-            bound = (pong_deadline, Exit::PongTimeout);
-        }
-        bound
+    fn write_deadline(&self) -> Option<MonoInstant> {
+        self.active_write.as_ref().map(|write| write.deadline)
     }
 
     fn start_write(&mut self, op: WriteOp) {
         if self.active_write.is_some() {
             return;
         }
-        let (deadline, on_timeout) = self.transport_write_deadline(SEND_TIMEOUT);
         let state = match op {
             WriteOp::Send(message) => WriteState::Send(Some(message)),
             WriteOp::Flush => WriteState::Flush,
         };
         self.active_write = Some(ActiveWrite {
             state,
-            deadline,
-            on_timeout,
+            deadline: self.clock.deadline_after(SEND_TIMEOUT),
         });
     }
 
@@ -883,8 +868,8 @@ impl Wire {
                 biased;
                 () = wait_stopped(stop) => return Err(Exit::Stopping),
                 () = wait_deadline(&*clock, Some(deadline)) => return Err(phase_timeout),
-                () = wait_deadline(&*clock, write_limit.map(|(at, _)| at)), if write_limit.is_some() => {
-                    return Err(write_limit.map_or(phase_timeout, |(_, exit)| exit));
+                () = wait_deadline(&*clock, write_limit), if write_limit.is_some() => {
+                    return Err(Exit::SendTimeout);
                 }
                 () = wait_deadline(&*clock, heartbeat), if heartbeat.is_some() => {
                     self.heartbeat_tick()?;
@@ -982,11 +967,15 @@ impl Wire {
         let clock = self.clock.clone();
         while self.active_write.is_some() {
             let write_limit = self.write_deadline();
+            let heartbeat = self.heartbeat_poll_deadline();
             tokio::select! {
                 biased;
                 () = wait_stopped(stop) => return Err(Exit::Stopping),
-                () = wait_deadline(&*clock, write_limit.map(|(at, _)| at)), if write_limit.is_some() => {
-                    return Err(write_limit.map_or(Exit::SendTimeout, |(_, exit)| exit));
+                () = wait_deadline(&*clock, heartbeat), if heartbeat.is_some() => {
+                    self.heartbeat_tick()?;
+                }
+                () = wait_deadline(&*clock, write_limit), if write_limit.is_some() => {
+                    return Err(Exit::SendTimeout);
                 }
                 outcome = poll_active_write(&mut self.sink, &mut self.active_write), if self.active_write.is_some() => {
                     self.finish_write(outcome)?;
@@ -1343,7 +1332,8 @@ mod tests {
     async fn phase_deadline_never_leaks_into_active_write_across_phases()
     -> Result<(), Box<dyn std::error::Error>> {
         let clock = Arc::new(Clock::default());
-        let (transport, peer) = tokio::io::duplex(4096);
+        clock.at(29_950);
+        let (transport, peer) = tokio::io::duplex(512);
         let socket = WebSocketStream::from_raw_socket(
             Box::new(transport) as Box<dyn WebSocketIo>,
             tokio_tungstenite::tungstenite::protocol::Role::Client,
@@ -1357,7 +1347,11 @@ mod tests {
             None,
         )
         .await;
-        // Peer sends Ping right before connect deadline followed by HelloAck.
+        // Queue a 600-byte message into tungstenite's write buffer so flushing the Pong
+        // stalls on the 512-byte client->server duplex buffer while HelloAck is read.
+        wire.sink
+            .feed(Message::Text("b".repeat(600).into()))
+            .await?;
         server.send(Message::Ping(vec![1, 2].into())).await?;
         let hello = BridgeFrame::encode_json(
             1,
@@ -1373,7 +1367,6 @@ mod tests {
             .send(Message::Text(String::from_utf8(hello)?.into()))
             .await?;
 
-        clock.at(29_950);
         let connect_deadline = MonoInstant::from_millis(30_000);
         let (_stopping, stop) = watch::channel(false);
         let frame = wire
@@ -1381,12 +1374,63 @@ mod tests {
             .await
             .map_err(|e| e.reason())?;
         assert_eq!(frame.epoch, 1);
-        // If a control write remained active, its deadline must be SEND_TIMEOUT (39_950),
-        // never the expired connect_deadline (30_000).
-        if let Some((limit, on_timeout)) = wire.write_deadline() {
-            assert_eq!(on_timeout.reason(), Exit::SendTimeout.reason());
-            assert!(connect_deadline.is_earlier_than(limit));
-        }
+        let limit = wire
+            .write_deadline()
+            .ok_or("expected active control write to remain in flight after next_app")?;
+        assert!(connect_deadline.is_earlier_than(limit));
+
+        // Advancing past the expired connect_deadline must NOT abort the active write;
+        // only its own SEND_TIMEOUT (29_950 + 10_000 = 39_950) expires it.
+        let mut write = pin!(wire.drive_write_to_completion(&stop));
+        assert!(poll_once(write.as_mut()).await.is_pending());
+        clock.at(30_001);
+        tokio::time::advance(Duration::from_millis(51)).await;
+        assert!(poll_once(write.as_mut()).await.is_pending());
+        clock.at(39_950);
+        tokio::time::advance(Duration::from_millis(9_949)).await;
+        assert!(matches!(
+            poll_once(write.as_mut()).await,
+            Poll::Ready(Err(Exit::SendTimeout))
+        ));
+        Ok(())
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn write_started_before_pong_deadline_survives_after_valid_pong()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let clock = Arc::new(Clock::default());
+        let (mut wire, mut peer) = blocked_wire(&clock).await;
+        let challenge = 42_u64.to_be_bytes();
+        clock.at(15_000);
+        wire.heartbeat.start_ping(&*clock, challenge);
+        clock.at(24_900);
+        let (_stopping, stop) = watch::channel(false);
+        wire.start_write(WriteOp::Send(Message::Text("payload".repeat(10).into())));
+        // Valid Pong arrives 50ms before the old 25_000 pong_deadline.
+        clock.at(24_950);
+        wire.heartbeat
+            .pong(&*clock, &challenge)
+            .map_err(|e| e.reason())?;
+        let drain = {
+            let mut write = pin!(wire.drive_write_to_completion(&stop));
+            assert!(poll_once(write.as_mut()).await.is_pending());
+            // Crossing the old 25_000 pong_deadline must NOT trigger PongTimeout.
+            clock.at(25_001);
+            tokio::time::advance(Duration::from_millis(51)).await;
+            assert!(poll_once(write.as_mut()).await.is_pending());
+            let drain = tokio::spawn(async move {
+                let mut buf = [0u8; 256];
+                while let Ok(n) = peer.read(&mut buf).await {
+                    if n == 0 {
+                        break;
+                    }
+                }
+            });
+            assert!(write.await.is_ok());
+            drain
+        };
+        drop(wire);
+        let _ = drain.await;
         Ok(())
     }
 
